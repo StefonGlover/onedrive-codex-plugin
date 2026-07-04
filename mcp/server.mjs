@@ -2,7 +2,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createReadStream, readFileSync } from "node:fs";
-import { mkdir, open, realpath, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -10,6 +10,10 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const configPath = join(homedir(), ".codex", "onedrive-plugin", "config.json");
 const downloadRoot = join(homedir(), ".codex", "onedrive-plugin", "downloads");
+const cacheRoot = join(homedir(), ".codex", "onedrive-plugin", "cache");
+const cachePath = join(cacheRoot, "metadata-cache.json");
+const updateRoot = join(homedir(), ".codex", "onedrive-plugin", "updates");
+const backupRoot = join(homedir(), ".codex", "onedrive-plugin", "backups");
 const localOneDriveSyncRoots = [
   { path: join(homedir(), "Library", "CloudStorage", "OneDrive"), prefix: false },
   { path: join(homedir(), "Library", "CloudStorage", "OneDrive-"), prefix: true },
@@ -22,7 +26,7 @@ const simpleUploadLimit = 250 * 1024 * 1024;
 const uploadChunkUnit = 320 * 1024;
 const defaultUploadChunkSize = 10 * 1024 * 1024;
 const maxUploadChunkSize = 60 * 1024 * 1024;
-const defaultSelect = "id,name,size,folder,file,webUrl,createdDateTime,lastModifiedDateTime,parentReference";
+const defaultSelect = "id,name,size,folder,file,webUrl,createdDateTime,lastModifiedDateTime,parentReference,eTag,cTag,deleted";
 const textExtensions = new Set([
   ".bat", ".c", ".cfg", ".conf", ".cpp", ".cs", ".css", ".csv", ".env", ".go", ".h", ".hpp", ".htm",
   ".html", ".ini", ".java", ".js", ".json", ".jsx", ".log", ".md", ".mjs", ".php", ".properties",
@@ -79,6 +83,7 @@ const officeKinds = {
 
 let tokenCache = null;
 let pendingDevice = null;
+let metadataCacheMemory = null;
 
 const outputFormatSchema = {
   type: "string",
@@ -322,7 +327,7 @@ const tools = [
   },
   {
     name: "onedrive_find",
-    description: "Stateless remote-first file finder. Runs live Graph searches, ranks matches in memory, and optionally falls back to bounded recursive scans.",
+    description: "Cache-assisted remote-first file finder. Uses metadata cache when available, runs live Graph searches, ranks matches in memory, and optionally falls back to bounded recursive scans.",
     inputSchema: {
       type: "object",
       required: ["query"],
@@ -354,6 +359,11 @@ const tools = [
           default: 78,
           description: "If the best search-only match scores below this, use scan fallback when enabled."
         },
+        useCache: {
+          type: "boolean",
+          default: true,
+          description: "Use the local metadata cache as a fast ranking source before live Graph search."
+        },
         format: outputFormatSchema
       },
       additionalProperties: false
@@ -361,7 +371,7 @@ const tools = [
   },
   {
     name: "onedrive_find_all",
-    description: "Broader remote-first file locator for larger OneDrive searches. Searches common folders first, forces bounded scan fallback, and returns more ranked matches.",
+    description: "Broader cache-assisted remote-first file locator for larger OneDrive searches. Searches common folders first, forces bounded scan fallback when needed, and returns more ranked matches.",
     inputSchema: {
       type: "object",
       required: ["query"],
@@ -384,6 +394,11 @@ const tools = [
         scanMaxDepth: { type: "integer", minimum: 0, maximum: 50, default: 25 },
         searchPageSize: { type: "integer", minimum: 1, maximum: 200, default: 100 },
         searchMaxItemsPerTerm: { type: "integer", minimum: 1, maximum: 1000, default: 250 },
+        useCache: {
+          type: "boolean",
+          default: true,
+          description: "Use the local metadata cache as a fast ranking source before live Graph search."
+        },
         format: outputFormatSchema
       },
       additionalProperties: false
@@ -404,6 +419,39 @@ const tools = [
       },
       additionalProperties: false
     }
+  },
+  {
+    name: "onedrive_sync_status",
+    description: "Show local metadata-cache status, delta cursor availability, and plugin storage locations.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        includeSamples: { type: "boolean", default: false }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_cache_refresh",
+    description: "Refresh the local metadata cache from a bounded recursive scan, or from delta when a previous cursor exists.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...folderTargetProperties,
+        mode: { type: "string", enum: ["auto", "scan", "delta"], default: "auto" },
+        pageSize: { type: "integer", minimum: 1, maximum: 200, default: 200 },
+        maxItems: { type: "integer", minimum: 1, maximum: 50000, default: 10000 },
+        maxFolders: { type: "integer", minimum: 1, maximum: 10000, default: 2000 },
+        maxDepth: { type: "integer", minimum: 0, maximum: 50, default: 25 },
+        includeFolders: { type: "boolean", default: true }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_cache_clear",
+    description: "Clear the local OneDrive metadata cache.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false }
   },
   {
     name: "onedrive_get_info",
@@ -436,6 +484,24 @@ const tools = [
           type: "boolean",
           default: false,
           description: "When true, bypass MIME/extension text checks while keeping maxBytes enforcement."
+        }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_preview",
+    description: "Return a bounded safe preview for text files and Graph-supported document text exports.",
+    inputSchema: {
+      type: "object",
+      anyOf: itemTargetAnyOf,
+      properties: {
+        ...pathTargetProperties,
+        maxBytes: { type: "integer", minimum: 1, maximum: 1048576, default: 65536 },
+        preferExportText: {
+          type: "boolean",
+          default: true,
+          description: "For likely Office files, ask Graph for a text export before falling back to raw text checks."
         }
       },
       additionalProperties: false
@@ -626,6 +692,7 @@ const tools = [
       properties: {
         ...pathTargetProperties,
         newName: { type: "string", minLength: 1 },
+        dryRun: { type: "boolean", default: false },
         expectedName: { type: "string", description: "Optional safety check: item name must match before renaming." },
         expectedId: { type: "string", description: "Optional safety check: item ID must match before renaming." }
       },
@@ -647,6 +714,7 @@ const tools = [
         destinationParentItemId: { type: "string", description: "Destination folder drive item ID." },
         ...destinationPresetProperties,
         newName: { type: "string", description: "Optional new name after moving." },
+        dryRun: { type: "boolean", default: false },
         expectedName: { type: "string", description: "Optional safety check: source item name must match." },
         expectedId: { type: "string", description: "Optional safety check: source item ID must match." }
       },
@@ -668,6 +736,7 @@ const tools = [
         destinationParentItemId: { type: "string", description: "Destination folder drive item ID." },
         ...destinationPresetProperties,
         newName: { type: "string", description: "Optional copied item name." },
+        dryRun: { type: "boolean", default: false },
         waitForCompletion: { type: "boolean", default: false },
         timeoutSeconds: { type: "integer", minimum: 1, maximum: 300, default: 60 },
         expectedName: { type: "string", description: "Optional safety check: source item name must match." },
@@ -736,6 +805,248 @@ const tools = [
       properties: {
         ...pathTargetProperties,
         format: outputFormatSchema
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_batch_get_info",
+    description: "Get metadata for up to 20 OneDrive items using Microsoft Graph batching.",
+    inputSchema: {
+      type: "object",
+      required: ["items"],
+      properties: {
+        items: {
+          type: "array",
+          minItems: 1,
+          maxItems: 20,
+          items: {
+            type: "object",
+            anyOf: itemTargetAnyOf,
+            properties: pathTargetProperties,
+            additionalProperties: false
+          }
+        },
+        format: outputFormatSchema
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_batch_permissions",
+    description: "Audit sharing permissions for up to 20 OneDrive files or folders using Microsoft Graph batching.",
+    inputSchema: {
+      type: "object",
+      required: ["items"],
+      properties: {
+        items: {
+          type: "array",
+          minItems: 1,
+          maxItems: 20,
+          items: {
+            type: "object",
+            anyOf: itemTargetAnyOf,
+            properties: pathTargetProperties,
+            additionalProperties: false
+          }
+        },
+        format: outputFormatSchema
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_batch_download",
+    description: "Download multiple OneDrive files serially with one result per item.",
+    inputSchema: {
+      type: "object",
+      required: ["items"],
+      properties: {
+        items: {
+          type: "array",
+          minItems: 1,
+          maxItems: 50,
+          items: {
+            type: "object",
+            anyOf: itemTargetAnyOf,
+            properties: {
+              ...pathTargetProperties,
+              localPath: { type: "string" },
+              overwrite: { type: "boolean", default: false }
+            },
+            additionalProperties: false
+          }
+        },
+        destinationFolder: { type: "string", description: "Optional local folder for downloaded files." },
+        overwrite: { type: "boolean", default: false },
+        allowLocalOneDriveSyncPath: { type: "boolean", default: false }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_batch_delete",
+    description: "Preview or delete multiple OneDrive items. Live deletes require dryRun=false and confirmed=true.",
+    inputSchema: {
+      type: "object",
+      required: ["items"],
+      properties: {
+        items: {
+          type: "array",
+          minItems: 1,
+          maxItems: 50,
+          items: {
+            type: "object",
+            anyOf: itemTargetAnyOf,
+            properties: {
+              ...pathTargetProperties,
+              expectedName: { type: "string" },
+              expectedId: { type: "string" }
+            },
+            additionalProperties: false
+          }
+        },
+        dryRun: { type: "boolean", default: true },
+        confirmed: { type: "boolean", default: false }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_batch_move",
+    description: "Preview or move multiple OneDrive items to one destination folder.",
+    inputSchema: {
+      type: "object",
+      required: ["items"],
+      properties: {
+        items: {
+          type: "array",
+          minItems: 1,
+          maxItems: 50,
+          items: {
+            type: "object",
+            anyOf: itemTargetAnyOf,
+            properties: {
+              path: { type: "string", description: "Source item path relative to OneDrive root." },
+              itemId: { type: "string", description: "Source drive item ID." },
+              preset: presetSchema,
+              relativePath: relativePathSchema,
+              newName: { type: "string" },
+              expectedName: { type: "string" },
+              expectedId: { type: "string" }
+            },
+            additionalProperties: false
+          }
+        },
+        destinationParentPath: { type: "string", description: "Destination folder path relative to root. Omit or use / for root." },
+        destinationParentItemId: { type: "string", description: "Destination folder drive item ID." },
+        ...destinationPresetProperties,
+        dryRun: { type: "boolean", default: true },
+        confirmed: {
+          type: "boolean",
+          default: false,
+          description: "Must be true after explicit user confirmation for live batch moves."
+        }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_update_file",
+    description: "Safe file update workflow: checkout downloads a remote file with a manifest; commit uploads an edited file back after conflict checks.",
+    inputSchema: {
+      type: "object",
+      required: ["mode", "remotePath"],
+      properties: {
+        mode: { type: "string", enum: ["checkout", "commit"] },
+        remotePath: { type: "string", description: "Remote OneDrive path including filename." },
+        itemId: { type: "string", description: "Optional item ID for checkout." },
+        localPath: { type: "string", description: "Checkout destination or commit source. Checkout defaults to ~/.codex/onedrive-plugin/updates." },
+        manifestPath: { type: "string", description: "Optional checkout manifest path. Defaults to localPath + .onedrive-update.json." },
+        conflictCheck: { type: "boolean", default: true },
+        force: { type: "boolean", default: false },
+        createBackup: { type: "boolean", default: true },
+        verify: { type: "boolean", default: true },
+        overwriteLocal: { type: "boolean", default: false },
+        overwriteManifest: { type: "boolean", default: false },
+        allowLocalOneDriveSyncPath: { type: "boolean", default: false }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_recent",
+    description: "List recently used OneDrive files from Microsoft Graph.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+        format: outputFormatSchema
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_large_files",
+    description: "Find large files by scanning OneDrive and sorting by size.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...folderTargetProperties,
+        minBytes: { type: "integer", minimum: 0, default: 104857600 },
+        limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+        maxItems: { type: "integer", minimum: 1, maximum: 50000, default: 10000 },
+        maxFolders: { type: "integer", minimum: 1, maximum: 10000, default: 2000 },
+        maxDepth: { type: "integer", minimum: 0, maximum: 50, default: 25 },
+        format: outputFormatSchema
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_duplicates",
+    description: "Find likely duplicate files by scanning OneDrive and grouping by hash when available, otherwise by name and size.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...folderTargetProperties,
+        limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+        maxItems: { type: "integer", minimum: 1, maximum: 50000, default: 10000 },
+        maxFolders: { type: "integer", minimum: 1, maximum: 10000, default: 2000 },
+        maxDepth: { type: "integer", minimum: 0, maximum: 50, default: 25 },
+        format: outputFormatSchema
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_shared_by_me",
+    description: "Scan files and folders and return items with explicit sharing permissions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...folderTargetProperties,
+        limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+        maxItems: { type: "integer", minimum: 1, maximum: 5000, default: 1000 },
+        maxFolders: { type: "integer", minimum: 1, maximum: 1000, default: 250 },
+        maxDepth: { type: "integer", minimum: 0, maximum: 50, default: 15 },
+        includeFolders: { type: "boolean", default: true }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_public_links",
+    description: "Scan files and folders and return anonymous sharing links.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...folderTargetProperties,
+        limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+        maxItems: { type: "integer", minimum: 1, maximum: 5000, default: 1000 },
+        maxFolders: { type: "integer", minimum: 1, maximum: 1000, default: 250 },
+        maxDepth: { type: "integer", minimum: 0, maximum: 50, default: 15 },
+        includeFolders: { type: "boolean", default: true }
       },
       additionalProperties: false
     }
@@ -862,6 +1173,140 @@ function publicConfig() {
   };
 }
 
+function emptyMetadataCache() {
+  return {
+    version: 1,
+    createdAt: new Date().toISOString(),
+    updatedAt: null,
+    deltaLink: null,
+    scanRoot: null,
+    itemCount: 0,
+    itemsById: {},
+    pathsByLower: {}
+  };
+}
+
+async function loadMetadataCache() {
+  if (metadataCacheMemory) return metadataCacheMemory;
+  try {
+    const parsed = JSON.parse(await readFile(cachePath, "utf8"));
+    metadataCacheMemory = {
+      ...emptyMetadataCache(),
+      ...parsed,
+      itemsById: parsed.itemsById || {},
+      pathsByLower: parsed.pathsByLower || {}
+    };
+  } catch {
+    metadataCacheMemory = emptyMetadataCache();
+  }
+  return metadataCacheMemory;
+}
+
+async function saveMetadataCache(cache) {
+  cache.updatedAt = new Date().toISOString();
+  cache.itemCount = Object.keys(cache.itemsById || {}).length;
+  await mkdir(cacheRoot, { recursive: true });
+  await writeFile(cachePath, JSON.stringify(cache, null, 2));
+  metadataCacheMemory = cache;
+  return cache;
+}
+
+function cachePathKey(remotePath = "") {
+  return cleanPath(remotePath).toLowerCase();
+}
+
+function cachePutSimplified(cache, item) {
+  if (!item?.id) return;
+  if (item.deleted) {
+    cacheRemoveItemAndDescendants(cache, item);
+    return;
+  }
+  const simplified = item.remotePath !== undefined ? item : simplifyItem(item);
+  const previous = cache.itemsById?.[simplified.id];
+  if (previous?.remotePath && previous.remotePath !== simplified.remotePath) {
+    delete cache.pathsByLower[cachePathKey(previous.remotePath)];
+  }
+  cache.itemsById[simplified.id] = simplified;
+  if (simplified.remotePath) cache.pathsByLower[cachePathKey(simplified.remotePath)] = simplified.id;
+}
+
+function cacheRemoveItemAndDescendants(cache, item) {
+  const old = cache.itemsById?.[item.id] || (item.remotePath ? item : null);
+  const remotePath = old?.remotePath || item.remotePath;
+  const lowerPath = remotePath ? cachePathKey(remotePath) : null;
+  for (const [id, cached] of Object.entries(cache.itemsById || {})) {
+    const cachedLower = cached.remotePath ? cachePathKey(cached.remotePath) : "";
+    if (id === item.id || (lowerPath && (cachedLower === lowerPath || cachedLower.startsWith(`${lowerPath}/`)))) {
+      if (cached.remotePath) delete cache.pathsByLower[cachePathKey(cached.remotePath)];
+      delete cache.itemsById[id];
+    }
+  }
+  if (lowerPath) delete cache.pathsByLower[lowerPath];
+}
+
+async function cacheItems(items = [], metadata = {}) {
+  if (!items.length && !metadata.deltaLink && !metadata.scanRoot) return await loadMetadataCache();
+  const cache = await loadMetadataCache();
+  for (const item of items) cachePutSimplified(cache, item);
+  if (metadata.deltaLink) cache.deltaLink = metadata.deltaLink;
+  if (metadata.scanRoot !== undefined) cache.scanRoot = metadata.scanRoot;
+  return await saveMetadataCache(cache);
+}
+
+async function clearMetadataCache() {
+  metadataCacheMemory = emptyMetadataCache();
+  await mkdir(cacheRoot, { recursive: true });
+  await writeFile(cachePath, JSON.stringify(metadataCacheMemory, null, 2));
+  return metadataCacheMemory;
+}
+
+async function syncStatus(args = {}) {
+  const cache = await loadMetadataCache();
+  const items = Object.values(cache.itemsById || {});
+  return {
+    cachePath,
+    downloadRoot,
+    updateRoot,
+    backupRoot,
+    itemCount: items.length,
+    updatedAt: cache.updatedAt,
+    deltaLinkAvailable: Boolean(cache.deltaLink),
+    scanRoot: cache.scanRoot,
+    samples: args.includeSamples ? items.slice(0, 10).map((item) => formatSimplifiedItem(item, "compact")) : undefined
+  };
+}
+
+async function cachedItems() {
+  const cache = await loadMetadataCache();
+  return Object.values(cache.itemsById || {});
+}
+
+async function cachedItemByPath(path) {
+  const cache = await loadMetadataCache();
+  const id = cache.pathsByLower?.[cachePathKey(path)];
+  return id ? cache.itemsById[id] : null;
+}
+
+async function cachedItemById(id) {
+  const cache = await loadMetadataCache();
+  return id ? cache.itemsById[id] || null : null;
+}
+
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 async function doctor(args = {}) {
   const checks = [];
   const addCheck = (name, status, details = {}) => {
@@ -944,7 +1389,8 @@ async function postForm(url, params) {
   const response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams(params)
+    body: new URLSearchParams(params),
+    signal: timeoutSignal()
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -1040,6 +1486,18 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function fetchTimeoutMs() {
+  const value = Number(process.env.ONEDRIVE_FETCH_TIMEOUT_MS || 60_000);
+  return Number.isFinite(value) && value > 0 ? value : 60_000;
+}
+
+function timeoutSignal(timeoutMs = fetchTimeoutMs()) {
+  if (AbortSignal.timeout) return AbortSignal.timeout(timeoutMs);
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), timeoutMs).unref?.();
+  return controller.signal;
+}
+
 function retryDelayMs(response, attempt) {
   const retryAfter = response.headers.get("retry-after");
   if (retryAfter) {
@@ -1091,12 +1549,18 @@ async function parseResponseBody(response) {
 
 async function fetchWithRetry(url, options = {}, retryOptions = {}) {
   const maxRetries = retryOptions.maxRetries ?? 3;
+  const timeoutMs = retryOptions.timeoutMs ?? fetchTimeoutMs();
   for (let attempt = 0; ; attempt += 1) {
     let response;
     try {
-      response = await fetch(url, options);
+      response = await fetch(url, { ...options, signal: options.signal || timeoutSignal(timeoutMs) });
     } catch (error) {
-      if (attempt >= maxRetries) throw error;
+      if (attempt >= maxRetries) {
+        if (error.name === "AbortError" || error.name === "TimeoutError") {
+          throw new Error(`Request timed out after ${timeoutMs}ms: ${url}`);
+        }
+        throw error;
+      }
       await sleep(Math.min(1000 * 2 ** attempt, 8000));
       continue;
     }
@@ -1133,6 +1597,19 @@ function graphUrl(path, options = {}) {
   return target.toString();
 }
 
+function assertTrustedCopyMonitorUrl(monitorUrl) {
+  const base = new URL(graphBaseUrl());
+  const target = new URL(monitorUrl, base);
+  const host = target.hostname.toLowerCase();
+  const trustedMicrosoftHost = host === "my.microsoftpersonalcontent.com"
+    || host.endsWith(".microsoftpersonalcontent.com")
+    || host.endsWith(".sharepoint.com");
+  if (target.origin !== base.origin && !trustedMicrosoftHost) {
+    throw new Error(`Refusing to poll untrusted copy monitor URL: ${target.origin}${target.pathname}`);
+  }
+  return target.toString();
+}
+
 async function graph(path, options = {}) {
   const { returnResponse = false, maxRetries, skipAuth = false, ...fetchOptions } = options;
   const accessToken = skipAuth ? null : await getAccessToken();
@@ -1156,8 +1633,69 @@ async function graph(path, options = {}) {
   return body;
 }
 
+async function graphLimitedBuffer(path, maxBytes, options = {}) {
+  const accessToken = await getAccessToken();
+  const url = graphUrl(path);
+  const limit = Math.max(1, maxBytes);
+  const response = await fetchWithRetry(url, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Range: `bytes=0-${limit}`
+    }
+  }, { maxRetries: 3 });
+  if (!response.ok && response.status !== 206) {
+    const body = await parseResponseBody(response);
+    throw microsoftGraphError(body, response);
+  }
+
+  if (!response.body?.getReader) {
+    const buffer = Buffer.from(await response.arrayBuffer());
+    return {
+      buffer: buffer.subarray(0, limit),
+      bytesRead: buffer.length,
+      truncated: buffer.length > limit
+    };
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let bytesRead = 0;
+  let truncated = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = Buffer.from(value);
+      bytesRead += chunk.length;
+      const remaining = limit + 1 - chunks.reduce((sum, entry) => sum + entry.length, 0);
+      if (remaining > 0) chunks.push(chunk.subarray(0, remaining));
+      if (bytesRead > limit) {
+        truncated = true;
+        await reader.cancel().catch(() => {});
+        break;
+      }
+    }
+  } finally {
+    reader.releaseLock?.();
+  }
+
+  const buffer = Buffer.concat(chunks);
+  return {
+    buffer: buffer.subarray(0, limit),
+    bytesRead,
+    truncated: truncated || bytesRead > limit || buffer.length > limit
+  };
+}
+
 function cleanPath(path = "") {
   return String(path).replace(/^\/+/, "").replace(/\/+$/, "");
+}
+
+function clampInteger(value, defaultValue, min, max) {
+  const number = Number(value ?? defaultValue);
+  if (!Number.isInteger(number)) return defaultValue;
+  return Math.min(Math.max(number, min), max);
 }
 
 function assertSafeRemotePath(path = "", label = "path") {
@@ -1375,6 +1913,9 @@ function simplifyItem(item) {
     size: item.size,
     createdDateTime: item.createdDateTime,
     lastModifiedDateTime: item.lastModifiedDateTime,
+    eTag: item.eTag,
+    cTag: item.cTag,
+    deleted: item.deleted,
     folder: item.folder ? { childCount: item.folder.childCount } : undefined,
     file: item.file ? { mimeType: item.file.mimeType, hashes: item.file.hashes } : undefined
   };
@@ -1400,9 +1941,10 @@ function decodeGraphPath(path = "") {
 
 async function list(args = {}) {
   const params = new URLSearchParams();
-  params.set("$top", String(args.limit ?? 100));
+  params.set("$top", String(clampInteger(args.limit, 100, 1, 200)));
   params.set("$select", args.select || defaultSelect);
   const result = await graph(`${childrenPath(args)}?${params.toString()}`);
+  await cacheItems(result.value || []);
   return { items: (result.value || []).map((item) => formatDriveItem(item, args.format)), nextLink: result["@odata.nextLink"] || null };
 }
 
@@ -1415,7 +1957,9 @@ async function collectPages(firstPath, maxItems, format = "compact", formatter =
     const result = await graph(nextPath);
     const pageItems = result.value || [];
     const remaining = maxItems - items.length;
-    items.push(...pageItems.slice(0, remaining).map((item) => formatter(item, format)));
+    const acceptedItems = pageItems.slice(0, remaining);
+    await cacheItems(acceptedItems, { deltaLink: result["@odata.deltaLink"] || undefined });
+    items.push(...acceptedItems.map((item) => formatter(item, format)));
     nextLink = result["@odata.nextLink"] || null;
     deltaLink = result["@odata.deltaLink"] || null;
     nextPath = nextLink && items.length < maxItems ? nextLink : null;
@@ -1424,9 +1968,9 @@ async function collectPages(firstPath, maxItems, format = "compact", formatter =
 }
 
 async function listAll(args = {}) {
-  const maxItems = Math.min(args.maxItems ?? 1000, 5000);
+  const maxItems = clampInteger(args.maxItems, 1000, 1, 5000);
   const params = new URLSearchParams();
-  params.set("$top", String(args.pageSize ?? 200));
+  params.set("$top", String(clampInteger(args.pageSize, 200, 1, 200)));
   params.set("$select", args.select || defaultSelect);
   return await collectPages(`${childrenPath(args)}?${params.toString()}`, maxItems, args.format);
 }
@@ -1465,7 +2009,7 @@ async function resolveScanRoot(args = {}) {
   if (args.itemId) {
     const folder = await getRawInfo({ itemId: args.itemId });
     if (!folder.folder && !folder.root) throw new Error(`Scan target is not a folder: ${folder.name}`);
-    return { id: folder.id, name: folder.name || "root", remotePath: itemRemotePath(folder) || "", target: "itemId" };
+    return { id: folder.id, name: folder.name || "root", remotePath: itemRemotePath(folder) || "", target: `itemId:${folder.id}` };
   }
 
   const resolvedPath = resolvePresetPath(args);
@@ -1480,11 +2024,11 @@ async function resolveScanRoot(args = {}) {
 }
 
 async function scan(args = {}) {
-  const pageSize = Math.min(args.pageSize ?? 200, 200);
-  const maxItems = Math.min(args.maxItems ?? 10000, 50000);
-  const maxResults = Math.min(args.maxResults ?? 500, 5000);
-  const maxDepth = Math.min(args.maxDepth ?? 25, 50);
-  const maxFolders = Math.min(args.maxFolders ?? 1000, 10000);
+  const pageSize = clampInteger(args.pageSize, 200, 1, 200);
+  const maxItems = clampInteger(args.maxItems, 10000, 1, 50000);
+  const maxResults = clampInteger(args.maxResults, 500, 1, 5000);
+  const maxDepth = clampInteger(args.maxDepth, 25, 0, 50);
+  const maxFolders = clampInteger(args.maxFolders, 1000, 1, 10000);
   const extensionFilter = normalizeExtensions(args.extensions || []);
   const root = await resolveScanRoot(args);
   const params = new URLSearchParams();
@@ -1522,11 +2066,13 @@ async function scan(args = {}) {
         break;
       }
       const page = await graph(nextPath);
+      const cacheableItems = [];
       for (const item of page.value || []) {
         if (counters.itemsScanned >= maxItems) {
           truncatedReason = "maxItems";
           break;
         }
+        cacheableItems.push(item);
         counters.itemsScanned += 1;
         if (item.file) counters.filesScanned += 1;
         if (item.folder) counters.foldersScanned += 1;
@@ -1551,6 +2097,7 @@ async function scan(args = {}) {
           });
         }
       }
+      await cacheItems(cacheableItems);
       if (truncatedReason) break;
       nextPath = page["@odata.nextLink"] || null;
     }
@@ -1589,16 +2136,17 @@ async function scan(args = {}) {
 async function search(args = {}) {
   const escaped = String(args.query).replace(/'/g, "''");
   const params = new URLSearchParams();
-  params.set("$top", String(args.limit ?? 50));
+  params.set("$top", String(clampInteger(args.limit, 50, 1, 200)));
   const result = await graph(`/me/drive/root/search(q='${encodeURIComponent(escaped)}')?${params.toString()}`);
+  await cacheItems(result.value || []);
   return { items: (result.value || []).map((item) => formatDriveItem(item, args.format)), nextLink: result["@odata.nextLink"] || null };
 }
 
 async function searchAll(args = {}) {
   const escaped = String(args.query).replace(/'/g, "''");
-  const maxItems = Math.min(args.maxItems ?? 1000, 5000);
+  const maxItems = clampInteger(args.maxItems, 1000, 1, 5000);
   const params = new URLSearchParams();
-  params.set("$top", String(args.pageSize ?? 200));
+  params.set("$top", String(clampInteger(args.pageSize, 200, 1, 200)));
   return await collectPages(`/me/drive/root/search(q='${encodeURIComponent(escaped)}')?${params.toString()}`, maxItems, args.format);
 }
 
@@ -1759,6 +2307,9 @@ function scoreFindCandidate(item, context = {}) {
   } else if (context.source === "scan") {
     score += 12;
     reasons.push(`scan: ${context.folder || "root"}`);
+  } else if (context.source === "cache") {
+    score += 10;
+    reasons.push("metadata cache");
   }
 
   if (queryText && nameText === queryText) {
@@ -1855,6 +2406,15 @@ function addFindCandidate(candidates, item, context) {
   if (!shouldIncludeFindItem(item, context.args, context.extensionInfo)) return;
   const key = findCandidateKey(item);
   const scored = scoreFindCandidate(item, context);
+  const hasQueryRelevance = scored.matchedTokens > 0 || scored.reasons.some((reason) =>
+    reason.startsWith("exact filename")
+    || reason.startsWith("filename contains")
+    || reason.startsWith("path contains")
+    || reason.startsWith("date match")
+    || reason.startsWith("requested extension")
+    || reason.startsWith("likely file type")
+  );
+  if (context.source !== "exactPath" && !hasQueryRelevance) return;
   const existing = candidates.get(key);
   if (!existing || scored.score > existing.score) {
     candidates.set(key, {
@@ -1876,6 +2436,10 @@ function rankedFindCandidates(candidates) {
   });
 }
 
+function candidateHasLiveSource(candidate) {
+  return candidate.sources.some((source) => source.source && source.source !== "cache");
+}
+
 async function find(args = {}) {
   const query = String(args.query || "").trim();
   if (!query) throw new Error("query is required.");
@@ -1888,6 +2452,22 @@ async function find(args = {}) {
   const candidates = new Map();
   const searchRuns = [];
   const scanRuns = [];
+  let cacheCandidateCount = 0;
+
+  if (args.useCache !== false) {
+    const cacheList = await cachedItems();
+    for (const item of cacheList) {
+      addFindCandidate(candidates, item, {
+        args,
+        query,
+        source: "cache",
+        term: "metadata-cache",
+        extensionInfo,
+        folderHints
+      });
+    }
+    cacheCandidateCount = cacheList.length;
+  }
 
   if (query.includes("/")) {
     try {
@@ -1929,8 +2509,8 @@ async function find(args = {}) {
   }
 
   let ranked = rankedFindCandidates(candidates);
-  const bestSearchScore = ranked[0]?.score || 0;
-  const shouldScan = args.scanFallback !== false && bestSearchScore < (args.minConfidenceForSearchOnly ?? 78);
+  const bestLiveScore = ranked.find(candidateHasLiveSource)?.score || 0;
+  const shouldScan = args.scanFallback !== false && bestLiveScore < (args.minConfidenceForSearchOnly ?? 78);
 
   if (shouldScan) {
     const scanNeedle = findScanNeedle(query);
@@ -1988,9 +2568,12 @@ async function find(args = {}) {
   }
 
   ranked = rankedFindCandidates(candidates);
+  if (shouldScan) {
+    ranked = ranked.filter(candidateHasLiveSource);
+  }
   return {
     query,
-    strategy: "stateless-remote-first",
+    strategy: "cache-assisted-remote-first",
     searchTerms,
     inferred: {
       extensions: [...extensionInfo.inferred],
@@ -2005,7 +2588,8 @@ async function find(args = {}) {
       usedScanFallback: shouldScan,
       scanRuns: scanRuns.length,
       localIndexUsed: false,
-      persistentCacheUsed: false
+      persistentCacheUsed: cacheCandidateCount > 0,
+      cacheCandidates: cacheCandidateCount
     },
     searchRuns,
     scanRuns,
@@ -2016,8 +2600,8 @@ async function find(args = {}) {
       sources: candidate.sources.slice(0, 5)
     })),
     note: shouldScan
-      ? "Used live Graph searches, then bounded remote recursive scan fallback. No local index or persistent cache was used."
-      : "Search confidence was high enough to skip recursive fallback. No local index or persistent cache was used."
+      ? "Used metadata cache when available, live Graph searches, then bounded remote recursive scan fallback."
+      : "Search confidence was high enough to skip recursive fallback. Used metadata cache when available."
   };
 }
 
@@ -2058,9 +2642,11 @@ async function findAll(args = {}) {
   });
   return {
     ...result,
-    strategy: "broad-stateless-remote-first",
+    strategy: "broad-cache-assisted-remote-first",
     folderPlan: broadFindFolderHints(query, args.folderHints || []).map((folder) => folder || "root"),
-    note: "Searched live Graph results and common folders first, then used bounded remote recursive scan fallback. No local index or persistent cache was used."
+    note: result.summary?.persistentCacheUsed
+      ? "Used metadata cache, live Graph results, common folders, and bounded remote recursive scan fallback as needed."
+      : "Searched live Graph results and common folders first, then used bounded remote recursive scan fallback as needed. No local index was used."
   };
 }
 
@@ -2071,12 +2657,12 @@ function formatDeltaItem(item, format = "compact") {
 }
 
 async function delta(args = {}) {
-  const maxItems = Math.min(args.maxItems ?? 1000, 5000);
+  const maxItems = clampInteger(args.maxItems, 1000, 1, 5000);
   let firstPath = args.nextLink || args.deltaLink;
   let target = args.nextLink ? "nextLink" : args.deltaLink ? "deltaLink" : "root";
   if (!firstPath) {
     const params = new URLSearchParams();
-    params.set("$top", String(args.pageSize ?? 200));
+    params.set("$top", String(clampInteger(args.pageSize, 200, 1, 200)));
     if (args.itemId) {
       firstPath = `/me/drive/items/${encodeURIComponent(args.itemId)}/delta?${params.toString()}`;
       target = "itemId";
@@ -2102,11 +2688,211 @@ async function delta(args = {}) {
   };
 }
 
+async function cacheRefresh(args = {}) {
+  const existing = await loadMetadataCache();
+  const mode = args.mode || "auto";
+  const requestedTarget = args.itemId
+    ? `itemId:${args.itemId}`
+    : (resolvePresetPath(args) || "root");
+  const cachedTarget = existing.scanRoot?.target || "root";
+  const targetMatchesCache = requestedTarget === cachedTarget;
+  if ((mode === "delta" || mode === "auto") && existing.deltaLink && targetMatchesCache) {
+    const result = await delta({
+      deltaLink: existing.deltaLink,
+      pageSize: clampInteger(args.pageSize, 200, 1, 200),
+      maxItems: clampInteger(args.maxItems, 10000, 1, 50000),
+      format: "full"
+    });
+    return {
+      mode: "delta",
+      result,
+      cache: await syncStatus(),
+      note: result.deltaLink ? "Applied delta changes and stored the latest deltaLink." : "Delta scan is incomplete; run again with nextLink before treating cache as fresh."
+    };
+  }
+
+  if (mode === "delta") {
+    if (!existing.deltaLink) {
+      throw new Error("No cached deltaLink exists yet. Run onedrive_cache_refresh with mode: scan or auto first.");
+    }
+    throw new Error(`Cached deltaLink is for ${cachedTarget}, not requested target ${requestedTarget}. Run onedrive_cache_refresh with mode: scan for this target.`);
+  }
+
+  await clearMetadataCache();
+  const result = await scan({
+    ...args,
+    format: "full",
+    includeFiles: true,
+    includeFolders: args.includeFolders !== false,
+    maxItems: clampInteger(args.maxItems, 10000, 1, 50000),
+    maxFolders: clampInteger(args.maxFolders, 2000, 1, 10000),
+    maxDepth: clampInteger(args.maxDepth, 25, 0, 50)
+  });
+  await cacheItems([], { scanRoot: result.root });
+
+  try {
+    const deltaResult = await delta({
+      ...args,
+      pageSize: clampInteger(args.pageSize, 200, 1, 200),
+      maxItems: clampInteger(args.maxItems, 10000, 1, 50000),
+      format: "full"
+    });
+    return {
+      mode: "scan+delta",
+      scan: result,
+      delta: { count: deltaResult.count, deltaLink: deltaResult.deltaLink, nextLink: deltaResult.nextLink },
+      cache: await syncStatus(),
+      note: "Rebuilt the metadata cache from a bounded scan and attempted to store a fresh deltaLink."
+    };
+  } catch (error) {
+    return {
+      mode: "scan",
+      scan: result,
+      cache: await syncStatus(),
+      deltaError: error.message,
+      note: "Rebuilt the metadata cache from a bounded scan, but could not get a fresh deltaLink."
+    };
+  }
+}
+
+async function batchGraph(requests = []) {
+  if (!requests.length) return [];
+  if (requests.length > 20) throw new Error("Microsoft Graph batch requests support at most 20 subrequests.");
+  const result = await graph("/$batch", {
+    method: "POST",
+    body: JSON.stringify({
+      requests: requests.map((request, index) => ({
+        id: String(index + 1),
+        method: request.method || "GET",
+        url: String(request.url || "").replace(/^\/+/, ""),
+        ...(request.headers ? { headers: request.headers } : {}),
+        ...(request.body ? { body: request.body } : {})
+      }))
+    })
+  });
+  const responses = new Map((result.responses || []).map((response) => [response.id, response]));
+  return requests.map((request, index) => {
+    const response = responses.get(String(index + 1));
+    if (!response) return { ok: false, status: 0, error: "Missing batch response.", request };
+    return {
+      ok: response.status >= 200 && response.status < 300,
+      status: response.status,
+      body: response.body,
+      headers: response.headers,
+      request
+    };
+  });
+}
+
+async function batchGetInfo(args = {}) {
+  const items = args.items || [];
+  const responses = await batchGraph(items.map((target) => ({ url: itemBase(target), target })));
+  const rawItems = responses.filter((response) => response.ok && response.body).map((response) => response.body);
+  await cacheItems(rawItems);
+  return {
+    count: responses.length,
+    items: responses.map((response) => response.ok
+      ? formatDriveItem(response.body, args.format || "compact")
+      : { error: response.body?.error?.message || response.error || `HTTP ${response.status}`, status: response.status, target: response.request.target })
+  };
+}
+
+async function batchPermissions(args = {}) {
+  const items = args.items || [];
+  const responses = await batchGraph(items.map((target) => ({ url: `${itemBase(target)}/permissions`, target })));
+  return {
+    count: responses.length,
+    items: responses.map((response) => response.ok
+      ? {
+          target: response.request.target,
+          permissions: (response.body?.value || []).map((permission) => simplifyPermission(permission, args.format)),
+          count: (response.body?.value || []).length
+        }
+      : { error: response.body?.error?.message || response.error || `HTTP ${response.status}`, status: response.status, target: response.request.target })
+  };
+}
+
+async function batchDownload(args = {}) {
+  const destinationFolder = args.destinationFolder ? resolve(args.destinationFolder) : null;
+  if (destinationFolder) await assertNotLocalOneDriveSyncPathForWrite(destinationFolder, "Batch download", args);
+  const results = [];
+  for (const [index, item] of (args.items || []).entries()) {
+    try {
+      if (item.localPath) await assertNotLocalOneDriveSyncPathForWrite(resolve(item.localPath), "Batch download", args);
+      const info = await getInfo(item);
+      const localPath = item.localPath
+        ? item.localPath
+        : destinationFolder
+          ? join(destinationFolder, info.name || `onedrive-download-${index + 1}`)
+          : undefined;
+      results.push(await download({ ...item, localPath, overwrite: item.overwrite ?? args.overwrite, allowLocalOneDriveSyncPath: args.allowLocalOneDriveSyncPath }));
+    } catch (error) {
+      results.push({ target: item, error: error.message });
+    }
+  }
+  return { count: results.length, results };
+}
+
+async function batchDelete(args = {}) {
+  const results = [];
+  for (const item of args.items || []) {
+    try {
+      results.push(await deleteItem({ ...item, dryRun: args.dryRun !== false, confirmed: args.confirmed === true }));
+    } catch (error) {
+      results.push({ target: item, error: error.message });
+    }
+  }
+  return { dryRun: args.dryRun !== false, confirmed: args.confirmed === true, count: results.length, results };
+}
+
+async function batchMove(args = {}) {
+  if (args.dryRun === false) {
+    if (args.confirmed !== true) {
+      return {
+        dryRun: false,
+        confirmed: false,
+        count: (args.items || []).length,
+        requiredToMove: "Set dryRun: false and confirmed: true after explicit user confirmation."
+      };
+    }
+    const missingExpected = (args.items || []).filter((item) => !item.expectedName && !item.expectedId);
+    if (missingExpected.length) {
+      return {
+        dryRun: false,
+        confirmed: true,
+        count: (args.items || []).length,
+        requiredToMove: "Provide expectedName or expectedId for every item in a live batch move.",
+        missingExpectedCount: missingExpected.length
+      };
+    }
+  }
+  const parentReference = await resolveDestinationParent(args);
+  const results = [];
+  for (const item of args.items || []) {
+    try {
+      results.push(await moveItem({
+        ...item,
+        destinationParentItemId: parentReference.id,
+        dryRun: args.dryRun !== false
+      }));
+    } catch (error) {
+      results.push({ target: item, error: error.message });
+    }
+  }
+  return { dryRun: args.dryRun !== false, confirmed: args.confirmed === true, destination: parentReference, count: results.length, results };
+}
+
 async function getRawInfo(args = {}) {
   const resolved = itemArgsWithResolvedPath(args);
   if (!resolved.path && !resolved.itemId) throw new Error("Provide path, preset, or itemId.");
+  if (!args.includeDeletedItems) {
+    const cached = resolved.itemId ? await cachedItemById(resolved.itemId) : await cachedItemByPath(resolved.path);
+    if (cached && args.useCache === true) return cached;
+  }
   const suffix = args.includeDeletedItems && resolved.itemId ? "?includeDeletedItems=true" : "";
-  return await graph(`${itemBase(args)}${suffix}`);
+  const item = await graph(`${itemBase(args)}${suffix}`);
+  await cacheItems([item]);
+  return item;
 }
 
 async function getInfo(args = {}) {
@@ -2161,6 +2947,14 @@ function permissionKey(permission = {}) {
   return permission.id
     || permission.link?.webUrl
     || `${(permission.roles || []).join(",")}:${permission.link?.type || ""}:${permission.link?.scope || ""}:${permission.grantedTo?.email || permission.invitation?.email || ""}`;
+}
+
+function isExplicitSharingPermission(permission = {}) {
+  if (permission.inheritedFrom) return false;
+  if (permission.link || permission.invitation) return true;
+  const roles = new Set(permission.roles || []);
+  if (roles.has("owner")) return false;
+  return Boolean(permission.grantedTo || permission.grantedToV2 || permission.grantedToIdentities?.length);
 }
 
 function diffPermissions(before = [], after = []) {
@@ -2241,15 +3035,16 @@ async function resolveDestinationParent(args = {}) {
 
 async function readText(args = {}) {
   const info = await getInfo(args);
-  const maxBytes = args.maxBytes ?? textFileLimit;
+  const maxBytes = clampInteger(args.maxBytes, textFileLimit, 1, textFileLimit);
   assertTextReadable(info, args);
   if (info.size && info.size > maxBytes) {
     throw new Error(`File is ${info.size} bytes, above maxBytes ${maxBytes}. Use onedrive_download instead.`);
   }
-  const buffer = Buffer.from(await graph(contentPath(args)));
-  if (buffer.length > maxBytes) {
-    throw new Error(`Downloaded content is ${buffer.length} bytes, above maxBytes ${maxBytes}.`);
+  const limited = await graphLimitedBuffer(contentPath(args), maxBytes);
+  if (limited.truncated) {
+    throw new Error(`Downloaded content is above maxBytes ${maxBytes}. Use onedrive_download instead.`);
   }
+  const buffer = limited.buffer;
   if (args.force !== true) assertNoBinaryNulls(buffer);
   return { item: info, content: buffer.toString("utf8") };
 }
@@ -2335,6 +3130,225 @@ async function downloadExport(args = {}, formatName) {
   };
 }
 
+function truncateUtf8(text, maxBytes) {
+  const buffer = Buffer.from(String(text), "utf8");
+  if (buffer.length <= maxBytes) return { text: String(text), truncated: false, bytes: buffer.length };
+  return {
+    text: buffer.subarray(0, maxBytes).toString("utf8").replace(/\uFFFD$/u, ""),
+    truncated: true,
+    bytes: buffer.length
+  };
+}
+
+async function preview(args = {}) {
+  const info = await getInfo(args);
+  const maxBytes = clampInteger(args.maxBytes, 65536, 1, 1048576);
+  if (info.folder) return { item: info, preview: null, note: "Item is a folder; preview is only available for files." };
+
+  if (args.preferExportText !== false && !isLikelyTextItem(info, args)) {
+    try {
+      const params = new URLSearchParams();
+      params.set("format", "text");
+      const exported = await graphLimitedBuffer(`${contentPath(args)}?${params.toString()}`, maxBytes);
+      const previewText = exported.buffer.toString("utf8").replace(/\uFFFD$/u, "");
+      return { item: info, preview: previewText, bytes: exported.bytesRead, truncated: exported.truncated, source: "graph-text-export" };
+    } catch (error) {
+      return { item: info, preview: null, source: "metadata", exportError: error.message, note: "Graph text export was not available for this file." };
+    }
+  }
+
+  assertTextReadable(info, args);
+  const limited = await graphLimitedBuffer(contentPath(args), maxBytes);
+  if (args.force !== true) assertNoBinaryNulls(limited.buffer);
+  const previewText = limited.buffer.toString("utf8").replace(/\uFFFD$/u, "");
+  return { item: info, preview: previewText, bytes: limited.bytesRead, truncated: limited.truncated, source: "text-read" };
+}
+
+function updateManifestPath(localPath, manifestPath) {
+  return manifestPath ? resolve(manifestPath) : `${resolve(localPath)}.onedrive-update.json`;
+}
+
+async function updateFile(args = {}) {
+  const remote = assertSafeRemotePath(args.remotePath, "remotePath");
+  if (!remote) throw new Error("remotePath is required.");
+
+  if (args.mode === "checkout") {
+    const info = await getInfo(args.itemId ? { itemId: args.itemId } : { path: remote });
+    if (info.folder) throw new Error(`Cannot checkout a folder: ${info.name}`);
+    const localPath = args.localPath ? resolve(args.localPath) : join(updateRoot, info.name || basename(remote));
+    await assertNotLocalOneDriveSyncPathForWrite(localPath, "Checkout", args);
+    const manifestPath = updateManifestPath(localPath, args.manifestPath);
+    await assertNotLocalOneDriveSyncPathForWrite(manifestPath, "Checkout manifest", args);
+    if (args.overwriteManifest !== true) {
+      try {
+        await stat(manifestPath);
+        throw new Error(`Checkout manifest already exists: ${manifestPath}. Pass overwriteManifest: true to replace it.`);
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+    }
+    const downloaded = await download({
+      ...(args.itemId ? { itemId: args.itemId } : { path: remote }),
+      localPath,
+      overwrite: args.overwriteLocal === true,
+      allowLocalOneDriveSyncPath: args.allowLocalOneDriveSyncPath
+    });
+    const manifest = {
+      version: 1,
+      checkedOutAt: new Date().toISOString(),
+      remotePath: remote,
+      item: downloaded.item,
+      localPath: downloaded.localPath
+    };
+    await mkdir(dirname(manifestPath), { recursive: true });
+    await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+    return { mode: "checkout", ...downloaded, manifestPath };
+  }
+
+  if (args.mode !== "commit") throw new Error("mode must be checkout or commit.");
+  const localPath = resolve(args.localPath || join(updateRoot, basename(remote)));
+  await assertNotLocalOneDriveSyncPathForRead(localPath, "Commit", args);
+  const manifestPath = updateManifestPath(localPath, args.manifestPath);
+  let manifest = null;
+  try {
+    manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  } catch (error) {
+    if (args.force !== true) throw new Error(`Could not read checkout manifest ${manifestPath}. Pass force: true only when intentionally overwriting without checkout metadata.`);
+  }
+
+  const current = await getRawInfo({ path: remote });
+  if (args.conflictCheck !== false && manifest?.item && args.force !== true) {
+    const checked = manifest.item;
+    const changed = [
+      checked.id && current.id !== checked.id ? "id" : null,
+      checked.eTag && current.eTag !== checked.eTag ? "eTag" : null,
+      checked.cTag && current.cTag !== checked.cTag ? "cTag" : null,
+      Number.isFinite(checked.size) && current.size !== checked.size ? "size" : null,
+      checked.lastModifiedDateTime && current.lastModifiedDateTime !== checked.lastModifiedDateTime ? "lastModifiedDateTime" : null
+    ].filter(Boolean);
+    if (changed.length) {
+      throw new Error(`Remote file changed since checkout (${changed.join(", ")}). Re-checkout or pass force: true if you intend to overwrite.`);
+    }
+  }
+
+  let backup = null;
+  if (args.createBackup !== false) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const backupPath = join(backupRoot, `${stamp}-${basename(remote)}`);
+    backup = await download({ path: remote, localPath: backupPath, overwrite: true });
+  }
+
+  const uploaded = await upload({
+    localPath,
+    remotePath: remote,
+    conflictBehavior: "replace",
+    allowLocalOneDriveSyncPath: args.allowLocalOneDriveSyncPath
+  });
+  const verified = args.verify !== false ? await getInfo({ path: remote }) : null;
+  return {
+    mode: "commit",
+    remotePath: remote,
+    localPath,
+    manifestPath,
+    backup,
+    uploaded,
+    verified,
+    note: "Committed local edits after checkout-manifest conflict checks."
+  };
+}
+
+async function recent(args = {}) {
+  const params = new URLSearchParams();
+  params.set("$top", String(clampInteger(args.limit, 50, 1, 200)));
+  const result = await graph(`/me/drive/recent?${params.toString()}`);
+  await cacheItems(result.value || []);
+  return { items: (result.value || []).map((item) => formatDriveItem(item, args.format)), count: (result.value || []).length };
+}
+
+async function largeFiles(args = {}) {
+  const result = await scan({
+    ...args,
+    includeFiles: true,
+    includeFolders: false,
+    maxResults: Math.min(clampInteger(args.maxItems, 10000, 1, 50000), 5000),
+    format: "full"
+  });
+  const minBytes = args.minBytes ?? 104857600;
+  const files = (result.items || [])
+    .filter((item) => item.file && (item.size || 0) >= minBytes)
+    .sort((left, right) => (right.size || 0) - (left.size || 0))
+    .slice(0, clampInteger(args.limit, 50, 1, 200))
+    .map((item) => formatSimplifiedItem(item, args.format));
+  return { filters: { minBytes }, scanSummary: result.summary, count: files.length, items: files };
+}
+
+function duplicateKey(item) {
+  const hashes = item.file?.hashes || {};
+  const hash = hashes.quickXorHash || hashes.sha1Hash || hashes.sha256Hash;
+  if (hash) return `hash:${hash}`;
+  return `name-size:${String(item.name || "").toLowerCase()}:${item.size || 0}`;
+}
+
+async function duplicates(args = {}) {
+  const result = await scan({
+    ...args,
+    includeFiles: true,
+    includeFolders: false,
+    maxResults: Math.min(clampInteger(args.maxItems, 10000, 1, 50000), 5000),
+    format: "full"
+  });
+  const groups = new Map();
+  for (const item of result.items || []) {
+    if (!item.file) continue;
+    const key = duplicateKey(item);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  }
+  const duplicates = [...groups.entries()]
+    .filter(([, items]) => items.length > 1)
+    .map(([key, items]) => ({
+      key,
+      count: items.length,
+      totalBytes: items.reduce((sum, item) => sum + (item.size || 0), 0),
+      items: items.map((item) => formatSimplifiedItem(item, args.format))
+    }))
+    .sort((left, right) => right.totalBytes - left.totalBytes)
+    .slice(0, clampInteger(args.limit, 50, 1, 200));
+  return { scanSummary: result.summary, duplicateGroups: duplicates.length, groups: duplicates };
+}
+
+async function sharingAudit(args = {}, publicOnly = false) {
+  const scanResult = await scan({
+    ...args,
+    includeFiles: true,
+    includeFolders: args.includeFolders !== false,
+    maxResults: Math.min(clampInteger(args.maxItems, 1000, 1, 50000), 5000),
+    format: "full"
+  });
+  const matches = [];
+  await mapWithConcurrency(scanResult.items || [], 4, async (item) => {
+    const limit = clampInteger(args.limit, 50, 1, 200);
+    if (matches.length >= limit) return;
+    try {
+      const audit = await permissionList({ itemId: item.id }, "compact");
+      const permissions = publicOnly
+        ? audit.filter((permission) => permission.link?.scope === "anonymous")
+        : audit.filter(isExplicitSharingPermission);
+      if (permissions.length && matches.length < limit) {
+        matches.push({ item: formatSimplifiedItem(item, "compact"), permissions, count: permissions.length });
+      }
+    } catch {
+      // Permission scans should be best-effort across many items.
+    }
+  });
+  return {
+    scanSummary: scanResult.summary,
+    count: matches.length,
+    items: matches,
+    note: publicOnly ? "Returned items with anonymous sharing links." : "Returned items with explicit sharing permissions."
+  };
+}
+
 async function upload(args = {}) {
   const localPath = resolve(args.localPath);
   await assertNotLocalOneDriveSyncPathForRead(localPath, "Upload", args);
@@ -2355,6 +3369,7 @@ async function upload(args = {}) {
     duplex: "half",
     headers: { "Content-Type": "application/octet-stream" }
   });
+  await cacheItems([result]);
   return { item: simplifyItem(result), localPath, bytesUploaded: fileStat.size, uploadMode: "simple" };
 }
 
@@ -2409,6 +3424,7 @@ async function uploadLarge(args = {}, fileStat) {
     await handle.close();
   }
 
+  if (finalItem) await cacheItems([finalItem]);
   return {
     item: simplifyItem(finalItem),
     localPath: args.localPath,
@@ -2458,6 +3474,7 @@ async function writeText(args = {}) {
     body: Buffer.from(args.content, "utf8"),
     headers: { "Content-Type": "text/plain; charset=utf-8" }
   });
+  await cacheItems([result]);
   return { item: simplifyItem(result), bytesUploaded: Buffer.byteLength(args.content, "utf8") };
 }
 
@@ -2478,6 +3495,7 @@ async function createFolder(args = {}) {
       "@microsoft.graph.conflictBehavior": args.conflictBehavior || "fail"
     })
   });
+  await cacheItems([result]);
   return simplifyItem(result);
 }
 
@@ -2487,10 +3505,14 @@ async function rename(args = {}) {
   const current = await getRawInfo(args);
   if (current.root) throw new Error("Rename refuses to operate on the OneDrive root.");
   assertExpectedItem(current, args, "Rename");
+  if (args.dryRun === true) {
+    return { dryRun: true, wouldRename: simplifyItem(current), newName };
+  }
   const result = await graph(itemBase(args), {
     method: "PATCH",
     body: JSON.stringify({ name: newName })
   });
+  await cacheItems([result]);
   return simplifyItem(result);
 }
 
@@ -2503,33 +3525,38 @@ async function moveItem(args = {}) {
   const parentReference = await resolveDestinationParent(args);
   const body = { parentReference: { id: parentReference.id } };
   if (args.newName) body.name = args.newName;
+  if (args.dryRun === true) {
+    return { dryRun: true, wouldMove: simplifyItem(current), destination: parentReference, newName: args.newName || null };
+  }
   const result = await graph(itemBase(args), {
     method: "PATCH",
     body: JSON.stringify(body)
   });
+  await cacheItems([result]);
   return simplifyItem(result);
 }
 
 async function pollCopyMonitor(monitorUrl, timeoutSeconds = 60) {
+  const trustedMonitorUrl = assertTrustedCopyMonitorUrl(monitorUrl);
   const deadline = Date.now() + timeoutSeconds * 1000;
   let last = null;
   while (Date.now() < deadline) {
-    const response = await graph(monitorUrl, { skipAuth: true, returnResponse: true, maxRetries: 3, redirect: "manual" });
+    const response = await graph(trustedMonitorUrl, { skipAuth: true, returnResponse: true, maxRetries: 3, redirect: "manual" });
     last = response.body && !(response.body instanceof ArrayBuffer) ? response.body : null;
     if (response.status === 303) {
       return {
         complete: true,
         status: response.status,
         resourceLocation: response.headers.get("location"),
-        monitorUrl
+        monitorUrl: trustedMonitorUrl
       };
     }
     if (response.ok && last?.status && !["notStarted", "running", "inProgress"].includes(String(last.status))) {
-      return { complete: true, status: response.status, monitorUrl, monitor: last };
+      return { complete: true, status: response.status, monitorUrl: trustedMonitorUrl, monitor: last };
     }
     await sleep(2000);
   }
-  return { complete: false, timeoutSeconds, monitorUrl, monitor: last };
+  return { complete: false, timeoutSeconds, monitorUrl: trustedMonitorUrl, monitor: last };
 }
 
 async function copyItem(args = {}) {
@@ -2539,6 +3566,9 @@ async function copyItem(args = {}) {
   if (current.root) throw new Error("Copy refuses to operate on the OneDrive root.");
   assertExpectedItem(current, args, "Copy");
   const parentReference = await resolveDestinationParent(args);
+  if (args.dryRun === true) {
+    return { dryRun: true, wouldCopy: simplifyItem(current), destination: parentReference, newName: args.newName || null };
+  }
   const response = await graph(`${itemBase(args)}/copy`, {
     method: "POST",
     returnResponse: true,
@@ -2639,6 +3669,7 @@ async function deleteItem(args = {}) {
     };
   }
   await graph(itemBase(args), { method: "DELETE" });
+  await cacheItems([{ ...rawItem, deleted: {} }]);
   return { dryRun: false, confirmed: true, deleted: item };
 }
 
@@ -2753,10 +3784,18 @@ async function callTool(name, args = {}) {
       return textResult(await findAll(args));
     case "onedrive_delta":
       return textResult(await delta(args));
+    case "onedrive_sync_status":
+      return textResult(await syncStatus(args));
+    case "onedrive_cache_refresh":
+      return textResult(await cacheRefresh(args));
+    case "onedrive_cache_clear":
+      return textResult(await clearMetadataCache());
     case "onedrive_get_info":
       return textResult(await getInfo(args));
     case "onedrive_read_text":
       return textResult(await readText(args));
+    case "onedrive_preview":
+      return textResult(await preview(args));
     case "onedrive_download":
       return textResult(await download(args));
     case "onedrive_download_excel":
@@ -2785,6 +3824,28 @@ async function callTool(name, args = {}) {
       return textResult(await createSharingLink(args));
     case "onedrive_permissions":
       return textResult(await permissions(args));
+    case "onedrive_batch_get_info":
+      return textResult(await batchGetInfo(args));
+    case "onedrive_batch_permissions":
+      return textResult(await batchPermissions(args));
+    case "onedrive_batch_download":
+      return textResult(await batchDownload(args));
+    case "onedrive_batch_delete":
+      return textResult(await batchDelete(args));
+    case "onedrive_batch_move":
+      return textResult(await batchMove(args));
+    case "onedrive_update_file":
+      return textResult(await updateFile(args));
+    case "onedrive_recent":
+      return textResult(await recent(args));
+    case "onedrive_large_files":
+      return textResult(await largeFiles(args));
+    case "onedrive_duplicates":
+      return textResult(await duplicates(args));
+    case "onedrive_shared_by_me":
+      return textResult(await sharingAudit(args, false));
+    case "onedrive_public_links":
+      return textResult(await sharingAudit(args, true));
     case "onedrive_restore_deleted":
       return textResult(await restoreDeleted(args));
     case "onedrive_delete":
