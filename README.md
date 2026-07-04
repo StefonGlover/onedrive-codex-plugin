@@ -64,8 +64,10 @@ Tools that accept `path` can also accept `preset` plus `relativePath`; upload/wr
 - `onedrive_presets`
 - `onedrive_list`
 - `onedrive_list_all`
+- `onedrive_scan`
 - `onedrive_search`
 - `onedrive_search_all`
+- `onedrive_find`
 - `onedrive_delta`
 - `onedrive_get_info`
 - `onedrive_read_text`
@@ -94,7 +96,9 @@ Tools that accept `path` can also accept `preset` plus `relativePath`; upload/wr
 - Text reads use MIME/extension checks and refuse likely binary files unless `force: true` is set.
 - Downloads go to `~/.codex/onedrive-plugin/downloads` unless `localPath` is provided.
 - Uploads use simple upload for smaller files and upload sessions for large files, or when `uploadMode: "session"` is requested.
-- List, search, and delta tools return compact item summaries by default; pass `format: "full"` for richer metadata.
+- List, search, find, scan, and delta tools return compact item summaries by default; pass `format: "full"` for richer metadata.
+- `onedrive_find` is the preferred file lookup helper. It is stateless and remote-first: it runs live Graph search variants, ranks results in memory, and can fall back to bounded recursive remote scans without creating a local index or persistent cache.
+- `onedrive_list_all` follows pagination within one folder. Use `onedrive_scan` when you need recursive traversal across subfolders or the whole OneDrive.
 - `onedrive_permissions` audits current sharing/permission grants before changing access.
 - `onedrive_delta` can return deleted item changes. Microsoft Graph does not expose a normal OneDrive recycle-bin listing endpoint through the driveItem file APIs.
 - `onedrive_get_info` supports `includeDeletedItems: true` when targeting an item ID; Microsoft documents this as OneDrive Personal-only.

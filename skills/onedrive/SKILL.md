@@ -27,10 +27,12 @@ Never ask the user to paste Microsoft passwords, access tokens, or refresh token
 - Use `onedrive_me` to confirm the signed-in account.
 - Use `onedrive_presets` when the user refers to a friendly location such as documents, desktop, screenshots, or a configured alias.
 - Use `onedrive_list` before changing or deleting remote files unless the target is already explicit.
-- Use compact output by default for list, search, and delta results. Pass `format: "full"` only when richer metadata is needed.
+- Use compact output by default for list, search, find, scan, and delta results. Pass `format: "full"` only when richer metadata is needed.
 - Use `onedrive_list_all` only when the user needs a complete folder listing; set a bounded `maxItems`.
-- Use `onedrive_search` for file lookup before broad manual listing.
+- Use `onedrive_find` for normal file lookup by name, partial name, or fuzzy user wording. It is stateless: it performs live Graph searches, ranks matches in memory, and only uses bounded remote scan fallback when search confidence is low.
+- Use `onedrive_search` for direct Graph search when the user specifically wants raw Graph search behavior.
 - Use `onedrive_search_all` only when the user needs paginated search results; set a bounded `maxItems`.
+- Use `onedrive_scan` when the user wants to scan the whole OneDrive or recursively inspect subfolders. Set bounded `maxItems`, `maxFolders`, and `maxResults`; use filters like `nameContains`, `extensions`, and `includeFolders: false` when searching for files.
 - Use `onedrive_delta` to answer what changed since a previous scan. Save `deltaLink` when present; use `nextLink` to continue an incomplete delta scan.
 - Use `onedrive_get_info` with `includeDeletedItems: true` and an `itemId` when inspecting a deleted item ID on OneDrive Personal.
 - Use `onedrive_read_text` only for bounded text files.

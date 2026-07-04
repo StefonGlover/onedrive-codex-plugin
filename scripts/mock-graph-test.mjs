@@ -42,9 +42,18 @@ function item(id, name, extra = {}) {
   };
 }
 
+function folder(id, name, extra = {}) {
+  return item(id, name, {
+    folder: { childCount: 1 },
+    file: undefined,
+    ...extra
+  });
+}
+
 const graph = createServer((req, res) => {
   const url = new URL(req.url, "http://127.0.0.1");
   const path = url.pathname;
+  const decodedUrl = decodeURIComponent(req.url);
   requests.push({ method: req.method, path, url: req.url });
 
   if (req.method === "GET" && path === "/v1.0/me/drive") {
@@ -67,6 +76,50 @@ const graph = createServer((req, res) => {
 
   if (req.method === "GET" && path === "/v1.0/me/drive/root") {
     return json(res, 200, { id: "root", name: "root", root: {}, folder: {} });
+  }
+
+  if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='")) {
+    return json(res, 200, { value: [] });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/root/children") {
+    return json(res, 200, {
+      value: [
+        folder("folder-a", "Folder A"),
+        item("root-note", "root-note.txt")
+      ],
+      "@odata.nextLink": `http://127.0.0.1:${graph.address().port}/v1.0/mock/root-children-page-2`
+    });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/mock/root-children-page-2") {
+    return json(res, 200, {
+      value: [
+        folder("folder-b", "Folder B")
+      ]
+    });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/folder-a/children") {
+    return json(res, 200, {
+      value: [
+        item("deep-deck", "Deep Summary Deck.pptx", {
+          parentReference: { path: "/drive/root:/Folder A" },
+          file: { mimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
+        })
+      ]
+    });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/folder-b/children") {
+    return json(res, 200, {
+      value: [
+        item("deep-pdf", "Nested Eval.pdf", {
+          parentReference: { path: "/drive/root:/Folder B" },
+          file: { mimeType: "application/pdf" }
+        })
+      ]
+    });
   }
 
   if (req.method === "POST" && path === "/v1.0/me/drive/items/copy-src/copy") {
@@ -214,6 +267,46 @@ try {
     assert(result.value.monitor?.status === 303, "copy monitor did not preserve 303", result.value.monitor);
     assert(result.value.monitor?.resourceLocation?.includes("/v1.0/me/drive/items/copied"), "missing resource location", result.value.monitor);
     return result.value.monitor;
+  });
+
+  await check("recursive scan finds nested files beyond root", async () => {
+    const result = await tool("onedrive_scan", {
+      nameContains: "deck",
+      extensions: ["pptx"],
+      includeFolders: false,
+      maxItems: 20,
+      maxResults: 10
+    });
+    assert(!result.isError, "scan should succeed", result);
+    assert(result.value.summary.itemsScanned === 5, "scan did not inspect all mock items", result.value.summary);
+    assert(result.value.summary.foldersVisited === 3, "scan did not visit nested folders", result.value.summary);
+    assert(result.value.summary.matched === 1, "scan should match one nested deck", result.value.summary);
+    assert(result.value.items[0]?.id === "deep-deck", "scan did not return the nested deck", result.value.items);
+    assert(result.value.items[0]?.remotePath === "Folder A/Deep Summary Deck.pptx", "scan did not include useful remotePath", result.value.items[0]);
+    return {
+      summary: result.value.summary,
+      found: result.value.items[0]
+    };
+  });
+
+  await check("stateless find falls back to remote scan for nested deck", async () => {
+    const result = await tool("onedrive_find", {
+      query: "Deep Summary Deck",
+      maxResults: 3,
+      scanMaxItems: 20,
+      scanMaxFolders: 10
+    });
+    assert(!result.isError, "find should succeed", result);
+    assert(result.value.summary.localIndexUsed === false, "find must not use a local index", result.value.summary);
+    assert(result.value.summary.persistentCacheUsed === false, "find must not use persistent cache", result.value.summary);
+    assert(result.value.summary.usedScanFallback === true, "find should use scan fallback when search misses", result.value.summary);
+    assert(result.value.items[0]?.id === "deep-deck", "find did not return the nested deck first", result.value.items);
+    assert(result.value.items[0]?.score >= 78, "find top score should be confident", result.value.items[0]);
+    return {
+      summary: result.value.summary,
+      found: result.value.items[0],
+      searchTerms: result.value.searchTerms
+    };
   });
 } finally {
   child.stdin.end();

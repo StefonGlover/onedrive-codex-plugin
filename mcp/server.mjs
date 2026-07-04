@@ -226,6 +226,49 @@ const tools = [
     }
   },
   {
+    name: "onedrive_scan",
+    description: "Recursively scan OneDrive folders from a starting folder, following pagination and subfolders up to safe caps.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...folderTargetProperties,
+        pageSize: { type: "integer", minimum: 1, maximum: 200, default: 200 },
+        select: { type: "string", description: "Optional Graph $select fields." },
+        maxItems: { type: "integer", minimum: 1, maximum: 50000, default: 10000 },
+        maxResults: {
+          type: "integer",
+          minimum: 1,
+          maximum: 5000,
+          default: 500,
+          description: "Maximum matching items returned in the response. The scan can inspect more items than it returns."
+        },
+        maxDepth: { type: "integer", minimum: 0, maximum: 50, default: 25 },
+        maxFolders: {
+          type: "integer",
+          minimum: 1,
+          maximum: 10000,
+          default: 1000,
+          description: "Maximum folders to visit during recursive traversal."
+        },
+        nameContains: { type: "string", description: "Optional case-insensitive filename/folder-name substring filter." },
+        extensions: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional file extension filter such as ['.pdf', 'pptx']. Folders are unaffected unless includeFolders is false."
+        },
+        includeFiles: { type: "boolean", default: true },
+        includeFolders: { type: "boolean", default: true },
+        stopAfterResults: {
+          type: "boolean",
+          default: false,
+          description: "When true, stop traversal once maxResults matching items have been returned."
+        },
+        format: outputFormatSchema
+      },
+      additionalProperties: false
+    }
+  },
+  {
     name: "onedrive_search",
     description: "Search the signed-in user's OneDrive.",
     inputSchema: {
@@ -249,6 +292,45 @@ const tools = [
         query: { type: "string", minLength: 1 },
         pageSize: { type: "integer", minimum: 1, maximum: 200, default: 200 },
         maxItems: { type: "integer", minimum: 1, maximum: 5000, default: 1000 },
+        format: outputFormatSchema
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_find",
+    description: "Stateless remote-first file finder. Runs live Graph searches, ranks matches in memory, and optionally falls back to bounded recursive scans.",
+    inputSchema: {
+      type: "object",
+      required: ["query"],
+      properties: {
+        query: { type: "string", minLength: 1 },
+        extensions: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional hard extension filter such as ['.pdf', 'pptx']."
+        },
+        folderHints: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional root-relative folders to try first during fallback scans."
+        },
+        includeFolders: { type: "boolean", default: false },
+        maxResults: { type: "integer", minimum: 1, maximum: 50, default: 10 },
+        maxSearchTerms: { type: "integer", minimum: 1, maximum: 12, default: 8 },
+        searchPageSize: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+        searchMaxItemsPerTerm: { type: "integer", minimum: 1, maximum: 500, default: 100 },
+        scanFallback: { type: "boolean", default: true },
+        scanMaxItems: { type: "integer", minimum: 1, maximum: 10000, default: 1500 },
+        scanMaxFolders: { type: "integer", minimum: 1, maximum: 2000, default: 250 },
+        scanMaxDepth: { type: "integer", minimum: 0, maximum: 50, default: 20 },
+        minConfidenceForSearchOnly: {
+          type: "integer",
+          minimum: 0,
+          maximum: 100,
+          default: 78,
+          description: "If the best search-only match scores below this, use scan fallback when enabled."
+        },
         format: outputFormatSchema
       },
       additionalProperties: false
@@ -918,10 +1000,15 @@ function remotePath(args = {}) {
 
 function formatDriveItem(item, format = "compact") {
   const simplified = simplifyItem(item);
+  return formatSimplifiedItem(simplified, format);
+}
+
+function formatSimplifiedItem(simplified, format = "compact") {
   if (!simplified || format === "full") return simplified;
   return {
     id: simplified.id,
     name: simplified.name,
+    remotePath: simplified.remotePath,
     type: simplified.folder ? "folder" : simplified.file ? "file" : "item",
     size: simplified.size,
     lastModifiedDateTime: simplified.lastModifiedDateTime,
@@ -993,6 +1080,7 @@ function simplifyItem(item) {
   return {
     id: item.id,
     name: item.name,
+    remotePath: itemRemotePath(item),
     path: item.parentReference?.path,
     webUrl: item.webUrl,
     size: item.size,
@@ -1001,6 +1089,24 @@ function simplifyItem(item) {
     folder: item.folder ? { childCount: item.folder.childCount } : undefined,
     file: item.file ? { mimeType: item.file.mimeType, hashes: item.file.hashes } : undefined
   };
+}
+
+function itemRemotePath(item) {
+  if (!item?.name) return undefined;
+  const parentPath = item.parentReference?.path || "";
+  const rootMarker = "/drive/root:";
+  const parentRemotePath = parentPath.startsWith(rootMarker)
+    ? decodeGraphPath(parentPath.slice(rootMarker.length).replace(/^\/+|\/+$/g, ""))
+    : "";
+  return [parentRemotePath, item.name].filter(Boolean).join("/");
+}
+
+function decodeGraphPath(path = "") {
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    return path;
+  }
 }
 
 async function list(args = {}) {
@@ -1036,6 +1142,161 @@ async function listAll(args = {}) {
   return await collectPages(`${childrenPath(args)}?${params.toString()}`, maxItems, args.format);
 }
 
+function normalizeExtensions(extensions = []) {
+  return new Set(
+    extensions
+      .map((extension) => String(extension || "").trim().toLowerCase())
+      .filter(Boolean)
+      .map((extension) => extension.startsWith(".") ? extension : `.${extension}`)
+  );
+}
+
+function scanItemMatches(item, args = {}, extensionFilter = new Set()) {
+  const isFolder = Boolean(item.folder);
+  const isFile = Boolean(item.file);
+  if (isFile && args.includeFiles === false) return false;
+  if (isFolder && args.includeFolders === false) return false;
+  if (!isFile && !isFolder && args.includeFiles === false && args.includeFolders === false) return false;
+
+  if (args.nameContains) {
+    const needle = String(args.nameContains).toLowerCase();
+    if (!String(item.name || "").toLowerCase().includes(needle)) return false;
+  }
+
+  if (extensionFilter.size && isFile) {
+    const extension = extname(item.name || "").toLowerCase();
+    if (!extensionFilter.has(extension)) return false;
+  }
+
+  if (extensionFilter.size && isFolder && args.includeFolders === false) return false;
+  return true;
+}
+
+async function resolveScanRoot(args = {}) {
+  if (args.itemId) {
+    const folder = await getRawInfo({ itemId: args.itemId });
+    if (!folder.folder && !folder.root) throw new Error(`Scan target is not a folder: ${folder.name}`);
+    return { id: folder.id, name: folder.name || "root", remotePath: itemRemotePath(folder) || "", target: "itemId" };
+  }
+
+  const resolvedPath = resolvePresetPath(args);
+  if (resolvedPath) {
+    const folder = await getRawInfo({ path: resolvedPath });
+    if (!folder.folder && !folder.root) throw new Error(`Scan target is not a folder: ${folder.name}`);
+    return { id: folder.id, name: folder.name || resolvedPath, remotePath: resolvedPath, target: resolvedPath };
+  }
+
+  const root = await graph("/me/drive/root");
+  return { id: root.id, name: "root", remotePath: "", target: "root" };
+}
+
+async function scan(args = {}) {
+  const pageSize = Math.min(args.pageSize ?? 200, 200);
+  const maxItems = Math.min(args.maxItems ?? 10000, 50000);
+  const maxResults = Math.min(args.maxResults ?? 500, 5000);
+  const maxDepth = Math.min(args.maxDepth ?? 25, 50);
+  const maxFolders = Math.min(args.maxFolders ?? 1000, 10000);
+  const extensionFilter = normalizeExtensions(args.extensions || []);
+  const root = await resolveScanRoot(args);
+  const params = new URLSearchParams();
+  params.set("$top", String(pageSize));
+  params.set("$select", args.select || defaultSelect);
+
+  const queue = [{ id: root.id, name: root.name, remotePath: root.remotePath, depth: 0 }];
+  const results = [];
+  const counters = {
+    itemsScanned: 0,
+    filesScanned: 0,
+    foldersScanned: 0,
+    foldersVisited: 0,
+    matched: 0
+  };
+  let truncatedReason = null;
+
+  while (queue.length) {
+    if (counters.itemsScanned >= maxItems) {
+      truncatedReason = "maxItems";
+      break;
+    }
+    if (counters.foldersVisited >= maxFolders) {
+      truncatedReason = "maxFolders";
+      break;
+    }
+
+    const folder = queue.shift();
+    counters.foldersVisited += 1;
+    let nextPath = `/me/drive/items/${encodeURIComponent(folder.id)}/children?${params.toString()}`;
+
+    while (nextPath) {
+      if (counters.itemsScanned >= maxItems) {
+        truncatedReason = "maxItems";
+        break;
+      }
+      const page = await graph(nextPath);
+      for (const item of page.value || []) {
+        if (counters.itemsScanned >= maxItems) {
+          truncatedReason = "maxItems";
+          break;
+        }
+        counters.itemsScanned += 1;
+        if (item.file) counters.filesScanned += 1;
+        if (item.folder) counters.foldersScanned += 1;
+
+        if (scanItemMatches(item, args, extensionFilter)) {
+          counters.matched += 1;
+          if (results.length < maxResults) {
+            results.push(formatDriveItem(item, args.format));
+          }
+          if (args.stopAfterResults === true && results.length >= maxResults) {
+            truncatedReason = "maxResults";
+            break;
+          }
+        }
+
+        if (item.folder && folder.depth < maxDepth) {
+          queue.push({
+            id: item.id,
+            name: item.name,
+            remotePath: itemRemotePath(item),
+            depth: folder.depth + 1
+          });
+        }
+      }
+      if (truncatedReason) break;
+      nextPath = page["@odata.nextLink"] || null;
+    }
+
+    if (truncatedReason) break;
+  }
+
+  if (!truncatedReason && queue.length) truncatedReason = "queueRemaining";
+  return {
+    root,
+    filters: {
+      nameContains: args.nameContains || null,
+      extensions: [...extensionFilter],
+      includeFiles: args.includeFiles !== false,
+      includeFolders: args.includeFolders !== false,
+      maxDepth,
+      maxItems,
+      maxFolders,
+      maxResults
+    },
+    summary: {
+      ...counters,
+      returned: results.length,
+      resultTruncated: counters.matched > results.length,
+      traversalTruncated: Boolean(truncatedReason),
+      truncatedReason,
+      foldersQueued: queue.length
+    },
+    items: results,
+    note: truncatedReason
+      ? `Scan stopped at ${truncatedReason}. Increase the relevant cap or narrow the scan.`
+      : "Recursive scan completed within the requested caps."
+  };
+}
+
 async function search(args = {}) {
   const escaped = String(args.query).replace(/'/g, "''");
   const params = new URLSearchParams();
@@ -1050,6 +1311,395 @@ async function searchAll(args = {}) {
   const params = new URLSearchParams();
   params.set("$top", String(args.pageSize ?? 200));
   return await collectPages(`/me/drive/root/search(q='${encodeURIComponent(escaped)}')?${params.toString()}`, maxItems, args.format);
+}
+
+const findStopWords = new Set([
+  "a", "an", "and", "by", "for", "from", "in", "me", "my", "of", "on", "or", "the", "to", "with"
+]);
+const findGenericWords = new Set([
+  "file", "files", "folder", "folders", "document", "documents", "summary"
+]);
+const findKindHints = [
+  {
+    kind: "presentation",
+    words: ["deck", "decks", "presentation", "presentations", "powerpoint", "ppt", "pptx", "slides", "slideshow"],
+    extensions: [".pptx", ".ppt", ".pptm", ".ppsx", ".odp"]
+  },
+  {
+    kind: "spreadsheet",
+    words: ["spreadsheet", "spreadsheets", "sheet", "sheets", "excel", "xlsx", "xls", "csv", "workbook"],
+    extensions: [".xlsx", ".xls", ".xlsm", ".xlsb", ".csv", ".ods"]
+  },
+  {
+    kind: "word",
+    words: ["doc", "docs", "docx", "word", "letter", "memo"],
+    extensions: [".docx", ".doc", ".docm", ".rtf", ".odt"]
+  },
+  {
+    kind: "pdf",
+    words: ["pdf", "report", "evaluation"],
+    extensions: [".pdf"]
+  },
+  {
+    kind: "image",
+    words: ["image", "images", "photo", "photos", "picture", "pictures", "screenshot", "screenshots", "png", "jpg", "jpeg"],
+    extensions: [".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".tif", ".tiff"]
+  }
+];
+
+function normalizeFindText(value = "") {
+  return String(value)
+    .toLowerCase()
+    .replace(/[_]+/g, " ")
+    .replace(/[^\p{L}\p{N}.-]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function findTokens(value = {}) {
+  const normalized = normalizeFindText(value);
+  const rawTokens = normalized.match(/[\p{L}\p{N}]+(?:[-.][\p{L}\p{N}]+)*/gu) || [];
+  const expanded = [];
+  for (const token of rawTokens) {
+    expanded.push(token);
+    if (/[-.]/.test(token)) expanded.push(...token.split(/[-.]/).filter(Boolean));
+  }
+  return [...new Set(expanded.filter((token) => token.length > 1 && !findStopWords.has(token)))];
+}
+
+function findDateTokens(query) {
+  return [...new Set(String(query).match(/\b\d{4}[-_. ]\d{1,2}[-_. ]\d{1,2}\b/g) || [])]
+    .map((token) => token.trim().replace(/[_. ]/g, "-"));
+}
+
+function findImportantTokens(query) {
+  return findTokens(query).filter((token) => !findGenericWords.has(token));
+}
+
+function buildFindSearchTerms(query, maxSearchTerms = 8) {
+  const terms = [];
+  const add = (term) => {
+    const clean = String(term || "").replace(/\s+/g, " ").trim();
+    if (clean && !terms.some((existing) => existing.toLowerCase() === clean.toLowerCase())) terms.push(clean);
+  };
+  const dateTokens = findDateTokens(query);
+  const dateParts = new Set(dateTokens.flatMap((token) => [token, ...token.split("-")]));
+  const important = findImportantTokens(query).filter((token) => !dateParts.has(token));
+
+  add(query);
+  for (const dateToken of dateTokens) add(dateToken);
+  if (important.length) add(important.join(" "));
+  if (important.length >= 3) add(important.slice(-3).join(" "));
+  if (important.length >= 2) {
+    for (let index = 0; index < important.length - 1; index += 1) {
+      add(`${important[index]} ${important[index + 1]}`);
+    }
+  }
+  for (const token of [...important].sort((a, b) => b.length - a.length)) {
+    if (token.length >= 4) add(token);
+  }
+
+  return terms.slice(0, Math.min(maxSearchTerms, 12));
+}
+
+function inferFindExtensions(query, explicitExtensions = []) {
+  const explicit = normalizeExtensions(explicitExtensions);
+  const inferred = new Set();
+  const tokens = new Set(findTokens(query));
+  const normalized = normalizeFindText(query);
+  const matchedKinds = [];
+  for (const hint of findKindHints) {
+    if (hint.words.some((word) => tokens.has(word) || normalized.includes(word))) {
+      matchedKinds.push(hint.kind);
+      for (const extension of hint.extensions) inferred.add(extension);
+    }
+  }
+  return {
+    explicit,
+    inferred,
+    effectiveForScan: explicit.size ? explicit : inferred,
+    matchedKinds
+  };
+}
+
+function findItemExtension(item = {}) {
+  return extname(item.name || "").toLowerCase();
+}
+
+function findItemType(item = {}) {
+  return item.folder ? "folder" : item.file ? "file" : "item";
+}
+
+function findCandidateKey(item = {}) {
+  return item.id || item.remotePath || `${item.name || "unnamed"}:${item.size || 0}:${item.lastModifiedDateTime || ""}`;
+}
+
+function shouldIncludeFindItem(item, args = {}, extensionInfo = {}) {
+  const type = findItemType(item);
+  if (type === "folder" && args.includeFolders !== true) return false;
+  if (extensionInfo.explicit?.size && type === "file" && !extensionInfo.explicit.has(findItemExtension(item))) return false;
+  return true;
+}
+
+function scoreFindCandidate(item, context = {}) {
+  const queryText = normalizeFindText(context.query);
+  const queryTokens = findImportantTokens(context.query);
+  const dateTokens = findDateTokens(context.query);
+  const nameText = normalizeFindText(item.name || "");
+  const pathText = normalizeFindText(item.remotePath || item.path || "");
+  const nameTokenSet = new Set(findTokens(item.name || ""));
+  const pathTokenSet = new Set(findTokens(item.remotePath || item.path || ""));
+  const extension = findItemExtension(item);
+  const reasons = [];
+  let score = 0;
+  let matchedTokens = 0;
+
+  if (context.source === "exactPath") {
+    score += 100;
+    reasons.push("exact path");
+  } else if (context.source === "search") {
+    score += 18;
+    reasons.push(`Graph search: ${context.term}`);
+  } else if (context.source === "scan") {
+    score += 12;
+    reasons.push(`scan: ${context.folder || "root"}`);
+  }
+
+  if (queryText && nameText === queryText) {
+    score += 90;
+    reasons.push("exact filename");
+  } else if (queryText && nameText.includes(queryText)) {
+    score += 65;
+    reasons.push("filename contains full query");
+  } else if (queryText && pathText.includes(queryText)) {
+    score += 35;
+    reasons.push("path contains full query");
+  }
+
+  for (const token of queryTokens) {
+    if (nameTokenSet.has(token) || nameText.includes(token)) {
+      matchedTokens += 1;
+      score += token.length >= 5 ? 9 : 5;
+    } else if (pathTokenSet.has(token) || pathText.includes(token)) {
+      matchedTokens += 1;
+      score += token.length >= 5 ? 4 : 2;
+    }
+  }
+
+  if (queryTokens.length) {
+    const coverage = matchedTokens / queryTokens.length;
+    score += Math.round(coverage * 45);
+    if (coverage >= 0.85) reasons.push("strong token match");
+    else if (coverage >= 0.5) reasons.push("partial token match");
+  }
+
+  for (const dateToken of dateTokens) {
+    const compact = dateToken.replace(/-/g, "");
+    if (nameText.includes(dateToken) || pathText.includes(dateToken) || nameText.replace(/[-_. ]/g, "").includes(compact)) {
+      score += 18;
+      reasons.push(`date match: ${dateToken}`);
+    }
+  }
+
+  if (context.extensionInfo?.explicit?.size && context.extensionInfo.explicit.has(extension)) {
+    score += 35;
+    reasons.push(`requested extension: ${extension}`);
+  } else if (context.extensionInfo?.inferred?.size && context.extensionInfo.inferred.has(extension)) {
+    score += 24;
+    reasons.push(`likely file type: ${extension}`);
+  }
+
+  if (findItemType(item) === "folder") score -= 15;
+  if (item.remotePath && context.folderHints?.some((hint) => item.remotePath.toLowerCase().startsWith(`${hint.toLowerCase()}/`))) {
+    score += 8;
+    reasons.push("folder hint");
+  }
+
+  return {
+    score: Math.max(0, Math.round(score)),
+    matchedTokens,
+    reasons: [...new Set(reasons)].slice(0, 6)
+  };
+}
+
+function defaultFindFolderHints(query = "") {
+  const normalized = normalizeFindText(query);
+  const hints = [
+    "Personal/Documents",
+    "Documents",
+    "Personal",
+    "Microsoft Copilot Chat Files",
+    "Desktop"
+  ];
+  if (normalized.includes("screenshot") || normalized.includes("photo") || normalized.includes("picture")) {
+    hints.unshift("Pictures/Screenshots", "Pictures");
+  }
+  if (normalized.includes("health") || normalized.includes("eval") || normalized.includes("evaluation")) {
+    hints.unshift("Personal/Documents/Health");
+  }
+  return [...new Set(hints)];
+}
+
+function findScanNeedle(query = "") {
+  const tokens = findImportantTokens(query)
+    .filter((token) => !["deck", "presentation", "powerpoint", "spreadsheet", "sheet", "pdf", "doc", "word"].includes(token))
+    .sort((a, b) => b.length - a.length);
+  return tokens.find((token) => token.length >= 4) || findDateTokens(query)[0] || tokens[0] || "";
+}
+
+function addFindCandidate(candidates, item, context) {
+  if (!shouldIncludeFindItem(item, context.args, context.extensionInfo)) return;
+  const key = findCandidateKey(item);
+  const scored = scoreFindCandidate(item, context);
+  const existing = candidates.get(key);
+  if (!existing || scored.score > existing.score) {
+    candidates.set(key, {
+      item,
+      score: scored.score,
+      reasons: scored.reasons,
+      sources: [{ source: context.source, term: context.term, folder: context.folder }]
+    });
+  } else {
+    existing.sources.push({ source: context.source, term: context.term, folder: context.folder });
+    existing.reasons = [...new Set([...existing.reasons, ...scored.reasons])].slice(0, 6);
+  }
+}
+
+function rankedFindCandidates(candidates) {
+  return [...candidates.values()].sort((left, right) => {
+    if (right.score !== left.score) return right.score - left.score;
+    return String(left.item.name || "").localeCompare(String(right.item.name || ""));
+  });
+}
+
+async function find(args = {}) {
+  const query = String(args.query || "").trim();
+  if (!query) throw new Error("query is required.");
+
+  const maxResults = Math.min(args.maxResults ?? 10, 50);
+  const maxSearchTerms = Math.min(args.maxSearchTerms ?? 8, 12);
+  const searchTerms = buildFindSearchTerms(query, maxSearchTerms);
+  const extensionInfo = inferFindExtensions(query, args.extensions || []);
+  const folderHints = [...new Set([...(args.folderHints || []), ...defaultFindFolderHints(query), ""])];
+  const candidates = new Map();
+  const searchRuns = [];
+  const scanRuns = [];
+
+  if (query.includes("/")) {
+    try {
+      const item = simplifyItem(await getRawInfo({ path: query }));
+      addFindCandidate(candidates, item, {
+        args,
+        query,
+        source: "exactPath",
+        extensionInfo,
+        folderHints
+      });
+    } catch (error) {
+      searchRuns.push({ strategy: "exactPath", path: query, error: error.message });
+    }
+  }
+
+  for (const term of searchTerms) {
+    try {
+      const result = await searchAll({
+        query: term,
+        pageSize: args.searchPageSize ?? 50,
+        maxItems: args.searchMaxItemsPerTerm ?? 100,
+        format: "full"
+      });
+      searchRuns.push({ term, count: result.count, truncated: result.truncated });
+      for (const item of result.items || []) {
+        addFindCandidate(candidates, item, {
+          args,
+          query,
+          source: "search",
+          term,
+          extensionInfo,
+          folderHints
+        });
+      }
+    } catch (error) {
+      searchRuns.push({ term, error: error.message });
+    }
+  }
+
+  let ranked = rankedFindCandidates(candidates);
+  const bestSearchScore = ranked[0]?.score || 0;
+  const shouldScan = args.scanFallback !== false && bestSearchScore < (args.minConfidenceForSearchOnly ?? 78);
+
+  if (shouldScan) {
+    let remainingItems = Math.min(args.scanMaxItems ?? 1500, 10000);
+    let remainingFolders = Math.min(args.scanMaxFolders ?? 250, 2000);
+    const scanNeedle = findScanNeedle(query);
+    for (const folder of folderHints) {
+      if (remainingItems <= 0 || remainingFolders <= 0) break;
+      try {
+        const result = await scan({
+          path: folder,
+          nameContains: scanNeedle,
+          extensions: [...extensionInfo.effectiveForScan],
+          includeFiles: true,
+          includeFolders: args.includeFolders === true,
+          maxItems: remainingItems,
+          maxFolders: remainingFolders,
+          maxDepth: args.scanMaxDepth ?? 20,
+          maxResults: Math.max(maxResults * 2, 20),
+          stopAfterResults: true,
+          format: "full"
+        });
+        scanRuns.push({ folder: folder || "root", summary: result.summary });
+        remainingItems -= result.summary.itemsScanned || 0;
+        remainingFolders -= result.summary.foldersVisited || 0;
+        for (const item of result.items || []) {
+          addFindCandidate(candidates, item, {
+            args,
+            query,
+            source: "scan",
+            folder: folder || "root",
+            extensionInfo,
+            folderHints
+          });
+        }
+        ranked = rankedFindCandidates(candidates);
+        if ((ranked[0]?.score || 0) >= (args.minConfidenceForSearchOnly ?? 78) && ranked.length >= maxResults) break;
+      } catch (error) {
+        scanRuns.push({ folder: folder || "root", error: error.message });
+      }
+    }
+  }
+
+  ranked = rankedFindCandidates(candidates);
+  return {
+    query,
+    strategy: "stateless-remote-first",
+    searchTerms,
+    inferred: {
+      extensions: [...extensionInfo.inferred],
+      matchedKinds: extensionInfo.matchedKinds,
+      explicitExtensions: [...extensionInfo.explicit]
+    },
+    summary: {
+      candidates: ranked.length,
+      returned: Math.min(ranked.length, maxResults),
+      bestScore: ranked[0]?.score || 0,
+      usedScanFallback: shouldScan,
+      scanRuns: scanRuns.length,
+      localIndexUsed: false,
+      persistentCacheUsed: false
+    },
+    searchRuns,
+    scanRuns,
+    items: ranked.slice(0, maxResults).map((candidate) => ({
+      ...formatSimplifiedItem(candidate.item, args.format),
+      score: candidate.score,
+      reasons: candidate.reasons,
+      sources: candidate.sources.slice(0, 5)
+    })),
+    note: shouldScan
+      ? "Used live Graph searches, then bounded remote recursive scan fallback. No local index or persistent cache was used."
+      : "Search confidence was high enough to skip recursive fallback. No local index or persistent cache was used."
+  };
 }
 
 function formatDeltaItem(item, format = "compact") {
@@ -1620,10 +2270,14 @@ async function callTool(name, args = {}) {
       return textResult(await list(args));
     case "onedrive_list_all":
       return textResult(await listAll(args));
+    case "onedrive_scan":
+      return textResult(await scan(args));
     case "onedrive_search":
       return textResult(await search(args));
     case "onedrive_search_all":
       return textResult(await searchAll(args));
+    case "onedrive_find":
+      return textResult(await find(args));
     case "onedrive_delta":
       return textResult(await delta(args));
     case "onedrive_get_info":
