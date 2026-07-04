@@ -6,6 +6,7 @@ description: Work with files and folders in OneDrive through the local OneDrive 
 # OneDrive
 
 Use the `onedrive` MCP tools to manage files in the signed-in user's OneDrive through Microsoft Graph.
+Prefer remote Microsoft Graph operations through this plugin. Do not inspect, write, or rely on the user's local OneDrive sync folder on the laptop unless the user explicitly asks for local sync-folder access or a local temporary file is required for processing.
 
 ## Configuration
 
@@ -39,13 +40,14 @@ Never ask the user to paste Microsoft passwords, access tokens, or refresh token
 - If `onedrive_read_text` refuses likely binary content, use `onedrive_download` instead of forcing text unless the user specifically wants raw text extraction.
 - Use `onedrive_download` for binary files or larger files.
 - Use `onedrive_download_excel`, `onedrive_download_word`, or `onedrive_download_powerpoint` for Office/document-specific downloads when the user names a document type.
-- Use `onedrive_upload` for local-file-to-OneDrive uploads. It automatically uses upload sessions for files above the simple upload limit; use `uploadMode: "session"` when explicitly testing resumable upload behavior.
+- Use `onedrive_upload` for local-file-to-OneDrive uploads only when the source is truly local and not already in a local OneDrive sync folder. It automatically uses upload sessions for files above the simple upload limit; use `uploadMode: "session"` when explicitly testing resumable upload behavior.
 - Use `onedrive_write_text` for creating or replacing small text files.
 - Use `onedrive_move` and `onedrive_copy` when the user asks to reorganize files; include `expectedName` or `expectedId` when the target was resolved in a previous step.
 - Use `onedrive_permissions` to audit sharing/permission state before creating or changing links.
 - `onedrive_create_sharing_link` changes access to a file or folder. It defaults to dry-run; only set `dryRun: false` and `confirmed: true` after explicit user authorization for the exact item and link scope.
 - `onedrive_restore_deleted` restores by deleted item ID and defaults to dry-run; only set `dryRun: false` and `confirmed: true` after explicit user authorization. Microsoft Graph does not provide a normal OneDrive recycle-bin listing API through driveItem file operations, so use `onedrive_delta` deleted changes to discover deleted item IDs when available.
 - `onedrive_delete` defaults to `dryRun: true`; only set `dryRun: false` and `confirmed: true` after explicit user authorization. Live deletes require `expectedName` or `expectedId`.
+- Uploads and downloads refuse local OneDrive sync-folder paths by default. Pass `allowLocalOneDriveSyncPath: true` only when the user explicitly needs the local synced folder rather than the remote plugin path.
 
 ## Maintenance
 

@@ -10,6 +10,12 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const configPath = join(homedir(), ".codex", "onedrive-plugin", "config.json");
 const downloadRoot = join(homedir(), ".codex", "onedrive-plugin", "downloads");
+const localOneDriveSyncRoots = [
+  { path: join(homedir(), "Library", "CloudStorage", "OneDrive"), prefix: false },
+  { path: join(homedir(), "Library", "CloudStorage", "OneDrive-"), prefix: true },
+  { path: join(homedir(), "OneDrive"), prefix: false },
+  { path: join(homedir(), "OneDrive - "), prefix: true }
+];
 const localConfig = readLocalConfig();
 const textFileLimit = 5 * 1024 * 1024;
 const simpleUploadLimit = 250 * 1024 * 1024;
@@ -397,7 +403,12 @@ const tools = [
       properties: {
         ...pathTargetProperties,
         localPath: { type: "string", description: "Optional destination path. Defaults to ~/.codex/onedrive-plugin/downloads/<filename>." },
-        overwrite: { type: "boolean", default: false }
+        overwrite: { type: "boolean", default: false },
+        allowLocalOneDriveSyncPath: {
+          type: "boolean",
+          default: false,
+          description: "Explicit override to write into a locally synced OneDrive folder. Prefer remote plugin operations instead."
+        }
       },
       additionalProperties: false
     }
@@ -411,7 +422,12 @@ const tools = [
       properties: {
         ...pathTargetProperties,
         localPath: { type: "string", description: "Optional destination path. Defaults to ~/.codex/onedrive-plugin/downloads/excel/<filename>." },
-        overwrite: { type: "boolean", default: false }
+        overwrite: { type: "boolean", default: false },
+        allowLocalOneDriveSyncPath: {
+          type: "boolean",
+          default: false,
+          description: "Explicit override to write into a locally synced OneDrive folder. Prefer remote plugin operations instead."
+        }
       },
       additionalProperties: false
     }
@@ -425,7 +441,12 @@ const tools = [
       properties: {
         ...pathTargetProperties,
         localPath: { type: "string", description: "Optional destination path. Defaults to ~/.codex/onedrive-plugin/downloads/word/<filename>." },
-        overwrite: { type: "boolean", default: false }
+        overwrite: { type: "boolean", default: false },
+        allowLocalOneDriveSyncPath: {
+          type: "boolean",
+          default: false,
+          description: "Explicit override to write into a locally synced OneDrive folder. Prefer remote plugin operations instead."
+        }
       },
       additionalProperties: false
     }
@@ -439,7 +460,12 @@ const tools = [
       properties: {
         ...pathTargetProperties,
         localPath: { type: "string", description: "Optional destination path. Defaults to ~/.codex/onedrive-plugin/downloads/powerpoint/<filename>." },
-        overwrite: { type: "boolean", default: false }
+        overwrite: { type: "boolean", default: false },
+        allowLocalOneDriveSyncPath: {
+          type: "boolean",
+          default: false,
+          description: "Explicit override to write into a locally synced OneDrive folder. Prefer remote plugin operations instead."
+        }
       },
       additionalProperties: false
     }
@@ -457,6 +483,11 @@ const tools = [
         ...remotePresetProperties,
         conflictBehavior: { type: "string", enum: ["fail", "replace", "rename"], default: "fail" },
         uploadMode: { type: "string", enum: ["auto", "simple", "session"], default: "auto" },
+        allowLocalOneDriveSyncPath: {
+          type: "boolean",
+          default: false,
+          description: "Explicit override to read from a locally synced OneDrive folder. Prefer remote plugin operations instead."
+        },
         chunkSize: {
           type: "integer",
           minimum: 327680,
@@ -996,6 +1027,26 @@ function remotePath(args = {}) {
     relativeField: "remoteRelativePath",
     allowEmpty: false
   });
+}
+
+function normalizeLocalPathForCompare(path) {
+  return resolve(path).replace(/\/+$/g, "");
+}
+
+function isLocalOneDriveSyncPath(path) {
+  const normalized = normalizeLocalPathForCompare(path);
+  return localOneDriveSyncRoots.some((root) => {
+    const normalizedRoot = normalizeLocalPathForCompare(root.path);
+    return normalized === normalizedRoot
+      || normalized.startsWith(`${normalizedRoot}/`)
+      || (root.prefix && normalized.startsWith(normalizedRoot));
+  });
+}
+
+function assertNotLocalOneDriveSyncPath(path, operation, args = {}) {
+  if (args.allowLocalOneDriveSyncPath === true) return;
+  if (!isLocalOneDriveSyncPath(path)) return;
+  throw new Error(`${operation} refuses to use a local OneDrive sync folder by default: ${path}. Use remote OneDrive plugin tools instead, or pass allowLocalOneDriveSyncPath: true only when you explicitly need local sync-folder access.`);
 }
 
 function formatDriveItem(item, format = "compact") {
@@ -1862,6 +1913,7 @@ async function readText(args = {}) {
 async function download(args = {}) {
   const info = await getInfo(args);
   const target = args.localPath ? resolve(args.localPath) : join(downloadRoot, info.name || basename(cleanPath(args.path || args.itemId || "download")));
+  assertNotLocalOneDriveSyncPath(target, "Download", args);
   if (args.overwrite !== true) {
     try {
       await stat(target);
@@ -1899,6 +1951,7 @@ async function downloadOffice(args = {}, kindName) {
 
 async function upload(args = {}) {
   const localPath = resolve(args.localPath);
+  assertNotLocalOneDriveSyncPath(localPath, "Upload", args);
   const destinationPath = remotePath(args);
   const fileStat = await stat(localPath);
   if (!fileStat.isFile()) throw new Error(`Not a file: ${localPath}`);

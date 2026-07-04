@@ -3,6 +3,7 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -267,6 +268,28 @@ try {
     assert(result.value.monitor?.status === 303, "copy monitor did not preserve 303", result.value.monitor);
     assert(result.value.monitor?.resourceLocation?.includes("/v1.0/me/drive/items/copied"), "missing resource location", result.value.monitor);
     return result.value.monitor;
+  });
+
+  await check("download refuses local OneDrive sync destination by default", async () => {
+    const result = await tool("onedrive_download", {
+      itemId: "delete-target",
+      localPath: join(homedir(), "Library", "CloudStorage", "OneDrive-Personal", "blocked-download.txt")
+    });
+    assert(result.isError, "download to local OneDrive sync path should fail");
+    assert(String(result.value).includes("local OneDrive sync folder"), "unexpected sync-path guard message", result);
+    return { blocked: true };
+  });
+
+  await check("upload refuses local OneDrive sync source before local or Graph work", async () => {
+    const before = requests.length;
+    const result = await tool("onedrive_upload", {
+      localPath: join(homedir(), "Library", "CloudStorage", "OneDrive-Personal", "blocked-upload.txt"),
+      remotePath: "Blocked Upload.txt"
+    });
+    assert(result.isError, "upload from local OneDrive sync path should fail");
+    assert(String(result.value).includes("local OneDrive sync folder"), "unexpected sync-path guard message", result);
+    assert(requests.length === before, "upload guard should not reach mock Graph", { before, after: requests.length });
+    return { graphRequestsAdded: requests.length - before };
   });
 
   await check("recursive scan finds nested files beyond root", async () => {

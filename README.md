@@ -4,6 +4,8 @@ Local Codex plugin for OneDrive file operations through Microsoft Graph.
 
 This is an unofficial integration and is not affiliated with, endorsed by, or sponsored by Microsoft.
 
+The plugin is remote-first: it uses Microsoft Graph rather than the laptop's local OneDrive sync folder. Upload and download tools refuse local OneDrive sync-folder paths by default unless `allowLocalOneDriveSyncPath: true` is explicitly provided.
+
 ## Setup
 
 This plugin uses Microsoft identity platform device-code login and stores refresh tokens in macOS Keychain. It does not store Microsoft passwords.
@@ -95,6 +97,7 @@ Tools that accept `path` can also accept `preset` plus `relativePath`; upload/wr
 - Text reads are bounded to 5 MB by default.
 - Text reads use MIME/extension checks and refuse likely binary files unless `force: true` is set.
 - Downloads go to `~/.codex/onedrive-plugin/downloads` unless `localPath` is provided.
+- Downloads and uploads refuse local OneDrive sync-folder paths by default. Use `allowLocalOneDriveSyncPath: true` only for an explicit local sync-folder workflow.
 - Uploads use simple upload for smaller files and upload sessions for large files, or when `uploadMode: "session"` is requested.
 - List, search, find, scan, and delta tools return compact item summaries by default; pass `format: "full"` for richer metadata.
 - `onedrive_find` is the preferred file lookup helper. It is stateless and remote-first: it runs live Graph search variants, ranks results in memory, and can fall back to bounded recursive remote scans without creating a local index or persistent cache.
