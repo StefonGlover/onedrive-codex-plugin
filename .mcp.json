@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "onedrive": {
+      "cwd": ".",
+      "command": "node",
+      "args": [
+        "./mcp/server.mjs"
+      ],
+      "env": {
+        "ONEDRIVE_TENANT": "common",
+        "ONEDRIVE_SCOPES": "offline_access User.Read Files.ReadWrite"
+      }
+    }
+  }
+}

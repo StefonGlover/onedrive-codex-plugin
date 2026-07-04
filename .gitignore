@@ -1,0 +1,32 @@
+# Local runtime/config
+.codex/
+.env
+.env.*
+!.env.example
+config.json
+
+# OneDrive plugin local state
+.DS_Store
+work/
+downloads/
+onedrive-beta/
+
+# Dependencies and build output
+node_modules/
+dist/
+build/
+coverage/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Credentials and tokens
+*.pem
+*.key
+*.p12
+*.pfx
+*token*
+*secret*
