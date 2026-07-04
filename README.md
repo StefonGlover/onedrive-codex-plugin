@@ -58,6 +58,7 @@ Tools that accept `path` can also accept `preset` plus `relativePath`; upload/wr
 ## Tools
 
 - `onedrive_config`
+- `onedrive_doctor`
 - `onedrive_auth_device_start`
 - `onedrive_auth_device_poll`
 - `onedrive_logout`
@@ -70,6 +71,7 @@ Tools that accept `path` can also accept `preset` plus `relativePath`; upload/wr
 - `onedrive_search`
 - `onedrive_search_all`
 - `onedrive_find`
+- `onedrive_find_all`
 - `onedrive_delta`
 - `onedrive_get_info`
 - `onedrive_read_text`
@@ -77,6 +79,8 @@ Tools that accept `path` can also accept `preset` plus `relativePath`; upload/wr
 - `onedrive_download_excel`
 - `onedrive_download_word`
 - `onedrive_download_powerpoint`
+- `onedrive_export_pdf`
+- `onedrive_export_text`
 - `onedrive_upload`
 - `onedrive_write_text`
 - `onedrive_create_folder`
@@ -93,6 +97,7 @@ Tools that accept `path` can also accept `preset` plus `relativePath`; upload/wr
 - Delete defaults to dry-run.
 - Live delete requires `confirmed: true` plus `expectedName` or `expectedId`.
 - Sharing-link creation defaults to dry-run and requires both `dryRun: false` and `confirmed: true`.
+- Sharing-link creation can include a before/after permission diff so the caller can see what changed.
 - Rename, move, copy, share, and delete refuse to operate on the OneDrive root.
 - Text reads are bounded to 5 MB by default.
 - Text reads use MIME/extension checks and refuse likely binary files unless `force: true` is set.
@@ -101,7 +106,10 @@ Tools that accept `path` can also accept `preset` plus `relativePath`; upload/wr
 - Uploads use simple upload for smaller files and upload sessions for large files, or when `uploadMode: "session"` is requested.
 - List, search, find, scan, and delta tools return compact item summaries by default; pass `format: "full"` for richer metadata.
 - `onedrive_find` is the preferred file lookup helper. It is stateless and remote-first: it runs live Graph search variants, ranks results in memory, and can fall back to bounded recursive remote scans without creating a local index or persistent cache.
+- `onedrive_find_all` is the broader locator for “look everywhere” requests. It searches common folders first and uses larger bounded scan caps while still avoiding local indexes and persistent caches.
 - `onedrive_list_all` follows pagination within one folder. Use `onedrive_scan` when you need recursive traversal across subfolders or the whole OneDrive.
+- `onedrive_doctor` checks config, auth, profile, drive metadata, presets, and optional root listing in one call.
+- `onedrive_export_pdf` and `onedrive_export_text` ask Microsoft Graph to convert supported Office files before saving locally. Microsoft Graph may reject conversions for unsupported file types.
 - `onedrive_permissions` audits current sharing/permission grants before changing access.
 - `onedrive_delta` can return deleted item changes. Microsoft Graph does not expose a normal OneDrive recycle-bin listing endpoint through the driveItem file APIs.
 - `onedrive_get_info` supports `includeDeletedItems: true` when targeting an item ID; Microsoft documents this as OneDrive Personal-only.
@@ -135,6 +143,16 @@ scripts/beta-test.mjs
 ```
 
 The test creates a clearly named temporary OneDrive folder, exercises CRUD and safety behavior, and deletes only that test folder during cleanup.
+
+## Plugin Gallery
+
+The plugin manifest includes a file-manager flow screenshot at `assets/screenshot-file-manager.png` so the Codex plugin page shows the OneDrive search, read, upload, and safety workflow rather than only an icon.
+
+![OneDrive plugin file manager flow](assets/screenshot-file-manager.png)
+
+## CI
+
+The GitHub Actions workflow in `.github/workflows/ci.yml` runs syntax checks, the mocked Microsoft Graph regression suite, and the prepackage guard on every push and pull request.
 
 ## Microsoft References
 

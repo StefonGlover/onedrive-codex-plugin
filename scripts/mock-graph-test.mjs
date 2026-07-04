@@ -34,6 +34,11 @@ function text(res, status, body, headers = {}) {
   res.end(body);
 }
 
+function binary(res, status, body, headers = {}) {
+  res.writeHead(status, headers);
+  res.end(body);
+}
+
 function item(id, name, extra = {}) {
   return {
     id,
@@ -61,6 +66,10 @@ const graph = createServer((req, res) => {
   const path = url.pathname;
   const decodedUrl = decodeURIComponent(req.url);
   requests.push({ method: req.method, path, url: req.url });
+
+  if (req.method === "GET" && path === "/v1.0/me") {
+    return json(res, 200, { displayName: "Mock User", userPrincipalName: "mock@example.test", mail: "mock@example.test" });
+  }
 
   if (req.method === "GET" && path === "/v1.0/me/drive") {
     if (count("drive") === 1) return json(res, 429, { error: { code: "tooManyRequests", message: "retry please" } }, { "Retry-After": "0" });
@@ -99,8 +108,47 @@ const graph = createServer((req, res) => {
     return json(res, 200, item("copy-src", "copy-source.txt"));
   }
 
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/copy-src/permissions") {
+    const base = [{ id: "perm-owner", roles: ["owner"], grantedTo: { user: { displayName: "Mock User", email: "mock@example.test" } } }];
+    if (counters.get("create-link")) {
+      base.push({ id: "perm-link", roles: ["read"], link: { type: "view", scope: "anonymous", webUrl: "https://example.test/share/link" } });
+    }
+    return json(res, 200, { value: base });
+  }
+
+  if (req.method === "POST" && path === "/v1.0/me/drive/items/copy-src/createLink") {
+    count("create-link");
+    return json(res, 200, { id: "perm-link", roles: ["read"], link: { type: "view", scope: "anonymous", webUrl: "https://example.test/share/link" } });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/quarterly-report") {
+    return json(res, 200, item("quarterly-report", "Quarterly Report.docx", {
+      parentReference: { path: "/drive/root:/Folder B" },
+      file: { mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+    }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/quarterly-report/content") {
+    if (url.searchParams.get("format") === "pdf") {
+      return binary(res, 200, Buffer.from("%PDF-1.7 mock export\n"), { "Content-Type": "application/pdf" });
+    }
+    if (url.searchParams.get("format") === "text") {
+      return text(res, 200, "Quarterly Report mock text export\n");
+    }
+    return text(res, 200, "Quarterly Report raw content\n");
+  }
+
   if (req.method === "GET" && path === "/v1.0/me/drive/root") {
     return json(res, 200, { id: "root", name: "root", root: {}, folder: {} });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/root/children") {
+    return json(res, 200, {
+      value: [
+        folder("folder-a", "Folder A"),
+        item("root-note", "root-note.txt")
+      ]
+    });
   }
 
   if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='")) {
@@ -281,6 +329,15 @@ try {
     return { attempts: counters.get("drive") };
   });
 
+  await check("doctor reports healthy mock config and Graph access", async () => {
+    const result = await tool("onedrive_doctor", { checkRootList: true, rootListLimit: 2 });
+    assert(!result.isError, "doctor should succeed", result);
+    assert(result.value.ok === true, "doctor should be healthy", result.value);
+    assert(result.value.summary.fail === 0, "doctor should have no failed checks", result.value.summary);
+    assert(result.value.checks.some((check) => check.name === "root list"), "doctor should include root list check", result.value.checks);
+    return result.value.summary;
+  });
+
   await check("GET requests retry transient network failures", async () => {
     const result = await tool("onedrive_get_info", { itemId: "flaky-network" });
     assert(!result.isError, "transient network failure should be retried", result);
@@ -381,6 +438,31 @@ try {
     return result.value.monitor;
   });
 
+  await check("sharing dry-run includes before permission audit", async () => {
+    const result = await tool("onedrive_create_sharing_link", { itemId: "copy-src", type: "view", scope: "anonymous" });
+    assert(!result.isError, "sharing dry-run should succeed", result);
+    assert(result.value.dryRun === true, "sharing dry-run should not mutate", result.value);
+    assert(result.value.beforePermissionCount === 1, "sharing dry-run should include before permissions", result.value);
+    assert(!counters.get("create-link"), "dry-run should not create a link", { createLinkCount: counters.get("create-link") });
+    return { beforePermissionCount: result.value.beforePermissionCount };
+  });
+
+  await check("sharing live action returns permission diff", async () => {
+    const result = await tool("onedrive_create_sharing_link", {
+      itemId: "copy-src",
+      type: "view",
+      scope: "anonymous",
+      dryRun: false,
+      confirmed: true,
+      expectedName: "copy-source.txt"
+    });
+    assert(!result.isError, "confirmed sharing link should succeed", result);
+    assert(result.value.permissionDiff?.added?.length === 1, "sharing diff should include the new permission", result.value.permissionDiff);
+    assert(result.value.permissionDiff?.beforeCount === 1, "sharing diff should track before count", result.value.permissionDiff);
+    assert(result.value.permissionDiff?.afterCount === 2, "sharing diff should track after count", result.value.permissionDiff);
+    return result.value.permissionDiff;
+  });
+
   await check("download refuses local OneDrive sync destination by default", async () => {
     const result = await tool("onedrive_download", {
       itemId: "delete-target",
@@ -401,6 +483,24 @@ try {
     assert(String(result.value).includes("local OneDrive sync folder"), "unexpected sync-path guard message", result);
     assert(requests.length === before, "upload guard should not reach mock Graph", { before, after: requests.length });
     return { graphRequestsAdded: requests.length - before };
+  });
+
+  await check("document PDF export writes converted content", async () => {
+    const localPath = join(pluginRoot, "work", "mock-export.pdf");
+    const result = await tool("onedrive_export_pdf", { itemId: "quarterly-report", localPath, overwrite: true });
+    assert(!result.isError, "PDF export should succeed", result);
+    assert(result.value.exportFormat === "pdf", "unexpected export format", result.value);
+    assert(result.value.bytesWritten > 0, "PDF export should write bytes", result.value);
+    return { bytesWritten: result.value.bytesWritten, localPath: result.value.localPath };
+  });
+
+  await check("document text export writes converted content", async () => {
+    const localPath = join(pluginRoot, "work", "mock-export.txt");
+    const result = await tool("onedrive_export_text", { itemId: "quarterly-report", localPath, overwrite: true });
+    assert(!result.isError, "text export should succeed", result);
+    assert(result.value.exportFormat === "text", "unexpected export format", result.value);
+    assert(result.value.bytesWritten > 0, "text export should write bytes", result.value);
+    return { bytesWritten: result.value.bytesWritten, localPath: result.value.localPath };
   });
 
   await check("recursive scan finds nested files beyond root", async () => {
@@ -476,6 +576,26 @@ try {
       summary: result.value.summary,
       found: result.value.items[0],
       inferred: result.value.inferred
+    };
+  });
+
+  await check("find_all returns broader ranked results without local cache", async () => {
+    const result = await tool("onedrive_find_all", {
+      query: "Quarterly Report",
+      maxResults: 20,
+      scanMaxItems: 20,
+      scanMaxFolders: 10
+    });
+    assert(!result.isError, "find_all should succeed", result);
+    assert(result.value.strategy === "broad-stateless-remote-first", "unexpected strategy", result.value);
+    assert(result.value.summary.localIndexUsed === false, "find_all must not use a local index", result.value.summary);
+    assert(result.value.summary.persistentCacheUsed === false, "find_all must not use persistent cache", result.value.summary);
+    assert(result.value.items.some((item) => item.id === "quarterly-report"), "find_all should include docx report", result.value.items);
+    assert(result.value.folderPlan?.includes("root"), "find_all should include root in folder plan", result.value.folderPlan);
+    return {
+      summary: result.value.summary,
+      folderPlan: result.value.folderPlan,
+      names: result.value.items.map((item) => item.name)
     };
   });
 } finally {

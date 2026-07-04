@@ -192,6 +192,27 @@ const tools = [
     inputSchema: { type: "object", properties: {}, additionalProperties: false }
   },
   {
+    name: "onedrive_doctor",
+    description: "Run a bundled OneDrive plugin health check for config, auth, profile, drive, presets, and optional root listing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        checkRootList: {
+          type: "boolean",
+          default: true,
+          description: "When true, list a few root items to verify Files.Read permissions."
+        },
+        rootListLimit: {
+          type: "integer",
+          minimum: 1,
+          maximum: 20,
+          default: 5
+        }
+      },
+      additionalProperties: false
+    }
+  },
+  {
     name: "onedrive_presets",
     description: "List configured OneDrive path presets and their root-relative paths.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false }
@@ -339,6 +360,36 @@ const tools = [
     }
   },
   {
+    name: "onedrive_find_all",
+    description: "Broader remote-first file locator for larger OneDrive searches. Searches common folders first, forces bounded scan fallback, and returns more ranked matches.",
+    inputSchema: {
+      type: "object",
+      required: ["query"],
+      properties: {
+        query: { type: "string", minLength: 1 },
+        extensions: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional hard extension filter such as ['.pdf', 'pptx']."
+        },
+        folderHints: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional root-relative folders to scan before the default common folders."
+        },
+        includeFolders: { type: "boolean", default: false },
+        maxResults: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+        scanMaxItems: { type: "integer", minimum: 1, maximum: 50000, default: 10000 },
+        scanMaxFolders: { type: "integer", minimum: 1, maximum: 10000, default: 2000 },
+        scanMaxDepth: { type: "integer", minimum: 0, maximum: 50, default: 25 },
+        searchPageSize: { type: "integer", minimum: 1, maximum: 200, default: 100 },
+        searchMaxItemsPerTerm: { type: "integer", minimum: 1, maximum: 1000, default: 250 },
+        format: outputFormatSchema
+      },
+      additionalProperties: false
+    }
+  },
+  {
     name: "onedrive_delta",
     description: "List recent changes from OneDrive delta sync, optionally continuing from a previous deltaLink or nextLink.",
     inputSchema: {
@@ -456,6 +507,44 @@ const tools = [
       properties: {
         ...pathTargetProperties,
         localPath: { type: "string", description: "Optional destination path. Defaults to ~/.codex/onedrive-plugin/downloads/powerpoint/<filename>." },
+        overwrite: { type: "boolean", default: false },
+        allowLocalOneDriveSyncPath: {
+          type: "boolean",
+          default: false,
+          description: "Explicit override to write into a locally synced OneDrive folder. Prefer remote plugin operations instead."
+        }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_export_pdf",
+    description: "Ask Microsoft Graph to export a supported OneDrive document to PDF and save it locally.",
+    inputSchema: {
+      type: "object",
+      anyOf: itemTargetAnyOf,
+      properties: {
+        ...pathTargetProperties,
+        localPath: { type: "string", description: "Optional destination path. Defaults to ~/.codex/onedrive-plugin/downloads/export/<name>.pdf." },
+        overwrite: { type: "boolean", default: false },
+        allowLocalOneDriveSyncPath: {
+          type: "boolean",
+          default: false,
+          description: "Explicit override to write into a locally synced OneDrive folder. Prefer remote plugin operations instead."
+        }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_export_text",
+    description: "Ask Microsoft Graph to export a supported OneDrive document to plain text and save it locally when Graph supports that conversion.",
+    inputSchema: {
+      type: "object",
+      anyOf: itemTargetAnyOf,
+      properties: {
+        ...pathTargetProperties,
+        localPath: { type: "string", description: "Optional destination path. Defaults to ~/.codex/onedrive-plugin/downloads/export/<name>.txt." },
         overwrite: { type: "boolean", default: false },
         allowLocalOneDriveSyncPath: {
           type: "boolean",
@@ -598,6 +687,11 @@ const tools = [
         type: { type: "string", enum: ["view", "edit", "embed"], default: "view" },
         scope: { type: "string", enum: ["anonymous", "organization", "users"], default: "anonymous" },
         retainInheritedPermissions: { type: "boolean" },
+        includePermissionDiff: {
+          type: "boolean",
+          default: true,
+          description: "When true, include before-permissions in dry-run and before/after permission diff for live creation."
+        },
         dryRun: { type: "boolean", default: true },
         confirmed: {
           type: "boolean",
@@ -765,6 +859,75 @@ function publicConfig() {
     keychainTokenConfigured: Boolean(stored?.refresh_token),
     configPath,
     pathPresets: pathPresets()
+  };
+}
+
+async function doctor(args = {}) {
+  const checks = [];
+  const addCheck = (name, status, details = {}) => {
+    checks.push({ name, status, details });
+  };
+  const runCheck = async (name, fn) => {
+    try {
+      addCheck(name, "pass", await fn());
+    } catch (error) {
+      addCheck(name, "fail", { error: error.message });
+    }
+  };
+
+  const cfgStatus = publicConfig();
+  addCheck("config", cfgStatus.clientIdConfigured ? "pass" : "fail", {
+    clientIdConfigured: cfgStatus.clientIdConfigured,
+    tenant: cfgStatus.tenant,
+    scopes: cfgStatus.scopes,
+    keychainTokenConfigured: cfgStatus.keychainTokenConfigured,
+    configPath: cfgStatus.configPath
+  });
+
+  await runCheck("access token", async () => {
+    await getAccessToken();
+    return { accessTokenAvailable: true };
+  });
+  await runCheck("profile", async () => {
+    const profile = await graph("/me");
+    return {
+      displayName: profile.displayName,
+      userPrincipalName: profile.userPrincipalName,
+      mail: profile.mail
+    };
+  });
+  await runCheck("drive", async () => {
+    const drive = await graph("/me/drive");
+    return {
+      id: drive.id,
+      name: drive.name,
+      driveType: drive.driveType,
+      quotaState: drive.quota?.state
+    };
+  });
+  addCheck("presets", "pass", { pathPresets: cfgStatus.pathPresets });
+
+  if (args.checkRootList !== false) {
+    await runCheck("root list", async () => {
+      const result = await list({ limit: Math.min(args.rootListLimit ?? 5, 20) });
+      return {
+        returned: result.items.length,
+        nextLink: Boolean(result.nextLink),
+        sample: result.items.slice(0, 3).map((item) => ({ name: item.name, type: item.type }))
+      };
+    });
+  }
+
+  const failCount = checks.filter((check) => check.status === "fail").length;
+  const warnCount = checks.filter((check) => check.status === "warn").length;
+  return {
+    ok: failCount === 0,
+    status: failCount ? "fail" : warnCount ? "warn" : "pass",
+    summary: { total: checks.length, pass: checks.length - failCount - warnCount, warn: warnCount, fail: failCount },
+    checks,
+    note: failCount
+      ? "At least one OneDrive health check failed. Fix the failed check before relying on file tools."
+      : "OneDrive plugin health checks passed."
   };
 }
 
@@ -1717,7 +1880,7 @@ async function find(args = {}) {
   const query = String(args.query || "").trim();
   if (!query) throw new Error("query is required.");
 
-  const maxResults = Math.min(args.maxResults ?? 10, 50);
+  const maxResults = Math.min(args.maxResults ?? 10, args.maxResultsLimit ?? 50);
   const maxSearchTerms = Math.min(args.maxSearchTerms ?? 8, 12);
   const searchTerms = buildFindSearchTerms(query, maxSearchTerms);
   const extensionInfo = inferFindExtensions(query, args.extensions || []);
@@ -1858,6 +2021,49 @@ async function find(args = {}) {
   };
 }
 
+function broadFindFolderHints(query = "", userHints = []) {
+  const presets = pathPresets();
+  const common = [
+    presets.documents,
+    presets.desktop,
+    presets.pictures,
+    presets.screenshots,
+    "Personal/Documents",
+    "Personal",
+    "Microsoft Copilot Chat Files",
+    ""
+  ];
+  return [...new Set([
+    ...(userHints || []),
+    ...defaultFindFolderHints(query),
+    ...common
+  ].filter((hint) => hint !== undefined && hint !== null))];
+}
+
+async function findAll(args = {}) {
+  const query = String(args.query || "").trim();
+  if (!query) throw new Error("query is required.");
+  const result = await find({
+    ...args,
+    maxResults: Math.min(args.maxResults ?? 50, 200),
+    maxResultsLimit: 200,
+    folderHints: broadFindFolderHints(query, args.folderHints || []),
+    scanFallback: true,
+    scanMaxItems: Math.min(args.scanMaxItems ?? 10000, 50000),
+    scanMaxFolders: Math.min(args.scanMaxFolders ?? 2000, 10000),
+    scanMaxDepth: Math.min(args.scanMaxDepth ?? 25, 50),
+    searchPageSize: Math.min(args.searchPageSize ?? 100, 200),
+    searchMaxItemsPerTerm: Math.min(args.searchMaxItemsPerTerm ?? 250, 1000),
+    minConfidenceForSearchOnly: 101
+  });
+  return {
+    ...result,
+    strategy: "broad-stateless-remote-first",
+    folderPlan: broadFindFolderHints(query, args.folderHints || []).map((folder) => folder || "root"),
+    note: "Searched live Graph results and common folders first, then used bounded remote recursive scan fallback. No local index or persistent cache was used."
+  };
+}
+
 function formatDeltaItem(item, format = "compact") {
   const formatted = formatDriveItem(item, format);
   if (format === "full") return formatted ? { ...formatted, deleted: item.deleted } : formatted;
@@ -1943,6 +2149,39 @@ async function permissions(args = {}) {
     item: await getInfo({ ...args, format: args.format || "compact" }).catch(() => null),
     permissions: (result.value || []).map((permission) => simplifyPermission(permission, args.format)),
     count: (result.value || []).length
+  };
+}
+
+async function permissionList(args = {}, format = "compact") {
+  const result = await graph(`${itemBase(args)}/permissions`);
+  return (result.value || []).map((permission) => simplifyPermission(permission, format));
+}
+
+function permissionKey(permission = {}) {
+  return permission.id
+    || permission.link?.webUrl
+    || `${(permission.roles || []).join(",")}:${permission.link?.type || ""}:${permission.link?.scope || ""}:${permission.grantedTo?.email || permission.invitation?.email || ""}`;
+}
+
+function diffPermissions(before = [], after = []) {
+  const beforeMap = new Map(before.map((permission) => [permissionKey(permission), permission]));
+  const afterMap = new Map(after.map((permission) => [permissionKey(permission), permission]));
+  const added = [];
+  const removed = [];
+  const unchanged = [];
+  for (const [key, permission] of afterMap) {
+    if (beforeMap.has(key)) unchanged.push(permission);
+    else added.push(permission);
+  }
+  for (const [key, permission] of beforeMap) {
+    if (!afterMap.has(key)) removed.push(permission);
+  }
+  return {
+    added,
+    removed,
+    unchangedCount: unchanged.length,
+    beforeCount: before.length,
+    afterCount: after.length
   };
 }
 
@@ -2053,6 +2292,47 @@ async function downloadOffice(args = {}, kindName) {
     localPath: args.localPath || join(downloadRoot, kindName, info.name || `${kindName}-download`),
     overwrite: args.overwrite
   });
+}
+
+function exportFileName(name = "document", extension = ".pdf") {
+  const base = basename(name, extname(name)) || "document";
+  return `${base}${extension}`;
+}
+
+async function downloadExport(args = {}, formatName) {
+  const exportFormats = {
+    pdf: { graphFormat: "pdf", extension: ".pdf", label: "PDF" },
+    text: { graphFormat: "text", extension: ".txt", label: "plain text" }
+  };
+  const format = exportFormats[formatName];
+  if (!format) throw new Error(`Unknown export format: ${formatName}`);
+  if (args.localPath) await assertNotLocalOneDriveSyncPathForWrite(resolve(args.localPath), "Export", args);
+  const info = await getInfo(args);
+  if (info.folder) throw new Error(`Item is a folder, not an exportable document: ${info.name}`);
+  const target = args.localPath
+    ? resolve(args.localPath)
+    : join(downloadRoot, "export", exportFileName(info.name, format.extension));
+  await assertNotLocalOneDriveSyncPathForWrite(target, "Export", args);
+  if (args.overwrite !== true) {
+    try {
+      await stat(target);
+      throw new Error(`Local file already exists: ${target}. Pass overwrite: true to replace it.`);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  await mkdir(dirname(target), { recursive: true });
+  const params = new URLSearchParams();
+  params.set("format", format.graphFormat);
+  const buffer = Buffer.from(await graph(`${contentPath(args)}?${params.toString()}`));
+  await writeFile(target, buffer);
+  return {
+    item: info,
+    localPath: target,
+    bytesWritten: buffer.length,
+    exportFormat: formatName,
+    note: `Exported using Microsoft Graph format=${format.graphFormat}. Some file types may not support ${format.label} conversion.`
+  };
 }
 
 async function upload(args = {}) {
@@ -2286,6 +2566,8 @@ async function createSharingLink(args = {}) {
   const current = await getRawInfo(args);
   if (current.root) throw new Error("Create sharing link refuses to operate on the OneDrive root.");
   assertExpectedItem(current, args, "Create sharing link");
+  const includePermissionDiff = args.includePermissionDiff !== false;
+  const beforePermissions = includePermissionDiff ? await permissionList(args, "compact") : null;
   const preview = {
     dryRun: args.dryRun !== false,
     confirmed: args.confirmed === true,
@@ -2294,7 +2576,11 @@ async function createSharingLink(args = {}) {
       type: args.type || "view",
       scope: args.scope || "anonymous",
       retainInheritedPermissions: args.retainInheritedPermissions
-    }
+    },
+    ...(includePermissionDiff ? {
+      beforePermissions,
+      beforePermissionCount: beforePermissions.length
+    } : {})
   };
   if (args.dryRun !== false || args.confirmed !== true) {
     return {
@@ -2313,11 +2599,17 @@ async function createSharingLink(args = {}) {
     method: "POST",
     body: JSON.stringify(body)
   });
+  const afterPermissions = includePermissionDiff ? await permissionList(args, "compact") : null;
   return {
     dryRun: false,
     confirmed: true,
     item: simplifyItem(current),
-    permission: result
+    permission: result,
+    ...(includePermissionDiff ? {
+      beforePermissions,
+      afterPermissions,
+      permissionDiff: diffPermissions(beforePermissions, afterPermissions)
+    } : {})
   };
 }
 
@@ -2441,6 +2733,8 @@ async function callTool(name, args = {}) {
       return textResult(await graph("/me"));
     case "onedrive_drive":
       return textResult(await graph("/me/drive"));
+    case "onedrive_doctor":
+      return textResult(await doctor(args));
     case "onedrive_presets":
       return textResult({ pathPresets: pathPresets(), configPath });
     case "onedrive_list":
@@ -2455,6 +2749,8 @@ async function callTool(name, args = {}) {
       return textResult(await searchAll(args));
     case "onedrive_find":
       return textResult(await find(args));
+    case "onedrive_find_all":
+      return textResult(await findAll(args));
     case "onedrive_delta":
       return textResult(await delta(args));
     case "onedrive_get_info":
@@ -2469,6 +2765,10 @@ async function callTool(name, args = {}) {
       return textResult(await downloadOffice(args, "word"));
     case "onedrive_download_powerpoint":
       return textResult(await downloadOffice(args, "powerpoint"));
+    case "onedrive_export_pdf":
+      return textResult(await downloadExport(args, "pdf"));
+    case "onedrive_export_text":
+      return textResult(await downloadExport(args, "text"));
     case "onedrive_upload":
       return textResult(await upload(args));
     case "onedrive_write_text":

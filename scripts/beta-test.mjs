@@ -139,6 +139,7 @@ try {
   const toolNames = listed.result.tools.map((entry) => entry.name).sort();
   const requiredTools = [
     "onedrive_config",
+    "onedrive_doctor",
     "onedrive_me",
     "onedrive_drive",
     "onedrive_presets",
@@ -148,6 +149,7 @@ try {
     "onedrive_search",
     "onedrive_search_all",
     "onedrive_find",
+    "onedrive_find_all",
     "onedrive_delta",
     "onedrive_get_info",
     "onedrive_read_text",
@@ -155,6 +157,8 @@ try {
     "onedrive_download_excel",
     "onedrive_download_word",
     "onedrive_download_powerpoint",
+    "onedrive_export_pdf",
+    "onedrive_export_text",
     "onedrive_upload",
     "onedrive_write_text",
     "onedrive_create_folder",
@@ -177,6 +181,13 @@ try {
     scopes: config.scopes,
     keychainTokenConfigured: config.keychainTokenConfigured,
     accessTokenAvailable: config.accessTokenAvailable
+  });
+
+  const doctor = assertOk("onedrive_doctor", await tool("onedrive_doctor", { checkRootList: true, rootListLimit: 3 }));
+  record("doctor health check passes", doctor.ok === true && doctor.summary?.fail === 0 ? "pass" : "fail", {
+    status: doctor.status,
+    summary: doctor.summary,
+    checks: doctor.checks?.map((check) => ({ name: check.name, status: check.status }))
   });
 
   const me = assertOk("onedrive_me", await tool("onedrive_me"));
@@ -396,6 +407,19 @@ try {
     top: found.items[0]
   });
 
+  const foundAll = assertOk("onedrive_find_all", await tool("onedrive_find_all", {
+    query: "uploaded session",
+    folderHints: [folderName],
+    maxResults: 20,
+    scanMaxItems: 100,
+    scanMaxFolders: 20
+  }));
+  record("find_all broad locator works without local index", foundAll.items.some((item) => item.name === "uploaded-session.txt") && foundAll.summary?.localIndexUsed === false && foundAll.summary?.persistentCacheUsed === false ? "pass" : "fail", {
+    summary: foundAll.summary,
+    folderPlan: foundAll.folderPlan,
+    names: foundAll.items.map((item) => item.name)
+  });
+
   const blockedDownload = await tool("onedrive_download", {
     path: `${folderName}/uploaded.txt`,
     localPath: blockedSyncDownload,
@@ -453,7 +477,8 @@ try {
     scope: "anonymous"
   }));
   record("sharing link dry-run is safe", sharingDryRun.dryRun === true && sharingDryRun.requiredToCreate ? "pass" : "fail", {
-    requiredToCreate: sharingDryRun.requiredToCreate
+    requiredToCreate: sharingDryRun.requiredToCreate,
+    beforePermissionCount: sharingDryRun.beforePermissionCount
   });
 
   const expectedMismatch = await tool("onedrive_delete", {

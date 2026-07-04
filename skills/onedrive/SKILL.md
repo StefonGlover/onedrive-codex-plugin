@@ -23,6 +23,7 @@ Never ask the user to paste Microsoft passwords, access tokens, or refresh token
 ## Tool Guidance
 
 - Start with `onedrive_config` to check whether a client ID and Keychain token are configured.
+- Use `onedrive_doctor` when setup, auth, or Graph access seems questionable, or before a larger workflow where a single health check would save time.
 - Use `onedrive_auth_device_start` when no refresh token is stored. Ask the user to open the returned verification URL and enter the returned user code.
 - Use `onedrive_auth_device_poll` after the user finishes browser sign-in.
 - Use `onedrive_logout` only when the user asks to disconnect or reset OneDrive auth. Do not delete the Keychain token unless the user explicitly asks.
@@ -33,6 +34,7 @@ Never ask the user to paste Microsoft passwords, access tokens, or refresh token
 - Use compact output by default for list, search, find, scan, and delta results. Pass `format: "full"` only when richer metadata is needed.
 - Use `onedrive_list_all` only when the user needs a complete folder listing; set a bounded `maxItems`.
 - Use `onedrive_find` for normal file lookup by name, partial name, or fuzzy user wording. It is stateless: it performs live Graph searches, ranks matches in memory, and only uses bounded remote scan fallback when search confidence is low.
+- Use `onedrive_find_all` for broader “look everywhere” or “scan my OneDrive” file-location requests. Keep caps bounded and prefer folder hints when the user gives them.
 - Use `onedrive_search` for direct Graph search when the user specifically wants raw Graph search behavior.
 - Use `onedrive_search_all` only when the user needs paginated search results; set a bounded `maxItems`.
 - Use `onedrive_scan` when the user wants to scan the whole OneDrive or recursively inspect subfolders. Set bounded `maxItems`, `maxFolders`, and `maxResults`; use filters like `nameContains`, `extensions`, and `includeFolders: false` when searching for files.
@@ -42,13 +44,14 @@ Never ask the user to paste Microsoft passwords, access tokens, or refresh token
 - If `onedrive_read_text` refuses likely binary content, use `onedrive_download` instead of forcing text unless the user specifically wants raw text extraction.
 - Use `onedrive_download` for binary files or larger files.
 - Use `onedrive_download_excel`, `onedrive_download_word`, or `onedrive_download_powerpoint` for Office/document-specific downloads when the user names a document type.
+- Use `onedrive_export_pdf` or `onedrive_export_text` when the user wants an Office document converted before local processing. These rely on Microsoft Graph conversion support and may fail cleanly for unsupported file types.
 - Use `onedrive_upload` for local-file-to-OneDrive uploads only when the source is truly local and not already in a local OneDrive sync folder. It automatically uses upload sessions for files above the simple upload limit; use `uploadMode: "session"` when explicitly testing resumable upload behavior.
 - Use `onedrive_write_text` for creating or replacing small text files.
 - Use `onedrive_create_folder` to create remote folders; folder names must be single item names, not paths.
 - Use `onedrive_rename` to rename one remote item; include `expectedName` or `expectedId` when the item was resolved earlier.
 - Use `onedrive_move` and `onedrive_copy` when the user asks to reorganize files; include `expectedName` or `expectedId` when the target was resolved in a previous step.
 - Use `onedrive_permissions` to audit sharing/permission state before creating or changing links.
-- `onedrive_create_sharing_link` changes access to a file or folder. It defaults to dry-run; only set `dryRun: false` and `confirmed: true` after explicit user authorization for the exact item and link scope.
+- `onedrive_create_sharing_link` changes access to a file or folder. It defaults to dry-run and includes permission-preview data by default; only set `dryRun: false` and `confirmed: true` after explicit user authorization for the exact item and link scope.
 - `onedrive_restore_deleted` restores by deleted item ID and defaults to dry-run; only set `dryRun: false` and `confirmed: true` after explicit user authorization. Microsoft Graph does not provide a normal OneDrive recycle-bin listing API through driveItem file operations, so use `onedrive_delta` deleted changes to discover deleted item IDs when available.
 - `onedrive_delete` defaults to `dryRun: true`; only set `dryRun: false` and `confirmed: true` after explicit user authorization. Live deletes require `expectedName` or `expectedId`.
 - Uploads and downloads refuse local OneDrive sync-folder paths by default. Pass `allowLocalOneDriveSyncPath: true` only when the user explicitly needs the local synced folder rather than the remote plugin path.
