@@ -29,6 +29,11 @@ function empty(res, status, headers = {}) {
   res.end();
 }
 
+function text(res, status, body, headers = {}) {
+  res.writeHead(status, { "Content-Type": "text/plain; charset=utf-8", ...headers });
+  res.end(body);
+}
+
 function item(id, name, extra = {}) {
   return {
     id,
@@ -64,6 +69,25 @@ const graph = createServer((req, res) => {
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/delete-target") {
     return json(res, 200, item("delete-target", "delete-me.txt"));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/flaky-network") {
+    if (count("flaky-network") === 1) {
+      req.socket.destroy();
+      return;
+    }
+    return json(res, 200, item("flaky-network", "flaky-network.txt"));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/text-error") {
+    return text(res, 503, "temporary plain text failure");
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/evil-pager/children") {
+    return json(res, 200, {
+      value: [item("before-evil-link", "before-evil-link.txt")],
+      "@odata.nextLink": "https://evil.example.test/steal"
+    });
   }
 
   if (req.method === "DELETE" && path === "/v1.0/me/drive/items/delete-target") {
@@ -118,6 +142,10 @@ const graph = createServer((req, res) => {
         item("deep-pdf", "Nested Eval.pdf", {
           parentReference: { path: "/drive/root:/Folder B" },
           file: { mimeType: "application/pdf" }
+        }),
+        item("quarterly-report", "Quarterly Report.docx", {
+          parentReference: { path: "/drive/root:/Folder B" },
+          file: { mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
         })
       ]
     });
@@ -202,6 +230,12 @@ async function tool(name, args = {}) {
   return { isError: Boolean(response.result?.isError), value };
 }
 
+async function listTools() {
+  const response = await request("tools/list", {});
+  if (response.error) throw new Error(response.error.message);
+  return response.result?.tools || [];
+}
+
 function assert(condition, message, details = {}) {
   if (!condition) {
     const error = new Error(message);
@@ -223,12 +257,53 @@ async function check(name, fn) {
 try {
   await request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "mock-graph-test", version: "1.0.0" } });
 
+  await check("utility auth/config schemas are callable without item targets", async () => {
+    const toolList = await listTools();
+    const utilityNames = new Set([
+      "onedrive_config",
+      "onedrive_auth_device_start",
+      "onedrive_auth_device_poll",
+      "onedrive_logout"
+    ]);
+    const utilities = toolList.filter((entry) => utilityNames.has(entry.name));
+    assert(utilities.length === utilityNames.size, "missing utility tools", { found: utilities.map((entry) => entry.name) });
+    for (const entry of utilities) {
+      assert(!entry.inputSchema?.anyOf, `${entry.name} should not require OneDrive item target fields`, entry.inputSchema);
+    }
+    return { checked: utilities.map((entry) => entry.name).sort() };
+  });
+
   await check("GET requests retry 429 once", async () => {
     const result = await tool("onedrive_drive");
     assert(!result.isError, "onedrive_drive returned an error", result);
     assert(result.value.name === "Mock OneDrive", "drive response did not come from mock Graph", result.value);
     assert(counters.get("drive") === 2, "expected one retry after 429", { count: counters.get("drive") });
     return { attempts: counters.get("drive") };
+  });
+
+  await check("GET requests retry transient network failures", async () => {
+    const result = await tool("onedrive_get_info", { itemId: "flaky-network" });
+    assert(!result.isError, "transient network failure should be retried", result);
+    assert(result.value.id === "flaky-network", "unexpected item after retry", result.value);
+    assert(counters.get("flaky-network") === 2, "expected one retry after socket failure", { count: counters.get("flaky-network") });
+    return { attempts: counters.get("flaky-network") };
+  });
+
+  await check("plain text Graph errors are surfaced", async () => {
+    const result = await tool("onedrive_get_info", { itemId: "text-error" });
+    assert(result.isError, "plain text Graph error should fail");
+    assert(String(result.value).includes("temporary plain text failure"), "text error body was not included", result);
+    return { message: String(result.value) };
+  });
+
+  await check("untrusted absolute nextLink is blocked before fetch", async () => {
+    const before = requests.length;
+    const result = await tool("onedrive_list_all", { itemId: "evil-pager", maxItems: 2 });
+    assert(result.isError, "untrusted nextLink should fail");
+    assert(String(result.value).includes("untrusted URL"), "unexpected nextLink error", result);
+    const afterPaths = requests.slice(before).map((request) => request.url);
+    assert(!afterPaths.some((url) => url.includes("evil.example.test")), "should not fetch untrusted nextLink", { afterPaths });
+    return { graphRequestsAdded: requests.length - before };
   });
 
   await check("preset traversal is blocked before Graph", async () => {
@@ -245,6 +320,42 @@ try {
     assert(!result.isError, "safe preset path should succeed", result);
     assert(result.value.id === "pictures", "unexpected item", result.value);
     return { id: result.value.id };
+  });
+
+  await check("remotePreset requires an explicit relative destination", async () => {
+    const before = requests.length;
+    const result = await tool("onedrive_write_text", { remotePreset: "documents", content: "hello" });
+    assert(result.isError, "remotePreset without remoteRelativePath should fail");
+    assert(String(result.value).includes("remoteRelativePath is required"), "unexpected remotePreset error", result);
+    assert(requests.length === before, "remotePreset validation should not reach Graph", { before, after: requests.length });
+    return { graphRequestsAdded: requests.length - before };
+  });
+
+  await check("unsafe create folder names are blocked before Graph", async () => {
+    const before = requests.length;
+    const result = await tool("onedrive_create_folder", { parentPath: "Folder A", name: "bad/name" });
+    assert(result.isError, "path-like folder name should fail");
+    assert(String(result.value).includes("single item name"), "unexpected folder name error", result);
+    assert(requests.length === before, "unsafe folder name should not reach Graph", { before, after: requests.length });
+    return { graphRequestsAdded: requests.length - before };
+  });
+
+  await check("unsafe rename names are blocked before Graph", async () => {
+    const before = requests.length;
+    const result = await tool("onedrive_rename", { itemId: "delete-target", newName: "bad/name" });
+    assert(result.isError, "path-like rename should fail");
+    assert(String(result.value).includes("single item name"), "unexpected rename error", result);
+    assert(requests.length === before, "unsafe rename should not reach Graph", { before, after: requests.length });
+    return { graphRequestsAdded: requests.length - before };
+  });
+
+  await check("unsafe restore destinations are blocked in dry-run", async () => {
+    const before = requests.length;
+    const result = await tool("onedrive_restore_deleted", { itemId: "deleted-item", destinationParentPath: "../Documents" });
+    assert(result.isError, "unsafe restore destination should fail");
+    assert(String(result.value).includes("unsafe path segment"), "unexpected restore destination error", result);
+    assert(requests.length === before, "unsafe restore dry-run should not reach Graph", { before, after: requests.length });
+    return { graphRequestsAdded: requests.length - before };
   });
 
   await check("delete requires confirmation before DELETE", async () => {
@@ -301,7 +412,7 @@ try {
       maxResults: 10
     });
     assert(!result.isError, "scan should succeed", result);
-    assert(result.value.summary.itemsScanned === 5, "scan did not inspect all mock items", result.value.summary);
+    assert(result.value.summary.itemsScanned === 6, "scan did not inspect all mock items", result.value.summary);
     assert(result.value.summary.foldersVisited === 3, "scan did not visit nested folders", result.value.summary);
     assert(result.value.summary.matched === 1, "scan should match one nested deck", result.value.summary);
     assert(result.value.items[0]?.id === "deep-deck", "scan did not return the nested deck", result.value.items);
@@ -329,6 +440,42 @@ try {
       summary: result.value.summary,
       found: result.value.items[0],
       searchTerms: result.value.searchTerms
+    };
+  });
+
+  await check("conversational find query still scans for a PowerPoint deck", async () => {
+    const result = await tool("onedrive_find", {
+      query: "where is my powerpoint deck",
+      maxResults: 3,
+      scanMaxItems: 20,
+      scanMaxFolders: 10
+    });
+    assert(!result.isError, "conversational find should succeed", result);
+    assert(result.value.summary.usedScanFallback === true, "conversational find should use scan fallback", result.value.summary);
+    assert(result.value.items[0]?.id === "deep-deck", "conversational find did not return the nested deck first", result.value.items);
+    return {
+      summary: result.value.summary,
+      found: result.value.items[0],
+      searchTerms: result.value.searchTerms,
+      inferred: result.value.inferred
+    };
+  });
+
+  await check("report find does not force a PDF-only scan", async () => {
+    const result = await tool("onedrive_find", {
+      query: "Quarterly Report",
+      maxResults: 3,
+      scanMaxItems: 20,
+      scanMaxFolders: 10
+    });
+    assert(!result.isError, "report find should succeed", result);
+    assert(result.value.summary.usedScanFallback === true, "report find should use scan fallback when search misses", result.value.summary);
+    assert(result.value.items[0]?.id === "quarterly-report", "report find should return the docx report", result.value.items);
+    assert(!result.value.inferred?.strictExtensions?.includes(".pdf"), "report should not infer a strict PDF filter", result.value.inferred);
+    return {
+      summary: result.value.summary,
+      found: result.value.items[0],
+      inferred: result.value.inferred
     };
   });
 } finally {

@@ -25,7 +25,9 @@ Never ask the user to paste Microsoft passwords, access tokens, or refresh token
 - Start with `onedrive_config` to check whether a client ID and Keychain token are configured.
 - Use `onedrive_auth_device_start` when no refresh token is stored. Ask the user to open the returned verification URL and enter the returned user code.
 - Use `onedrive_auth_device_poll` after the user finishes browser sign-in.
+- Use `onedrive_logout` only when the user asks to disconnect or reset OneDrive auth. Do not delete the Keychain token unless the user explicitly asks.
 - Use `onedrive_me` to confirm the signed-in account.
+- Use `onedrive_drive` to inspect drive metadata such as drive type, name, and quota state.
 - Use `onedrive_presets` when the user refers to a friendly location such as documents, desktop, screenshots, or a configured alias.
 - Use `onedrive_list` before changing or deleting remote files unless the target is already explicit.
 - Use compact output by default for list, search, find, scan, and delta results. Pass `format: "full"` only when richer metadata is needed.
@@ -42,6 +44,8 @@ Never ask the user to paste Microsoft passwords, access tokens, or refresh token
 - Use `onedrive_download_excel`, `onedrive_download_word`, or `onedrive_download_powerpoint` for Office/document-specific downloads when the user names a document type.
 - Use `onedrive_upload` for local-file-to-OneDrive uploads only when the source is truly local and not already in a local OneDrive sync folder. It automatically uses upload sessions for files above the simple upload limit; use `uploadMode: "session"` when explicitly testing resumable upload behavior.
 - Use `onedrive_write_text` for creating or replacing small text files.
+- Use `onedrive_create_folder` to create remote folders; folder names must be single item names, not paths.
+- Use `onedrive_rename` to rename one remote item; include `expectedName` or `expectedId` when the item was resolved earlier.
 - Use `onedrive_move` and `onedrive_copy` when the user asks to reorganize files; include `expectedName` or `expectedId` when the target was resolved in a previous step.
 - Use `onedrive_permissions` to audit sharing/permission state before creating or changing links.
 - `onedrive_create_sharing_link` changes access to a file or folder. It defaults to dry-run; only set `dryRun: false` and `confirmed: true` after explicit user authorization for the exact item and link scope.

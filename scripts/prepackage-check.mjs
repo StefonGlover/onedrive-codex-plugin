@@ -12,6 +12,8 @@ const args = process.argv.slice(2);
 const installedIndex = args.indexOf("--installed");
 const installedRoot = installedIndex >= 0 ? resolve(args[installedIndex + 1] || "") : null;
 const problems = [];
+const ignoredPackageDirs = new Set([".git", "work", "downloads", "node_modules"]);
+const ignoredPackageFiles = new Set([".DS_Store"]);
 
 const textExtensions = new Set([
   ".json", ".md", ".mjs", ".js", ".zsh", ".sh", ".txt", ".example", ".yaml", ".yml"
@@ -46,9 +48,11 @@ async function walk(dir, files = []) {
   for (const entry of await readdir(dir, { withFileTypes: true })) {
     const path = join(dir, entry.name);
     if (entry.isDirectory()) {
+      if (ignoredPackageDirs.has(entry.name)) continue;
       if (entry.name === ".codex") fail(`Packaged review/artifact directory found: ${path}`);
       await walk(path, files);
     } else if (entry.isFile()) {
+      if (ignoredPackageFiles.has(entry.name)) continue;
       files.push(path);
     }
   }
@@ -107,20 +111,80 @@ function checkRequiredFiles() {
   }
 }
 
-function checkInstalledDrift() {
+async function packageFileSet(root) {
+  return (await walk(root, [])).map((file) => relative(root, file)).sort();
+}
+
+async function checkInstalledDrift() {
   if (!installedRoot) return;
   if (!existsSync(installedRoot)) return fail(`Installed root does not exist: ${installedRoot}`);
-  const diff = spawnSync("diff", ["-qr", pluginRoot, installedRoot], { encoding: "utf8" });
-  const output = `${diff.stdout || ""}${diff.stderr || ""}`.trim();
-  if (diff.status !== 0) fail(`Installed cache differs from source:\n${output}`);
+  const sourceFiles = await packageFileSet(pluginRoot);
+  const installedFiles = await packageFileSet(installedRoot);
+  const sourceSet = new Set(sourceFiles);
+  const installedSet = new Set(installedFiles);
+  const missing = sourceFiles.filter((file) => !installedSet.has(file));
+  const extra = installedFiles.filter((file) => !sourceSet.has(file));
+  const changed = [];
+  for (const file of sourceFiles) {
+    if (!installedSet.has(file)) continue;
+    const source = readFileSync(join(pluginRoot, file));
+    const installed = readFileSync(join(installedRoot, file));
+    if (!source.equals(installed)) changed.push(file);
+  }
+  if (missing.length || extra.length || changed.length) {
+    fail(`Installed cache differs from source:\n${JSON.stringify({ missing, extra, changed }, null, 2)}`);
+  }
+}
+
+function checkToolSchemas() {
+  const serverPath = join(pluginRoot, "mcp", "server.mjs");
+  const input = [
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "prepackage-check", version: "1" } } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
+    ""
+  ].join("\n");
+  const result = spawnSync(process.execPath, [serverPath], {
+    cwd: pluginRoot,
+    input,
+    encoding: "utf8",
+    env: { ...process.env, ONEDRIVE_TEST_ACCESS_TOKEN: "prepackage-schema-check" },
+    timeout: 10_000
+  });
+  if (result.error) return fail(`Could not inspect MCP tool schemas: ${result.error.message}`);
+  if (result.status !== 0 && result.signal !== "SIGTERM") {
+    return fail(`MCP schema inspection failed: ${result.stderr || result.stdout}`);
+  }
+  const lines = (result.stdout || "").trim().split("\n").filter(Boolean);
+  const listMessage = lines.map((line) => {
+    try {
+      return JSON.parse(line);
+    } catch {
+      return null;
+    }
+  }).find((message) => message?.id === 2);
+  const tools = listMessage?.result?.tools;
+  if (!Array.isArray(tools)) return fail("MCP tools/list did not return a tools array during schema inspection.");
+  for (const tool of tools) {
+    const schema = tool.inputSchema || {};
+    const properties = schema.properties || {};
+    for (const required of schema.required || []) {
+      if (!Object.hasOwn(properties, required)) fail(`${tool.name} schema requires undeclared property: ${required}`);
+    }
+    for (const branch of schema.anyOf || []) {
+      for (const required of branch.required || []) {
+        if (!Object.hasOwn(properties, required)) fail(`${tool.name} anyOf requires undeclared property: ${required}`);
+      }
+    }
+  }
 }
 
 const files = await walk(pluginRoot);
 checkRequiredFiles();
 checkManifest();
 checkMcp();
+checkToolSchemas();
 checkNoAbsoluteLocalPaths(files);
-checkInstalledDrift();
+await checkInstalledDrift();
 
 if (problems.length) {
   console.error(JSON.stringify({ ok: false, pluginRoot, installedRoot, problems }, null, 2));

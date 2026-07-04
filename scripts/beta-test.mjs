@@ -3,6 +3,7 @@
 import { spawn } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -18,6 +19,8 @@ const localDownload = join(outDir, "upload-downloaded.txt");
 const excelDownload = join(outDir, "downloaded-sheet.csv");
 const wordDownload = join(outDir, "downloaded-doc.docx");
 const powerpointDownload = join(outDir, "downloaded-deck.pptx");
+const blockedSyncDownload = join(homedir(), "Library", "CloudStorage", "OneDrive-Personal", `${unique}-blocked-download.txt`);
+const blockedSyncUpload = join(homedir(), "Library", "CloudStorage", "OneDrive-Personal", `${unique}-blocked-upload.txt`);
 const folderName = `Codex OneDrive Plugin Beta Test ${unique}`;
 const movedFolderName = "Moved";
 const renamedTextFile = "note-renamed.txt";
@@ -141,8 +144,10 @@ try {
     "onedrive_presets",
     "onedrive_list",
     "onedrive_list_all",
+    "onedrive_scan",
     "onedrive_search",
     "onedrive_search_all",
+    "onedrive_find",
     "onedrive_delta",
     "onedrive_get_info",
     "onedrive_read_text",
@@ -364,6 +369,48 @@ try {
   record("list_all follows pagination", allFolder.items.length >= 5 && allFolder.count === allFolder.items.length ? "pass" : "fail", {
     count: allFolder.count,
     truncated: allFolder.truncated
+  });
+
+  const scanned = assertOk("onedrive_scan", await tool("onedrive_scan", {
+    path: folderName,
+    nameContains: "uploaded",
+    includeFolders: false,
+    maxItems: 50,
+    maxFolders: 10,
+    maxResults: 10
+  }));
+  record("scan finds nested test files", scanned.items.some((item) => item.name === "uploaded.txt") && scanned.items.every((item) => item.remotePath) ? "pass" : "fail", {
+    summary: scanned.summary,
+    names: scanned.items.map((item) => item.name)
+  });
+
+  const found = assertOk("onedrive_find", await tool("onedrive_find", {
+    query: "uploaded session",
+    folderHints: [folderName],
+    maxResults: 5,
+    scanMaxItems: 50,
+    scanMaxFolders: 10
+  }));
+  record("find ranks test file without local index", found.items.some((item) => item.name === "uploaded-session.txt") && found.summary?.localIndexUsed === false && found.summary?.persistentCacheUsed === false ? "pass" : "fail", {
+    summary: found.summary,
+    top: found.items[0]
+  });
+
+  const blockedDownload = await tool("onedrive_download", {
+    path: `${folderName}/uploaded.txt`,
+    localPath: blockedSyncDownload,
+    overwrite: true
+  });
+  record("download refuses local OneDrive sync path", blockedDownload.isError && String(blockedDownload.value).includes("local OneDrive sync folder") ? "pass" : "fail", {
+    response: blockedDownload.value
+  });
+
+  const blockedUpload = await tool("onedrive_upload", {
+    localPath: blockedSyncUpload,
+    remotePath: `${folderName}/blocked-upload.txt`
+  });
+  record("upload refuses local OneDrive sync path", blockedUpload.isError && String(blockedUpload.value).includes("local OneDrive sync folder") ? "pass" : "fail", {
+    response: blockedUpload.value
   });
 
   const search = assertOk("onedrive_search", await tool("onedrive_search", { query: unique, limit: 10 }));

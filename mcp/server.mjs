@@ -2,8 +2,8 @@
 
 import { execFileSync } from "node:child_process";
 import { createReadStream, readFileSync } from "node:fs";
-import { mkdir, open, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, extname, join, resolve } from "node:path";
+import { mkdir, open, realpath, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -128,7 +128,7 @@ const itemTargetAnyOf = [
 ];
 const remoteTargetAnyOf = [
   { required: ["remotePath"] },
-  { required: ["remotePreset"] }
+  { required: ["remotePreset", "remoteRelativePath"] }
 ];
 
 const tools = [
@@ -137,7 +137,6 @@ const tools = [
     description: "Show OneDrive plugin configuration status without exposing secrets.",
     inputSchema: {
       type: "object",
-      anyOf: itemTargetAnyOf,
       properties: {
         checkToken: {
           type: "boolean",
@@ -153,7 +152,6 @@ const tools = [
     description: "Start Microsoft device-code login for OneDrive and return the user code and verification URL.",
     inputSchema: {
       type: "object",
-      anyOf: itemTargetAnyOf,
       properties: {
         tenant: { type: "string", description: "Optional tenant override. Defaults to configured tenant or common." },
         scopes: { type: "string", description: "Optional space-separated scope override." }
@@ -166,7 +164,6 @@ const tools = [
     description: "Poll Microsoft token endpoint after the user completes device-code login, then store tokens in Keychain.",
     inputSchema: {
       type: "object",
-      anyOf: itemTargetAnyOf,
       properties: {
         deviceCode: { type: "string", description: "Optional device_code from onedrive_auth_device_start. Defaults to the latest pending code." }
       },
@@ -178,7 +175,6 @@ const tools = [
     description: "Forget cached OneDrive tokens from memory and optionally delete the Keychain token.",
     inputSchema: {
       type: "object",
-      anyOf: itemTargetAnyOf,
       properties: {
         deleteKeychainToken: { type: "boolean", default: false }
       },
@@ -923,13 +919,24 @@ async function parseResponseBody(response) {
   if (response.status === 204) return null;
   const contentType = response.headers.get("content-type") || "";
   if (contentType.includes("application/json")) return await response.json().catch(() => ({}));
-  return await response.arrayBuffer();
+  const buffer = await response.arrayBuffer();
+  if (contentType.startsWith("text/") || (!response.ok && buffer.byteLength <= 4096)) {
+    return new TextDecoder().decode(buffer);
+  }
+  return buffer;
 }
 
 async function fetchWithRetry(url, options = {}, retryOptions = {}) {
   const maxRetries = retryOptions.maxRetries ?? 3;
   for (let attempt = 0; ; attempt += 1) {
-    const response = await fetch(url, options);
+    let response;
+    try {
+      response = await fetch(url, options);
+    } catch (error) {
+      if (attempt >= maxRetries) throw error;
+      await sleep(Math.min(1000 * 2 ** attempt, 8000));
+      continue;
+    }
     if (!shouldRetryResponse(response) || attempt >= maxRetries) return response;
     await parseResponseBody(response).catch(() => null);
     await sleep(retryDelayMs(response, attempt));
@@ -938,17 +945,35 @@ async function fetchWithRetry(url, options = {}, retryOptions = {}) {
 
 function microsoftGraphError(body, response) {
   const code = body?.error?.code ? `${body.error.code}: ` : "";
-  const message = body?.error?.message || `${response.status} ${response.statusText}`;
+  const textBody = typeof body === "string" ? body.trim() : "";
+  const message = body?.error?.message || textBody || `${response.status} ${response.statusText}`;
   const requestId = body?.error?.innerError?.["request-id"] || body?.error?.innerError?.requestId;
   const suffix = requestId ? ` (request-id: ${requestId})` : "";
   return new Error(`Microsoft Graph error: ${code}${message}${suffix}`);
 }
 
+function graphBaseUrl() {
+  return process.env.ONEDRIVE_GRAPH_BASE_URL || "https://graph.microsoft.com/v1.0";
+}
+
+function graphUrl(path, options = {}) {
+  const base = new URL(graphBaseUrl());
+  if (!String(path).startsWith("http")) return `${base.toString().replace(/\/+$/, "")}${path}`;
+  const target = new URL(path);
+  if (options.skipAuth) return target.toString();
+  const basePath = base.pathname.replace(/\/+$/, "");
+  const targetAllowed = target.origin === base.origin
+    && (target.pathname === basePath || target.pathname.startsWith(`${basePath}/`));
+  if (!targetAllowed) {
+    throw new Error(`Refusing to send an authenticated Microsoft Graph request to an untrusted URL: ${target.origin}${target.pathname}`);
+  }
+  return target.toString();
+}
+
 async function graph(path, options = {}) {
   const { returnResponse = false, maxRetries, skipAuth = false, ...fetchOptions } = options;
   const accessToken = skipAuth ? null : await getAccessToken();
-  const graphBaseUrl = process.env.ONEDRIVE_GRAPH_BASE_URL || "https://graph.microsoft.com/v1.0";
-  const url = path.startsWith("http") ? path : `${graphBaseUrl}${path}`;
+  const url = graphUrl(path, { skipAuth });
   const headers = {
     ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
     ...(shouldDefaultJsonContentType(fetchOptions.body) ? { "Content-Type": "application/json" } : {}),
@@ -980,6 +1005,17 @@ function assertSafeRemotePath(path = "", label = "path") {
     }
   }
   return clean;
+}
+
+function assertSafeItemName(name = "", label = "name") {
+  if (typeof name !== "string") throw new Error(`${label} must be a string.`);
+  const value = String(name);
+  const trimmed = value.trim();
+  if (!trimmed) throw new Error(`${label} must not be empty.`);
+  if (trimmed === "." || trimmed === "..") throw new Error(`${label} must not be "." or "..".`);
+  if (/[\/\\]/.test(value)) throw new Error(`${label} must be a single item name, not a path.`);
+  if (/[\u0000-\u001F]/.test(value)) throw new Error(`${label} contains control characters.`);
+  return trimmed;
 }
 
 function pathName(path = "") {
@@ -1021,12 +1057,17 @@ function itemArgsWithResolvedPath(args = {}) {
 }
 
 function remotePath(args = {}) {
-  return resolvePresetPath(args, {
+  if (args.remotePreset && !args.remoteRelativePath) {
+    throw new Error("remoteRelativePath is required when remotePreset is used, and must include the destination filename.");
+  }
+  const resolved = resolvePresetPath(args, {
     pathField: "remotePath",
     presetField: "remotePreset",
     relativeField: "remoteRelativePath",
     allowEmpty: false
   });
+  if (args.remotePreset) splitRemotePath(resolved);
+  return resolved;
 }
 
 function normalizeLocalPathForCompare(path) {
@@ -1047,6 +1088,40 @@ function assertNotLocalOneDriveSyncPath(path, operation, args = {}) {
   if (args.allowLocalOneDriveSyncPath === true) return;
   if (!isLocalOneDriveSyncPath(path)) return;
   throw new Error(`${operation} refuses to use a local OneDrive sync folder by default: ${path}. Use remote OneDrive plugin tools instead, or pass allowLocalOneDriveSyncPath: true only when you explicitly need local sync-folder access.`);
+}
+
+async function existingRealPath(path) {
+  try {
+    return await realpath(path);
+  } catch {
+    return null;
+  }
+}
+
+async function realPathForPotentialWrite(path) {
+  const target = resolve(path);
+  const existingTarget = await existingRealPath(target);
+  if (existingTarget) return existingTarget;
+
+  let parent = dirname(target);
+  while (parent && parent !== dirname(parent)) {
+    const existingParent = await existingRealPath(parent);
+    if (existingParent) return join(existingParent, relative(parent, target));
+    parent = dirname(parent);
+  }
+  return target;
+}
+
+async function assertNotLocalOneDriveSyncPathForRead(path, operation, args = {}) {
+  assertNotLocalOneDriveSyncPath(path, operation, args);
+  const real = await existingRealPath(path);
+  if (real) assertNotLocalOneDriveSyncPath(real, operation, args);
+}
+
+async function assertNotLocalOneDriveSyncPathForWrite(path, operation, args = {}) {
+  assertNotLocalOneDriveSyncPath(path, operation, args);
+  const real = await realPathForPotentialWrite(path);
+  assertNotLocalOneDriveSyncPath(real, operation, args);
 }
 
 function formatDriveItem(item, format = "compact") {
@@ -1365,10 +1440,11 @@ async function searchAll(args = {}) {
 }
 
 const findStopWords = new Set([
-  "a", "an", "and", "by", "for", "from", "in", "me", "my", "of", "on", "or", "the", "to", "with"
+  "a", "an", "and", "by", "can", "could", "find", "for", "from", "get", "i", "in", "is", "it",
+  "locate", "me", "my", "named", "of", "on", "or", "please", "show", "the", "to", "where", "with"
 ]);
 const findGenericWords = new Set([
-  "file", "files", "folder", "folders", "document", "documents", "summary"
+  "called", "file", "files", "folder", "folders", "named", "document", "documents", "summary"
 ]);
 const findKindHints = [
   {
@@ -1388,7 +1464,7 @@ const findKindHints = [
   },
   {
     kind: "pdf",
-    words: ["pdf", "report", "evaluation"],
+    words: ["pdf"],
     extensions: [".pdf"]
   },
   {
@@ -1456,6 +1532,7 @@ function buildFindSearchTerms(query, maxSearchTerms = 8) {
 function inferFindExtensions(query, explicitExtensions = []) {
   const explicit = normalizeExtensions(explicitExtensions);
   const inferred = new Set();
+  const strictInferred = new Set();
   const tokens = new Set(findTokens(query));
   const normalized = normalizeFindText(query);
   const matchedKinds = [];
@@ -1463,12 +1540,17 @@ function inferFindExtensions(query, explicitExtensions = []) {
     if (hint.words.some((word) => tokens.has(word) || normalized.includes(word))) {
       matchedKinds.push(hint.kind);
       for (const extension of hint.extensions) inferred.add(extension);
+      const strictMatch = hint.words.some((word) => tokens.has(word) && (word.startsWith(".") || hint.extensions.includes(`.${word}`) || ["pdf", "ppt", "pptx", "powerpoint", "excel", "xlsx", "xls", "csv", "doc", "docx", "word", "png", "jpg", "jpeg"].includes(word)));
+      if (strictMatch) {
+        for (const extension of hint.extensions) strictInferred.add(extension);
+      }
     }
   }
   return {
     explicit,
     inferred,
-    effectiveForScan: explicit.size ? explicit : inferred,
+    strictInferred,
+    effectiveForScan: explicit.size ? explicit : strictInferred,
     matchedKinds
   };
 }
@@ -1598,6 +1680,14 @@ function findScanNeedle(query = "") {
   return tokens.find((token) => token.length >= 4) || findDateTokens(query)[0] || tokens[0] || "";
 }
 
+function scanNeedleIsWeak(needle = "", query = "") {
+  if (!needle) return true;
+  const important = findImportantTokens(query);
+  if (!important.includes(needle)) return true;
+  if (needle.length <= 3) return true;
+  return false;
+}
+
 function addFindCandidate(candidates, item, context) {
   if (!shouldIncludeFindItem(item, context.args, context.extensionInfo)) return;
   const key = findCandidateKey(item);
@@ -1680,43 +1770,57 @@ async function find(args = {}) {
   const shouldScan = args.scanFallback !== false && bestSearchScore < (args.minConfidenceForSearchOnly ?? 78);
 
   if (shouldScan) {
-    let remainingItems = Math.min(args.scanMaxItems ?? 1500, 10000);
-    let remainingFolders = Math.min(args.scanMaxFolders ?? 250, 2000);
     const scanNeedle = findScanNeedle(query);
-    for (const folder of folderHints) {
-      if (remainingItems <= 0 || remainingFolders <= 0) break;
-      try {
-        const result = await scan({
-          path: folder,
-          nameContains: scanNeedle,
-          extensions: [...extensionInfo.effectiveForScan],
-          includeFiles: true,
-          includeFolders: args.includeFolders === true,
-          maxItems: remainingItems,
-          maxFolders: remainingFolders,
-          maxDepth: args.scanMaxDepth ?? 20,
-          maxResults: Math.max(maxResults * 2, 20),
-          stopAfterResults: true,
-          format: "full"
-        });
-        scanRuns.push({ folder: folder || "root", summary: result.summary });
-        remainingItems -= result.summary.itemsScanned || 0;
-        remainingFolders -= result.summary.foldersVisited || 0;
-        for (const item of result.items || []) {
-          addFindCandidate(candidates, item, {
-            args,
-            query,
-            source: "scan",
-            folder: folder || "root",
-            extensionInfo,
-            folderHints
+    const scanPlans = [
+      { nameContains: scanNeedle, extensions: [...extensionInfo.effectiveForScan], reason: "targeted" }
+    ];
+    if (extensionInfo.effectiveForScan.size || scanNeedleIsWeak(scanNeedle, query)) {
+      scanPlans.push({ nameContains: scanNeedle, extensions: [], reason: "no-extension-filter" });
+    }
+    if (scanNeedle && scanNeedleIsWeak(scanNeedle, query) && extensionInfo.inferred.size) {
+      scanPlans.push({ nameContains: "", extensions: [...extensionInfo.strictInferred], reason: "type-only" });
+    }
+
+    for (const plan of scanPlans) {
+      let remainingItems = Math.min(args.scanMaxItems ?? 1500, 10000);
+      let remainingFolders = Math.min(args.scanMaxFolders ?? 250, 2000);
+      for (const folder of folderHints) {
+        if (remainingItems <= 0 || remainingFolders <= 0) break;
+        try {
+          const result = await scan({
+            path: folder,
+            nameContains: plan.nameContains,
+            extensions: plan.extensions,
+            includeFiles: true,
+            includeFolders: args.includeFolders === true,
+            maxItems: remainingItems,
+            maxFolders: remainingFolders,
+            maxDepth: args.scanMaxDepth ?? 20,
+            maxResults: Math.max(maxResults * 2, 20),
+            stopAfterResults: true,
+            format: "full"
           });
+          scanRuns.push({ folder: folder || "root", reason: plan.reason, nameContains: plan.nameContains || null, extensions: plan.extensions, summary: result.summary });
+          remainingItems -= result.summary.itemsScanned || 0;
+          remainingFolders -= result.summary.foldersVisited || 0;
+          for (const item of result.items || []) {
+            addFindCandidate(candidates, item, {
+              args,
+              query,
+              source: "scan",
+              folder: folder || "root",
+              extensionInfo,
+              folderHints
+            });
+          }
+          ranked = rankedFindCandidates(candidates);
+          if ((ranked[0]?.score || 0) >= (args.minConfidenceForSearchOnly ?? 78) && ranked.length >= maxResults) break;
+        } catch (error) {
+          scanRuns.push({ folder: folder || "root", reason: plan.reason, error: error.message });
         }
-        ranked = rankedFindCandidates(candidates);
-        if ((ranked[0]?.score || 0) >= (args.minConfidenceForSearchOnly ?? 78) && ranked.length >= maxResults) break;
-      } catch (error) {
-        scanRuns.push({ folder: folder || "root", error: error.message });
       }
+      ranked = rankedFindCandidates(candidates);
+      if (ranked.length > 0) break;
     }
   }
 
@@ -1727,6 +1831,7 @@ async function find(args = {}) {
     searchTerms,
     inferred: {
       extensions: [...extensionInfo.inferred],
+      strictExtensions: [...extensionInfo.strictInferred],
       matchedKinds: extensionInfo.matchedKinds,
       explicitExtensions: [...extensionInfo.explicit]
     },
@@ -1911,9 +2016,10 @@ async function readText(args = {}) {
 }
 
 async function download(args = {}) {
+  if (args.localPath) await assertNotLocalOneDriveSyncPathForWrite(resolve(args.localPath), "Download", args);
   const info = await getInfo(args);
   const target = args.localPath ? resolve(args.localPath) : join(downloadRoot, info.name || basename(cleanPath(args.path || args.itemId || "download")));
-  assertNotLocalOneDriveSyncPath(target, "Download", args);
+  await assertNotLocalOneDriveSyncPathForWrite(target, "Download", args);
   if (args.overwrite !== true) {
     try {
       await stat(target);
@@ -1951,7 +2057,7 @@ async function downloadOffice(args = {}, kindName) {
 
 async function upload(args = {}) {
   const localPath = resolve(args.localPath);
-  assertNotLocalOneDriveSyncPath(localPath, "Upload", args);
+  await assertNotLocalOneDriveSyncPathForRead(localPath, "Upload", args);
   const destinationPath = remotePath(args);
   const fileStat = await stat(localPath);
   if (!fileStat.isFile()) throw new Error(`Not a file: ${localPath}`);
@@ -2076,6 +2182,7 @@ async function writeText(args = {}) {
 }
 
 async function createFolder(args = {}) {
+  const name = assertSafeItemName(args.name, "name");
   const endpoint = args.parentItemId
     ? `/me/drive/items/${encodeURIComponent(args.parentItemId)}/children`
     : childrenPath({
@@ -2086,7 +2193,7 @@ async function createFolder(args = {}) {
   const result = await graph(endpoint, {
     method: "POST",
     body: JSON.stringify({
-      name: args.name,
+      name,
       folder: {},
       "@microsoft.graph.conflictBehavior": args.conflictBehavior || "fail"
     })
@@ -2095,18 +2202,20 @@ async function createFolder(args = {}) {
 }
 
 async function rename(args = {}) {
+  const newName = assertSafeItemName(args.newName, "newName");
   requireNonRootTarget(args, "Rename");
   const current = await getRawInfo(args);
   if (current.root) throw new Error("Rename refuses to operate on the OneDrive root.");
   assertExpectedItem(current, args, "Rename");
   const result = await graph(itemBase(args), {
     method: "PATCH",
-    body: JSON.stringify({ name: args.newName })
+    body: JSON.stringify({ name: newName })
   });
   return simplifyItem(result);
 }
 
 async function moveItem(args = {}) {
+  if (args.newName) assertSafeItemName(args.newName, "newName");
   requireNonRootTarget(args, "Move");
   const current = await getRawInfo(args);
   if (current.root) throw new Error("Move refuses to operate on the OneDrive root.");
@@ -2144,6 +2253,7 @@ async function pollCopyMonitor(monitorUrl, timeoutSeconds = 60) {
 }
 
 async function copyItem(args = {}) {
+  if (args.newName) assertSafeItemName(args.newName, "newName");
   requireNonRootTarget(args, "Copy");
   const current = await getRawInfo(args);
   if (current.root) throw new Error("Copy refuses to operate on the OneDrive root.");
@@ -2240,7 +2350,21 @@ async function deleteItem(args = {}) {
   return { dryRun: false, confirmed: true, deleted: item };
 }
 
+function validateRestoreArgs(args = {}) {
+  if (args.newName) assertSafeItemName(args.newName, "newName");
+  if (args.destinationParentPath) assertSafeRemotePath(args.destinationParentPath, "destinationParentPath");
+  if (args.destinationParentRelativePath) assertSafeRemotePath(args.destinationParentRelativePath, "destinationParentRelativePath");
+  if (args.destinationParentPreset) {
+    resolvePresetPath(args, {
+      pathField: "destinationParentPath",
+      presetField: "destinationParentPreset",
+      relativeField: "destinationParentRelativePath"
+    });
+  }
+}
+
 async function restoreDeleted(args = {}) {
+  validateRestoreArgs(args);
   if (args.expectedId && args.expectedId !== args.itemId) {
     throw new Error(`Restore expected item ID ${args.expectedId}, but got ${args.itemId}. Refusing to continue.`);
   }
