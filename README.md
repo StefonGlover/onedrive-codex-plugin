@@ -73,8 +73,12 @@ Tools that accept `path` can also accept `preset` plus `relativePath`; upload/wr
 - `onedrive_find`
 - `onedrive_find_all`
 - `onedrive_delta`
+- `onedrive_sync_status`
+- `onedrive_cache_refresh`
+- `onedrive_cache_clear`
 - `onedrive_get_info`
 - `onedrive_read_text`
+- `onedrive_preview`
 - `onedrive_download`
 - `onedrive_download_excel`
 - `onedrive_download_word`
@@ -89,6 +93,17 @@ Tools that accept `path` can also accept `preset` plus `relativePath`; upload/wr
 - `onedrive_copy`
 - `onedrive_create_sharing_link`
 - `onedrive_permissions`
+- `onedrive_batch_get_info`
+- `onedrive_batch_permissions`
+- `onedrive_batch_download`
+- `onedrive_batch_delete`
+- `onedrive_batch_move`
+- `onedrive_update_file`
+- `onedrive_recent`
+- `onedrive_large_files`
+- `onedrive_duplicates`
+- `onedrive_shared_by_me`
+- `onedrive_public_links`
 - `onedrive_restore_deleted`
 - `onedrive_delete`
 
@@ -105,8 +120,16 @@ Tools that accept `path` can also accept `preset` plus `relativePath`; upload/wr
 - Downloads and uploads refuse local OneDrive sync-folder paths by default. Use `allowLocalOneDriveSyncPath: true` only for an explicit local sync-folder workflow.
 - Uploads use simple upload for smaller files and upload sessions for large files, or when `uploadMode: "session"` is requested.
 - List, search, find, scan, and delta tools return compact item summaries by default; pass `format: "full"` for richer metadata.
-- `onedrive_find` is the preferred file lookup helper. It is stateless and remote-first: it runs live Graph search variants, ranks results in memory, and can fall back to bounded recursive remote scans without creating a local index or persistent cache.
-- `onedrive_find_all` is the broader locator for “look everywhere” requests. It searches common folders first and uses larger bounded scan caps while still avoiding local indexes and persistent caches.
+- Normal list, search, scan, delta, and metadata calls opportunistically maintain a local metadata cache at `~/.codex/onedrive-plugin/cache/metadata-cache.json`.
+- `onedrive_sync_status` reports cache age, item count, delta cursor availability, and plugin storage locations.
+- `onedrive_cache_refresh` rebuilds the cache from a bounded recursive scan and uses delta refreshes when a previous cursor exists. `onedrive_cache_clear` clears the cache.
+- `onedrive_find` is the preferred file lookup helper. It uses the local metadata cache when available, runs live Graph search variants, ranks results in memory, and can fall back to bounded recursive remote scans. Cache-only hits must still have query relevance and are confirmed with live evidence before they suppress fallback scanning. Pass `useCache: false` for a fully live lookup.
+- `onedrive_find_all` is the broader locator for “look everywhere” requests. It searches common folders first and uses larger bounded scan caps, with cache acceleration when available.
+- `onedrive_preview` returns bounded text previews for text files and Graph-supported document text exports without reading unbounded remote content into memory.
+- `onedrive_update_file` provides a checkout/commit edit workflow with a local manifest, eTag/cTag/size/mtime conflict checks, optional backup, and post-commit verification. Checkout refuses to overwrite an existing manifest unless `overwriteManifest: true` is provided.
+- `onedrive_batch_get_info` and `onedrive_batch_permissions` use Microsoft Graph batching for up to 20 items. Batch download/delete/move tools provide one result per item with dry-run support where destructive.
+- `onedrive_rename`, `onedrive_move`, and `onedrive_copy` support `dryRun: true` previews. Live `onedrive_batch_move` requires `dryRun: false`, `confirmed: true`, and `expectedName` or `expectedId` for every item.
+- `onedrive_recent`, `onedrive_large_files`, `onedrive_duplicates`, `onedrive_shared_by_me`, and `onedrive_public_links` provide cleanup and sharing-audit workflows.
 - `onedrive_list_all` follows pagination within one folder. Use `onedrive_scan` when you need recursive traversal across subfolders or the whole OneDrive.
 - `onedrive_doctor` checks config, auth, profile, drive metadata, presets, and optional root listing in one call.
 - `onedrive_export_pdf` and `onedrive_export_text` ask Microsoft Graph to convert supported Office files before saving locally. Microsoft Graph may reject conversions for unsupported file types.
@@ -142,7 +165,7 @@ Run the live CRUD/regression test from the plugin directory or with an absolute 
 scripts/beta-test.mjs
 ```
 
-The test creates a clearly named temporary OneDrive folder, exercises CRUD and safety behavior, and deletes only that test folder during cleanup.
+The test creates a clearly named temporary OneDrive folder, exercises CRUD and safety behavior, deletes only that test folder during cleanup, and removes local temporary work on success. Pass `--keep-work` to keep local artifacts for debugging.
 
 ## Plugin Gallery
 

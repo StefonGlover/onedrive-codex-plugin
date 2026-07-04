@@ -10,6 +10,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, "..");
 const serverPath = join(pluginRoot, "mcp", "server.mjs");
 const workspace = process.cwd();
+const keepWork = process.argv.includes("--keep-work");
 const unique = `codex-beta-${Date.now()}-${process.pid}`;
 const outDir = join(workspace, "work", "onedrive-beta", unique);
 const localUpload = join(outDir, "upload-source.txt");
@@ -151,8 +152,12 @@ try {
     "onedrive_find",
     "onedrive_find_all",
     "onedrive_delta",
+    "onedrive_sync_status",
+    "onedrive_cache_refresh",
+    "onedrive_cache_clear",
     "onedrive_get_info",
     "onedrive_read_text",
+    "onedrive_preview",
     "onedrive_download",
     "onedrive_download_excel",
     "onedrive_download_word",
@@ -167,6 +172,17 @@ try {
     "onedrive_copy",
     "onedrive_create_sharing_link",
     "onedrive_permissions",
+    "onedrive_batch_get_info",
+    "onedrive_batch_permissions",
+    "onedrive_batch_download",
+    "onedrive_batch_delete",
+    "onedrive_batch_move",
+    "onedrive_update_file",
+    "onedrive_recent",
+    "onedrive_large_files",
+    "onedrive_duplicates",
+    "onedrive_shared_by_me",
+    "onedrive_public_links",
     "onedrive_restore_deleted",
     "onedrive_delete"
   ];
@@ -402,7 +418,7 @@ try {
     scanMaxItems: 50,
     scanMaxFolders: 10
   }));
-  record("find ranks test file without local index", found.items.some((item) => item.name === "uploaded-session.txt") && found.summary?.localIndexUsed === false && found.summary?.persistentCacheUsed === false ? "pass" : "fail", {
+  record("find ranks test file with cache acceleration", found.items.some((item) => item.name === "uploaded-session.txt") && found.summary?.localIndexUsed === false && found.summary?.persistentCacheUsed === true ? "pass" : "fail", {
     summary: found.summary,
     top: found.items[0]
   });
@@ -414,7 +430,7 @@ try {
     scanMaxItems: 100,
     scanMaxFolders: 20
   }));
-  record("find_all broad locator works without local index", foundAll.items.some((item) => item.name === "uploaded-session.txt") && foundAll.summary?.localIndexUsed === false && foundAll.summary?.persistentCacheUsed === false ? "pass" : "fail", {
+  record("find_all broad locator works with cache acceleration", foundAll.items.some((item) => item.name === "uploaded-session.txt") && foundAll.summary?.localIndexUsed === false && foundAll.summary?.persistentCacheUsed === true ? "pass" : "fail", {
     summary: foundAll.summary,
     folderPlan: foundAll.folderPlan,
     names: foundAll.items.map((item) => item.name)
@@ -568,6 +584,13 @@ try {
 const passCount = results.checks.filter((check) => check.status === "pass").length;
 const failCount = results.checks.filter((check) => check.status === "fail").length;
 results.summary = { passCount, failCount, total: results.checks.length };
+
+if (!results.error && failCount === 0 && !keepWork) {
+  await rm(outDir, { recursive: true, force: true });
+  results.localWorkCleaned = true;
+} else {
+  results.localWorkDir = outDir;
+}
 
 console.log(JSON.stringify(results, null, 2));
 

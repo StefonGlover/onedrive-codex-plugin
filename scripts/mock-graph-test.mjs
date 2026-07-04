@@ -2,13 +2,17 @@
 
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, "..");
 const serverPath = join(pluginRoot, "mcp", "server.mjs");
+const mockHome = join(pluginRoot, "work", "mock-home");
+const keepWork = process.argv.includes("--keep-work");
+rmSync(mockHome, { recursive: true, force: true });
+mkdirSync(mockHome, { recursive: true });
 
 const requests = [];
 const counters = new Map();
@@ -80,12 +84,39 @@ const graph = createServer((req, res) => {
     return json(res, 200, item("delete-target", "delete-me.txt"));
   }
 
+  if (req.method === "PATCH" && path === "/v1.0/me/drive/items/delete-target") {
+    return json(res, 200, item("delete-target", "renamed-cache.txt"));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/root-note") {
+    return json(res, 200, item("root-note", "root-note.txt"));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/root-note/content") {
+    return text(res, 200, "root note mock content\n");
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/big-text") {
+    return json(res, 200, item("big-text", "big-text.txt", { size: 1 }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/big-text/content") {
+    return text(res, 200, "0123456789abcdefghijklmnopqrstuvwxyz");
+  }
+
   if (req.method === "GET" && path === "/v1.0/me/drive/items/flaky-network") {
     if (count("flaky-network") === 1) {
       req.socket.destroy();
       return;
     }
     return json(res, 200, item("flaky-network", "flaky-network.txt"));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/stale-cache") {
+    return json(res, 200, item("stale-cache", "Stale Cache Deck.pptx", {
+      parentReference: { path: "/drive/root:/Missing" },
+      file: { mimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
+    }));
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/text-error") {
@@ -108,12 +139,31 @@ const graph = createServer((req, res) => {
     return json(res, 200, item("copy-src", "copy-source.txt"));
   }
 
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/copy-evil") {
+    return json(res, 200, item("copy-evil", "copy-evil.txt"));
+  }
+
   if (req.method === "GET" && path === "/v1.0/me/drive/items/copy-src/permissions") {
     const base = [{ id: "perm-owner", roles: ["owner"], grantedTo: { user: { displayName: "Mock User", email: "mock@example.test" } } }];
     if (counters.get("create-link")) {
       base.push({ id: "perm-link", roles: ["read"], link: { type: "view", scope: "anonymous", webUrl: "https://example.test/share/link" } });
     }
     return json(res, 200, { value: base });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/root-note/permissions") {
+    return json(res, 200, {
+      value: [{ id: "perm-owner-root-note", roles: ["owner"], grantedTo: { user: { displayName: "Mock User", email: "mock@example.test" } } }]
+    });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/deep-deck/permissions") {
+    return json(res, 200, {
+      value: [
+        { id: "perm-owner-deep-deck", roles: ["owner"], grantedTo: { user: { displayName: "Mock User", email: "mock@example.test" } } },
+        { id: "perm-public-deep-deck", roles: ["read"], link: { type: "view", scope: "anonymous", webUrl: "https://example.test/public/deep-deck" } }
+      ]
+    });
   }
 
   if (req.method === "POST" && path === "/v1.0/me/drive/items/copy-src/createLink") {
@@ -184,6 +234,20 @@ const graph = createServer((req, res) => {
     });
   }
 
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/folder-a") {
+    return json(res, 200, folder("folder-a", "Folder A"));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/folder-a/delta") {
+    return json(res, 200, {
+      value: [item("deep-deck", "Deep Summary Deck.pptx", {
+        parentReference: { path: "/drive/root:/Folder A" },
+        file: { mimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
+      })],
+      "@odata.deltaLink": `http://127.0.0.1:${graph.address().port}/v1.0/mock/delta/folder-a`
+    });
+  }
+
   if (req.method === "GET" && path === "/v1.0/me/drive/items/folder-b/children") {
     return json(res, 200, {
       value: [
@@ -199,8 +263,26 @@ const graph = createServer((req, res) => {
     });
   }
 
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/folder-b") {
+    return json(res, 200, folder("folder-b", "Folder B"));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/folder-b/delta") {
+    return json(res, 200, {
+      value: [item("quarterly-report", "Quarterly Report.docx", {
+        parentReference: { path: "/drive/root:/Folder B" },
+        file: { mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+      })],
+      "@odata.deltaLink": `http://127.0.0.1:${graph.address().port}/v1.0/mock/delta/folder-b`
+    });
+  }
+
   if (req.method === "POST" && path === "/v1.0/me/drive/items/copy-src/copy") {
     return empty(res, 202, { Location: `http://127.0.0.1:${graph.address().port}/monitor/copy` });
+  }
+
+  if (req.method === "POST" && path === "/v1.0/me/drive/items/copy-evil/copy") {
+    return empty(res, 202, { Location: "https://evil.example.test/monitor/copy" });
   }
 
   if (req.method === "GET" && path === "/monitor/copy") {
@@ -221,6 +303,8 @@ const child = spawn(process.execPath, [serverPath], {
   cwd: pluginRoot,
   env: {
     ...process.env,
+    HOME: mockHome,
+    ONEDRIVE_CLIENT_ID: "mock-client-id",
     ONEDRIVE_TEST_ACCESS_TOKEN: "mock-token",
     ONEDRIVE_GRAPH_BASE_URL: graphBaseUrl
   },
@@ -321,6 +405,31 @@ try {
     return { checked: utilities.map((entry) => entry.name).sort() };
   });
 
+  await check("new efficiency and cleanup tools are registered", async () => {
+    const toolList = await listTools();
+    const names = new Set(toolList.map((entry) => entry.name));
+    const expected = [
+      "onedrive_sync_status",
+      "onedrive_cache_refresh",
+      "onedrive_cache_clear",
+      "onedrive_preview",
+      "onedrive_batch_get_info",
+      "onedrive_batch_permissions",
+      "onedrive_batch_download",
+      "onedrive_batch_delete",
+      "onedrive_batch_move",
+      "onedrive_update_file",
+      "onedrive_recent",
+      "onedrive_large_files",
+      "onedrive_duplicates",
+      "onedrive_shared_by_me",
+      "onedrive_public_links"
+    ];
+    const missing = expected.filter((name) => !names.has(name));
+    assert(missing.length === 0, "missing new tools", { missing });
+    return { checked: expected.length };
+  });
+
   await check("GET requests retry 429 once", async () => {
     const result = await tool("onedrive_drive");
     assert(!result.isError, "onedrive_drive returned an error", result);
@@ -361,6 +470,21 @@ try {
     const afterPaths = requests.slice(before).map((request) => request.url);
     assert(!afterPaths.some((url) => url.includes("evil.example.test")), "should not fetch untrusted nextLink", { afterPaths });
     return { graphRequestsAdded: requests.length - before };
+  });
+
+  await check("raw list and search limits are clamped server-side", async () => {
+    const beforeList = requests.length;
+    const listResult = await tool("onedrive_list", { path: "/", limit: 99999 });
+    assert(!listResult.isError, "list should succeed with clamped raw limit", listResult);
+    const listRequest = requests.slice(beforeList).find((request) => request.path === "/v1.0/me/drive/root/children");
+    assert(listRequest?.url.includes("%24top=200") || listRequest?.url.includes("$top=200"), "list did not clamp $top", { listRequest });
+
+    const beforeSearch = requests.length;
+    const searchResult = await tool("onedrive_search", { query: "anything", limit: 99999 });
+    assert(!searchResult.isError, "search should succeed with clamped raw limit", searchResult);
+    const searchRequest = requests.slice(beforeSearch).find((request) => request.url.includes("/search(q='"));
+    assert(searchRequest?.url.includes("%24top=200") || searchRequest?.url.includes("$top=200"), "search did not clamp $top", { searchRequest });
+    return { listUrl: listRequest.url, searchUrl: searchRequest.url };
   });
 
   await check("preset traversal is blocked before Graph", async () => {
@@ -438,6 +562,13 @@ try {
     return result.value.monitor;
   });
 
+  await check("copy monitor rejects untrusted external URLs", async () => {
+    const result = await tool("onedrive_copy", { itemId: "copy-evil", waitForCompletion: true, timeoutSeconds: 5 });
+    assert(result.isError, "copy should reject untrusted monitor URL", result);
+    assert(String(result.value).includes("untrusted copy monitor URL"), "unexpected monitor rejection", result);
+    return { response: result.value };
+  });
+
   await check("sharing dry-run includes before permission audit", async () => {
     const result = await tool("onedrive_create_sharing_link", { itemId: "copy-src", type: "view", scope: "anonymous" });
     assert(!result.isError, "sharing dry-run should succeed", result);
@@ -466,7 +597,7 @@ try {
   await check("download refuses local OneDrive sync destination by default", async () => {
     const result = await tool("onedrive_download", {
       itemId: "delete-target",
-      localPath: join(homedir(), "Library", "CloudStorage", "OneDrive-Personal", "blocked-download.txt")
+      localPath: join(mockHome, "Library", "CloudStorage", "OneDrive-Personal", "blocked-download.txt")
     });
     assert(result.isError, "download to local OneDrive sync path should fail");
     assert(String(result.value).includes("local OneDrive sync folder"), "unexpected sync-path guard message", result);
@@ -476,7 +607,7 @@ try {
   await check("upload refuses local OneDrive sync source before local or Graph work", async () => {
     const before = requests.length;
     const result = await tool("onedrive_upload", {
-      localPath: join(homedir(), "Library", "CloudStorage", "OneDrive-Personal", "blocked-upload.txt"),
+      localPath: join(mockHome, "Library", "CloudStorage", "OneDrive-Personal", "blocked-upload.txt"),
       remotePath: "Blocked Upload.txt"
     });
     assert(result.isError, "upload from local OneDrive sync path should fail");
@@ -503,6 +634,90 @@ try {
     return { bytesWritten: result.value.bytesWritten, localPath: result.value.localPath };
   });
 
+  await check("preview returns bounded document text export", async () => {
+    const result = await tool("onedrive_preview", { itemId: "quarterly-report", maxBytes: 12 });
+    assert(!result.isError, "preview should succeed", result);
+    assert(result.value.source === "graph-text-export", "preview should use Graph text export for docx", result.value);
+    assert(result.value.preview.length <= 12, "preview should be bounded", result.value);
+    assert(result.value.truncated === true, "preview should report truncation", result.value);
+    return { source: result.value.source, preview: result.value.preview };
+  });
+
+  await check("read_text refuses oversized content without full-read semantics", async () => {
+    const result = await tool("onedrive_read_text", { itemId: "big-text", maxBytes: 10 });
+    assert(result.isError, "read_text should refuse content above maxBytes", result);
+    assert(String(result.value).includes("above maxBytes 10"), "unexpected oversize message", result);
+    return { response: result.value };
+  });
+
+  await check("preview truncates oversized text content safely", async () => {
+    const result = await tool("onedrive_preview", { itemId: "big-text", maxBytes: 10 });
+    assert(!result.isError, "preview should succeed", result);
+    assert(result.value.source === "text-read", "preview should use text path for text files", result.value);
+    assert(result.value.preview === "0123456789", "preview should return bounded prefix", result.value);
+    assert(result.value.truncated === true, "preview should report truncation", result.value);
+    return { preview: result.value.preview, bytes: result.value.bytes };
+  });
+
+  await check("update_file checkout refuses to overwrite existing manifest", async () => {
+    const manifestPath = join(mockHome, "work", "existing-manifest.json");
+    const localPath = join(mockHome, "work", "checkout-root-note.txt");
+    mkdirSync(dirname(manifestPath), { recursive: true });
+    writeFileSync(manifestPath, "do not replace", "utf8");
+    const before = requests.length;
+    const result = await tool("onedrive_update_file", {
+      mode: "checkout",
+      remotePath: "root-note.txt",
+      itemId: "root-note",
+      localPath,
+      manifestPath
+    });
+    assert(result.isError, "checkout should refuse existing manifest", result);
+    assert(readFileSync(manifestPath, "utf8") === "do not replace", "manifest was overwritten");
+    const added = requests.slice(before);
+    assert(!added.some((request) => request.path.endsWith("/content")), "checkout should not download after manifest refusal", { added });
+    return { response: result.value, graphRequestsAdded: added.length };
+  });
+
+  await check("batch_download refuses item local sync path before Graph", async () => {
+    const before = requests.length;
+    const result = await tool("onedrive_batch_download", {
+      items: [{
+        itemId: "root-note",
+        localPath: join(mockHome, "Library", "CloudStorage", "OneDrive-Personal", "blocked-batch-download.txt")
+      }]
+    });
+    assert(!result.isError, "batch_download should report per-item error without failing the whole batch", result);
+    assert(result.value.results[0]?.error?.includes("local OneDrive sync folder"), "unexpected batch error", result.value);
+    const added = requests.slice(before);
+    assert(added.length === 0, "batch_download should reject unsafe local path before Graph", { added });
+    return { error: result.value.results[0].error };
+  });
+
+  await check("batch_move live action requires confirmation and expected identity before Graph", async () => {
+    const beforeNoConfirm = requests.length;
+    const noConfirm = await tool("onedrive_batch_move", {
+      items: [{ itemId: "root-note", expectedId: "root-note" }],
+      destinationParentItemId: "folder-a",
+      dryRun: false
+    });
+    assert(!noConfirm.isError, "batch_move no-confirm response should be structured", noConfirm);
+    assert(noConfirm.value.requiredToMove, "batch_move should require confirmation", noConfirm.value);
+    assert(requests.length === beforeNoConfirm, "batch_move should not touch Graph before confirmation", { added: requests.slice(beforeNoConfirm) });
+
+    const beforeMissingExpected = requests.length;
+    const missingExpected = await tool("onedrive_batch_move", {
+      items: [{ itemId: "root-note" }],
+      destinationParentItemId: "folder-a",
+      dryRun: false,
+      confirmed: true
+    });
+    assert(!missingExpected.isError, "batch_move missing-expected response should be structured", missingExpected);
+    assert(missingExpected.value.requiredToMove?.includes("expectedName or expectedId"), "batch_move should require expected identity", missingExpected.value);
+    assert(requests.length === beforeMissingExpected, "batch_move should not touch Graph before expected identity", { added: requests.slice(beforeMissingExpected) });
+    return { noConfirm: noConfirm.value.requiredToMove, missingExpected: missingExpected.value.requiredToMove };
+  });
+
   await check("recursive scan finds nested files beyond root", async () => {
     const result = await tool("onedrive_scan", {
       nameContains: "deck",
@@ -523,7 +738,87 @@ try {
     };
   });
 
-  await check("stateless find falls back to remote scan for nested deck", async () => {
+  await check("scan maxItems cap limits metadata cache writes", async () => {
+    await tool("onedrive_cache_clear");
+    const result = await tool("onedrive_scan", { maxItems: 1, maxFolders: 10, maxResults: 10 });
+    assert(!result.isError, "capped scan should succeed", result);
+    assert(result.value.summary.itemsScanned === 1, "scan should process one item", result.value.summary);
+    const status = await tool("onedrive_sync_status");
+    assert(!status.isError, "sync status should succeed", status);
+    assert(status.value.itemCount === 1, "cache should contain only processed items", status.value);
+    return { itemsScanned: result.value.summary.itemsScanned, cacheItems: status.value.itemCount };
+  });
+
+  await check("cache refresh auto does not reuse deltaLink for a different target", async () => {
+    await tool("onedrive_cache_clear");
+    const first = await tool("onedrive_cache_refresh", { itemId: "folder-a", mode: "scan", maxItems: 10, maxFolders: 5, maxDepth: 1 });
+    assert(!first.isError, "first cache refresh should succeed", first);
+    const before = requests.length;
+    const second = await tool("onedrive_cache_refresh", { itemId: "folder-b", mode: "auto", maxItems: 10, maxFolders: 5, maxDepth: 1 });
+    assert(!second.isError, "second cache refresh should succeed", second);
+    assert(second.value.cache.scanRoot.target === "itemId:folder-b", "cache refresh should switch scan root", second.value.cache);
+    const added = requests.slice(before);
+    assert(!added.some((request) => request.url.includes("/mock/delta/folder-a")), "cache refresh reused old folder delta", { added });
+    return { mode: second.value.mode, scanRoot: second.value.cache.scanRoot.target };
+  });
+
+  await check("sync status reports metadata cache after scan", async () => {
+    const result = await tool("onedrive_sync_status", { includeSamples: true });
+    assert(!result.isError, "sync status should succeed", result);
+    assert(result.value.itemCount >= 3, "sync status should report cached items", result.value);
+    assert(result.value.samples?.length > 0, "sync status should return samples when requested", result.value);
+    return { itemCount: result.value.itemCount, sampleCount: result.value.samples.length };
+  });
+
+  await check("rename dry-run previews without PATCH", async () => {
+    const before = requests.length;
+    const result = await tool("onedrive_rename", { itemId: "delete-target", newName: "renamed.txt", dryRun: true });
+    assert(!result.isError, "rename dry-run should succeed", result);
+    assert(result.value.dryRun === true, "rename dry-run should not mutate", result.value);
+    const added = requests.slice(before);
+    assert(!added.some((request) => request.method === "PATCH"), "rename dry-run should not PATCH", { added });
+    return { graphRequestsAdded: added.length };
+  });
+
+  await check("rename updates cache path keys", async () => {
+    await tool("onedrive_cache_clear");
+    const info = await tool("onedrive_get_info", { itemId: "delete-target" });
+    assert(!info.isError, "get_info should seed cache", info);
+    const result = await tool("onedrive_rename", { itemId: "delete-target", newName: "renamed-cache.txt", expectedName: "delete-me.txt" });
+    assert(!result.isError, "rename should succeed", result);
+    const cache = JSON.parse(readFileSync(join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json"), "utf8"));
+    assert(!Object.hasOwn(cache.pathsByLower, "delete-me.txt"), "old cache path key should be removed", cache.pathsByLower);
+    assert(cache.pathsByLower["renamed-cache.txt"] === "delete-target", "new cache path key should be present", cache.pathsByLower);
+    return { paths: cache.pathsByLower };
+  });
+
+  await check("find ignores unrelated cache-only no-match results", async () => {
+    const result = await tool("onedrive_find", {
+      query: "qwertyuiopasdf",
+      maxResults: 3,
+      scanFallback: false
+    });
+    assert(!result.isError, "no-match find should succeed", result);
+    assert(result.value.items.length === 0, "no-match find should not return unrelated cached items", result.value);
+    return { summary: result.value.summary };
+  });
+
+  await check("find drops stale cache-only hits when live scan cannot confirm", async () => {
+    const seeded = await tool("onedrive_get_info", { itemId: "stale-cache" });
+    assert(!seeded.isError, "get_info should seed stale cache item", seeded);
+    const result = await tool("onedrive_find", {
+      query: "Stale Cache Deck",
+      maxResults: 3,
+      scanMaxItems: 20,
+      scanMaxFolders: 10
+    });
+    assert(!result.isError, "stale-cache find should succeed", result);
+    assert(result.value.summary.usedScanFallback === true, "stale cache hit should not suppress scan", result.value.summary);
+    assert(!result.value.items.some((item) => item.id === "stale-cache"), "stale cache-only item should not be returned", result.value.items);
+    return { summary: result.value.summary, ids: result.value.items.map((item) => item.id) };
+  });
+
+  await check("find confirms cached nested deck with live scan", async () => {
     const result = await tool("onedrive_find", {
       query: "Deep Summary Deck",
       maxResults: 3,
@@ -532,8 +827,8 @@ try {
     });
     assert(!result.isError, "find should succeed", result);
     assert(result.value.summary.localIndexUsed === false, "find must not use a local index", result.value.summary);
-    assert(result.value.summary.persistentCacheUsed === false, "find must not use persistent cache", result.value.summary);
-    assert(result.value.summary.usedScanFallback === true, "find should use scan fallback when search misses", result.value.summary);
+    assert(result.value.summary.persistentCacheUsed === true, "find should use persistent cache after earlier scans populate it", result.value.summary);
+    assert(result.value.summary.usedScanFallback === true, "find should confirm cache-only hit with scan fallback", result.value.summary);
     assert(result.value.items[0]?.id === "deep-deck", "find did not return the nested deck first", result.value.items);
     assert(result.value.items[0]?.score >= 78, "find top score should be confident", result.value.items[0]);
     return {
@@ -569,7 +864,8 @@ try {
       scanMaxFolders: 10
     });
     assert(!result.isError, "report find should succeed", result);
-    assert(result.value.summary.usedScanFallback === true, "report find should use scan fallback when search misses", result.value.summary);
+    assert(result.value.summary.persistentCacheUsed === true, "report find should use cache when available", result.value.summary);
+    assert(result.value.summary.usedScanFallback === true, "report find should confirm cache-only hit with scan fallback", result.value.summary);
     assert(result.value.items[0]?.id === "quarterly-report", "report find should return the docx report", result.value.items);
     assert(!result.value.inferred?.strictExtensions?.includes(".pdf"), "report should not infer a strict PDF filter", result.value.inferred);
     return {
@@ -579,7 +875,7 @@ try {
     };
   });
 
-  await check("find_all returns broader ranked results without local cache", async () => {
+  await check("find_all returns broader ranked results with cache acceleration", async () => {
     const result = await tool("onedrive_find_all", {
       query: "Quarterly Report",
       maxResults: 20,
@@ -587,9 +883,10 @@ try {
       scanMaxFolders: 10
     });
     assert(!result.isError, "find_all should succeed", result);
-    assert(result.value.strategy === "broad-stateless-remote-first", "unexpected strategy", result.value);
+    assert(result.value.strategy === "broad-cache-assisted-remote-first", "unexpected strategy", result.value);
     assert(result.value.summary.localIndexUsed === false, "find_all must not use a local index", result.value.summary);
-    assert(result.value.summary.persistentCacheUsed === false, "find_all must not use persistent cache", result.value.summary);
+    assert(result.value.summary.persistentCacheUsed === true, "find_all should use persistent cache when available", result.value.summary);
+    assert(!result.value.note.includes("persistent cache was used"), "find_all note should not contradict cache use", result.value);
     assert(result.value.items.some((item) => item.id === "quarterly-report"), "find_all should include docx report", result.value.items);
     assert(result.value.folderPlan?.includes("root"), "find_all should include root in folder plan", result.value.folderPlan);
     return {
@@ -597,6 +894,31 @@ try {
       folderPlan: result.value.folderPlan,
       names: result.value.items.map((item) => item.name)
     };
+  });
+
+  await check("sharing audits ignore owner-only private permissions", async () => {
+    const shared = await tool("onedrive_shared_by_me", {
+      maxItems: 20,
+      maxFolders: 10,
+      maxDepth: 2,
+      limit: 10
+    });
+    assert(!shared.isError, "shared_by_me should succeed", shared);
+    const sharedIds = shared.value.items.map((entry) => entry.item.id);
+    assert(sharedIds.includes("deep-deck"), "shared_by_me should include explicitly shared deck", shared.value);
+    assert(!sharedIds.includes("root-note"), "shared_by_me should exclude owner-only private files", shared.value);
+
+    const publicLinks = await tool("onedrive_public_links", {
+      maxItems: 20,
+      maxFolders: 10,
+      maxDepth: 2,
+      limit: 10
+    });
+    assert(!publicLinks.isError, "public_links should succeed", publicLinks);
+    const publicIds = publicLinks.value.items.map((entry) => entry.item.id);
+    assert(publicIds.includes("deep-deck"), "public_links should include anonymous link", publicLinks.value);
+    assert(!publicIds.includes("root-note"), "public_links should exclude owner-only private files", publicLinks.value);
+    return { sharedIds, publicIds };
   });
 } finally {
   child.stdin.end();
@@ -606,4 +928,9 @@ try {
 
 const failCount = results.filter((result) => result.status === "fail").length;
 console.log(JSON.stringify({ graphBaseUrl, results, stderr: stderr.join(""), summary: { total: results.length, failCount } }, null, 2));
+if (failCount === 0 && !keepWork) {
+  rmSync(mockHome, { recursive: true, force: true });
+  rmSync(join(pluginRoot, "work", "mock-export.pdf"), { force: true });
+  rmSync(join(pluginRoot, "work", "mock-export.txt"), { force: true });
+}
 if (failCount > 0) process.exitCode = 1;
