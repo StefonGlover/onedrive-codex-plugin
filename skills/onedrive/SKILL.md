@@ -19,6 +19,7 @@ Refresh tokens are stored in macOS Keychain.
 - `ONEDRIVE_KEYCHAIN_SERVICE`: Optional Keychain service name. Defaults to `Codex OneDrive`.
 
 Never ask the user to paste Microsoft passwords, access tokens, or refresh tokens into chat. Use device-code login and Keychain-backed storage.
+When the configured tenant is `common`, the plugin can retry Microsoft-account-only auth failures on the `consumers` endpoint automatically.
 
 ## Tool Guidance
 

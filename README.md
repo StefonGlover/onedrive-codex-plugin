@@ -41,6 +41,7 @@ export ONEDRIVE_KEYCHAIN_SERVICE="Codex OneDrive"
 ```
 
 `ONEDRIVE_TENANT` can be `common`, `consumers`, `organizations`, or a tenant ID. Use `common` for a plugin that may access either personal Microsoft accounts or work/school accounts.
+If Microsoft reports that the app is Microsoft-account-only and requires `/consumers`, the plugin retries device-code and refresh-token auth on `consumers` automatically when the configured tenant is `common`.
 
 You can also add friendly path aliases to the config file:
 

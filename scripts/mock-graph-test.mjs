@@ -15,6 +15,7 @@ rmSync(mockHome, { recursive: true, force: true });
 mkdirSync(mockHome, { recursive: true });
 
 const requests = [];
+const authRequests = [];
 const counters = new Map();
 
 function count(key) {
@@ -51,6 +52,8 @@ function item(id, name, extra = {}) {
     size: 12,
     createdDateTime: "2026-07-04T00:00:00Z",
     lastModifiedDateTime: "2026-07-04T00:00:00Z",
+    eTag: `etag-${id}`,
+    cTag: `ctag-${id}`,
     parentReference: { path: "/drive/root:" },
     file: { mimeType: "text/plain" },
     ...extra
@@ -69,7 +72,7 @@ const graph = createServer((req, res) => {
   const url = new URL(req.url, "http://127.0.0.1");
   const path = url.pathname;
   const decodedUrl = decodeURIComponent(req.url);
-  requests.push({ method: req.method, path, url: req.url });
+  requests.push({ method: req.method, path, url: req.url, headers: req.headers });
 
   if (req.method === "GET" && path === "/v1.0/me") {
     return json(res, 200, { displayName: "Mock User", userPrincipalName: "mock@example.test", mail: "mock@example.test" });
@@ -92,8 +95,26 @@ const graph = createServer((req, res) => {
     return json(res, 200, item("root-note", "root-note.txt"));
   }
 
+  if (req.method === "GET" && path === "/v1.0/me/drive/root:/root-note.txt:") {
+    return json(res, 200, item("root-note", "root-note.txt"));
+  }
+
   if (req.method === "GET" && path === "/v1.0/me/drive/items/root-note/content") {
     return text(res, 200, "root note mock content\n");
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/root:/root-note.txt:/content") {
+    return text(res, 200, "root note mock content\n");
+  }
+
+  if (req.method === "PUT" && path === "/v1.0/me/drive/root:/root-note.txt:/content") {
+    count("root-note-upload");
+    return json(res, 200, item("root-note", "root-note.txt"));
+  }
+
+  if (req.method === "PUT" && path === "/v1.0/me/drive/root:/empty-session.txt:/content") {
+    count("empty-session-simple-upload");
+    return json(res, 200, item("empty-session", "empty-session.txt", { size: 0 }));
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/big-text") {
@@ -238,6 +259,10 @@ const graph = createServer((req, res) => {
     return json(res, 200, folder("folder-a", "Folder A"));
   }
 
+  if (req.method === "PATCH" && path === "/v1.0/me/drive/items/folder-a") {
+    return json(res, 200, folder("folder-a", "Folder Renamed"));
+  }
+
   if (req.method === "GET" && path === "/v1.0/me/drive/items/folder-a/delta") {
     return json(res, 200, {
       value: [item("deep-deck", "Deep Summary Deck.pptx", {
@@ -265,6 +290,33 @@ const graph = createServer((req, res) => {
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/folder-b") {
     return json(res, 200, folder("folder-b", "Folder B"));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/bulk-large") {
+    return json(res, 200, folder("bulk-large", "Bulk Large"));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/bulk-large/children") {
+    return json(res, 200, {
+      value: [
+        ...Array.from({ length: 5000 }, (_, index) => item(`small-${index}`, `small-${index}.txt`, { size: 1, parentReference: { path: "/drive/root:/Bulk Large" } })),
+        item("huge-after-cap", "huge-after-cap.bin", { size: 999999999, parentReference: { path: "/drive/root:/Bulk Large" } })
+      ]
+    });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/bulk-dupes") {
+    return json(res, 200, folder("bulk-dupes", "Bulk Dupes"));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/bulk-dupes/children") {
+    return json(res, 200, {
+      value: [
+        ...Array.from({ length: 5000 }, (_, index) => item(`unique-${index}`, `unique-${index}.txt`, { size: index + 1, parentReference: { path: "/drive/root:/Bulk Dupes" } })),
+        item("dup-a", "same-name.txt", { size: 42, parentReference: { path: "/drive/root:/Bulk Dupes" } }),
+        item("dup-b", "same-name.txt", { size: 42, parentReference: { path: "/drive/root:/Bulk Dupes" } })
+      ]
+    });
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/folder-b/delta") {
@@ -299,6 +351,35 @@ const graph = createServer((req, res) => {
 await new Promise((resolve) => graph.listen(0, "127.0.0.1", resolve));
 const graphBaseUrl = `http://127.0.0.1:${graph.address().port}/v1.0`;
 
+const identity = createServer((req, res) => {
+  const url = new URL(req.url, "http://127.0.0.1");
+  authRequests.push({ method: req.method, path: url.pathname });
+
+  if (req.method === "POST" && url.pathname === "/common/oauth2/v2.0/devicecode") {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "AADSTS9002331: Application is configured for use by Microsoft Account users only. Please use the /consumers endpoint to serve this request."
+    });
+  }
+
+  if (req.method === "POST" && url.pathname === "/consumers/oauth2/v2.0/devicecode") {
+    return json(res, 200, {
+      user_code: "MOCK-CODE",
+      device_code: "mock-device-code",
+      verification_uri: "https://microsoft.com/devicelogin",
+      verification_uri_complete: "https://microsoft.com/devicelogin?user_code=MOCK-CODE",
+      expires_in: 900,
+      interval: 5,
+      message: "Use code MOCK-CODE"
+    });
+  }
+
+  json(res, 404, { error: "not_found", error_description: `${req.method} ${url.pathname}` });
+});
+
+await new Promise((resolve) => identity.listen(0, "127.0.0.1", resolve));
+const identityBaseUrl = `http://127.0.0.1:${identity.address().port}`;
+
 const child = spawn(process.execPath, [serverPath], {
   cwd: pluginRoot,
   env: {
@@ -306,7 +387,8 @@ const child = spawn(process.execPath, [serverPath], {
     HOME: mockHome,
     ONEDRIVE_CLIENT_ID: "mock-client-id",
     ONEDRIVE_TEST_ACCESS_TOKEN: "mock-token",
-    ONEDRIVE_GRAPH_BASE_URL: graphBaseUrl
+    ONEDRIVE_GRAPH_BASE_URL: graphBaseUrl,
+    ONEDRIVE_IDENTITY_BASE_URL: identityBaseUrl
   },
   stdio: ["pipe", "pipe", "pipe"]
 });
@@ -428,6 +510,16 @@ try {
     const missing = expected.filter((name) => !names.has(name));
     assert(missing.length === 0, "missing new tools", { missing });
     return { checked: expected.length };
+  });
+
+  await check("MSA-only common tenant auth retries device login on consumers endpoint", async () => {
+    const result = await tool("onedrive_auth_device_start", { tenant: "common" });
+    assert(!result.isError, "device-code login should retry on consumers", result);
+    assert(result.value.authTenant === "consumers", "device-code login should report consumers fallback", result.value);
+    assert(result.value.userCode === "MOCK-CODE", "device-code login should return mocked consumers response", result.value);
+    assert(authRequests.some((request) => request.path === "/common/oauth2/v2.0/devicecode"), "common endpoint was not attempted", authRequests);
+    assert(authRequests.some((request) => request.path === "/consumers/oauth2/v2.0/devicecode"), "consumers endpoint was not attempted", authRequests);
+    return { authTenant: result.value.authTenant, paths: authRequests.map((request) => request.path) };
   });
 
   await check("GET requests retry 429 once", async () => {
@@ -554,6 +646,24 @@ try {
     return { deleteCount: counters.get("delete") };
   });
 
+  await check("batch_delete live action preflights expected identity before any DELETE", async () => {
+    const beforeDeleteCount = counters.get("delete") || 0;
+    const beforeRequests = requests.length;
+    const result = await tool("onedrive_batch_delete", {
+      items: [
+        { itemId: "delete-target", expectedName: "delete-me.txt" },
+        { itemId: "root-note" }
+      ],
+      dryRun: false,
+      confirmed: true
+    });
+    assert(!result.isError, "batch_delete guard should return a structured response", result);
+    assert(result.value.requiredToDelete?.includes("expectedName or expectedId"), "batch_delete should require expected identity for every item", result.value);
+    assert((counters.get("delete") || 0) === beforeDeleteCount, "batch_delete should not delete any item before preflight passes", { beforeDeleteCount, afterDeleteCount: counters.get("delete") || 0 });
+    assert(requests.length === beforeRequests, "batch_delete preflight should not touch Graph when an item is missing expected identity", { added: requests.slice(beforeRequests) });
+    return { requiredToDelete: result.value.requiredToDelete, deleteCount: counters.get("delete") || 0 };
+  });
+
   await check("copy monitor exposes manual 303", async () => {
     const result = await tool("onedrive_copy", { itemId: "copy-src", waitForCompletion: true, timeoutSeconds: 5 });
     assert(!result.isError, "copy should succeed", result);
@@ -614,6 +724,25 @@ try {
     assert(String(result.value).includes("local OneDrive sync folder"), "unexpected sync-path guard message", result);
     assert(requests.length === before, "upload guard should not reach mock Graph", { before, after: requests.length });
     return { graphRequestsAdded: requests.length - before };
+  });
+
+  await check("zero-byte session upload falls back to simple upload", async () => {
+    const localPath = join(mockHome, "work", "empty-upload.txt");
+    mkdirSync(dirname(localPath), { recursive: true });
+    writeFileSync(localPath, "");
+    const before = requests.length;
+    const result = await tool("onedrive_upload", {
+      localPath,
+      remotePath: "empty-session.txt",
+      uploadMode: "session"
+    });
+    assert(!result.isError, "zero-byte upload should succeed", result);
+    assert(result.value.uploadMode === "simple", "zero-byte session upload should use simple upload", result.value);
+    assert(result.value.bytesUploaded === 0, "zero-byte upload should report zero bytes", result.value);
+    const added = requests.slice(before);
+    assert(added.some((request) => request.method === "PUT" && request.path === "/v1.0/me/drive/root:/empty-session.txt:/content"), "simple upload endpoint was not used", { added });
+    assert(!added.some((request) => request.url.includes("createUploadSession")), "zero-byte upload should not create an upload session", { added });
+    return { uploadMode: result.value.uploadMode, bytesUploaded: result.value.bytesUploaded };
   });
 
   await check("document PDF export writes converted content", async () => {
@@ -677,6 +806,32 @@ try {
     const added = requests.slice(before);
     assert(!added.some((request) => request.path.endsWith("/content")), "checkout should not download after manifest refusal", { added });
     return { response: result.value, graphRequestsAdded: added.length };
+  });
+
+  await check("update_file commit sends checkout eTag as If-Match", async () => {
+    const localPath = join(mockHome, "work", "commit-root-note.txt");
+    const manifestPath = `${localPath}.onedrive-update.json`;
+    mkdirSync(dirname(localPath), { recursive: true });
+    writeFileSync(localPath, "edited root note\n", "utf8");
+    writeFileSync(manifestPath, JSON.stringify({
+      version: 1,
+      checkedOutAt: "2026-07-04T00:00:00.000Z",
+      remotePath: "root-note.txt",
+      item: item("root-note", "root-note.txt"),
+      localPath
+    }, null, 2));
+    const before = requests.length;
+    const result = await tool("onedrive_update_file", {
+      mode: "commit",
+      remotePath: "root-note.txt",
+      localPath,
+      manifestPath
+    });
+    assert(!result.isError, "commit should succeed", result);
+    const uploadRequest = requests.slice(before).find((request) => request.method === "PUT" && request.path === "/v1.0/me/drive/root:/root-note.txt:/content");
+    assert(uploadRequest, "commit upload request was not observed", { added: requests.slice(before) });
+    assert(uploadRequest.headers["if-match"] === "etag-root-note", "commit upload should include checkout eTag If-Match", { headers: uploadRequest.headers });
+    return { ifMatch: uploadRequest.headers["if-match"], uploadCount: counters.get("root-note-upload") };
   });
 
   await check("batch_download refuses item local sync path before Graph", async () => {
@@ -790,6 +945,47 @@ try {
     assert(!Object.hasOwn(cache.pathsByLower, "delete-me.txt"), "old cache path key should be removed", cache.pathsByLower);
     assert(cache.pathsByLower["renamed-cache.txt"] === "delete-target", "new cache path key should be present", cache.pathsByLower);
     return { paths: cache.pathsByLower };
+  });
+
+  await check("folder rename invalidates cached descendant paths", async () => {
+    await tool("onedrive_cache_clear");
+    const scanResult = await tool("onedrive_scan", { itemId: "folder-a", maxItems: 10, maxFolders: 5, maxDepth: 1 });
+    assert(!scanResult.isError, "scan should seed folder descendants", scanResult);
+    let cache = JSON.parse(readFileSync(join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json"), "utf8"));
+    assert(cache.pathsByLower["folder a/deep summary deck.pptx"] === "deep-deck", "expected descendant cache path before rename", cache.pathsByLower);
+
+    const renamed = await tool("onedrive_rename", { itemId: "folder-a", newName: "Folder Renamed", expectedName: "Folder A" });
+    assert(!renamed.isError, "folder rename should succeed", renamed);
+    cache = JSON.parse(readFileSync(join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json"), "utf8"));
+    assert(!Object.hasOwn(cache.pathsByLower, "folder a/deep summary deck.pptx"), "folder rename should remove stale descendant cache path", cache.pathsByLower);
+    assert(cache.pathsByLower["folder renamed"] === "folder-a", "folder rename should cache the renamed folder path", cache.pathsByLower);
+    return { paths: cache.pathsByLower };
+  });
+
+  await check("large_files evaluates scanned files beyond returned scan result cap", async () => {
+    const result = await tool("onedrive_large_files", {
+      itemId: "bulk-large",
+      minBytes: 1000,
+      maxItems: 6000,
+      maxFolders: 2,
+      limit: 5
+    });
+    assert(!result.isError, "large_files should succeed", result);
+    assert(result.value.items.some((entry) => entry.id === "huge-after-cap"), "large_files should include huge file after first 5000 scan matches", result.value);
+    return { count: result.value.count, ids: result.value.items.map((entry) => entry.id), scanned: result.value.scanSummary.itemsScanned };
+  });
+
+  await check("duplicates evaluates scanned files beyond returned scan result cap", async () => {
+    const result = await tool("onedrive_duplicates", {
+      itemId: "bulk-dupes",
+      maxItems: 6005,
+      maxFolders: 2,
+      limit: 5
+    });
+    assert(!result.isError, "duplicates should succeed", result);
+    const group = result.value.groups.find((entry) => entry.items.some((item) => item.id === "dup-a"));
+    assert(group?.items.some((item) => item.id === "dup-b"), "duplicates should include pair after first 5000 scan matches", result.value);
+    return { duplicateGroups: result.value.duplicateGroups, group };
   });
 
   await check("find ignores unrelated cache-only no-match results", async () => {
@@ -924,6 +1120,7 @@ try {
   child.stdin.end();
   child.kill("SIGTERM");
   graph.close();
+  identity.close();
 }
 
 const failCount = results.filter((result) => result.status === "fail").length;

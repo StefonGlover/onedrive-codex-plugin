@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { createReadStream, readFileSync } from "node:fs";
-import { mkdir, open, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { createReadStream, createWriteStream, readFileSync } from "node:fs";
+import { mkdir, open, readFile, realpath, rename as renameFile, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const configPath = join(homedir(), ".codex", "onedrive-plugin", "config.json");
@@ -1106,11 +1108,31 @@ function requireClientId(cfg = config()) {
 }
 
 function tokenUrl(tenant) {
-  return `https://login.microsoftonline.com/${encodeURIComponent(tenant)}/oauth2/v2.0/token`;
+  return `${identityBaseUrl()}/${encodeURIComponent(tenant)}/oauth2/v2.0/token`;
 }
 
 function deviceCodeUrl(tenant) {
-  return `https://login.microsoftonline.com/${encodeURIComponent(tenant)}/oauth2/v2.0/devicecode`;
+  return `${identityBaseUrl()}/${encodeURIComponent(tenant)}/oauth2/v2.0/devicecode`;
+}
+
+function identityBaseUrl() {
+  return (process.env.ONEDRIVE_IDENTITY_BASE_URL || "https://login.microsoftonline.com").replace(/\/+$/, "");
+}
+
+function isMsaOnlyEndpointError(error) {
+  const message = `${error?.body?.error || ""} ${error?.body?.error_description || ""} ${error?.message || ""}`;
+  return message.includes("AADSTS9002331") || message.includes("/consumers endpoint");
+}
+
+async function postFormWithConsumerFallback(kind, cfg, params) {
+  try {
+    return { body: await postForm(kind === "device" ? deviceCodeUrl(cfg.tenant) : tokenUrl(cfg.tenant), params), tenant: cfg.tenant };
+  } catch (error) {
+    if (cfg.tenant === "common" && isMsaOnlyEndpointError(error)) {
+      return { body: await postForm(kind === "device" ? deviceCodeUrl("consumers") : tokenUrl("consumers"), params), tenant: "consumers" };
+    }
+    throw error;
+  }
 }
 
 function keychainAccount() {
@@ -1260,6 +1282,13 @@ async function clearMetadataCache() {
   return metadataCacheMemory;
 }
 
+async function cacheMovedOrRenamedItem(previous, current) {
+  if (previous?.folder) {
+    await cacheItems([{ ...simplifyItem(previous), deleted: {} }]);
+  }
+  await cacheItems([current]);
+}
+
 async function syncStatus(args = {}) {
   const cache = await loadMetadataCache();
   const items = Object.values(cache.itemsById || {});
@@ -1405,11 +1434,11 @@ async function postForm(url, params) {
 async function startDeviceLogin(args = {}) {
   const cfg = config(args);
   requireClientId(cfg);
-  const result = await postForm(deviceCodeUrl(cfg.tenant), {
+  const { body: result, tenant } = await postFormWithConsumerFallback("device", cfg, {
     client_id: cfg.clientId,
     scope: cfg.scopes
   });
-  pendingDevice = { ...result, tenant: cfg.tenant, scopes: cfg.scopes, startedAt: Date.now() };
+  pendingDevice = { ...result, tenant, scopes: cfg.scopes, startedAt: Date.now() };
   return {
     userCode: result.user_code,
     verificationUri: result.verification_uri,
@@ -1417,6 +1446,7 @@ async function startDeviceLogin(args = {}) {
     expiresIn: result.expires_in,
     interval: result.interval,
     message: result.message,
+    authTenant: tenant,
     deviceCodeStoredInMemory: true
   };
 }
@@ -1426,11 +1456,12 @@ async function pollDeviceLogin(args = {}) {
   if (!deviceCode) throw new Error("No pending device code. Run onedrive_auth_device_start first.");
   const cfg = config({ tenant: pendingDevice?.tenant, scopes: pendingDevice?.scopes });
   requireClientId(cfg);
-  const result = await postForm(tokenUrl(cfg.tenant), {
+  const tokenParams = {
     grant_type: "urn:ietf:params:oauth:grant-type:device_code",
     client_id: cfg.clientId,
     device_code: deviceCode
-  }).catch((error) => {
+  };
+  const tokenResponse = await postFormWithConsumerFallback("token", cfg, tokenParams).catch((error) => {
     if (error.body?.error === "authorization_pending") {
       return { authorizationPending: true, message: "Authorization is still pending. Try again after the user completes browser sign-in." };
     }
@@ -1439,12 +1470,14 @@ async function pollDeviceLogin(args = {}) {
     }
     throw error;
   });
+  const result = tokenResponse.body || tokenResponse;
   if (result.authorizationPending) return result;
   tokenCache = normalizeToken(result);
   setKeychainToken(tokenCache, cfg);
   pendingDevice = null;
   return {
     authenticated: true,
+    authTenant: tokenResponse.tenant || cfg.tenant,
     tokenType: tokenCache.token_type,
     expiresAt: tokenCache.expires_at ? new Date(tokenCache.expires_at).toISOString() : null,
     refreshTokenStoredInKeychain: Boolean(tokenCache.refresh_token)
@@ -1453,13 +1486,13 @@ async function pollDeviceLogin(args = {}) {
 
 async function refreshAccessToken(refreshToken, cfg = config()) {
   requireClientId(cfg);
-  const result = await postForm(tokenUrl(cfg.tenant), {
+  const { body: result, tenant } = await postFormWithConsumerFallback("token", cfg, {
     grant_type: "refresh_token",
     client_id: cfg.clientId,
     refresh_token: refreshToken,
     scope: cfg.scopes
   });
-  tokenCache = normalizeToken({ ...result, refresh_token: result.refresh_token || refreshToken });
+  tokenCache = normalizeToken({ ...result, auth_tenant: tenant, refresh_token: result.refresh_token || refreshToken });
   setKeychainToken(tokenCache, cfg);
   return tokenCache;
 }
@@ -1534,6 +1567,11 @@ function shouldDefaultJsonContentType(body) {
   return body
     && typeof body === "string"
     && body.trim().startsWith("{");
+}
+
+function contentLength(response) {
+  const value = Number(response.headers.get("content-length"));
+  return Number.isFinite(value) && value >= 0 ? value : null;
 }
 
 async function parseResponseBody(response) {
@@ -1631,6 +1669,45 @@ async function graph(path, options = {}) {
     throw microsoftGraphError(body, retriedResponse);
   }
   return body;
+}
+
+async function graphDownloadToFile(path, target, options = {}) {
+  const accessToken = await getAccessToken();
+  const url = graphUrl(path);
+  const response = await fetchWithRetry(url, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      ...(options.headers || {})
+    }
+  }, { maxRetries: 3 });
+  if (!response.ok) {
+    const body = await parseResponseBody(response);
+    throw microsoftGraphError(body, response);
+  }
+  await mkdir(dirname(target), { recursive: true });
+  const temp = `${target}.part-${process.pid}-${Date.now()}`;
+  let bytesWritten = 0;
+  try {
+    if (response.body) {
+      const counter = new TransformStream({
+        transform(chunk, controller) {
+          bytesWritten += chunk.byteLength;
+          controller.enqueue(chunk);
+        }
+      });
+      await pipeline(Readable.fromWeb(response.body.pipeThrough(counter)), createWriteStream(temp));
+    } else {
+      const buffer = Buffer.from(await response.arrayBuffer());
+      bytesWritten = buffer.length;
+      await writeFile(temp, buffer);
+    }
+    await renameFile(temp, target);
+  } catch (error) {
+    await rm(temp, { force: true });
+    throw error;
+  }
+  return { bytesWritten: bytesWritten || contentLength(response) || 0 };
 }
 
 async function graphLimitedBuffer(path, maxBytes, options = {}) {
@@ -2076,6 +2153,7 @@ async function scan(args = {}) {
         counters.itemsScanned += 1;
         if (item.file) counters.filesScanned += 1;
         if (item.folder) counters.foldersScanned += 1;
+        if (typeof args.onItem === "function") await args.onItem(item);
 
         if (scanItemMatches(item, args, extensionFilter)) {
           counters.matched += 1;
@@ -2834,6 +2912,26 @@ async function batchDownload(args = {}) {
 }
 
 async function batchDelete(args = {}) {
+  if (args.dryRun === false) {
+    if (args.confirmed !== true) {
+      return {
+        dryRun: false,
+        confirmed: false,
+        count: (args.items || []).length,
+        requiredToDelete: "Set dryRun: false and confirmed: true after explicit user confirmation."
+      };
+    }
+    const missingExpected = (args.items || []).filter((item) => !item.expectedName && !item.expectedId);
+    if (missingExpected.length) {
+      return {
+        dryRun: false,
+        confirmed: true,
+        count: (args.items || []).length,
+        requiredToDelete: "Provide expectedName or expectedId for every item in a live batch delete.",
+        missingExpectedCount: missingExpected.length
+      };
+    }
+  }
   const results = [];
   for (const item of args.items || []) {
     try {
@@ -3063,9 +3161,8 @@ async function download(args = {}) {
     }
   }
   await mkdir(dirname(target), { recursive: true });
-  const buffer = Buffer.from(await graph(contentPath(args)));
-  await writeFile(target, buffer);
-  return { item: info, localPath: target, bytesWritten: buffer.length };
+  const downloaded = await graphDownloadToFile(contentPath(args), target);
+  return { item: info, localPath: target, bytesWritten: downloaded.bytesWritten };
 }
 
 function assertOfficeKind(info, kindName) {
@@ -3119,12 +3216,11 @@ async function downloadExport(args = {}, formatName) {
   await mkdir(dirname(target), { recursive: true });
   const params = new URLSearchParams();
   params.set("format", format.graphFormat);
-  const buffer = Buffer.from(await graph(`${contentPath(args)}?${params.toString()}`));
-  await writeFile(target, buffer);
+  const downloaded = await graphDownloadToFile(`${contentPath(args)}?${params.toString()}`, target);
   return {
     item: info,
     localPath: target,
-    bytesWritten: buffer.length,
+    bytesWritten: downloaded.bytesWritten,
     exportFormat: formatName,
     note: `Exported using Microsoft Graph format=${format.graphFormat}. Some file types may not support ${format.label} conversion.`
   };
@@ -3242,7 +3338,8 @@ async function updateFile(args = {}) {
     localPath,
     remotePath: remote,
     conflictBehavior: "replace",
-    allowLocalOneDriveSyncPath: args.allowLocalOneDriveSyncPath
+    allowLocalOneDriveSyncPath: args.allowLocalOneDriveSyncPath,
+    ifMatch: args.conflictCheck !== false && args.force !== true ? manifest?.item?.eTag : undefined
   });
   const verified = args.verify !== false ? await getInfo({ path: remote }) : null;
   return {
@@ -3266,16 +3363,19 @@ async function recent(args = {}) {
 }
 
 async function largeFiles(args = {}) {
+  const minBytes = args.minBytes ?? 104857600;
+  const matches = [];
   const result = await scan({
     ...args,
     includeFiles: true,
     includeFolders: false,
-    maxResults: Math.min(clampInteger(args.maxItems, 10000, 1, 50000), 5000),
-    format: "full"
+    maxResults: 1,
+    format: "full",
+    onItem: (item) => {
+      if (item.file && (item.size || 0) >= minBytes) matches.push(simplifyItem(item));
+    }
   });
-  const minBytes = args.minBytes ?? 104857600;
-  const files = (result.items || [])
-    .filter((item) => item.file && (item.size || 0) >= minBytes)
+  const files = matches
     .sort((left, right) => (right.size || 0) - (left.size || 0))
     .slice(0, clampInteger(args.limit, 50, 1, 200))
     .map((item) => formatSimplifiedItem(item, args.format));
@@ -3290,20 +3390,21 @@ function duplicateKey(item) {
 }
 
 async function duplicates(args = {}) {
+  const groups = new Map();
   const result = await scan({
     ...args,
     includeFiles: true,
     includeFolders: false,
-    maxResults: Math.min(clampInteger(args.maxItems, 10000, 1, 50000), 5000),
-    format: "full"
+    maxResults: 1,
+    format: "full",
+    onItem: (item) => {
+      if (!item.file) return;
+      const simplified = simplifyItem(item);
+      const key = duplicateKey(simplified);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(simplified);
+    }
   });
-  const groups = new Map();
-  for (const item of result.items || []) {
-    if (!item.file) continue;
-    const key = duplicateKey(item);
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(item);
-  }
   const duplicates = [...groups.entries()]
     .filter(([, items]) => items.length > 1)
     .map(([key, items]) => ({
@@ -3356,7 +3457,7 @@ async function upload(args = {}) {
   const fileStat = await stat(localPath);
   if (!fileStat.isFile()) throw new Error(`Not a file: ${localPath}`);
   const uploadMode = args.uploadMode || "auto";
-  if (uploadMode === "session" || (uploadMode === "auto" && fileStat.size > simpleUploadLimit)) {
+  if (fileStat.size > 0 && (uploadMode === "session" || (uploadMode === "auto" && fileStat.size > simpleUploadLimit))) {
     return await uploadLarge({ ...args, localPath, remotePath: destinationPath }, fileStat);
   }
   if (uploadMode === "simple" && fileStat.size > simpleUploadLimit) {
@@ -3367,7 +3468,10 @@ async function upload(args = {}) {
     method: "PUT",
     body: stream,
     duplex: "half",
-    headers: { "Content-Type": "application/octet-stream" }
+    headers: {
+      "Content-Type": "application/octet-stream",
+      ...(args.ifMatch ? { "If-Match": args.ifMatch } : {})
+    }
   });
   await cacheItems([result]);
   return { item: simplifyItem(result), localPath, bytesUploaded: fileStat.size, uploadMode: "simple" };
@@ -3387,7 +3491,7 @@ function normalizeChunkSize(value = defaultUploadChunkSize) {
 async function uploadLarge(args = {}, fileStat) {
   const chunkSize = normalizeChunkSize(args.chunkSize ?? defaultUploadChunkSize);
   const sessionTarget = await uploadSessionTarget(args.remotePath);
-  const session = await createUploadSession(sessionTarget, args.conflictBehavior || "fail");
+  const session = await createUploadSession(sessionTarget, args.conflictBehavior || "fail", args.ifMatch);
   if (!session.uploadUrl) throw new Error("Microsoft Graph did not return an uploadUrl.");
 
   let position = 0;
@@ -3434,7 +3538,7 @@ async function uploadLarge(args = {}, fileStat) {
   };
 }
 
-async function createUploadSession(sessionTarget, conflictBehavior) {
+async function createUploadSession(sessionTarget, conflictBehavior, ifMatch) {
   const bodies = [
     {
       item: {
@@ -3457,6 +3561,7 @@ async function createUploadSession(sessionTarget, conflictBehavior) {
       try {
         return await graph(endpoint, {
           method: "POST",
+          ...(ifMatch ? { headers: { "If-Match": ifMatch } } : {}),
           ...(body ? { body: JSON.stringify(body) } : {})
         });
       } catch (error) {
@@ -3512,7 +3617,7 @@ async function rename(args = {}) {
     method: "PATCH",
     body: JSON.stringify({ name: newName })
   });
-  await cacheItems([result]);
+  await cacheMovedOrRenamedItem(current, result);
   return simplifyItem(result);
 }
 
@@ -3532,7 +3637,7 @@ async function moveItem(args = {}) {
     method: "PATCH",
     body: JSON.stringify(body)
   });
-  await cacheItems([result]);
+  await cacheMovedOrRenamedItem(current, result);
   return simplifyItem(result);
 }
 
