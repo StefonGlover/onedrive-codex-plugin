@@ -112,6 +112,15 @@ const pathTargetProperties = {
   preset: presetSchema,
   relativePath: relativePathSchema
 };
+const driveRecipientSchema = {
+  type: "object",
+  properties: {
+    email: { type: "string", minLength: 1 },
+    alias: { type: "string", minLength: 1 },
+    objectId: { type: "string", minLength: 1 }
+  },
+  additionalProperties: false
+};
 const folderTargetProperties = {
   path: { type: "string", description: "Folder path relative to OneDrive root. Omit or use / for root." },
   itemId: { type: "string", description: "Drive item ID for the folder." },
@@ -777,6 +786,8 @@ const tools = [
         ...pathTargetProperties,
         type: { type: "string", enum: ["view", "edit", "embed"], default: "view" },
         scope: { type: "string", enum: ["anonymous", "organization", "users"], default: "anonymous" },
+        password: { type: "string", minLength: 1, description: "Optional sharing-link password. Never returned in dry-runs or audit logs." },
+        expirationDateTime: { type: "string", minLength: 1, description: "Optional ISO 8601 link expiration timestamp." },
         retainInheritedPermissions: { type: "boolean" },
         includePermissionDiff: {
           type: "boolean",
@@ -788,6 +799,46 @@ const tools = [
           type: "boolean",
           default: false,
           description: "Must be true after explicit user confirmation because this can expose access to a file or folder."
+        },
+        expectedName: { type: "string", description: "Optional safety check: item name must match." },
+        expectedId: { type: "string", description: "Optional safety check: item ID must match." }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_invite_permission",
+    description: "Invite users or groups to a OneDrive item. Defaults to dry-run and silent direct grants unless sendInvitation=true is set.",
+    inputSchema: {
+      type: "object",
+      required: ["recipients"],
+      anyOf: itemTargetAnyOf,
+      properties: {
+        ...pathTargetProperties,
+        recipients: {
+          type: "array",
+          minItems: 1,
+          maxItems: 50,
+          items: driveRecipientSchema,
+          description: "Recipients to grant access to. Each item must include exactly one of email, alias, or objectId."
+        },
+        role: { type: "string", enum: ["read", "write"], default: "read" },
+        sendInvitation: { type: "boolean", default: false },
+        requireSignIn: { type: "boolean", default: true },
+        message: { type: "string", description: "Optional invitation message. Only useful when sendInvitation=true; never written to audit logs." },
+        password: { type: "string", minLength: 1, description: "Optional invite password when supported by Microsoft Graph. Never returned in dry-runs or audit logs." },
+        expirationDateTime: { type: "string", minLength: 1, description: "Optional ISO 8601 expiration timestamp." },
+        retainInheritedPermissions: { type: "boolean" },
+        includePermissionDiff: {
+          type: "boolean",
+          default: true,
+          description: "When true, include before-permissions in dry-run and before/after permission diff for live invitation."
+        },
+        dryRun: { type: "boolean", default: true },
+        confirmed: {
+          type: "boolean",
+          default: false,
+          description: "Must be true after explicit user confirmation because this grants access to a file or folder."
         },
         expectedName: { type: "string", description: "Optional safety check: item name must match." },
         expectedId: { type: "string", description: "Optional safety check: item ID must match." }
@@ -2245,6 +2296,7 @@ function permissionAuditSummary(permission = {}) {
     } : undefined,
     grantedToPresent: Boolean(permission.grantedTo || permission.grantedToV2),
     grantedToIdentityCount: Array.isArray(permission.grantedToIdentities) ? permission.grantedToIdentities.length : undefined,
+    grantedToIdentityV2Count: Array.isArray(permission.grantedToIdentitiesV2) ? permission.grantedToIdentitiesV2.length : undefined,
     invitationPresent: Boolean(permission.invitation),
     invitationSignInRequired: permission.invitation?.signInRequired,
     inheritedFrom: permission.inheritedFrom ? itemAuditSummary(permission.inheritedFrom) : undefined,
@@ -2277,7 +2329,8 @@ function sanitizeAuditValue(value) {
   const clean = {};
   const forbidden = new Set([
     "access_token", "refresh_token", "id_token", "Authorization", "authorization",
-    "content", "body", "uploadUrl", "monitorUrl", "resourceLocation", "webUrl"
+    "content", "body", "uploadUrl", "monitorUrl", "resourceLocation", "webUrl",
+    "password", "recipients", "email", "alias", "objectId"
   ]);
   for (const [key, entry] of Object.entries(value)) {
     if (forbidden.has(key)) continue;
@@ -3475,8 +3528,20 @@ async function getInfo(args = {}) {
 
 function compactIdentity(identity) {
   if (!identity) return undefined;
-  const user = identity.user || identity.application || identity.device;
-  return user ? { id: user.id, displayName: user.displayName, email: user.email } : identity;
+  const typed = identity.user ? { type: "user", ...identity.user }
+    : identity.group ? { type: "group", ...identity.group }
+      : identity.siteUser ? { type: "siteUser", ...identity.siteUser }
+        : identity.siteGroup ? { type: "siteGroup", ...identity.siteGroup }
+          : identity.application ? { type: "application", ...identity.application }
+            : identity.device ? { type: "device", ...identity.device }
+              : null;
+  return typed ? {
+    type: typed.type,
+    id: typed.id,
+    displayName: typed.displayName,
+    email: typed.email,
+    loginName: typed.loginName
+  } : identity;
 }
 
 function simplifyPermission(permission, format = "compact") {
@@ -3493,6 +3558,7 @@ function simplifyPermission(permission, format = "compact") {
     grantedTo: compactIdentity(permission.grantedTo),
     grantedToV2: compactIdentity(permission.grantedToV2),
     grantedToIdentities: permission.grantedToIdentities?.map(compactIdentity),
+    grantedToIdentitiesV2: permission.grantedToIdentitiesV2?.map(compactIdentity),
     invitation: permission.invitation ? {
       email: permission.invitation.email,
       signInRequired: permission.invitation.signInRequired
@@ -4399,6 +4465,8 @@ async function createSharingLink(args = {}) {
       item: simplifyItem(current),
       type: args.type || "view",
       scope: args.scope || "anonymous",
+      passwordProvided: Boolean(args.password),
+      expirationDateTime: args.expirationDateTime,
       retainInheritedPermissions: args.retainInheritedPermissions
     },
     ...(includePermissionDiff ? {
@@ -4424,6 +4492,8 @@ async function createSharingLink(args = {}) {
     type: args.type || "view",
     scope: args.scope || "anonymous"
   };
+  if (args.password) body.password = args.password;
+  if (args.expirationDateTime) body.expirationDateTime = args.expirationDateTime;
   if (typeof args.retainInheritedPermissions === "boolean") {
     body.retainInheritedPermissions = args.retainInheritedPermissions;
   }
@@ -4437,6 +4507,13 @@ async function createSharingLink(args = {}) {
     await writeMutationAudit("onedrive_create_sharing_link", {
       status: "success",
       target: itemAuditSummary(current),
+      link: {
+        type: body.type,
+        scope: body.scope,
+        passwordProvided: Boolean(args.password),
+        expirationDateTime: args.expirationDateTime,
+        retainInheritedPermissions: body.retainInheritedPermissions
+      },
       beforePermissions: includePermissionDiff ? beforePermissions.map(permissionAuditSummary) : undefined,
       afterPermissions: includePermissionDiff ? afterPermissions.map(permissionAuditSummary) : undefined,
       permissionDiff: includePermissionDiff ? permissionDiffAuditSummary(permissionDiff) : undefined
@@ -4456,6 +4533,139 @@ async function createSharingLink(args = {}) {
     await writeMutationAudit("onedrive_create_sharing_link", {
       status: "failed",
       target: itemAuditSummary(current),
+      link: {
+        type: body.type,
+        scope: body.scope,
+        passwordProvided: Boolean(args.password),
+        expirationDateTime: args.expirationDateTime,
+        retainInheritedPermissions: body.retainInheritedPermissions
+      },
+      beforePermissions: includePermissionDiff ? beforePermissions.map(permissionAuditSummary) : undefined,
+      error: safeErrorInfo(error)
+    });
+    throw error;
+  }
+}
+
+function normalizeInviteRecipients(recipients = []) {
+  return recipients.map((recipient, index) => {
+    const keys = ["email", "alias", "objectId"].filter((key) => recipient[key]);
+    if (keys.length !== 1) {
+      throw new Error(`Invite recipient at index ${index} must include exactly one of email, alias, or objectId.`);
+    }
+    return { [keys[0]]: recipient[keys[0]] };
+  });
+}
+
+function recipientKinds(recipients = []) {
+  return recipients.map((recipient) => ["email", "alias", "objectId"].find((key) => recipient[key]) || "unknown");
+}
+
+function inviteBody(args = {}) {
+  const body = {
+    recipients: normalizeInviteRecipients(args.recipients || []),
+    roles: [args.role || "read"],
+    sendInvitation: args.sendInvitation === true,
+    requireSignIn: args.requireSignIn !== false
+  };
+  if (args.message) body.message = args.message;
+  if (args.password) body.password = args.password;
+  if (args.expirationDateTime) body.expirationDateTime = args.expirationDateTime;
+  if (typeof args.retainInheritedPermissions === "boolean") {
+    body.retainInheritedPermissions = args.retainInheritedPermissions;
+  }
+  return body;
+}
+
+function inviteAuditSummary(invite = {}) {
+  return {
+    recipientCount: invite.recipientCount,
+    recipientKinds: invite.recipientKinds,
+    role: invite.role,
+    sendInvitation: invite.sendInvitation,
+    requireSignIn: invite.requireSignIn,
+    messageProvided: invite.messageProvided,
+    passwordProvided: invite.passwordProvided,
+    expirationDateTime: invite.expirationDateTime,
+    retainInheritedPermissions: invite.retainInheritedPermissions
+  };
+}
+
+async function invitePermission(args = {}) {
+  requireNonRootTarget(args, "Invite permission");
+  const current = await getRawInfo(args);
+  if (current.root) throw new Error("Invite permission refuses to operate on the OneDrive root.");
+  assertExpectedItem(current, args, "Invite permission");
+  const body = inviteBody(args);
+  const includePermissionDiff = args.includePermissionDiff !== false;
+  const beforePermissions = includePermissionDiff ? await permissionList({ itemId: current.id }, "compact") : null;
+  const safeInvite = {
+    item: simplifyItem(current),
+    recipientCount: body.recipients.length,
+    recipientKinds: recipientKinds(body.recipients),
+    role: body.roles[0],
+    sendInvitation: body.sendInvitation,
+    requireSignIn: body.requireSignIn,
+    messageProvided: Boolean(args.message),
+    passwordProvided: Boolean(args.password),
+    expirationDateTime: args.expirationDateTime,
+    retainInheritedPermissions: args.retainInheritedPermissions
+  };
+  const preview = {
+    dryRun: args.dryRun !== false,
+    confirmed: args.confirmed === true,
+    wouldInvite: safeInvite,
+    ...(includePermissionDiff ? {
+      beforePermissions,
+      beforePermissionCount: beforePermissions.length
+    } : {})
+  };
+  if (args.dryRun !== false || args.confirmed !== true) {
+    return {
+      ...preview,
+      requiredToInvite: "Set dryRun: false and confirmed: true after explicit user confirmation."
+    };
+  }
+  if (!hasExpectedIdentity(args)) {
+    return {
+      ...preview,
+      dryRun: false,
+      confirmed: true,
+      requiredToInvite: "Provide expectedName or expectedId for live permission invitation."
+    };
+  }
+  try {
+    const result = await graph(`${itemMutationBase(current)}/invite`, {
+      method: "POST",
+      body: JSON.stringify(body)
+    });
+    const afterPermissions = includePermissionDiff ? await permissionList({ itemId: current.id }, "compact") : null;
+    const permissionDiff = includePermissionDiff ? diffPermissions(beforePermissions, afterPermissions) : null;
+    await writeMutationAudit("onedrive_invite_permission", {
+      status: "success",
+      target: itemAuditSummary(current),
+      invite: inviteAuditSummary(safeInvite),
+      beforePermissions: includePermissionDiff ? beforePermissions.map(permissionAuditSummary) : undefined,
+      afterPermissions: includePermissionDiff ? afterPermissions.map(permissionAuditSummary) : undefined,
+      permissionDiff: includePermissionDiff ? permissionDiffAuditSummary(permissionDiff) : undefined
+    });
+    return {
+      dryRun: false,
+      confirmed: true,
+      item: simplifyItem(current),
+      invite: safeInvite,
+      permissions: Array.isArray(result.value) ? result.value.map((permission) => simplifyPermission(permission, args.format)) : result,
+      ...(includePermissionDiff ? {
+        beforePermissions,
+        afterPermissions,
+        permissionDiff
+      } : {})
+    };
+  } catch (error) {
+    await writeMutationAudit("onedrive_invite_permission", {
+      status: "failed",
+      target: itemAuditSummary(current),
+      invite: inviteAuditSummary(safeInvite),
       beforePermissions: includePermissionDiff ? beforePermissions.map(permissionAuditSummary) : undefined,
       error: safeErrorInfo(error)
     });
@@ -4987,6 +5197,8 @@ async function callTool(name, args = {}) {
       return textResult(await copyItem(args));
     case "onedrive_create_sharing_link":
       return textResult(await createSharingLink(args));
+    case "onedrive_invite_permission":
+      return textResult(await invitePermission(args));
     case "onedrive_revoke_permission":
       return textResult(await revokePermission(args));
     case "onedrive_batch_revoke_permissions":

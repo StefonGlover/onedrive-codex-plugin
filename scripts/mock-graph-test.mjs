@@ -16,6 +16,7 @@ mkdirSync(mockHome, { recursive: true });
 
 const requests = [];
 const authRequests = [];
+const graphBodies = [];
 const counters = new Map();
 
 function count(key) {
@@ -44,6 +45,23 @@ function binary(res, status, body, headers = {}) {
   res.end(body);
 }
 
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf8");
+      if (!raw) return resolve({});
+      try {
+        resolve(JSON.parse(raw));
+      } catch (error) {
+        reject(error);
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
 function item(id, name, extra = {}) {
   return {
     id,
@@ -68,7 +86,7 @@ function folder(id, name, extra = {}) {
   });
 }
 
-const graph = createServer((req, res) => {
+const graph = createServer(async (req, res) => {
   const url = new URL(req.url, "http://127.0.0.1");
   const path = url.pathname;
   const decodedUrl = decodeURIComponent(req.url);
@@ -201,9 +219,22 @@ const graph = createServer((req, res) => {
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/copy-src/permissions") {
-    const base = [{ id: "perm-owner", roles: ["owner"], grantedTo: { user: { displayName: "Mock User", email: "mock@example.test" } } }];
+    const base = [{
+      id: "perm-owner",
+      roles: ["owner"],
+      grantedTo: { user: { displayName: "Mock User", email: "mock@example.test" } },
+      grantedToIdentitiesV2: [{ user: { id: "user-owner", displayName: "Mock User", email: "mock@example.test" } }]
+    }];
     if (counters.get("create-link")) {
       base.push({ id: "perm-link", roles: ["read"], link: { type: "view", scope: "anonymous", webUrl: "https://example.test/share/link" } });
+    }
+    if (counters.get("invite-permission")) {
+      base.push({
+        id: "perm-invite",
+        roles: ["read"],
+        grantedToIdentitiesV2: [{ user: { id: "user-invite", displayName: "Invited User", email: "person@example.test" } }],
+        invitation: { email: "person@example.test", signInRequired: true }
+      });
     }
     return json(res, 200, { value: base });
   }
@@ -225,7 +256,44 @@ const graph = createServer((req, res) => {
 
   if (req.method === "POST" && path === "/v1.0/me/drive/items/copy-src/createLink") {
     count("create-link");
+    graphBodies.push({ key: "create-link", body: await readJsonBody(req) });
     return json(res, 200, { id: "perm-link", roles: ["read"], link: { type: "view", scope: "anonymous", webUrl: "https://example.test/share/link" } }, { "request-id": "mock-create-link-request" });
+  }
+
+  if (req.method === "POST" && path === "/v1.0/me/drive/items/copy-src/invite") {
+    count("invite-permission");
+    const body = await readJsonBody(req);
+    graphBodies.push({ key: "invite-permission", body });
+    return json(res, 200, {
+      value: [{
+        id: "perm-invite",
+        roles: body.roles || ["read"],
+        grantedToIdentitiesV2: [{ user: { id: "user-invite", displayName: "Invited User", email: body.recipients?.[0]?.email } }],
+        invitation: { email: body.recipients?.[0]?.email, signInRequired: body.requireSignIn }
+      }]
+    }, { "request-id": "mock-invite-request" });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/invite-fail") {
+    return json(res, 200, item("invite-fail", "invite-fail.txt"));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/invite-fail/permissions") {
+    return json(res, 200, {
+      value: [{ id: "perm-owner-invite-fail", roles: ["owner"], grantedTo: { user: { displayName: "Mock User", email: "mock@example.test" } } }]
+    });
+  }
+
+  if (req.method === "POST" && path === "/v1.0/me/drive/items/invite-fail/invite") {
+    count("invite-fail");
+    graphBodies.push({ key: "invite-fail", body: await readJsonBody(req) });
+    return json(res, 403, {
+      error: {
+        code: "accessDenied",
+        message: "mock invite failure",
+        innerError: { "request-id": "mock-invite-fail-request" }
+      }
+    });
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/revoke-target") {
@@ -596,6 +664,7 @@ try {
     const toolList = await listTools();
     const names = new Set(toolList.map((entry) => entry.name));
     const expected = [
+      "onedrive_invite_permission",
       "onedrive_revoke_permission",
       "onedrive_batch_revoke_permissions",
       "onedrive_batch_move",
@@ -856,15 +925,128 @@ try {
       itemId: "copy-src",
       type: "view",
       scope: "anonymous",
+      password: "link-secret",
+      expirationDateTime: "2026-12-31T00:00:00Z",
       dryRun: false,
       confirmed: true,
       expectedName: "copy-source.txt"
     });
     assert(!result.isError, "confirmed sharing link should succeed", result);
+    const createBody = graphBodies.findLast((entry) => entry.key === "create-link")?.body;
+    assert(createBody?.password === "link-secret", "createLink should send password when provided", createBody);
+    assert(createBody?.expirationDateTime === "2026-12-31T00:00:00Z", "createLink should send expiration when provided", createBody);
     assert(result.value.permissionDiff?.added?.length === 1, "sharing diff should include the new permission", result.value.permissionDiff);
     assert(result.value.permissionDiff?.beforeCount === 1, "sharing diff should track before count", result.value.permissionDiff);
     assert(result.value.permissionDiff?.afterCount === 2, "sharing diff should track after count", result.value.permissionDiff);
     return result.value.permissionDiff;
+  });
+
+  await check("invite permission dry-run and live behavior", async () => {
+    const beforeInviteCount = counters.get("invite-permission") || 0;
+    const dryRun = await tool("onedrive_invite_permission", {
+      itemId: "copy-src",
+      recipients: [{ email: "person@example.test" }]
+    });
+    assert(!dryRun.isError, "invite dry-run should succeed", dryRun);
+    assert(dryRun.value.dryRun === true, "invite should dry-run by default", dryRun.value);
+    assert(dryRun.value.wouldInvite?.sendInvitation === false, "invite should default to silent grant", dryRun.value);
+    assert(dryRun.value.wouldInvite?.requireSignIn === true, "invite should require sign-in by default", dryRun.value);
+    assert(dryRun.value.wouldInvite?.recipientCount === 1, "invite dry-run should summarize recipients", dryRun.value);
+    assert((counters.get("invite-permission") || 0) === beforeInviteCount, "dry-run should not POST invite", { beforeInviteCount, afterInviteCount: counters.get("invite-permission") || 0 });
+
+    const noConfirm = await tool("onedrive_invite_permission", {
+      itemId: "copy-src",
+      recipients: [{ email: "person@example.test" }],
+      expectedId: "copy-src",
+      dryRun: false
+    });
+    assert(!noConfirm.isError, "invite no-confirm should be structured", noConfirm);
+    assert(noConfirm.value.requiredToInvite, "invite should require confirmation", noConfirm.value);
+    assert((counters.get("invite-permission") || 0) === beforeInviteCount, "unconfirmed invite should not POST", { beforeInviteCount, afterInviteCount: counters.get("invite-permission") || 0 });
+
+    const missingExpected = await tool("onedrive_invite_permission", {
+      itemId: "copy-src",
+      recipients: [{ email: "person@example.test" }],
+      dryRun: false,
+      confirmed: true
+    });
+    assert(!missingExpected.isError, "invite missing expected identity should be structured", missingExpected);
+    assert(missingExpected.value.requiredToInvite?.includes("expectedName or expectedId"), "invite should require expected identity", missingExpected.value);
+    assert((counters.get("invite-permission") || 0) === beforeInviteCount, "missing expected identity should not POST", { beforeInviteCount, afterInviteCount: counters.get("invite-permission") || 0 });
+
+    const live = await tool("onedrive_invite_permission", {
+      itemId: "copy-src",
+      recipients: [{ email: "person@example.test" }],
+      password: "invite-secret",
+      expirationDateTime: "2026-12-31T00:00:00Z",
+      dryRun: false,
+      confirmed: true,
+      expectedName: "copy-source.txt"
+    });
+    assert(!live.isError, "live silent invite should succeed", live);
+    assert(counters.get("invite-permission") === beforeInviteCount + 1, "live invite should POST once", { count: counters.get("invite-permission") });
+    const inviteBody = graphBodies.findLast((entry) => entry.key === "invite-permission")?.body;
+    assert(inviteBody?.recipients?.[0]?.email === "person@example.test", "invite should send recipient email", inviteBody);
+    assert(inviteBody?.roles?.[0] === "read", "invite should default to read role", inviteBody);
+    assert(inviteBody?.sendInvitation === false, "invite should default to silent direct grant", inviteBody);
+    assert(inviteBody?.requireSignIn === true, "invite should default requireSignIn to true", inviteBody);
+    assert(inviteBody?.password === "invite-secret", "invite should send password when provided", inviteBody);
+    assert(inviteBody?.expirationDateTime === "2026-12-31T00:00:00Z", "invite should send expiration when provided", inviteBody);
+    assert(live.value.permissionDiff?.added?.some((permission) => permission.id === "perm-invite"), "invite diff should show added permission", live.value.permissionDiff);
+    return live.value.permissionDiff;
+  });
+
+  await check("invite permission honors explicit email invitations and reports failures", async () => {
+    const liveEmail = await tool("onedrive_invite_permission", {
+      itemId: "copy-src",
+      recipients: [{ email: "person@example.test" }],
+      role: "write",
+      sendInvitation: true,
+      message: "Please review",
+      dryRun: false,
+      confirmed: true,
+      expectedId: "copy-src"
+    });
+    assert(!liveEmail.isError, "live email invite should succeed", liveEmail);
+    const inviteBody = graphBodies.findLast((entry) => entry.key === "invite-permission")?.body;
+    assert(inviteBody?.sendInvitation === true, "sendInvitation true should be honored", inviteBody);
+    assert(inviteBody?.roles?.[0] === "write", "write role should be honored", inviteBody);
+    assert(inviteBody?.message === "Please review", "message should be sent when provided", inviteBody);
+
+    const failed = await tool("onedrive_invite_permission", {
+      itemId: "invite-fail",
+      recipients: [{ email: "person@example.test" }],
+      dryRun: false,
+      confirmed: true,
+      expectedName: "invite-fail.txt"
+    });
+    assert(failed.isError, "failed invite should return tool error", failed);
+    assert(String(failed.value).includes("mock invite failure"), "invite failure should surface Graph message", failed);
+    return { sendInvitation: inviteBody.sendInvitation, failure: String(failed.value) };
+  });
+
+  await check("invite permission recipient validation runs before Graph mutation", async () => {
+    const before = requests.length;
+    const beforeInviteCount = counters.get("invite-permission") || 0;
+    const result = await tool("onedrive_invite_permission", {
+      itemId: "copy-src",
+      recipients: [{ email: "person@example.test", alias: "person" }]
+    });
+    assert(result.isError, "ambiguous recipient should fail");
+    assert(String(result.value).includes("exactly one of email, alias, or objectId"), "unexpected recipient validation error", result);
+    const added = requests.slice(before);
+    assert(!added.some((request) => request.method === "POST" && request.path.endsWith("/invite")), "recipient validation should not mutate", { added });
+    assert((counters.get("invite-permission") || 0) === beforeInviteCount, "recipient validation should not POST invite", { beforeInviteCount, afterInviteCount: counters.get("invite-permission") || 0 });
+    return { graphRequestsAdded: added.length };
+  });
+
+  await check("compact permissions include grantedToIdentitiesV2", async () => {
+    const result = await tool("onedrive_permissions", { itemId: "copy-src" });
+    assert(!result.isError, "permissions should succeed", result);
+    const owner = result.value.permissions.find((permission) => permission.id === "perm-owner");
+    assert(owner?.grantedToIdentitiesV2?.[0]?.type === "user", "compact permissions should include V2 identity type", owner);
+    assert(owner?.grantedToIdentitiesV2?.[0]?.email === "mock@example.test", "compact permissions should include V2 identity email", owner);
+    return owner.grantedToIdentitiesV2;
   });
 
   await check("batch_move preflight prevents partial mutation", async () => {
@@ -1385,11 +1567,16 @@ try {
     const tools = entries.map((entry) => entry.tool);
     assert(tools.includes("onedrive_delete"), "audit should include live delete", entries);
     assert(tools.includes("onedrive_create_sharing_link"), "audit should include live sharing link", entries);
+    assert(tools.includes("onedrive_invite_permission"), "audit should include live invite", entries);
     assert(tools.includes("onedrive_revoke_permission"), "audit should include live revoke", entries);
     assert(entries.some((entry) => entry.tool === "onedrive_delete" && entry.status === "failed" && entry.error?.message?.includes("mock delete failure")), "audit should include safe failed delete info", entries);
     const serialized = JSON.stringify(entries);
     assert(!serialized.includes("mock-token"), "audit should not include access token", entries);
     assert(!serialized.includes("https://example.test/share/link"), "audit should not include sharing webUrl", entries);
+    assert(!serialized.includes("link-secret"), "audit should not include sharing link password", entries);
+    assert(!serialized.includes("invite-secret"), "audit should not include invite password", entries);
+    assert(!serialized.includes("Please review"), "audit should not include invitation message", entries);
+    assert(!serialized.includes("person@example.test"), "audit should not include recipient email", entries);
     return { count: entries.length, tools };
   });
 

@@ -21,6 +21,10 @@ const auditExport = join(outDir, "audit-export.jsonl");
 const excelDownload = join(outDir, "downloaded-sheet.csv");
 const wordDownload = join(outDir, "downloaded-doc.docx");
 const powerpointDownload = join(outDir, "downloaded-deck.pptx");
+const exportPdfDownload = join(outDir, "exported-doc.pdf");
+const exportTextDownload = join(outDir, "exported-doc.txt");
+const updateCheckout = join(outDir, "update-checkout.txt");
+const updateManifest = join(outDir, "update-checkout.json");
 const blockedSyncDownload = join(homedir(), "Library", "CloudStorage", "OneDrive-Personal", `${unique}-blocked-download.txt`);
 const blockedSyncUpload = join(homedir(), "Library", "CloudStorage", "OneDrive-Personal", `${unique}-blocked-upload.txt`);
 const folderName = `Codex OneDrive Plugin Beta Test ${unique}`;
@@ -42,6 +46,10 @@ await rm(localDownload, { force: true });
 await rm(excelDownload, { force: true });
 await rm(wordDownload, { force: true });
 await rm(powerpointDownload, { force: true });
+await rm(exportPdfDownload, { force: true });
+await rm(exportTextDownload, { force: true });
+await rm(updateCheckout, { force: true });
+await rm(updateManifest, { force: true });
 
 const child = spawn(process.execPath, [serverPath], {
   cwd: workspace,
@@ -175,6 +183,7 @@ try {
     "onedrive_move",
     "onedrive_copy",
     "onedrive_create_sharing_link",
+    "onedrive_invite_permission",
     "onedrive_revoke_permission",
     "onedrive_batch_revoke_permissions",
     "onedrive_permissions",
@@ -288,6 +297,31 @@ try {
     content: `PowerPoint helper test ${unique}\n`,
     conflictBehavior: "fail"
   }));
+  await assertOk("write duplicate A", await tool("onedrive_write_text", {
+    remotePath: `${folderName}/duplicate.txt`,
+    content: `Duplicate helper test ${unique}\n`,
+    conflictBehavior: "fail"
+  }));
+  await assertOk("write duplicate B", await tool("onedrive_write_text", {
+    remotePath: `${folderName}/${movedFolderName}/duplicate.txt`,
+    content: `Duplicate helper test ${unique}\n`,
+    conflictBehavior: "fail"
+  }));
+  await assertOk("write batch move A", await tool("onedrive_write_text", {
+    remotePath: `${folderName}/batch-move-a.txt`,
+    content: `Batch move A ${unique}\n`,
+    conflictBehavior: "fail"
+  }));
+  await assertOk("write batch move B", await tool("onedrive_write_text", {
+    remotePath: `${folderName}/batch-move-b.txt`,
+    content: `Batch move B ${unique}\n`,
+    conflictBehavior: "fail"
+  }));
+  const batchDeleteTarget = assertOk("write batch delete target", await tool("onedrive_write_text", {
+    remotePath: `${folderName}/batch-delete.txt`,
+    content: `Batch delete ${unique}\n`,
+    conflictBehavior: "fail"
+  }));
 
   const excel = assertOk("download_excel", await tool("onedrive_download_excel", {
     path: `${folderName}/sheet.csv`,
@@ -305,6 +339,49 @@ try {
     excel: excel.localPath,
     word: word.localPath,
     powerpoint: powerpoint.localPath
+  });
+
+  const preview = assertOk("preview text file", await tool("onedrive_preview", {
+    path: `${folderName}/note.txt`,
+    maxBytes: 40
+  }));
+  record("preview returns bounded content", preview.preview?.includes("OneDrive plugin beta test") && preview.truncated === true ? "pass" : "fail", {
+    source: preview.source,
+    bytes: preview.bytes,
+    truncated: preview.truncated,
+    preview: preview.preview
+  });
+
+  const exportPdf = await tool("onedrive_export_pdf", {
+    path: `${folderName}/doc.docx`,
+    localPath: exportPdfDownload,
+    overwrite: true
+  });
+  record("export_pdf succeeds or reports Graph conversion limit", !exportPdf.isError
+    ? exportPdf.value.bytesWritten > 0
+      ? "pass"
+      : "fail"
+    : /format|convert|conversion|unsupported|notSupported|cannotOpenFile|NotAcceptable|UnknownError|406|invalid/i.test(String(exportPdf.value))
+      ? "pass"
+      : "fail", {
+    response: exportPdf.value,
+    note: "The beta creates a synthetic .docx text payload; Graph may reject conversion for non-Office binary content."
+  });
+
+  const exportText = await tool("onedrive_export_text", {
+    path: `${folderName}/doc.docx`,
+    localPath: exportTextDownload,
+    overwrite: true
+  });
+  record("export_text succeeds or reports Graph conversion limit", !exportText.isError
+    ? exportText.value.bytesWritten > 0
+      ? "pass"
+      : "fail"
+    : /format|convert|conversion|unsupported|notSupported|cannotOpenFile|NotAcceptable|UnknownError|406|invalid/i.test(String(exportText.value))
+      ? "pass"
+      : "fail", {
+    response: exportText.value,
+    note: "The beta creates a synthetic .docx text payload; Graph may reject conversion for non-Office binary content."
   });
 
   const renamed = assertOk("onedrive_rename", await tool("onedrive_rename", {
@@ -405,6 +482,76 @@ try {
     bytesWritten: downloaded.bytesWritten
   });
 
+  const checkout = assertOk("update_file checkout", await tool("onedrive_update_file", {
+    mode: "checkout",
+    remotePath: `${folderName}/uploaded.txt`,
+    localPath: updateCheckout,
+    manifestPath: updateManifest,
+    overwriteLocal: true,
+    overwriteManifest: true
+  }));
+  await writeFile(updateCheckout, `${downloadedContent}Edited through update_file commit: ${unique}\n`, "utf8");
+  const committed = assertOk("update_file commit", await tool("onedrive_update_file", {
+    mode: "commit",
+    remotePath: `${folderName}/uploaded.txt`,
+    localPath: updateCheckout,
+    manifestPath: updateManifest,
+    createBackup: true,
+    verify: true
+  }));
+  const updatedReadBack = assertOk("updated file readback", await tool("onedrive_read_text", {
+    path: `${folderName}/uploaded.txt`,
+    maxBytes: 10000
+  }));
+  record("update_file checkout and commit", checkout.mode === "checkout"
+    && committed.mode === "commit"
+    && committed.backup?.bytesWritten > 0
+    && updatedReadBack.content.includes("Edited through update_file commit") ? "pass" : "fail", {
+    checkout: { localPath: checkout.localPath, manifestPath: checkout.manifestPath },
+    commit: { backupBytes: committed.backup?.bytesWritten, verified: committed.verified?.name }
+  });
+
+  const batchMoveDryRun = assertOk("batch move dry-run", await tool("onedrive_batch_move", {
+    items: [
+      { path: `${folderName}/batch-move-a.txt`, expectedName: "batch-move-a.txt" },
+      { path: `${folderName}/batch-move-b.txt`, expectedName: "batch-move-b.txt" }
+    ],
+    destinationParentPath: `${folderName}/${movedFolderName}`
+  }));
+  record("batch_move dry-run previews every item", batchMoveDryRun.dryRun === true && batchMoveDryRun.results?.length === 2 ? "pass" : "fail", {
+    count: batchMoveDryRun.count
+  });
+
+  const batchMoved = assertOk("batch move live", await tool("onedrive_batch_move", {
+    items: [
+      { path: `${folderName}/batch-move-a.txt`, expectedName: "batch-move-a.txt" },
+      { path: `${folderName}/batch-move-b.txt`, expectedName: "batch-move-b.txt" }
+    ],
+    destinationParentPath: `${folderName}/${movedFolderName}`,
+    dryRun: false,
+    confirmed: true
+  }));
+  record("batch_move live succeeds", batchMoved.confirmed === true && batchMoved.results?.length === 2 ? "pass" : "fail", {
+    count: batchMoved.count,
+    names: batchMoved.results?.map((entry) => entry.moved?.name || entry.item?.name || entry.name)
+  });
+
+  const batchDeleteDryRun = assertOk("batch delete dry-run", await tool("onedrive_batch_delete", {
+    items: [{ itemId: batchDeleteTarget.item.id, expectedName: "batch-delete.txt" }]
+  }));
+  record("batch_delete dry-run previews item", batchDeleteDryRun.dryRun === true && batchDeleteDryRun.results?.length === 1 ? "pass" : "fail", {
+    count: batchDeleteDryRun.count
+  });
+
+  const batchDeleted = assertOk("batch delete live", await tool("onedrive_batch_delete", {
+    items: [{ itemId: batchDeleteTarget.item.id, expectedName: "batch-delete.txt" }],
+    dryRun: false,
+    confirmed: true
+  }));
+  record("batch_delete live succeeds", batchDeleted.confirmed === true && batchDeleted.results?.length === 1 ? "pass" : "fail", {
+    count: batchDeleted.count
+  });
+
   const listedFolder = assertOk("onedrive_list", await tool("onedrive_list", { path: folderName, limit: 20 }));
   const childNames = listedFolder.items.map((item) => item.name).sort();
   record("list folder children compactly", childNames.includes(copyFileName) && childNames.includes("uploaded.txt") && listedFolder.items.every((item) => item.type) ? "pass" : "fail", {
@@ -454,6 +601,77 @@ try {
     summary: foundAll.summary,
     folderPlan: foundAll.folderPlan,
     names: foundAll.items.map((item) => item.name)
+  });
+
+  const syncStatusBefore = assertOk("sync status", await tool("onedrive_sync_status", { includeSamples: true }));
+  record("sync_status reports cache state", Number.isInteger(syncStatusBefore.itemCount) && Array.isArray(syncStatusBefore.samples) ? "pass" : "fail", {
+    itemCount: syncStatusBefore.itemCount,
+    sampleCount: syncStatusBefore.samples?.length,
+    deltaLinkAvailable: syncStatusBefore.deltaLinkAvailable
+  });
+
+  const cacheRefresh = assertOk("cache refresh", await tool("onedrive_cache_refresh", {
+    path: folderName,
+    mode: "scan",
+    maxItems: 50,
+    maxFolders: 10,
+    maxDepth: 5
+  }));
+  record("cache_refresh scans selected folder", cacheRefresh.cache?.itemCount >= 1 && ["scan", "scan+delta"].includes(cacheRefresh.mode) ? "pass" : "fail", {
+    mode: cacheRefresh.mode,
+    itemCount: cacheRefresh.cache?.itemCount,
+    scanned: cacheRefresh.scan?.summary?.itemsScanned,
+    scanRoot: cacheRefresh.cache?.scanRoot
+  });
+
+  const cacheCleared = assertOk("cache clear", await tool("onedrive_cache_clear"));
+  record("cache_clear empties metadata cache", cacheCleared.itemCount === 0 ? "pass" : "fail", {
+    itemCount: cacheCleared.itemCount,
+    updatedAt: cacheCleared.updatedAt
+  });
+
+  const cacheRefreshAfterClear = assertOk("cache refresh after clear", await tool("onedrive_cache_refresh", {
+    path: folderName,
+    mode: "scan",
+    maxItems: 50,
+    maxFolders: 10,
+    maxDepth: 5
+  }));
+  record("cache_refresh rebuilds cache after clear", cacheRefreshAfterClear.cache?.itemCount >= 1 ? "pass" : "fail", {
+    mode: cacheRefreshAfterClear.mode,
+    itemCount: cacheRefreshAfterClear.cache?.itemCount,
+    scanned: cacheRefreshAfterClear.scan?.summary?.itemsScanned
+  });
+
+  const recent = assertOk("recent files", await tool("onedrive_recent", { limit: 10 }));
+  record("recent files call succeeds", Array.isArray(recent.items) && recent.count >= 0 ? "pass" : "fail", {
+    count: recent.count,
+    sample: recent.items?.[0]
+  });
+
+  const largeFiles = assertOk("large files", await tool("onedrive_large_files", {
+    path: folderName,
+    minBytes: 1,
+    limit: 10,
+    maxItems: 50,
+    maxFolders: 10,
+    maxDepth: 5
+  }));
+  record("large_files finds test files", largeFiles.items?.some((item) => item.name === "uploaded-session.txt") ? "pass" : "fail", {
+    count: largeFiles.count,
+    names: largeFiles.items?.map((item) => item.name)
+  });
+
+  const duplicates = assertOk("duplicates", await tool("onedrive_duplicates", {
+    path: folderName,
+    limit: 10,
+    maxItems: 50,
+    maxFolders: 10,
+    maxDepth: 5
+  }));
+  record("duplicates finds duplicate test files", duplicates.groups?.some((group) => group.items?.some((item) => item.name === "duplicate.txt")) ? "pass" : "fail", {
+    count: duplicates.count,
+    groups: duplicates.groups?.map((group) => ({ key: group.key, count: group.count, names: group.items.map((item) => item.name) }))
   });
 
   const blockedDownload = await tool("onedrive_download", {
@@ -535,12 +753,75 @@ try {
   const sharingDryRun = assertOk("sharing link dry-run", await tool("onedrive_create_sharing_link", {
     path: `${folderName}/${copyFileName}`,
     type: "view",
-    scope: "anonymous"
+    scope: "anonymous",
+    password: `${unique}-link-password`,
+    expirationDateTime: "2099-01-01T00:00:00Z"
   }));
-  record("sharing link dry-run is safe", sharingDryRun.dryRun === true && sharingDryRun.requiredToCreate ? "pass" : "fail", {
+  record("sharing link dry-run is safe", sharingDryRun.dryRun === true && sharingDryRun.requiredToCreate && sharingDryRun.wouldCreate?.passwordProvided === true && sharingDryRun.wouldCreate?.expirationDateTime === "2099-01-01T00:00:00Z" ? "pass" : "fail", {
     requiredToCreate: sharingDryRun.requiredToCreate,
-    beforePermissionCount: sharingDryRun.beforePermissionCount
+    beforePermissionCount: sharingDryRun.beforePermissionCount,
+    wouldCreate: sharingDryRun.wouldCreate
   });
+
+  const inviteRecipient = me.mail || me.userPrincipalName;
+  const inviteDryRun = assertOk("invite permission dry-run", await tool("onedrive_invite_permission", {
+    path: `${folderName}/${copyFileName}`,
+    recipients: [{ email: inviteRecipient }],
+    role: "read",
+    password: `${unique}-invite-password`,
+    expirationDateTime: "2099-01-01T00:00:00Z"
+  }));
+  record("invite permission dry-run is safe and silent by default", inviteDryRun.dryRun === true
+    && inviteDryRun.requiredToInvite
+    && inviteDryRun.wouldInvite?.sendInvitation === false
+    && inviteDryRun.wouldInvite?.requireSignIn === true
+    && inviteDryRun.wouldInvite?.passwordProvided === true
+    && inviteDryRun.wouldInvite?.expirationDateTime === "2099-01-01T00:00:00Z" ? "pass" : "fail", {
+    requiredToInvite: inviteDryRun.requiredToInvite,
+    beforePermissionCount: inviteDryRun.beforePermissionCount,
+    wouldInvite: inviteDryRun.wouldInvite
+  });
+
+  const inviteNeedsConfirmation = assertOk("invite permission requires confirmation", await tool("onedrive_invite_permission", {
+    itemId: copiedInfo.id,
+    recipients: [{ email: inviteRecipient }],
+    expectedName: copyFileName,
+    dryRun: false
+  }));
+  record("invite live action requires confirmation", inviteNeedsConfirmation.requiredToInvite && inviteNeedsConfirmation.confirmed === false ? "pass" : "fail", {
+    requiredToInvite: inviteNeedsConfirmation.requiredToInvite
+  });
+
+  const inviteMissingExpected = assertOk("invite permission requires expected identity", await tool("onedrive_invite_permission", {
+    itemId: copiedInfo.id,
+    recipients: [{ email: inviteRecipient }],
+    dryRun: false,
+    confirmed: true
+  }));
+  record("invite live action requires expected identity", inviteMissingExpected.requiredToInvite?.includes("expectedName or expectedId") ? "pass" : "fail", {
+    requiredToInvite: inviteMissingExpected.requiredToInvite
+  });
+
+  const inviteLive = await tool("onedrive_invite_permission", {
+    itemId: copiedInfo.id,
+    recipients: [{ email: inviteRecipient }],
+    role: "read",
+    expectedName: copyFileName,
+    dryRun: false,
+    confirmed: true
+  });
+  if (inviteLive.isError && /owner|same user|already|not.*supported|invalid.*recipient|cannot.*share/i.test(String(inviteLive.value))) {
+    record("invite permission live self-grant handled", "pass", {
+      response: inviteLive.value,
+      note: "The live beta uses the signed-in user as recipient to avoid emailing or exposing access; Microsoft Graph can reject redundant self-grants depending on drive/account type."
+    });
+  } else {
+    const inviteLiveValue = assertOk("invite permission live", inviteLive);
+    record("invite permission live silent grant succeeds", inviteLiveValue.confirmed === true && inviteLiveValue.invite?.sendInvitation === false && inviteLiveValue.permissionDiff ? "pass" : "fail", {
+      invite: inviteLiveValue.invite,
+      diff: inviteLiveValue.permissionDiff
+    });
+  }
 
   const sharingLive = assertOk("sharing link live", await tool("onedrive_create_sharing_link", {
     itemId: copiedInfo.id,
@@ -553,6 +834,26 @@ try {
   record("sharing link live creates permission diff", sharingLive.confirmed === true && sharingLive.permission?.id && sharingLive.permissionDiff ? "pass" : "fail", {
     permissionId: sharingLive.permission?.id,
     diff: sharingLive.permissionDiff
+  });
+
+  const sharedByMe = assertOk("shared by me audit", await tool("onedrive_shared_by_me", {
+    path: folderName,
+    limit: 20,
+    maxItems: 50,
+    maxFolders: 10,
+    maxDepth: 5
+  }));
+  const publicLinks = assertOk("public links audit", await tool("onedrive_public_links", {
+    path: folderName,
+    limit: 20,
+    maxItems: 50,
+    maxFolders: 10,
+    maxDepth: 5
+  }));
+  record("sharing audit tools find live anonymous link", sharedByMe.items?.some((entry) => entry.item?.id === copiedInfo.id)
+    && publicLinks.items?.some((entry) => entry.item?.id === copiedInfo.id) ? "pass" : "fail", {
+    sharedByMe: { count: sharedByMe.count, ids: sharedByMe.items?.map((entry) => entry.item?.id) },
+    publicLinks: { count: publicLinks.count, ids: publicLinks.items?.map((entry) => entry.item?.id) }
   });
 
   const revokeDryRun = assertOk("revoke permission dry-run", await tool("onedrive_revoke_permission", {
@@ -673,6 +974,27 @@ try {
   record("root delete is refused", rootDelete.isError && String(rootDelete.value).includes("OneDrive root") ? "pass" : "fail", {
     response: rootDelete.value
   });
+
+  const auditClearNoConfirm = assertOk("audit clear requires confirmation", await tool("onedrive_audit_clear"));
+  record("audit_clear requires confirmation", auditClearNoConfirm.requiredToClear && auditClearNoConfirm.confirmed === false ? "pass" : "fail", {
+    requiredToClear: auditClearNoConfirm.requiredToClear
+  });
+
+  const deviceStart = assertOk("auth device start", await tool("onedrive_auth_device_start", { tenant: "consumers" }));
+  record("auth_device_start returns device login metadata", deviceStart.userCode && deviceStart.verificationUri && deviceStart.deviceCodeStoredInMemory === true ? "pass" : "fail", {
+    authTenant: deviceStart.authTenant,
+    expiresIn: deviceStart.expiresIn,
+    verificationUri: deviceStart.verificationUri
+  });
+
+  const devicePoll = assertOk("auth device poll pending", await tool("onedrive_auth_device_poll"));
+  record("auth_device_poll reports pending authorization safely", devicePoll.authorizationPending === true ? "pass" : "fail", {
+    message: devicePoll.message,
+    slowDown: devicePoll.slowDown
+  });
+
+  const logoutMemoryOnly = assertOk("logout memory only", await tool("onedrive_logout", { deleteKeychainToken: false }));
+  record("logout clears memory without deleting Keychain token", logoutMemoryOnly.memoryCleared === true && logoutMemoryOnly.keychainTokenDeleted === false ? "pass" : "fail", logoutMemoryOnly);
 } catch (error) {
   results.error = error.stack || error.message;
   if (folder?.id) {
