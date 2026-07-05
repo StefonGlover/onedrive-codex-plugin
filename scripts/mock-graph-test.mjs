@@ -88,6 +88,7 @@ const graph = createServer((req, res) => {
   }
 
   if (req.method === "PATCH" && path === "/v1.0/me/drive/items/delete-target") {
+    count("rename");
     return json(res, 200, item("delete-target", "renamed-cache.txt"));
   }
 
@@ -125,6 +126,25 @@ const graph = createServer((req, res) => {
     return text(res, 200, "0123456789abcdefghijklmnopqrstuvwxyz");
   }
 
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/delete-fail") {
+    return json(res, 200, item("delete-fail", "delete-fail.txt"));
+  }
+
+  if (req.method === "DELETE" && path === "/v1.0/me/drive/items/delete-fail") {
+    count("delete-fail");
+    return json(res, 503, {
+      error: {
+        code: "serviceUnavailable",
+        message: "mock delete failure",
+        innerError: { "request-id": "mock-delete-fail-request" }
+      }
+    });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/root-note") {
+    return json(res, 200, item("root-note", "root-note.txt"));
+  }
+
   if (req.method === "GET" && path === "/v1.0/me/drive/items/flaky-network") {
     if (count("flaky-network") === 1) {
       req.socket.destroy();
@@ -153,7 +173,7 @@ const graph = createServer((req, res) => {
 
   if (req.method === "DELETE" && path === "/v1.0/me/drive/items/delete-target") {
     count("delete");
-    return empty(res, 204);
+    return empty(res, 204, { "request-id": "mock-delete-request" });
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/copy-src") {
@@ -189,7 +209,26 @@ const graph = createServer((req, res) => {
 
   if (req.method === "POST" && path === "/v1.0/me/drive/items/copy-src/createLink") {
     count("create-link");
-    return json(res, 200, { id: "perm-link", roles: ["read"], link: { type: "view", scope: "anonymous", webUrl: "https://example.test/share/link" } });
+    return json(res, 200, { id: "perm-link", roles: ["read"], link: { type: "view", scope: "anonymous", webUrl: "https://example.test/share/link" } }, { "request-id": "mock-create-link-request" });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/revoke-target") {
+    return json(res, 200, item("revoke-target", "shared-doc.txt"));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/revoke-target/permissions") {
+    const permissions = [
+      { id: "perm-owner", roles: ["owner"], grantedTo: { user: { displayName: "Mock User", email: "mock@example.test" } } }
+    ];
+    if (!counters.get("revoke-perm-public")) {
+      permissions.push({ id: "perm-public", roles: ["read"], link: { type: "view", scope: "anonymous", webUrl: "https://example.test/revoke/public" } });
+    }
+    return json(res, 200, { value: permissions });
+  }
+
+  if (req.method === "DELETE" && path === "/v1.0/me/drive/items/revoke-target/permissions/perm-public") {
+    count("revoke-perm-public");
+    return empty(res, 204, { "request-id": "mock-revoke-request" });
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/quarterly-report") {
@@ -273,6 +312,11 @@ const graph = createServer((req, res) => {
     });
   }
 
+  if (req.method === "PATCH" && path === "/v1.0/me/drive/items/root-note") {
+    count("move-root-note");
+    return json(res, 200, item("root-note", "root-note.txt", { parentReference: { path: "/drive/root:/Folder A" } }));
+  }
+
   if (req.method === "GET" && path === "/v1.0/me/drive/items/folder-b/children") {
     return json(res, 200, {
       value: [
@@ -330,7 +374,8 @@ const graph = createServer((req, res) => {
   }
 
   if (req.method === "POST" && path === "/v1.0/me/drive/items/copy-src/copy") {
-    return empty(res, 202, { Location: `http://127.0.0.1:${graph.address().port}/monitor/copy` });
+    count("copy");
+    return empty(res, 202, { Location: `http://127.0.0.1:${graph.address().port}/monitor/copy`, "request-id": "mock-copy-request" });
   }
 
   if (req.method === "POST" && path === "/v1.0/me/drive/items/copy-evil/copy") {
@@ -450,6 +495,15 @@ async function listTools() {
   return response.result?.tools || [];
 }
 
+function auditEntries() {
+  const path = join(mockHome, ".codex", "onedrive-plugin", "audit", "mutations.jsonl");
+  try {
+    return readFileSync(path, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  } catch {
+    return [];
+  }
+}
+
 function assert(condition, message, details = {}) {
   if (!condition) {
     const error = new Error(message);
@@ -520,6 +574,22 @@ try {
     assert(authRequests.some((request) => request.path === "/common/oauth2/v2.0/devicecode"), "common endpoint was not attempted", authRequests);
     assert(authRequests.some((request) => request.path === "/consumers/oauth2/v2.0/devicecode"), "consumers endpoint was not attempted", authRequests);
     return { authTenant: result.value.authTenant, paths: authRequests.map((request) => request.path) };
+  });
+
+  await check("safety, revoke, batch, and audit tools are registered", async () => {
+    const toolList = await listTools();
+    const names = new Set(toolList.map((entry) => entry.name));
+    const expected = [
+      "onedrive_revoke_permission",
+      "onedrive_batch_revoke_permissions",
+      "onedrive_batch_move",
+      "onedrive_audit_recent",
+      "onedrive_audit_export",
+      "onedrive_audit_clear"
+    ];
+    const missing = expected.filter((name) => !names.has(name));
+    assert(missing.length === 0, "missing safety tools", { missing });
+    return { checked: expected };
   });
 
   await check("GET requests retry 429 once", async () => {
@@ -595,11 +665,33 @@ try {
     return { id: result.value.id };
   });
 
+  await check("runtime validation rejects invalid arguments before handlers", async () => {
+    const cases = [
+      { name: "onedrive_rename", args: { itemId: "delete-target" }, label: "missing required" },
+      { name: "onedrive_get_info", args: { itemId: "delete-target", mystery: true }, label: "unknown property" },
+      { name: "onedrive_create_sharing_link", args: { itemId: "copy-src", type: "publish" }, label: "bad enum" },
+      { name: "onedrive_doctor", args: { rootListLimit: 99999 }, label: "number maximum" },
+      { name: "onedrive_batch_move", args: { items: [] }, label: "array minimum" },
+      { name: "onedrive_get_info", args: {}, label: "missing anyOf target" }
+    ];
+    const before = requests.length;
+    const outputs = [];
+    for (const entry of cases) {
+      const result = await tool(entry.name, entry.args);
+      assert(result.isError, `${entry.label} should be rejected`, result);
+      assert(result.value.error === "invalid_arguments", `${entry.label} should return structured validation error`, result.value);
+      outputs.push({ label: entry.label, details: result.value.details });
+    }
+    assert(requests.length === before, "validation failures should not reach Graph", { added: requests.slice(before) });
+    return { cases: outputs.length };
+  });
+
   await check("remotePreset requires an explicit relative destination", async () => {
     const before = requests.length;
     const result = await tool("onedrive_write_text", { remotePreset: "documents", content: "hello" });
     assert(result.isError, "remotePreset without remoteRelativePath should fail");
-    assert(String(result.value).includes("remoteRelativePath is required"), "unexpected remotePreset error", result);
+    assert(result.value.error === "invalid_arguments", "unexpected remotePreset error", result);
+    assert(result.value.details?.some((detail) => detail.message.includes("remotePreset + remoteRelativePath")), "remotePreset validation should explain target options", result);
     assert(requests.length === before, "remotePreset validation should not reach Graph", { before, after: requests.length });
     return { graphRequestsAdded: requests.length - before };
   });
@@ -663,17 +755,71 @@ try {
     assert(requests.length === beforeRequests, "batch_delete preflight should not touch Graph when an item is missing expected identity", { added: requests.slice(beforeRequests) });
     return { requiredToDelete: result.value.requiredToDelete, deleteCount: counters.get("delete") || 0 };
   });
+  await check("rename, move, and copy default to dry-run without mutation", async () => {
+    const before = requests.length;
+    const rename = await tool("onedrive_rename", { itemId: "delete-target", newName: "renamed.txt" });
+    const move = await tool("onedrive_move", { itemId: "root-note", destinationParentItemId: "folder-a" });
+    const copy = await tool("onedrive_copy", { itemId: "copy-src", destinationParentItemId: "folder-a" });
+    assert(!rename.isError && rename.value.dryRun === true, "rename should dry-run by default", rename);
+    assert(!move.isError && move.value.dryRun === true, "move should dry-run by default", move);
+    assert(!copy.isError && copy.value.dryRun === true, "copy should dry-run by default", copy);
+    const added = requests.slice(before);
+    assert(!added.some((request) => request.method === "PATCH" || request.method === "POST"), "dry-runs should not mutate", { added });
+    return { graphRequestsAdded: added.length };
+  });
 
-  await check("copy monitor exposes manual 303", async () => {
-    const result = await tool("onedrive_copy", { itemId: "copy-src", waitForCompletion: true, timeoutSeconds: 5 });
+  await check("rename, move, and copy live actions require confirmation", async () => {
+    const before = requests.length;
+    const rename = await tool("onedrive_rename", { itemId: "delete-target", newName: "renamed.txt", expectedName: "delete-me.txt", dryRun: false });
+    const move = await tool("onedrive_move", { itemId: "root-note", destinationParentItemId: "folder-a", expectedId: "root-note", dryRun: false });
+    const copy = await tool("onedrive_copy", { itemId: "copy-src", destinationParentItemId: "folder-a", expectedId: "copy-src", dryRun: false });
+    assert(rename.value.requiredToRename, "rename should require confirmation", rename.value);
+    assert(move.value.requiredToMove, "move should require confirmation", move.value);
+    assert(copy.value.requiredToCopy, "copy should require confirmation", copy.value);
+    const added = requests.slice(before);
+    assert(!added.some((request) => request.method === "PATCH" || request.method === "POST"), "unconfirmed live calls should not mutate", { added });
+    return { graphRequestsAdded: added.length };
+  });
+
+  await check("rename, move, and copy live actions require expected identity", async () => {
+    const before = requests.length;
+    const rename = await tool("onedrive_rename", { itemId: "delete-target", newName: "renamed.txt", dryRun: false, confirmed: true });
+    const move = await tool("onedrive_move", { itemId: "root-note", destinationParentItemId: "folder-a", dryRun: false, confirmed: true });
+    const copy = await tool("onedrive_copy", { itemId: "copy-src", destinationParentItemId: "folder-a", dryRun: false, confirmed: true });
+    assert(rename.value.requiredToRename?.includes("expectedName or expectedId"), "rename should require expected identity", rename.value);
+    assert(move.value.requiredToMove?.includes("expectedName or expectedId"), "move should require expected identity", move.value);
+    assert(copy.value.requiredToCopy?.includes("expectedName or expectedId"), "copy should require expected identity", copy.value);
+    const added = requests.slice(before);
+    assert(!added.some((request) => request.method === "PATCH" || request.method === "POST"), "missing-identity live calls should not mutate", { added });
+    return { graphRequestsAdded: added.length };
+  });
+
+  await check("confirmed copy sends one copy POST and preserves manual 303 monitor", async () => {
+    const result = await tool("onedrive_copy", {
+      itemId: "copy-src",
+      destinationParentItemId: "folder-a",
+      dryRun: false,
+      confirmed: true,
+      expectedName: "copy-source.txt",
+      waitForCompletion: true,
+      timeoutSeconds: 5
+    });
     assert(!result.isError, "copy should succeed", result);
+    assert(counters.get("copy") === 1, "copy should POST exactly once", { copyCount: counters.get("copy") });
     assert(result.value.monitor?.status === 303, "copy monitor did not preserve 303", result.value.monitor);
     assert(result.value.monitor?.resourceLocation?.includes("/v1.0/me/drive/items/copied"), "missing resource location", result.value.monitor);
     return result.value.monitor;
   });
 
   await check("copy monitor rejects untrusted external URLs", async () => {
-    const result = await tool("onedrive_copy", { itemId: "copy-evil", waitForCompletion: true, timeoutSeconds: 5 });
+    const result = await tool("onedrive_copy", {
+      itemId: "copy-evil",
+      dryRun: false,
+      confirmed: true,
+      expectedName: "copy-evil.txt",
+      waitForCompletion: true,
+      timeoutSeconds: 5
+    });
     assert(result.isError, "copy should reject untrusted monitor URL", result);
     assert(String(result.value).includes("untrusted copy monitor URL"), "unexpected monitor rejection", result);
     return { response: result.value };
@@ -702,6 +848,69 @@ try {
     assert(result.value.permissionDiff?.beforeCount === 1, "sharing diff should track before count", result.value.permissionDiff);
     assert(result.value.permissionDiff?.afterCount === 2, "sharing diff should track after count", result.value.permissionDiff);
     return result.value.permissionDiff;
+  });
+
+  await check("batch_move preflight prevents partial mutation", async () => {
+    const beforeMoveCount = counters.get("move-root-note") || 0;
+    const result = await tool("onedrive_batch_move", {
+      items: [
+        { itemId: "root-note", expectedId: "root-note" },
+        { itemId: "delete-target", expectedName: "wrong-name.txt" }
+      ],
+      destinationParentItemId: "folder-a",
+      dryRun: false,
+      confirmed: true
+    });
+    assert(!result.isError, "batch_move preflight failure should return structured result", result);
+    assert(result.value.preflightFailed === true, "batch_move should report preflight failure", result.value);
+    assert((counters.get("move-root-note") || 0) === beforeMoveCount, "batch_move should not PATCH any item after preflight failure", { beforeMoveCount, afterMoveCount: counters.get("move-root-note") || 0 });
+    return { errors: result.value.errors };
+  });
+
+  await check("revoke permission dry-run and live behavior", async () => {
+    const dryRun = await tool("onedrive_revoke_permission", { itemId: "revoke-target", permissionId: "perm-public" });
+    assert(!dryRun.isError, "revoke dry-run should succeed", dryRun);
+    assert(dryRun.value.dryRun === true, "revoke should dry-run by default", dryRun.value);
+    assert(dryRun.value.beforePermissions?.some((permission) => permission.id === "perm-public"), "dry-run should include before permissions", dryRun.value);
+    assert(!counters.get("revoke-perm-public"), "dry-run should not DELETE permission", { count: counters.get("revoke-perm-public") });
+
+    const noConfirm = await tool("onedrive_revoke_permission", {
+      itemId: "revoke-target",
+      permissionId: "perm-public",
+      expectedName: "shared-doc.txt",
+      dryRun: false
+    });
+    assert(!noConfirm.isError, "revoke no-confirm should be structured", noConfirm);
+    assert(noConfirm.value.requiredToRevoke, "revoke should require confirmation", noConfirm.value);
+    assert(!counters.get("revoke-perm-public"), "unconfirmed revoke should not DELETE permission", { count: counters.get("revoke-perm-public") });
+
+    const live = await tool("onedrive_revoke_permission", {
+      itemId: "revoke-target",
+      permissionId: "perm-public",
+      expectedName: "shared-doc.txt",
+      dryRun: false,
+      confirmed: true
+    });
+    assert(!live.isError, "live revoke should succeed", live);
+    assert(counters.get("revoke-perm-public") === 1, "live revoke should DELETE once", { count: counters.get("revoke-perm-public") });
+    assert(live.value.permissionDiff?.removed?.some((permission) => permission.id === "perm-public"), "live revoke diff should show removed permission", live.value.permissionDiff);
+    return live.value.permissionDiff;
+  });
+
+  await check("batch revoke preflight prevents partial deletion", async () => {
+    const beforeRevokeCount = counters.get("revoke-perm-public") || 0;
+    const result = await tool("onedrive_batch_revoke_permissions", {
+      items: [
+        { itemId: "copy-src", permissionId: "perm-owner", expectedId: "copy-src" },
+        { itemId: "revoke-target", permissionId: "missing-permission", expectedId: "revoke-target" }
+      ],
+      dryRun: false,
+      confirmed: true
+    });
+    assert(!result.isError, "batch revoke preflight failure should return structured result", result);
+    assert(result.value.preflightFailed === true, "batch revoke should report preflight failure", result.value);
+    assert((counters.get("revoke-perm-public") || 0) === beforeRevokeCount, "batch revoke should not DELETE after preflight failure", { beforeRevokeCount, afterRevokeCount: counters.get("revoke-perm-public") || 0 });
+    return { errors: result.value.errors };
   });
 
   await check("download refuses local OneDrive sync destination by default", async () => {
@@ -939,7 +1148,13 @@ try {
     await tool("onedrive_cache_clear");
     const info = await tool("onedrive_get_info", { itemId: "delete-target" });
     assert(!info.isError, "get_info should seed cache", info);
-    const result = await tool("onedrive_rename", { itemId: "delete-target", newName: "renamed-cache.txt", expectedName: "delete-me.txt" });
+    const result = await tool("onedrive_rename", {
+      itemId: "delete-target",
+      newName: "renamed-cache.txt",
+      expectedName: "delete-me.txt",
+      dryRun: false,
+      confirmed: true
+    });
     assert(!result.isError, "rename should succeed", result);
     const cache = JSON.parse(readFileSync(join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json"), "utf8"));
     assert(!Object.hasOwn(cache.pathsByLower, "delete-me.txt"), "old cache path key should be removed", cache.pathsByLower);
@@ -954,7 +1169,13 @@ try {
     let cache = JSON.parse(readFileSync(join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json"), "utf8"));
     assert(cache.pathsByLower["folder a/deep summary deck.pptx"] === "deep-deck", "expected descendant cache path before rename", cache.pathsByLower);
 
-    const renamed = await tool("onedrive_rename", { itemId: "folder-a", newName: "Folder Renamed", expectedName: "Folder A" });
+    const renamed = await tool("onedrive_rename", {
+      itemId: "folder-a",
+      newName: "Folder Renamed",
+      expectedName: "Folder A",
+      dryRun: false,
+      confirmed: true
+    });
     assert(!renamed.isError, "folder rename should succeed", renamed);
     cache = JSON.parse(readFileSync(join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json"), "utf8"));
     assert(!Object.hasOwn(cache.pathsByLower, "folder a/deep summary deck.pptx"), "folder rename should remove stale descendant cache path", cache.pathsByLower);
@@ -1116,6 +1337,39 @@ try {
     assert(!publicIds.includes("root-note"), "public_links should exclude owner-only private files", publicLinks.value);
     return { sharedIds, publicIds };
   });
+
+  await check("audit log records live successes and safe failures", async () => {
+    const failed = await tool("onedrive_delete", {
+      itemId: "delete-fail",
+      expectedName: "delete-fail.txt",
+      dryRun: false,
+      confirmed: true
+    });
+    assert(failed.isError, "failed live delete should return tool error", failed);
+    const recent = await tool("onedrive_audit_recent", { limit: 20 });
+    assert(!recent.isError, "audit recent should succeed", recent);
+    const entries = recent.value.entries || [];
+    const tools = entries.map((entry) => entry.tool);
+    assert(tools.includes("onedrive_delete"), "audit should include live delete", entries);
+    assert(tools.includes("onedrive_create_sharing_link"), "audit should include live sharing link", entries);
+    assert(tools.includes("onedrive_revoke_permission"), "audit should include live revoke", entries);
+    assert(entries.some((entry) => entry.tool === "onedrive_delete" && entry.status === "failed" && entry.error?.message?.includes("mock delete failure")), "audit should include safe failed delete info", entries);
+    const serialized = JSON.stringify(entries);
+    assert(!serialized.includes("mock-token"), "audit should not include access token", entries);
+    assert(!serialized.includes("https://example.test/share/link"), "audit should not include sharing webUrl", entries);
+    return { count: entries.length, tools };
+  });
+
+  await check("audit_clear requires explicit confirmation", async () => {
+    const noConfirm = await tool("onedrive_audit_clear");
+    assert(!noConfirm.isError, "audit_clear no-confirm should be structured", noConfirm);
+    assert(noConfirm.value.requiredToClear, "audit_clear should require confirmation", noConfirm.value);
+    assert(auditEntries().length > 0, "audit log should remain before confirmed clear");
+    const cleared = await tool("onedrive_audit_clear", { confirmed: true });
+    assert(!cleared.isError, "confirmed audit_clear should succeed", cleared);
+    assert(auditEntries().length === 0, "audit log should be removed after confirmed clear", auditEntries());
+    return { cleared: cleared.value.cleared };
+  });
 } finally {
   child.stdin.end();
   child.kill("SIGTERM");
@@ -1130,4 +1384,5 @@ if (failCount === 0 && !keepWork) {
   rmSync(join(pluginRoot, "work", "mock-export.pdf"), { force: true });
   rmSync(join(pluginRoot, "work", "mock-export.txt"), { force: true });
 }
+if (failCount === 0) rmSync(mockHome, { recursive: true, force: true });
 if (failCount > 0) process.exitCode = 1;

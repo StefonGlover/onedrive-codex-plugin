@@ -2,7 +2,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createReadStream, createWriteStream, readFileSync } from "node:fs";
-import { mkdir, open, readFile, realpath, rename as renameFile, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, open, readFile, realpath, rename as renameFile, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -16,6 +16,8 @@ const cacheRoot = join(homedir(), ".codex", "onedrive-plugin", "cache");
 const cachePath = join(cacheRoot, "metadata-cache.json");
 const updateRoot = join(homedir(), ".codex", "onedrive-plugin", "updates");
 const backupRoot = join(homedir(), ".codex", "onedrive-plugin", "backups");
+const auditRoot = join(homedir(), ".codex", "onedrive-plugin", "audit");
+const auditPath = join(auditRoot, "mutations.jsonl");
 const localOneDriveSyncRoots = [
   { path: join(homedir(), "Library", "CloudStorage", "OneDrive"), prefix: false },
   { path: join(homedir(), "Library", "CloudStorage", "OneDrive-"), prefix: true },
@@ -86,6 +88,7 @@ const officeKinds = {
 let tokenCache = null;
 let pendingDevice = null;
 let metadataCacheMemory = null;
+let lastGraphRequestId = null;
 
 const outputFormatSchema = {
   type: "string",
@@ -232,7 +235,7 @@ const tools = [
       anyOf: itemTargetAnyOf,
       properties: {
         ...folderTargetProperties,
-        limit: { type: "integer", minimum: 1, maximum: 200, default: 100 },
+        limit: { type: "integer", minimum: 1, default: 100 },
         select: { type: "string", description: "Optional Graph $select fields." },
         format: outputFormatSchema
       },
@@ -306,7 +309,7 @@ const tools = [
       required: ["query"],
       properties: {
         query: { type: "string", minLength: 1 },
-        limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+        limit: { type: "integer", minimum: 1, default: 50 },
         format: outputFormatSchema
       },
       additionalProperties: false
@@ -694,7 +697,12 @@ const tools = [
       properties: {
         ...pathTargetProperties,
         newName: { type: "string", minLength: 1 },
-        dryRun: { type: "boolean", default: false },
+        dryRun: { type: "boolean", default: true },
+        confirmed: {
+          type: "boolean",
+          default: false,
+          description: "Must be true after explicit user confirmation because this renames a file or folder."
+        },
         expectedName: { type: "string", description: "Optional safety check: item name must match before renaming." },
         expectedId: { type: "string", description: "Optional safety check: item ID must match before renaming." }
       },
@@ -716,7 +724,12 @@ const tools = [
         destinationParentItemId: { type: "string", description: "Destination folder drive item ID." },
         ...destinationPresetProperties,
         newName: { type: "string", description: "Optional new name after moving." },
-        dryRun: { type: "boolean", default: false },
+        dryRun: { type: "boolean", default: true },
+        confirmed: {
+          type: "boolean",
+          default: false,
+          description: "Must be true after explicit user confirmation because this moves a file or folder."
+        },
         expectedName: { type: "string", description: "Optional safety check: source item name must match." },
         expectedId: { type: "string", description: "Optional safety check: source item ID must match." }
       },
@@ -738,7 +751,12 @@ const tools = [
         destinationParentItemId: { type: "string", description: "Destination folder drive item ID." },
         ...destinationPresetProperties,
         newName: { type: "string", description: "Optional copied item name." },
-        dryRun: { type: "boolean", default: false },
+        dryRun: { type: "boolean", default: true },
+        confirmed: {
+          type: "boolean",
+          default: false,
+          description: "Must be true after explicit user confirmation because this copies a file or folder."
+        },
         waitForCompletion: { type: "boolean", default: false },
         timeoutSeconds: { type: "integer", minimum: 1, maximum: 300, default: 60 },
         expectedName: { type: "string", description: "Optional safety check: source item name must match." },
@@ -771,6 +789,107 @@ const tools = [
         },
         expectedName: { type: "string", description: "Optional safety check: item name must match." },
         expectedId: { type: "string", description: "Optional safety check: item ID must match." }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_revoke_permission",
+    description: "Preview or revoke a OneDrive sharing permission. Defaults to dry-run and requires confirmation plus expected item identity for live revocation.",
+    inputSchema: {
+      type: "object",
+      required: ["permissionId"],
+      anyOf: itemTargetAnyOf,
+      properties: {
+        ...pathTargetProperties,
+        permissionId: { type: "string", minLength: 1 },
+        includePermissions: {
+          type: "boolean",
+          default: true,
+          description: "When true, include before permissions in dry-run and before/after permission diff for live revocation."
+        },
+        dryRun: { type: "boolean", default: true },
+        confirmed: {
+          type: "boolean",
+          default: false,
+          description: "Must be true after explicit user confirmation because this removes sharing access."
+        },
+        expectedName: { type: "string", description: "Optional safety check: item name must match." },
+        expectedId: { type: "string", description: "Optional safety check: item ID must match." }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_batch_revoke_permissions",
+    description: "Preview or revoke multiple OneDrive sharing permissions. Live revoke preflights every item before any DELETE.",
+    inputSchema: {
+      type: "object",
+      required: ["items"],
+      properties: {
+        items: {
+          type: "array",
+          minItems: 1,
+          maxItems: 50,
+          items: {
+            type: "object",
+            required: ["permissionId"],
+            anyOf: itemTargetAnyOf,
+            properties: {
+              ...pathTargetProperties,
+              permissionId: { type: "string", minLength: 1 },
+              expectedName: { type: "string" },
+              expectedId: { type: "string" }
+            },
+            additionalProperties: false
+          }
+        },
+        includePermissions: { type: "boolean", default: true },
+        dryRun: { type: "boolean", default: true },
+        confirmed: {
+          type: "boolean",
+          default: false,
+          description: "Must be true after explicit user confirmation for live batch permission revocation."
+        }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_batch_move",
+    description: "Preview or move multiple OneDrive items to one destination folder. Live moves preflight every item before any PATCH.",
+    inputSchema: {
+      type: "object",
+      required: ["items"],
+      properties: {
+        items: {
+          type: "array",
+          minItems: 1,
+          maxItems: 50,
+          items: {
+            type: "object",
+            anyOf: itemTargetAnyOf,
+            properties: {
+              path: { type: "string", description: "Source item path relative to OneDrive root." },
+              itemId: { type: "string", description: "Source drive item ID." },
+              preset: presetSchema,
+              relativePath: relativePathSchema,
+              newName: { type: "string" },
+              expectedName: { type: "string" },
+              expectedId: { type: "string" }
+            },
+            additionalProperties: false
+          }
+        },
+        destinationParentPath: { type: "string", description: "Destination folder path relative to root. Omit or use / for root." },
+        destinationParentItemId: { type: "string", description: "Destination folder drive item ID." },
+        ...destinationPresetProperties,
+        dryRun: { type: "boolean", default: true },
+        confirmed: {
+          type: "boolean",
+          default: false,
+          description: "Must be true after explicit user confirmation for live batch moves."
+        }
       },
       additionalProperties: false
     }
@@ -1054,6 +1173,45 @@ const tools = [
     }
   },
   {
+    name: "onedrive_audit_recent",
+    description: "Read recent local OneDrive live-mutation audit log entries.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", minimum: 1, maximum: 500, default: 50 }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_audit_export",
+    description: "Export the local OneDrive live-mutation audit log to a JSONL file.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        localPath: { type: "string", description: "Optional export path. Defaults to ~/.codex/onedrive-plugin/audit/export-<timestamp>.jsonl." },
+        overwrite: { type: "boolean", default: false },
+        allowLocalOneDriveSyncPath: {
+          type: "boolean",
+          default: false,
+          description: "Explicit override to write into a locally synced OneDrive folder."
+        }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_audit_clear",
+    description: "Clear the local OneDrive live-mutation audit log. Requires confirmed=true.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        confirmed: { type: "boolean", default: false }
+      },
+      additionalProperties: false
+    }
+  },
+  {
     name: "onedrive_delete",
     description: "Delete a OneDrive item by path or item ID. Defaults to dry-run.",
     inputSchema: {
@@ -1074,6 +1232,128 @@ const tools = [
     }
   }
 ];
+
+const toolByName = new Map(tools.map((tool) => [tool.name, tool]));
+
+function schemaTypeMatches(value, type) {
+  if (type === "array") return Array.isArray(value);
+  if (type === "integer") return Number.isInteger(value);
+  if (type === "number") return typeof value === "number" && Number.isFinite(value);
+  if (type === "object") return value !== null && typeof value === "object" && !Array.isArray(value);
+  return typeof value === type;
+}
+
+function validationDetail(path, message) {
+  return { path, message };
+}
+
+function cloneDefault(value) {
+  if (value === null || typeof value !== "object") return value;
+  return JSON.parse(JSON.stringify(value));
+}
+
+function validateSchemaValue(value, schema = {}, path = "$") {
+  const details = [];
+  let normalized = value;
+
+  if (schema.default !== undefined && normalized === undefined) {
+    normalized = cloneDefault(schema.default);
+  }
+
+  if (normalized === undefined) return { ok: true, value: normalized, details };
+
+  if (schema.type && !schemaTypeMatches(normalized, schema.type)) {
+    details.push(validationDetail(path, `Expected ${schema.type}.`));
+    return { ok: false, value: normalized, details };
+  }
+
+  if (schema.enum && !schema.enum.includes(normalized)) {
+    details.push(validationDetail(path, `Expected one of: ${schema.enum.join(", ")}.`));
+  }
+
+  if ((schema.type === "number" || schema.type === "integer") && typeof normalized === "number") {
+    if (schema.minimum !== undefined && normalized < schema.minimum) {
+      details.push(validationDetail(path, `Must be >= ${schema.minimum}.`));
+    }
+    if (schema.maximum !== undefined && normalized > schema.maximum) {
+      details.push(validationDetail(path, `Must be <= ${schema.maximum}.`));
+    }
+  }
+
+  if (schema.type === "string" && typeof normalized === "string") {
+    if (schema.minLength !== undefined && normalized.length < schema.minLength) {
+      details.push(validationDetail(path, `Must be at least ${schema.minLength} characters.`));
+    }
+    if (schema.maxLength !== undefined && normalized.length > schema.maxLength) {
+      details.push(validationDetail(path, `Must be at most ${schema.maxLength} characters.`));
+    }
+  }
+
+  if (schema.type === "array" && Array.isArray(normalized)) {
+    if (schema.minItems !== undefined && normalized.length < schema.minItems) {
+      details.push(validationDetail(path, `Must contain at least ${schema.minItems} item(s).`));
+    }
+    if (schema.maxItems !== undefined && normalized.length > schema.maxItems) {
+      details.push(validationDetail(path, `Must contain at most ${schema.maxItems} item(s).`));
+    }
+    if (schema.items) {
+      normalized = normalized.map((item, index) => {
+        const child = validateSchemaValue(item, schema.items, `${path}[${index}]`);
+        details.push(...child.details);
+        return child.value;
+      });
+    }
+  }
+
+  if (schema.type === "object" && normalized && typeof normalized === "object" && !Array.isArray(normalized)) {
+    const properties = schema.properties || {};
+    normalized = { ...normalized };
+    for (const required of schema.required || []) {
+      if (!Object.hasOwn(normalized, required)) {
+        details.push(validationDetail(`${path}.${required}`, "Required field is missing."));
+      }
+    }
+    if (schema.additionalProperties === false) {
+      for (const key of Object.keys(normalized)) {
+        if (!Object.hasOwn(properties, key)) {
+          details.push(validationDetail(`${path}.${key}`, "Unknown property."));
+        }
+      }
+    }
+    for (const [key, propertySchema] of Object.entries(properties)) {
+      const child = validateSchemaValue(normalized[key], propertySchema, `${path}.${key}`);
+      details.push(...child.details);
+      if (child.value !== undefined || Object.hasOwn(normalized, key)) normalized[key] = child.value;
+    }
+    if (schema.anyOf?.length) {
+      const branchMatches = schema.anyOf.some((branch) => (branch.required || []).every((key) => Object.hasOwn(normalized, key)));
+      if (!branchMatches) {
+        const options = schema.anyOf
+          .map((branch) => (branch.required || []).join(" + "))
+          .filter(Boolean)
+          .join(" or ");
+        details.push(validationDetail(path, `Must include one target option: ${options}.`));
+      }
+    }
+  }
+
+  return { ok: details.length === 0, value: normalized, details };
+}
+
+function validateToolArguments(name, args = {}) {
+  const tool = toolByName.get(name);
+  if (!tool) return { ok: true, args };
+  const result = validateSchemaValue(args || {}, tool.inputSchema || { type: "object" }, "$");
+  if (result.ok) return { ok: true, args: result.value };
+  return {
+    ok: false,
+    error: {
+      error: "invalid_arguments",
+      tool: name,
+      details: result.details
+    }
+  };
+}
 
 function readLocalConfig() {
   try {
@@ -1608,13 +1888,25 @@ async function fetchWithRetry(url, options = {}, retryOptions = {}) {
   }
 }
 
+function graphRequestId(headers, body) {
+  return headers?.get?.("request-id")
+    || headers?.get?.("x-ms-request-id")
+    || headers?.get?.("client-request-id")
+    || body?.error?.innerError?.["request-id"]
+    || body?.error?.innerError?.requestId
+    || null;
+}
+
 function microsoftGraphError(body, response) {
   const code = body?.error?.code ? `${body.error.code}: ` : "";
   const textBody = typeof body === "string" ? body.trim() : "";
   const message = body?.error?.message || textBody || `${response.status} ${response.statusText}`;
-  const requestId = body?.error?.innerError?.["request-id"] || body?.error?.innerError?.requestId;
+  const requestId = graphRequestId(response.headers, body);
   const suffix = requestId ? ` (request-id: ${requestId})` : "";
-  return new Error(`Microsoft Graph error: ${code}${message}${suffix}`);
+  const error = new Error(`Microsoft Graph error: ${code}${message}${suffix}`);
+  error.graphRequestId = requestId;
+  error.graphStatus = response.status;
+  return error;
 }
 
 function graphBaseUrl() {
@@ -1662,8 +1954,9 @@ async function graph(path, options = {}) {
     headers
   }, { maxRetries: retryCountForRequest(fetchOptions, maxRetries) });
   const body = await parseResponseBody(retriedResponse);
+  lastGraphRequestId = graphRequestId(retriedResponse.headers, body);
   if (returnResponse) {
-    return { body, headers: retriedResponse.headers, status: retriedResponse.status, ok: retriedResponse.ok };
+    return { body, headers: retriedResponse.headers, status: retriedResponse.status, ok: retriedResponse.ok, graphRequestId: lastGraphRequestId };
   }
   if (!retriedResponse.ok) {
     throw microsoftGraphError(body, retriedResponse);
@@ -1927,6 +2220,10 @@ function itemBase(args = {}) {
   return `/me/drive/root:/${encodeDrivePath(resolved.path)}:`;
 }
 
+function itemIdBase(itemId) {
+  return `/me/drive/items/${encodeURIComponent(itemId)}`;
+}
+
 function requireNonRootTarget(args = {}, operation) {
   const resolved = itemArgsWithResolvedPath(args);
   if (!resolved.itemId && (!resolved.path || cleanPath(resolved.path) === "")) {
@@ -1941,6 +2238,141 @@ function assertExpectedItem(rawItem, args = {}, operation) {
   if (args.expectedName && rawItem.name !== args.expectedName) {
     throw new Error(`${operation} expected item named ${args.expectedName}, but resolved ${rawItem.name}. Refusing to continue.`);
   }
+}
+
+function hasExpectedIdentity(args = {}) {
+  return Boolean(args.expectedName || args.expectedId);
+}
+
+function itemAuditSummary(item) {
+  const simplified = item?.remotePath !== undefined ? item : simplifyItem(item);
+  if (!simplified) return null;
+  return {
+    id: simplified.id,
+    name: simplified.name,
+    remotePath: simplified.remotePath,
+    type: simplified.folder ? "folder" : simplified.file ? "file" : "item",
+    size: simplified.size,
+    lastModifiedDateTime: simplified.lastModifiedDateTime
+  };
+}
+
+function permissionAuditSummary(permission = {}) {
+  return {
+    id: permission.id,
+    roles: permission.roles,
+    link: permission.link ? {
+      type: permission.link.type,
+      scope: permission.link.scope,
+      preventsDownload: permission.link.preventsDownload
+    } : undefined,
+    grantedTo: permission.grantedTo,
+    grantedToV2: permission.grantedToV2,
+    grantedToIdentities: permission.grantedToIdentities,
+    invitation: permission.invitation,
+    inheritedFrom: permission.inheritedFrom ? itemAuditSummary(permission.inheritedFrom) : undefined,
+    expirationDateTime: permission.expirationDateTime,
+    hasPassword: permission.hasPassword
+  };
+}
+
+function permissionDiffAuditSummary(diff = {}) {
+  return {
+    added: (diff.added || []).map(permissionAuditSummary),
+    removed: (diff.removed || []).map(permissionAuditSummary),
+    unchangedCount: diff.unchangedCount || 0,
+    beforeCount: diff.beforeCount || 0,
+    afterCount: diff.afterCount || 0
+  };
+}
+
+function safeErrorInfo(error) {
+  return {
+    message: error?.message || String(error),
+    graphRequestId: error?.graphRequestId || lastGraphRequestId || undefined,
+    graphStatus: error?.graphStatus
+  };
+}
+
+function sanitizeAuditValue(value) {
+  if (Array.isArray(value)) return value.map(sanitizeAuditValue);
+  if (!value || typeof value !== "object") return value;
+  const clean = {};
+  const forbidden = new Set([
+    "access_token", "refresh_token", "id_token", "Authorization", "authorization",
+    "content", "body", "uploadUrl", "monitorUrl", "resourceLocation", "webUrl"
+  ]);
+  for (const [key, entry] of Object.entries(value)) {
+    if (forbidden.has(key)) continue;
+    clean[key] = sanitizeAuditValue(entry);
+  }
+  return clean;
+}
+
+async function writeMutationAudit(tool, entry) {
+  const record = sanitizeAuditValue({
+    timestamp: new Date().toISOString(),
+    tool,
+    ...entry,
+    graphRequestId: entry.graphRequestId || lastGraphRequestId || undefined
+  });
+  await mkdir(auditRoot, { recursive: true });
+  await appendFile(auditPath, `${JSON.stringify(record)}\n`, "utf8");
+  return record;
+}
+
+async function auditRecent(args = {}) {
+  let text = "";
+  try {
+    text = await readFile(auditPath, "utf8");
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const limit = args.limit ?? 50;
+  const entries = text.trim()
+    ? text.trim().split("\n").slice(-limit).map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return { malformed: true, line };
+        }
+      })
+    : [];
+  return { auditPath, count: entries.length, entries };
+}
+
+async function auditExport(args = {}) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const target = args.localPath ? resolve(args.localPath) : join(auditRoot, `export-${stamp}.jsonl`);
+  await assertNotLocalOneDriveSyncPathForWrite(target, "Audit export", args);
+  if (args.overwrite !== true) {
+    try {
+      await stat(target);
+      throw new Error(`Local file already exists: ${target}. Pass overwrite: true to replace it.`);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  await mkdir(dirname(target), { recursive: true });
+  try {
+    await copyFile(auditPath, target);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    await writeFile(target, "");
+  }
+  return { auditPath, localPath: target };
+}
+
+async function auditClear(args = {}) {
+  if (args.confirmed !== true) {
+    return {
+      confirmed: false,
+      auditPath,
+      requiredToClear: "Set confirmed: true after explicit user confirmation to clear the local mutation audit log."
+    };
+  }
+  await rm(auditPath, { force: true });
+  return { confirmed: true, auditPath, cleared: true };
 }
 
 function childrenPath(args = {}) {
@@ -2943,43 +3375,6 @@ async function batchDelete(args = {}) {
   return { dryRun: args.dryRun !== false, confirmed: args.confirmed === true, count: results.length, results };
 }
 
-async function batchMove(args = {}) {
-  if (args.dryRun === false) {
-    if (args.confirmed !== true) {
-      return {
-        dryRun: false,
-        confirmed: false,
-        count: (args.items || []).length,
-        requiredToMove: "Set dryRun: false and confirmed: true after explicit user confirmation."
-      };
-    }
-    const missingExpected = (args.items || []).filter((item) => !item.expectedName && !item.expectedId);
-    if (missingExpected.length) {
-      return {
-        dryRun: false,
-        confirmed: true,
-        count: (args.items || []).length,
-        requiredToMove: "Provide expectedName or expectedId for every item in a live batch move.",
-        missingExpectedCount: missingExpected.length
-      };
-    }
-  }
-  const parentReference = await resolveDestinationParent(args);
-  const results = [];
-  for (const item of args.items || []) {
-    try {
-      results.push(await moveItem({
-        ...item,
-        destinationParentItemId: parentReference.id,
-        dryRun: args.dryRun !== false
-      }));
-    } catch (error) {
-      results.push({ target: item, error: error.message });
-    }
-  }
-  return { dryRun: args.dryRun !== false, confirmed: args.confirmed === true, destination: parentReference, count: results.length, results };
-}
-
 async function getRawInfo(args = {}) {
   const resolved = itemArgsWithResolvedPath(args);
   if (!resolved.path && !resolved.itemId) throw new Error("Provide path, preset, or itemId.");
@@ -3457,24 +3852,45 @@ async function upload(args = {}) {
   const fileStat = await stat(localPath);
   if (!fileStat.isFile()) throw new Error(`Not a file: ${localPath}`);
   const uploadMode = args.uploadMode || "auto";
-  if (fileStat.size > 0 && (uploadMode === "session" || (uploadMode === "auto" && fileStat.size > simpleUploadLimit))) {
-    return await uploadLarge({ ...args, localPath, remotePath: destinationPath }, fileStat);
-  }
-  if (uploadMode === "simple" && fileStat.size > simpleUploadLimit) {
-    throw new Error(`Simple upload only supports files up to ${simpleUploadLimit} bytes. Use uploadMode: "session" or "auto".`);
-  }
-  const stream = createReadStream(localPath);
-  const result = await graph(uploadPath(destinationPath, args.conflictBehavior || "fail"), {
-    method: "PUT",
-    body: stream,
-    duplex: "half",
-    headers: {
-      "Content-Type": "application/octet-stream",
-      ...(args.ifMatch ? { "If-Match": args.ifMatch } : {})
+  try {
+    let response;
+    if (fileStat.size > 0 && (uploadMode === "session" || (uploadMode === "auto" && fileStat.size > simpleUploadLimit))) {
+      response = await uploadLarge({ ...args, localPath, remotePath: destinationPath }, fileStat);
+    } else {
+      if (uploadMode === "simple" && fileStat.size > simpleUploadLimit) {
+        throw new Error(`Simple upload only supports files up to ${simpleUploadLimit} bytes. Use uploadMode: "session" or "auto".`);
+      }
+      const stream = createReadStream(localPath);
+      const result = await graph(uploadPath(destinationPath, args.conflictBehavior || "fail"), {
+        method: "PUT",
+        body: stream,
+        duplex: "half",
+        headers: {
+          "Content-Type": "application/octet-stream",
+          ...(args.ifMatch ? { "If-Match": args.ifMatch } : {})
+        }
+      });
+      await cacheItems([result]);
+      response = { item: simplifyItem(result), localPath, bytesUploaded: fileStat.size, uploadMode: "simple" };
     }
-  });
-  await cacheItems([result]);
-  return { item: simplifyItem(result), localPath, bytesUploaded: fileStat.size, uploadMode: "simple" };
+    await writeMutationAudit("onedrive_upload", {
+      status: "success",
+      target: { remotePath: destinationPath },
+      after: itemAuditSummary(response.item),
+      localPath,
+      bytes: fileStat.size
+    });
+    return response;
+  } catch (error) {
+    await writeMutationAudit("onedrive_upload", {
+      status: "failed",
+      target: { remotePath: destinationPath },
+      localPath,
+      bytes: fileStat.size,
+      error: safeErrorInfo(error)
+    });
+    throw error;
+  }
 }
 
 function normalizeChunkSize(value = defaultUploadChunkSize) {
@@ -3574,13 +3990,30 @@ async function createUploadSession(sessionTarget, conflictBehavior, ifMatch) {
 
 async function writeText(args = {}) {
   const destinationPath = remotePath(args);
-  const result = await graph(uploadPath(destinationPath, args.conflictBehavior || "fail"), {
-    method: "PUT",
-    body: Buffer.from(args.content, "utf8"),
-    headers: { "Content-Type": "text/plain; charset=utf-8" }
-  });
-  await cacheItems([result]);
-  return { item: simplifyItem(result), bytesUploaded: Buffer.byteLength(args.content, "utf8") };
+  try {
+    const result = await graph(uploadPath(destinationPath, args.conflictBehavior || "fail"), {
+      method: "PUT",
+      body: Buffer.from(args.content, "utf8"),
+      headers: { "Content-Type": "text/plain; charset=utf-8" }
+    });
+    await cacheItems([result]);
+    const response = { item: simplifyItem(result), bytesUploaded: Buffer.byteLength(args.content, "utf8") };
+    await writeMutationAudit("onedrive_write_text", {
+      status: "success",
+      target: { remotePath: destinationPath },
+      after: itemAuditSummary(response.item),
+      bytes: response.bytesUploaded
+    });
+    return response;
+  } catch (error) {
+    await writeMutationAudit("onedrive_write_text", {
+      status: "failed",
+      target: { remotePath: destinationPath },
+      bytes: Buffer.byteLength(args.content || "", "utf8"),
+      error: safeErrorInfo(error)
+    });
+    throw error;
+  }
 }
 
 async function createFolder(args = {}) {
@@ -3592,16 +4025,31 @@ async function createFolder(args = {}) {
         preset: args.parentPreset,
         relativePath: args.parentRelativePath
       });
-  const result = await graph(endpoint, {
-    method: "POST",
-    body: JSON.stringify({
-      name,
-      folder: {},
-      "@microsoft.graph.conflictBehavior": args.conflictBehavior || "fail"
-    })
-  });
-  await cacheItems([result]);
-  return simplifyItem(result);
+  try {
+    const result = await graph(endpoint, {
+      method: "POST",
+      body: JSON.stringify({
+        name,
+        folder: {},
+        "@microsoft.graph.conflictBehavior": args.conflictBehavior || "fail"
+      })
+    });
+    await cacheItems([result]);
+    const item = simplifyItem(result);
+    await writeMutationAudit("onedrive_create_folder", {
+      status: "success",
+      target: { parentPath: args.parentPath, parentItemId: args.parentItemId, name },
+      after: itemAuditSummary(item)
+    });
+    return item;
+  } catch (error) {
+    await writeMutationAudit("onedrive_create_folder", {
+      status: "failed",
+      target: { parentPath: args.parentPath, parentItemId: args.parentItemId, name },
+      error: safeErrorInfo(error)
+    });
+    throw error;
+  }
 }
 
 async function rename(args = {}) {
@@ -3610,15 +4058,52 @@ async function rename(args = {}) {
   const current = await getRawInfo(args);
   if (current.root) throw new Error("Rename refuses to operate on the OneDrive root.");
   assertExpectedItem(current, args, "Rename");
-  if (args.dryRun === true) {
-    return { dryRun: true, wouldRename: simplifyItem(current), newName };
+  const item = simplifyItem(current);
+  if (args.dryRun !== false) {
+    return { dryRun: true, wouldRename: item, newName };
   }
-  const result = await graph(itemBase(args), {
-    method: "PATCH",
-    body: JSON.stringify({ name: newName })
-  });
-  await cacheMovedOrRenamedItem(current, result);
-  return simplifyItem(result);
+  if (args.confirmed !== true) {
+    return {
+      dryRun: false,
+      confirmed: false,
+      wouldRename: item,
+      newName,
+      requiredToRename: "Set dryRun: false and confirmed: true after explicit user confirmation."
+    };
+  }
+  if (!hasExpectedIdentity(args)) {
+    return {
+      dryRun: false,
+      confirmed: true,
+      wouldRename: item,
+      newName,
+      requiredToRename: "Provide expectedName or expectedId for live renames."
+    };
+  }
+  try {
+    const result = await graph(itemBase(args), {
+      method: "PATCH",
+      body: JSON.stringify({ name: newName })
+    });
+    await cacheMovedOrRenamedItem(current, result);
+    const renamed = simplifyItem(result);
+    await writeMutationAudit("onedrive_rename", {
+      status: "success",
+      target: itemAuditSummary(current),
+      before: itemAuditSummary(current),
+      after: itemAuditSummary(renamed)
+    });
+    return { dryRun: false, confirmed: true, renamed };
+  } catch (error) {
+    await writeMutationAudit("onedrive_rename", {
+      status: "failed",
+      target: itemAuditSummary(current),
+      before: itemAuditSummary(current),
+      requestedName: newName,
+      error: safeErrorInfo(error)
+    });
+    throw error;
+  }
 }
 
 async function moveItem(args = {}) {
@@ -3630,15 +4115,56 @@ async function moveItem(args = {}) {
   const parentReference = await resolveDestinationParent(args);
   const body = { parentReference: { id: parentReference.id } };
   if (args.newName) body.name = args.newName;
-  if (args.dryRun === true) {
-    return { dryRun: true, wouldMove: simplifyItem(current), destination: parentReference, newName: args.newName || null };
+  const item = simplifyItem(current);
+  if (args.dryRun !== false) {
+    return { dryRun: true, wouldMove: item, destination: parentReference, newName: args.newName || null };
   }
-  const result = await graph(itemBase(args), {
-    method: "PATCH",
-    body: JSON.stringify(body)
-  });
-  await cacheMovedOrRenamedItem(current, result);
-  return simplifyItem(result);
+  if (args.confirmed !== true) {
+    return {
+      dryRun: false,
+      confirmed: false,
+      wouldMove: item,
+      destination: parentReference,
+      newName: args.newName || null,
+      requiredToMove: "Set dryRun: false and confirmed: true after explicit user confirmation."
+    };
+  }
+  if (!hasExpectedIdentity(args)) {
+    return {
+      dryRun: false,
+      confirmed: true,
+      wouldMove: item,
+      destination: parentReference,
+      newName: args.newName || null,
+      requiredToMove: "Provide expectedName or expectedId for live moves."
+    };
+  }
+  try {
+    const result = await graph(itemBase(args), {
+      method: "PATCH",
+      body: JSON.stringify(body)
+    });
+    await cacheMovedOrRenamedItem(current, result);
+    const moved = simplifyItem(result);
+    await writeMutationAudit("onedrive_move", {
+      status: "success",
+      target: itemAuditSummary(current),
+      before: itemAuditSummary(current),
+      after: itemAuditSummary(moved),
+      destination: parentReference
+    });
+    return { dryRun: false, confirmed: true, moved };
+  } catch (error) {
+    await writeMutationAudit("onedrive_move", {
+      status: "failed",
+      target: itemAuditSummary(current),
+      before: itemAuditSummary(current),
+      destination: parentReference,
+      newName: args.newName || null,
+      error: safeErrorInfo(error)
+    });
+    throw error;
+  }
 }
 
 async function pollCopyMonitor(monitorUrl, timeoutSeconds = 60) {
@@ -3671,29 +4197,72 @@ async function copyItem(args = {}) {
   if (current.root) throw new Error("Copy refuses to operate on the OneDrive root.");
   assertExpectedItem(current, args, "Copy");
   const parentReference = await resolveDestinationParent(args);
-  if (args.dryRun === true) {
-    return { dryRun: true, wouldCopy: simplifyItem(current), destination: parentReference, newName: args.newName || null };
+  const item = simplifyItem(current);
+  if (args.dryRun !== false) {
+    return { dryRun: true, wouldCopy: item, destination: parentReference, newName: args.newName || null };
   }
-  const response = await graph(`${itemBase(args)}/copy`, {
-    method: "POST",
-    returnResponse: true,
-    body: JSON.stringify({
-      parentReference: { id: parentReference.id },
-      ...(args.newName ? { name: args.newName } : {})
-    })
-  });
-  if (!response.ok) throw microsoftGraphError(response.body, { status: response.status, statusText: "Copy failed" });
-  const monitorUrl = response.headers.get("location");
-  const result = {
-    accepted: response.status === 202 || response.ok,
-    status: response.status,
-    source: simplifyItem(current),
-    monitorUrl
-  };
-  if (args.waitForCompletion && monitorUrl) {
-    result.monitor = await pollCopyMonitor(monitorUrl, args.timeoutSeconds ?? 60);
+  if (args.confirmed !== true) {
+    return {
+      dryRun: false,
+      confirmed: false,
+      wouldCopy: item,
+      destination: parentReference,
+      newName: args.newName || null,
+      requiredToCopy: "Set dryRun: false and confirmed: true after explicit user confirmation."
+    };
   }
-  return result;
+  if (!hasExpectedIdentity(args)) {
+    return {
+      dryRun: false,
+      confirmed: true,
+      wouldCopy: item,
+      destination: parentReference,
+      newName: args.newName || null,
+      requiredToCopy: "Provide expectedName or expectedId for live copies."
+    };
+  }
+  try {
+    const response = await graph(`${itemBase(args)}/copy`, {
+      method: "POST",
+      returnResponse: true,
+      body: JSON.stringify({
+        parentReference: { id: parentReference.id },
+        ...(args.newName ? { name: args.newName } : {})
+      })
+    });
+    if (!response.ok) throw microsoftGraphError(response.body, { headers: response.headers, status: response.status, statusText: "Copy failed" });
+    const monitorUrl = response.headers.get("location");
+    const result = {
+      dryRun: false,
+      confirmed: true,
+      accepted: response.status === 202 || response.ok,
+      status: response.status,
+      source: item,
+      monitorUrl
+    };
+    await writeMutationAudit("onedrive_copy", {
+      status: "success",
+      target: itemAuditSummary(current),
+      before: itemAuditSummary(current),
+      destination: parentReference,
+      newName: args.newName || null,
+      graphRequestId: response.graphRequestId
+    });
+    if (args.waitForCompletion && monitorUrl) {
+      result.monitor = await pollCopyMonitor(monitorUrl, args.timeoutSeconds ?? 60);
+    }
+    return result;
+  } catch (error) {
+    await writeMutationAudit("onedrive_copy", {
+      status: "failed",
+      target: itemAuditSummary(current),
+      before: itemAuditSummary(current),
+      destination: parentReference,
+      newName: args.newName || null,
+      error: safeErrorInfo(error)
+    });
+    throw error;
+  }
 }
 
 async function createSharingLink(args = {}) {
@@ -3723,6 +4292,14 @@ async function createSharingLink(args = {}) {
       requiredToCreate: "Set dryRun: false and confirmed: true after explicit user confirmation."
     };
   }
+  if (!hasExpectedIdentity(args)) {
+    return {
+      ...preview,
+      dryRun: false,
+      confirmed: true,
+      requiredToCreate: "Provide expectedName or expectedId for live sharing-link creation."
+    };
+  }
   const body = {
     type: args.type || "view",
     scope: args.scope || "anonymous"
@@ -3730,22 +4307,327 @@ async function createSharingLink(args = {}) {
   if (typeof args.retainInheritedPermissions === "boolean") {
     body.retainInheritedPermissions = args.retainInheritedPermissions;
   }
-  const result = await graph(`${itemBase(args)}/createLink`, {
-    method: "POST",
-    body: JSON.stringify(body)
-  });
-  const afterPermissions = includePermissionDiff ? await permissionList(args, "compact") : null;
+  try {
+    const result = await graph(`${itemBase(args)}/createLink`, {
+      method: "POST",
+      body: JSON.stringify(body)
+    });
+    const afterPermissions = includePermissionDiff ? await permissionList(args, "compact") : null;
+    const permissionDiff = includePermissionDiff ? diffPermissions(beforePermissions, afterPermissions) : null;
+    await writeMutationAudit("onedrive_create_sharing_link", {
+      status: "success",
+      target: itemAuditSummary(current),
+      beforePermissions: includePermissionDiff ? beforePermissions.map(permissionAuditSummary) : undefined,
+      afterPermissions: includePermissionDiff ? afterPermissions.map(permissionAuditSummary) : undefined,
+      permissionDiff: includePermissionDiff ? permissionDiffAuditSummary(permissionDiff) : undefined
+    });
+    return {
+      dryRun: false,
+      confirmed: true,
+      item: simplifyItem(current),
+      permission: result,
+      ...(includePermissionDiff ? {
+        beforePermissions,
+        afterPermissions,
+        permissionDiff
+      } : {})
+    };
+  } catch (error) {
+    await writeMutationAudit("onedrive_create_sharing_link", {
+      status: "failed",
+      target: itemAuditSummary(current),
+      beforePermissions: includePermissionDiff ? beforePermissions.map(permissionAuditSummary) : undefined,
+      error: safeErrorInfo(error)
+    });
+    throw error;
+  }
+}
+
+function assertPermissionPresent(permissions = [], permissionId) {
+  if (!permissions.some((permission) => permission.id === permissionId)) {
+    throw new Error(`Permission ${permissionId} was not found on the target item. Refusing to continue.`);
+  }
+}
+
+async function preflightRevokePermission(args = {}, options = {}) {
+  requireNonRootTarget(args, "Revoke permission");
+  const current = await getRawInfo(args);
+  if (current.root) throw new Error("Revoke permission refuses to operate on the OneDrive root.");
+  assertExpectedItem(current, args, "Revoke permission");
+  const includePermissions = options.includePermissions !== false;
+  const beforePermissions = includePermissions ? await permissionList({ itemId: current.id }, "compact") : [];
+  if (includePermissions) assertPermissionPresent(beforePermissions, args.permissionId);
   return {
-    dryRun: false,
-    confirmed: true,
+    targetArgs: args,
+    rawItem: current,
     item: simplifyItem(current),
-    permission: result,
-    ...(includePermissionDiff ? {
-      beforePermissions,
-      afterPermissions,
-      permissionDiff: diffPermissions(beforePermissions, afterPermissions)
+    beforePermissions,
+    includePermissions
+  };
+}
+
+async function revokePermission(args = {}) {
+  const preflight = await preflightRevokePermission(args, { includePermissions: args.includePermissions });
+  const preview = {
+    dryRun: args.dryRun !== false,
+    confirmed: args.confirmed === true,
+    wouldRevoke: {
+      item: preflight.item,
+      permissionId: args.permissionId
+    },
+    ...(preflight.includePermissions ? {
+      beforePermissions: preflight.beforePermissions,
+      beforePermissionCount: preflight.beforePermissions.length
     } : {})
   };
+  if (args.dryRun !== false || args.confirmed !== true) {
+    return {
+      ...preview,
+      requiredToRevoke: "Set dryRun: false and confirmed: true after explicit user confirmation."
+    };
+  }
+  if (!hasExpectedIdentity(args)) {
+    return {
+      ...preview,
+      dryRun: false,
+      confirmed: true,
+      requiredToRevoke: "Provide expectedName or expectedId for live permission revocation."
+    };
+  }
+  try {
+    const response = await graph(`${itemIdBase(preflight.rawItem.id)}/permissions/${encodeURIComponent(args.permissionId)}`, {
+      method: "DELETE",
+      returnResponse: true
+    });
+    if (!response.ok) throw microsoftGraphError(response.body, { headers: response.headers, status: response.status, statusText: "Revoke permission failed" });
+    const afterPermissions = preflight.includePermissions ? await permissionList({ itemId: preflight.rawItem.id }, "compact") : null;
+    const permissionDiff = preflight.includePermissions ? diffPermissions(preflight.beforePermissions, afterPermissions) : null;
+    await writeMutationAudit("onedrive_revoke_permission", {
+      status: "success",
+      target: itemAuditSummary(preflight.rawItem),
+      permissionId: args.permissionId,
+      beforePermissions: preflight.includePermissions ? preflight.beforePermissions.map(permissionAuditSummary) : undefined,
+      afterPermissions: preflight.includePermissions ? afterPermissions.map(permissionAuditSummary) : undefined,
+      permissionDiff: preflight.includePermissions ? permissionDiffAuditSummary(permissionDiff) : undefined,
+      graphRequestId: response.graphRequestId
+    });
+    return {
+      dryRun: false,
+      confirmed: true,
+      item: preflight.item,
+      permissionId: args.permissionId,
+      ...(preflight.includePermissions ? {
+        beforePermissions: preflight.beforePermissions,
+        afterPermissions,
+        permissionDiff
+      } : {})
+    };
+  } catch (error) {
+    await writeMutationAudit("onedrive_revoke_permission", {
+      status: "failed",
+      target: itemAuditSummary(preflight.rawItem),
+      permissionId: args.permissionId,
+      beforePermissions: preflight.includePermissions ? preflight.beforePermissions.map(permissionAuditSummary) : undefined,
+      error: safeErrorInfo(error)
+    });
+    throw error;
+  }
+}
+
+async function batchRevokePermissions(args = {}) {
+  const items = args.items || [];
+  if (args.dryRun === false) {
+    if (args.confirmed !== true) {
+      return {
+        dryRun: false,
+        confirmed: false,
+        count: items.length,
+        requiredToRevoke: "Set dryRun: false and confirmed: true after explicit user confirmation."
+      };
+    }
+    const missingExpected = items.filter((item) => !hasExpectedIdentity(item));
+    if (missingExpected.length) {
+      return {
+        dryRun: false,
+        confirmed: true,
+        count: items.length,
+        requiredToRevoke: "Provide expectedName or expectedId for every item in a live batch permission revoke.",
+        missingExpectedCount: missingExpected.length
+      };
+    }
+  }
+
+  const preflight = [];
+  const preflightErrors = [];
+  for (const [index, item] of items.entries()) {
+    try {
+      preflight.push(await preflightRevokePermission(item, { includePermissions: args.includePermissions }));
+    } catch (error) {
+      preflightErrors.push({ index, target: item, error: error.message });
+    }
+  }
+  if (preflightErrors.length) {
+    return {
+      dryRun: args.dryRun !== false,
+      confirmed: args.confirmed === true,
+      count: items.length,
+      preflightFailed: true,
+      errors: preflightErrors,
+      requiredToRevoke: "Fix every preflight error before running a batch permission revoke."
+    };
+  }
+
+  if (args.dryRun !== false) {
+    return {
+      dryRun: true,
+      confirmed: args.confirmed === true,
+      count: preflight.length,
+      results: preflight.map((entry) => ({
+        wouldRevoke: { item: entry.item, permissionId: entry.targetArgs.permissionId },
+        ...(entry.includePermissions ? {
+          beforePermissions: entry.beforePermissions,
+          beforePermissionCount: entry.beforePermissions.length
+        } : {})
+      }))
+    };
+  }
+
+  const results = [];
+  try {
+    for (const entry of preflight) {
+      const response = await graph(`${itemIdBase(entry.rawItem.id)}/permissions/${encodeURIComponent(entry.targetArgs.permissionId)}`, {
+        method: "DELETE",
+        returnResponse: true
+      });
+      if (!response.ok) throw microsoftGraphError(response.body, { headers: response.headers, status: response.status, statusText: "Batch revoke permission failed" });
+      const afterPermissions = entry.includePermissions ? await permissionList({ itemId: entry.rawItem.id }, "compact") : null;
+      const permissionDiff = entry.includePermissions ? diffPermissions(entry.beforePermissions, afterPermissions) : null;
+      results.push({
+        item: entry.item,
+        permissionId: entry.targetArgs.permissionId,
+        ...(entry.includePermissions ? { beforePermissions: entry.beforePermissions, afterPermissions, permissionDiff } : {})
+      });
+    }
+    await writeMutationAudit("onedrive_batch_revoke_permissions", {
+      status: "success",
+      targets: preflight.map((entry) => itemAuditSummary(entry.rawItem)),
+      results: results.map((result) => ({
+        item: itemAuditSummary(result.item),
+        permissionId: result.permissionId,
+        permissionDiff: result.permissionDiff ? permissionDiffAuditSummary(result.permissionDiff) : undefined
+      }))
+    });
+    return { dryRun: false, confirmed: true, count: results.length, results };
+  } catch (error) {
+    await writeMutationAudit("onedrive_batch_revoke_permissions", {
+      status: "failed",
+      targets: preflight.map((entry) => itemAuditSummary(entry.rawItem)),
+      partialResults: results.map((result) => ({ item: itemAuditSummary(result.item), permissionId: result.permissionId })),
+      error: safeErrorInfo(error)
+    });
+    throw error;
+  }
+}
+
+async function preflightMoveItem(item = {}, destination) {
+  if (item.newName) assertSafeItemName(item.newName, "newName");
+  requireNonRootTarget(item, "Move");
+  const current = await getRawInfo(item);
+  if (current.root) throw new Error("Move refuses to operate on the OneDrive root.");
+  assertExpectedItem(current, item, "Move");
+  return { targetArgs: item, rawItem: current, item: simplifyItem(current), destination };
+}
+
+async function batchMove(args = {}) {
+  const items = args.items || [];
+  if (args.dryRun === false) {
+    if (args.confirmed !== true) {
+      return {
+        dryRun: false,
+        confirmed: false,
+        count: items.length,
+        requiredToMove: "Set dryRun: false and confirmed: true after explicit user confirmation."
+      };
+    }
+    const missingExpected = items.filter((item) => !hasExpectedIdentity(item));
+    if (missingExpected.length) {
+      return {
+        dryRun: false,
+        confirmed: true,
+        count: items.length,
+        requiredToMove: "Provide expectedName or expectedId for every item in a live batch move.",
+        missingExpectedCount: missingExpected.length
+      };
+    }
+  }
+
+  const destination = await resolveDestinationParent(args);
+  const preflight = [];
+  const preflightErrors = [];
+  for (const [index, item] of items.entries()) {
+    try {
+      preflight.push(await preflightMoveItem(item, destination));
+    } catch (error) {
+      preflightErrors.push({ index, target: item, error: error.message });
+    }
+  }
+  if (preflightErrors.length) {
+    return {
+      dryRun: args.dryRun !== false,
+      confirmed: args.confirmed === true,
+      destination,
+      count: items.length,
+      preflightFailed: true,
+      errors: preflightErrors,
+      requiredToMove: "Fix every preflight error before running a batch move."
+    };
+  }
+
+  if (args.dryRun !== false) {
+    return {
+      dryRun: true,
+      confirmed: args.confirmed === true,
+      destination,
+      count: preflight.length,
+      results: preflight.map((entry) => ({
+        wouldMove: entry.item,
+        destination,
+        newName: entry.targetArgs.newName || null
+      }))
+    };
+  }
+
+  const results = [];
+  try {
+    for (const entry of preflight) {
+      const body = { parentReference: { id: destination.id } };
+      if (entry.targetArgs.newName) body.name = entry.targetArgs.newName;
+      const result = await graph(itemIdBase(entry.rawItem.id), {
+        method: "PATCH",
+        body: JSON.stringify(body)
+      });
+      results.push({ before: entry.item, moved: simplifyItem(result), newName: entry.targetArgs.newName || null });
+    }
+    await writeMutationAudit("onedrive_batch_move", {
+      status: "success",
+      destination,
+      targets: preflight.map((entry) => itemAuditSummary(entry.rawItem)),
+      results: results.map((result) => ({
+        before: itemAuditSummary(result.before),
+        after: itemAuditSummary(result.moved)
+      }))
+    });
+    return { dryRun: false, confirmed: true, destination, count: results.length, results };
+  } catch (error) {
+    await writeMutationAudit("onedrive_batch_move", {
+      status: "failed",
+      destination,
+      targets: preflight.map((entry) => itemAuditSummary(entry.rawItem)),
+      partialResults: results.map((result) => ({ before: itemAuditSummary(result.before), after: itemAuditSummary(result.moved) })),
+      error: safeErrorInfo(error)
+    });
+    throw error;
+  }
 }
 
 async function deleteItem(args = {}) {
@@ -3773,9 +4655,24 @@ async function deleteItem(args = {}) {
       requiredToDelete: "Provide expectedName or expectedId for live deletes."
     };
   }
-  await graph(itemBase(args), { method: "DELETE" });
-  await cacheItems([{ ...rawItem, deleted: {} }]);
-  return { dryRun: false, confirmed: true, deleted: item };
+  try {
+    await graph(itemBase(args), { method: "DELETE" });
+    await cacheItems([{ ...rawItem, deleted: {} }]);
+    await writeMutationAudit("onedrive_delete", {
+      status: "success",
+      target: itemAuditSummary(rawItem),
+      before: itemAuditSummary(rawItem)
+    });
+    return { dryRun: false, confirmed: true, deleted: item };
+  } catch (error) {
+    await writeMutationAudit("onedrive_delete", {
+      status: "failed",
+      target: itemAuditSummary(rawItem),
+      before: itemAuditSummary(rawItem),
+      error: safeErrorInfo(error)
+    });
+    throw error;
+  }
 }
 
 function validateRestoreArgs(args = {}) {
@@ -3815,17 +4712,40 @@ async function restoreDeleted(args = {}) {
       requiredToRestore: "Set dryRun: false and confirmed: true after explicit user confirmation."
     };
   }
+  if (!args.expectedId) {
+    return {
+      ...preview,
+      dryRun: false,
+      confirmed: true,
+      requiredToRestore: "Provide expectedId for live restores."
+    };
+  }
   const body = {};
   if (args.destinationParentPath || args.destinationParentItemId || args.destinationParentPreset) {
     const parent = await resolveDestinationParent(args);
     body.parentReference = { id: parent.id };
   }
   if (args.newName) body.name = args.newName;
-  const result = await graph(`/me/drive/items/${encodeURIComponent(args.itemId)}/restore`, {
-    method: "POST",
-    body: JSON.stringify(body)
-  });
-  return { dryRun: false, confirmed: true, restored: simplifyItem(result) };
+  try {
+    const result = await graph(`/me/drive/items/${encodeURIComponent(args.itemId)}/restore`, {
+      method: "POST",
+      body: JSON.stringify(body)
+    });
+    const restored = simplifyItem(result);
+    await writeMutationAudit("onedrive_restore_deleted", {
+      status: "success",
+      target: { itemId: args.itemId },
+      after: itemAuditSummary(restored)
+    });
+    return { dryRun: false, confirmed: true, restored };
+  } catch (error) {
+    await writeMutationAudit("onedrive_restore_deleted", {
+      status: "failed",
+      target: { itemId: args.itemId },
+      error: safeErrorInfo(error)
+    });
+    throw error;
+  }
 }
 
 function textResult(value, isError = false) {
@@ -3927,6 +4847,10 @@ async function callTool(name, args = {}) {
       return textResult(await copyItem(args));
     case "onedrive_create_sharing_link":
       return textResult(await createSharingLink(args));
+    case "onedrive_revoke_permission":
+      return textResult(await revokePermission(args));
+    case "onedrive_batch_revoke_permissions":
+      return textResult(await batchRevokePermissions(args));
     case "onedrive_permissions":
       return textResult(await permissions(args));
     case "onedrive_batch_get_info":
@@ -3953,6 +4877,12 @@ async function callTool(name, args = {}) {
       return textResult(await sharingAudit(args, true));
     case "onedrive_restore_deleted":
       return textResult(await restoreDeleted(args));
+    case "onedrive_audit_recent":
+      return textResult(await auditRecent(args));
+    case "onedrive_audit_export":
+      return textResult(await auditExport(args));
+    case "onedrive_audit_clear":
+      return textResult(await auditClear(args));
     case "onedrive_delete":
       return textResult(await deleteItem(args));
     default:
@@ -3976,7 +4906,12 @@ async function handleRequest(message) {
       return;
     }
     if (method === "tools/call") {
-      sendResult(id, await callTool(params.name, params.arguments || {}));
+      const validation = validateToolArguments(params.name, params.arguments || {});
+      if (!validation.ok) {
+        sendResult(id, textResult(validation.error, true));
+        return;
+      }
+      sendResult(id, await callTool(params.name, validation.args || {}));
       return;
     }
     if (method?.startsWith("notifications/")) return;

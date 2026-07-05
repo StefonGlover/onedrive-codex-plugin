@@ -93,6 +93,9 @@ Tools that accept `path` can also accept `preset` plus `relativePath`; upload/wr
 - `onedrive_move`
 - `onedrive_copy`
 - `onedrive_create_sharing_link`
+- `onedrive_revoke_permission`
+- `onedrive_batch_revoke_permissions`
+- `onedrive_batch_move`
 - `onedrive_permissions`
 - `onedrive_batch_get_info`
 - `onedrive_batch_permissions`
@@ -106,15 +109,21 @@ Tools that accept `path` can also accept `preset` plus `relativePath`; upload/wr
 - `onedrive_shared_by_me`
 - `onedrive_public_links`
 - `onedrive_restore_deleted`
+- `onedrive_audit_recent`
+- `onedrive_audit_export`
+- `onedrive_audit_clear`
 - `onedrive_delete`
 
 ## Safety
 
-- Delete defaults to dry-run.
-- Live delete requires `confirmed: true` plus `expectedName` or `expectedId`.
-- Sharing-link creation defaults to dry-run and requires both `dryRun: false` and `confirmed: true`.
+- Remote mutations that move, rename, copy, expose, restore, delete, or revoke access use a preview-first pattern.
+- Rename, move, copy, sharing-link creation, permission revoke, restore, and delete default to dry-run where the operation has a dry-run mode.
+- Live rename, move, copy, sharing-link creation, permission revoke, restore, and delete require `dryRun: false`, `confirmed: true`, and stable expected identity (`expectedName` or `expectedId`; restore requires `expectedId`).
+- Batch move and batch permission revoke preflight every item before any mutation and refuse partial execution when a preflight check fails.
 - Sharing-link creation can include a before/after permission diff so the caller can see what changed.
+- Permission revoke uses Microsoft Graph `DELETE /me/drive/items/{item-id}/permissions/{permission-id}` and includes before permissions by default; live revoke includes after permissions and a permission diff.
 - Rename, move, copy, share, and delete refuse to operate on the OneDrive root.
+- Tool arguments are validated before handlers run, including required fields, unknown properties, enum values, numeric bounds, array bounds, and target `anyOf` rules.
 - Text reads are bounded to 5 MB by default.
 - Text reads use MIME/extension checks and refuse likely binary files unless `force: true` is set.
 - Downloads go to `~/.codex/onedrive-plugin/downloads` unless `localPath` is provided.
@@ -138,7 +147,16 @@ Tools that accept `path` can also accept `preset` plus `relativePath`; upload/wr
 - `onedrive_delta` can return deleted item changes. Microsoft Graph does not expose a normal OneDrive recycle-bin listing endpoint through the driveItem file APIs.
 - `onedrive_get_info` supports `includeDeletedItems: true` when targeting an item ID; Microsoft documents this as OneDrive Personal-only.
 - `onedrive_restore_deleted` defaults to dry-run and requires a deleted item ID. Live restore may require `Files.ReadWrite.All` for personal OneDrive.
+- Live remote mutations are recorded in a local JSONL audit log at `~/.codex/onedrive-plugin/audit/mutations.jsonl`. Audit entries include safe item summaries, before/after summaries when available, permission diffs when relevant, Graph request IDs when available, and safe error details for failed live mutations. They do not log tokens, authorization headers, file contents, or raw request bodies.
+- `onedrive_audit_recent` reads recent audit entries, `onedrive_audit_export` exports the JSONL log to a local file, and `onedrive_audit_clear` requires `confirmed: true`.
 - Graph requests retry transient `429`, `500`, `502`, `503`, and `504` responses with `Retry-After` support.
+
+## Safe Example Prompts
+
+- "Find the file named Project Plan, show me its item ID and current permissions, but do not change anything."
+- "Dry-run moving this file to Documents/Archive and show the exact item ID I would need to confirm."
+- "Revoke the anonymous link from this item only after previewing the permission diff and asking me to confirm."
+- "Show recent OneDrive mutation audit entries from this plugin."
 
 ## Beta Test
 

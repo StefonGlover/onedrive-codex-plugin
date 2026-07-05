@@ -1,6 +1,6 @@
 {
   "name": "onedrive",
-  "version": "0.1.0+codex.20260704195101",
+  "version": "0.1.0+codex.20260704211457",
   "description": "Manage OneDrive files from Codex through Microsoft Graph with device-code login and Keychain token storage.",
   "author": {
     "name": "Stefon Glover"
