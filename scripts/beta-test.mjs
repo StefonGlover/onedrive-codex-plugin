@@ -17,6 +17,7 @@ const localUpload = join(outDir, "upload-source.txt");
 const localSessionUpload = join(outDir, "upload-session-source.txt");
 const localBinary = join(outDir, "binary-source.bin");
 const localDownload = join(outDir, "upload-downloaded.txt");
+const auditExport = join(outDir, "audit-export.jsonl");
 const excelDownload = join(outDir, "downloaded-sheet.csv");
 const wordDownload = join(outDir, "downloaded-doc.docx");
 const powerpointDownload = join(outDir, "downloaded-deck.pptx");
@@ -140,6 +141,9 @@ try {
   const toolNames = listed.result.tools.map((entry) => entry.name).sort();
   const requiredTools = [
     "onedrive_config",
+    "onedrive_auth_device_start",
+    "onedrive_auth_device_poll",
+    "onedrive_logout",
     "onedrive_doctor",
     "onedrive_me",
     "onedrive_drive",
@@ -171,6 +175,8 @@ try {
     "onedrive_move",
     "onedrive_copy",
     "onedrive_create_sharing_link",
+    "onedrive_revoke_permission",
+    "onedrive_batch_revoke_permissions",
     "onedrive_permissions",
     "onedrive_batch_get_info",
     "onedrive_batch_permissions",
@@ -184,10 +190,15 @@ try {
     "onedrive_shared_by_me",
     "onedrive_public_links",
     "onedrive_restore_deleted",
+    "onedrive_audit_recent",
+    "onedrive_audit_export",
+    "onedrive_audit_clear",
     "onedrive_delete"
   ];
-  record("tools/list includes enhanced tools", requiredTools.every((name) => toolNames.includes(name)) ? "pass" : "fail", {
+  const uniqueToolNames = new Set(toolNames);
+  record("tools/list includes enhanced tools", requiredTools.every((name) => toolNames.includes(name)) && uniqueToolNames.size === toolNames.length ? "pass" : "fail", {
     toolCount: toolNames.length,
+    uniqueToolCount: uniqueToolNames.size,
     missing: requiredTools.filter((name) => !toolNames.includes(name))
   });
 
@@ -298,22 +309,29 @@ try {
 
   const renamed = assertOk("onedrive_rename", await tool("onedrive_rename", {
     path: `${folderName}/note.txt`,
-    newName: renamedTextFile
+    newName: renamedTextFile,
+    expectedName: "note.txt",
+    dryRun: false,
+    confirmed: true
   }));
-  record("rename file", renamed.name === renamedTextFile ? "pass" : "fail", { name: renamed.name });
+  const renamedItem = renamed.renamed || renamed;
+  record("rename file", renamedItem.name === renamedTextFile && renamed.confirmed === true ? "pass" : "fail", { name: renamedItem.name });
 
   const moved = assertOk("onedrive_move", await tool("onedrive_move", {
     path: `${folderName}/${renamedTextFile}`,
     destinationParentPath: `${folderName}/${movedFolderName}`,
     newName: movedTextFile,
-    expectedName: renamedTextFile
+    expectedName: renamedTextFile,
+    dryRun: false,
+    confirmed: true
   }));
+  const movedItem = moved.moved || moved;
   const movedInfo = assertOk("moved file info", await tool("onedrive_get_info", {
     path: `${folderName}/${movedFolderName}/${movedTextFile}`
   }));
-  record("move file with expectedName", moved.name === movedTextFile && movedInfo.id === moved.id ? "pass" : "fail", {
-    name: moved.name,
-    id: moved.id
+  record("move file with expectedName", movedItem.name === movedTextFile && movedInfo.id === movedItem.id && moved.confirmed === true ? "pass" : "fail", {
+    name: movedItem.name,
+    id: movedItem.id
   });
 
   const copied = assertOk("onedrive_copy", await tool("onedrive_copy", {
@@ -321,6 +339,8 @@ try {
     destinationParentPath: folderName,
     newName: copyFileName,
     expectedName: movedTextFile,
+    dryRun: false,
+    confirmed: true,
     waitForCompletion: true,
     timeoutSeconds: 90
   }));
@@ -487,6 +507,31 @@ try {
     item: permissionAudit.item?.name
   });
 
+  const batchInfo = assertOk("batch get info", await tool("onedrive_batch_get_info", {
+    items: [{ itemId: copiedInfo.id }, { path: `${folderName}/uploaded.txt` }]
+  }));
+  record("batch get_info returns per-item results", batchInfo.items?.length === 2 && batchInfo.items.every((entry) => !entry.error) ? "pass" : "fail", {
+    count: batchInfo.count,
+    names: batchInfo.items?.map((entry) => entry.name || entry.item?.name)
+  });
+
+  const batchPermissions = assertOk("batch permissions", await tool("onedrive_batch_permissions", {
+    items: [{ itemId: copiedInfo.id }, { path: `${folderName}/uploaded.txt` }]
+  }));
+  record("batch permissions returns per-item results", batchPermissions.items?.length === 2 && batchPermissions.items.every((entry) => !entry.error) ? "pass" : "fail", {
+    count: batchPermissions.count
+  });
+
+  const batchDownloaded = assertOk("batch download", await tool("onedrive_batch_download", {
+    items: [{ path: `${folderName}/uploaded.txt` }],
+    destinationFolder: outDir,
+    overwrite: true
+  }));
+  record("batch download succeeds", batchDownloaded.results?.[0]?.bytesWritten > 0 ? "pass" : "fail", {
+    count: batchDownloaded.count,
+    first: batchDownloaded.results?.[0]
+  });
+
   const sharingDryRun = assertOk("sharing link dry-run", await tool("onedrive_create_sharing_link", {
     path: `${folderName}/${copyFileName}`,
     type: "view",
@@ -495,6 +540,74 @@ try {
   record("sharing link dry-run is safe", sharingDryRun.dryRun === true && sharingDryRun.requiredToCreate ? "pass" : "fail", {
     requiredToCreate: sharingDryRun.requiredToCreate,
     beforePermissionCount: sharingDryRun.beforePermissionCount
+  });
+
+  const sharingLive = assertOk("sharing link live", await tool("onedrive_create_sharing_link", {
+    itemId: copiedInfo.id,
+    type: "view",
+    scope: "anonymous",
+    expectedName: copyFileName,
+    dryRun: false,
+    confirmed: true
+  }));
+  record("sharing link live creates permission diff", sharingLive.confirmed === true && sharingLive.permission?.id && sharingLive.permissionDiff ? "pass" : "fail", {
+    permissionId: sharingLive.permission?.id,
+    diff: sharingLive.permissionDiff
+  });
+
+  const revokeDryRun = assertOk("revoke permission dry-run", await tool("onedrive_revoke_permission", {
+    itemId: copiedInfo.id,
+    permissionId: sharingLive.permission.id,
+    expectedName: copyFileName
+  }));
+  record("revoke permission dry-run is safe", revokeDryRun.dryRun === true && revokeDryRun.requiredToRevoke ? "pass" : "fail", {
+    beforePermissionCount: revokeDryRun.beforePermissionCount,
+    requiredToRevoke: revokeDryRun.requiredToRevoke
+  });
+
+  const revoked = assertOk("revoke permission live", await tool("onedrive_revoke_permission", {
+    itemId: copiedInfo.id,
+    permissionId: sharingLive.permission.id,
+    expectedName: copyFileName,
+    dryRun: false,
+    confirmed: true
+  }));
+  record("revoke permission live removes sharing", revoked.confirmed === true && revoked.permissionDiff?.removed?.some((permission) => permission.id === sharingLive.permission.id) ? "pass" : "fail", {
+    permissionId: revoked.permissionId,
+    diff: revoked.permissionDiff
+  });
+
+  const sharingLiveBatch = assertOk("sharing link live for batch revoke", await tool("onedrive_create_sharing_link", {
+    itemId: copiedInfo.id,
+    type: "view",
+    scope: "anonymous",
+    expectedName: copyFileName,
+    dryRun: false,
+    confirmed: true
+  }));
+  const batchRevoked = assertOk("batch revoke permissions live", await tool("onedrive_batch_revoke_permissions", {
+    items: [{ itemId: copiedInfo.id, permissionId: sharingLiveBatch.permission.id, expectedId: copiedInfo.id }],
+    dryRun: false,
+    confirmed: true
+  }));
+  record("batch revoke permissions live succeeds", batchRevoked.confirmed === true && batchRevoked.results?.length === 1 ? "pass" : "fail", {
+    count: batchRevoked.count,
+    results: batchRevoked.results
+  });
+
+  const auditRecent = assertOk("audit recent", await tool("onedrive_audit_recent", { limit: 50 }));
+  record("audit recent includes live mutation entries", auditRecent.entries?.some((entry) => entry.tool === "onedrive_revoke_permission") && auditRecent.entries?.some((entry) => entry.tool === "onedrive_batch_revoke_permissions") ? "pass" : "fail", {
+    count: auditRecent.count,
+    tools: auditRecent.entries?.map((entry) => entry.tool)
+  });
+
+  const auditExported = assertOk("audit export", await tool("onedrive_audit_export", {
+    localPath: auditExport,
+    overwrite: true
+  }));
+  record("audit export writes local JSONL", auditExported.bytesWritten > 0 && auditExported.localPath === auditExport ? "pass" : "fail", {
+    localPath: auditExported.localPath,
+    bytesWritten: auditExported.bytesWritten
   });
 
   const expectedMismatch = await tool("onedrive_delete", {

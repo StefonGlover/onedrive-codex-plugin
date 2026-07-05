@@ -95,7 +95,6 @@ Tools that accept `path` can also accept `preset` plus `relativePath`; upload/wr
 - `onedrive_create_sharing_link`
 - `onedrive_revoke_permission`
 - `onedrive_batch_revoke_permissions`
-- `onedrive_batch_move`
 - `onedrive_permissions`
 - `onedrive_batch_get_info`
 - `onedrive_batch_permissions`

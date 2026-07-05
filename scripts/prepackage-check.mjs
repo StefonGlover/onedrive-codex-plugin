@@ -12,8 +12,10 @@ const args = process.argv.slice(2);
 const installedIndex = args.indexOf("--installed");
 const installedRoot = installedIndex >= 0 ? resolve(args[installedIndex + 1] || "") : null;
 const problems = [];
-const ignoredPackageDirs = new Set([".git", "work", "downloads", "node_modules"]);
+const ignoredPackageDirs = new Set([".git", "work", "downloads", "onedrive-beta", "node_modules", "dist", "build", "coverage"]);
 const ignoredPackageFiles = new Set([".DS_Store"]);
+const ignoredPackageFileExtensions = new Set([".log", ".tmp", ".temp", ".bak", ".swp"]);
+const ignoredPackageFileNames = new Set([".env", ".env.local", ".env.development", ".env.production"]);
 
 const textExtensions = new Set([
   ".json", ".md", ".mjs", ".js", ".zsh", ".sh", ".txt", ".example", ".yaml", ".yml"
@@ -53,6 +55,8 @@ async function walk(dir, files = []) {
       await walk(path, files);
     } else if (entry.isFile()) {
       if (ignoredPackageFiles.has(entry.name)) continue;
+      if (ignoredPackageFileNames.has(entry.name)) continue;
+      if (ignoredPackageFileExtensions.has(extname(entry.name).toLowerCase())) continue;
       files.push(path);
     }
   }
@@ -164,7 +168,10 @@ function checkToolSchemas() {
   }).find((message) => message?.id === 2);
   const tools = listMessage?.result?.tools;
   if (!Array.isArray(tools)) return fail("MCP tools/list did not return a tools array during schema inspection.");
+  const seenToolNames = new Set();
   for (const tool of tools) {
+    if (seenToolNames.has(tool.name)) fail(`Duplicate MCP tool registered: ${tool.name}`);
+    seenToolNames.add(tool.name);
     const schema = tool.inputSchema || {};
     const properties = schema.properties || {};
     for (const required of schema.required || []) {

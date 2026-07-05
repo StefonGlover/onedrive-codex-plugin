@@ -820,9 +820,10 @@ try {
       waitForCompletion: true,
       timeoutSeconds: 5
     });
-    assert(result.isError, "copy should reject untrusted monitor URL", result);
-    assert(String(result.value).includes("untrusted copy monitor URL"), "unexpected monitor rejection", result);
-    return { response: result.value };
+    assert(!result.isError, "copy acceptance should not be converted into a failed mutation", result);
+    assert(result.value.accepted === true, "copy should still report accepted mutation", result.value);
+    assert(result.value.monitorError?.includes("untrusted copy monitor URL"), "unexpected monitor rejection", result.value);
+    return { monitorError: result.value.monitorError };
   });
 
   await check("sharing dry-run includes before permission audit", async () => {

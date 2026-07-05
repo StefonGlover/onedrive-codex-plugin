@@ -10,6 +10,8 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const pluginRoot = resolve(__dirname, "..");
+const pluginManifest = JSON.parse(readFileSync(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"));
 const configPath = join(homedir(), ".codex", "onedrive-plugin", "config.json");
 const downloadRoot = join(homedir(), ".codex", "onedrive-plugin", "downloads");
 const cacheRoot = join(homedir(), ".codex", "onedrive-plugin", "cache");
@@ -856,45 +858,6 @@ const tools = [
     }
   },
   {
-    name: "onedrive_batch_move",
-    description: "Preview or move multiple OneDrive items to one destination folder. Live moves preflight every item before any PATCH.",
-    inputSchema: {
-      type: "object",
-      required: ["items"],
-      properties: {
-        items: {
-          type: "array",
-          minItems: 1,
-          maxItems: 50,
-          items: {
-            type: "object",
-            anyOf: itemTargetAnyOf,
-            properties: {
-              path: { type: "string", description: "Source item path relative to OneDrive root." },
-              itemId: { type: "string", description: "Source drive item ID." },
-              preset: presetSchema,
-              relativePath: relativePathSchema,
-              newName: { type: "string" },
-              expectedName: { type: "string" },
-              expectedId: { type: "string" }
-            },
-            additionalProperties: false
-          }
-        },
-        destinationParentPath: { type: "string", description: "Destination folder path relative to root. Omit or use / for root." },
-        destinationParentItemId: { type: "string", description: "Destination folder drive item ID." },
-        ...destinationPresetProperties,
-        dryRun: { type: "boolean", default: true },
-        confirmed: {
-          type: "boolean",
-          default: false,
-          description: "Must be true after explicit user confirmation for live batch moves."
-        }
-      },
-      additionalProperties: false
-    }
-  },
-  {
     name: "onedrive_restore_deleted",
     description: "Restore a deleted OneDrive item by item ID. Defaults to dry-run and may require Files.ReadWrite.All on personal OneDrive.",
     inputSchema: {
@@ -1528,8 +1491,13 @@ function cachePutSimplified(cache, item) {
   if (previous?.remotePath && previous.remotePath !== simplified.remotePath) {
     delete cache.pathsByLower[cachePathKey(previous.remotePath)];
   }
+  const pathKey = simplified.remotePath ? cachePathKey(simplified.remotePath) : null;
+  const existingIdForPath = pathKey ? cache.pathsByLower[pathKey] : null;
+  if (existingIdForPath && existingIdForPath !== simplified.id) {
+    delete cache.itemsById[existingIdForPath];
+  }
   cache.itemsById[simplified.id] = simplified;
-  if (simplified.remotePath) cache.pathsByLower[cachePathKey(simplified.remotePath)] = simplified.id;
+  if (pathKey) cache.pathsByLower[pathKey] = simplified.id;
 }
 
 function cacheRemoveItemAndDescendants(cache, item) {
@@ -2257,6 +2225,15 @@ function itemAuditSummary(item) {
   };
 }
 
+function itemMutationBase(rawItem) {
+  if (!rawItem?.id) throw new Error("Resolved item is missing an ID; refusing live mutation.");
+  return itemIdBase(rawItem.id);
+}
+
+function mutationMatchHeaders(rawItem) {
+  return rawItem?.eTag ? { "If-Match": rawItem.eTag } : {};
+}
+
 function permissionAuditSummary(permission = {}) {
   return {
     id: permission.id,
@@ -2266,10 +2243,10 @@ function permissionAuditSummary(permission = {}) {
       scope: permission.link.scope,
       preventsDownload: permission.link.preventsDownload
     } : undefined,
-    grantedTo: permission.grantedTo,
-    grantedToV2: permission.grantedToV2,
-    grantedToIdentities: permission.grantedToIdentities,
-    invitation: permission.invitation,
+    grantedToPresent: Boolean(permission.grantedTo || permission.grantedToV2),
+    grantedToIdentityCount: Array.isArray(permission.grantedToIdentities) ? permission.grantedToIdentities.length : undefined,
+    invitationPresent: Boolean(permission.invitation),
+    invitationSignInRequired: permission.invitation?.signInRequired,
     inheritedFrom: permission.inheritedFrom ? itemAuditSummary(permission.inheritedFrom) : undefined,
     expirationDateTime: permission.expirationDateTime,
     hasPassword: permission.hasPassword
@@ -2360,7 +2337,8 @@ async function auditExport(args = {}) {
     if (error.code !== "ENOENT") throw error;
     await writeFile(target, "");
   }
-  return { auditPath, localPath: target };
+  const written = await stat(target);
+  return { auditPath, localPath: target, bytesWritten: written.size };
 }
 
 async function auditClear(args = {}) {
@@ -2462,18 +2440,29 @@ async function collectPages(firstPath, maxItems, format = "compact", formatter =
   let nextPath = firstPath;
   let nextLink = null;
   let deltaLink = null;
+  let truncated = false;
+  const seenPages = new Set();
+  let pagesFetched = 0;
+  const maxPages = Math.max(1, Math.ceil(maxItems / 1) + 100);
   while (nextPath && items.length < maxItems) {
+    if (seenPages.has(nextPath)) throw new Error(`Microsoft Graph pagination cycle detected at ${safeDisplayPath(nextPath)}.`);
+    if (pagesFetched >= maxPages) throw new Error(`Microsoft Graph pagination exceeded ${maxPages} pages before reaching the item limit.`);
+    seenPages.add(nextPath);
+    pagesFetched += 1;
     const result = await graph(nextPath);
     const pageItems = result.value || [];
     const remaining = maxItems - items.length;
     const acceptedItems = pageItems.slice(0, remaining);
-    await cacheItems(acceptedItems, { deltaLink: result["@odata.deltaLink"] || undefined });
+    const pageTruncated = pageItems.length > remaining;
+    truncated = truncated || pageTruncated;
+    await cacheItems(acceptedItems, { deltaLink: !pageTruncated ? result["@odata.deltaLink"] || undefined : undefined });
     items.push(...acceptedItems.map((item) => formatter(item, format)));
     nextLink = result["@odata.nextLink"] || null;
-    deltaLink = result["@odata.deltaLink"] || null;
+    deltaLink = pageTruncated ? null : result["@odata.deltaLink"] || null;
     nextPath = nextLink && items.length < maxItems ? nextLink : null;
+    truncated = truncated || Boolean(nextLink);
   }
-  return { items, nextLink, deltaLink, truncated: Boolean(nextLink), count: items.length };
+  return { items, nextLink, deltaLink, truncated, count: items.length };
 }
 
 async function listAll(args = {}) {
@@ -2568,12 +2557,17 @@ async function scan(args = {}) {
     const folder = queue.shift();
     counters.foldersVisited += 1;
     let nextPath = `/me/drive/items/${encodeURIComponent(folder.id)}/children?${params.toString()}`;
+    const seenPages = new Set();
 
     while (nextPath) {
       if (counters.itemsScanned >= maxItems) {
         truncatedReason = "maxItems";
         break;
       }
+      if (seenPages.has(nextPath)) {
+        throw new Error(`Microsoft Graph pagination cycle detected while scanning ${folder.remotePath || folder.name || folder.id}.`);
+      }
+      seenPages.add(nextPath);
       const page = await graph(nextPath);
       const cacheableItems = [];
       for (const item of page.value || []) {
@@ -3344,35 +3338,93 @@ async function batchDownload(args = {}) {
 }
 
 async function batchDelete(args = {}) {
+  const items = args.items || [];
   if (args.dryRun === false) {
     if (args.confirmed !== true) {
       return {
         dryRun: false,
         confirmed: false,
-        count: (args.items || []).length,
+        count: items.length,
         requiredToDelete: "Set dryRun: false and confirmed: true after explicit user confirmation."
       };
     }
-    const missingExpected = (args.items || []).filter((item) => !item.expectedName && !item.expectedId);
+    const missingExpected = items.filter((item) => !item.expectedName && !item.expectedId);
     if (missingExpected.length) {
       return {
         dryRun: false,
         confirmed: true,
-        count: (args.items || []).length,
+        count: items.length,
         requiredToDelete: "Provide expectedName or expectedId for every item in a live batch delete.",
         missingExpectedCount: missingExpected.length
       };
     }
   }
-  const results = [];
-  for (const item of args.items || []) {
+
+  const preflight = [];
+  const preflightErrors = [];
+  for (const [index, item] of items.entries()) {
     try {
-      results.push(await deleteItem({ ...item, dryRun: args.dryRun !== false, confirmed: args.confirmed === true }));
+      requireNonRootTarget(item, "Delete");
+      const rawItem = await getRawInfo(item);
+      if (rawItem.root) throw new Error("Delete refuses to operate on the OneDrive root.");
+      assertExpectedItem(rawItem, item, "Delete");
+      preflight.push({ targetArgs: item, rawItem, item: simplifyItem(rawItem) });
     } catch (error) {
-      results.push({ target: item, error: error.message });
+      preflightErrors.push({ index, target: item, error: error.message });
     }
   }
-  return { dryRun: args.dryRun !== false, confirmed: args.confirmed === true, count: results.length, results };
+  if (preflightErrors.length) {
+    return {
+      dryRun: args.dryRun !== false,
+      confirmed: args.confirmed === true,
+      count: items.length,
+      preflightFailed: true,
+      errors: preflightErrors,
+      requiredToDelete: "Fix every preflight error before running a batch delete."
+    };
+  }
+
+  if (args.dryRun !== false) {
+    return {
+      dryRun: true,
+      confirmed: args.confirmed === true,
+      count: preflight.length,
+      results: preflight.map((entry) => ({ wouldDelete: entry.item }))
+    };
+  }
+
+  const results = [];
+  for (const [index, entry] of preflight.entries()) {
+    try {
+      await graph(itemMutationBase(entry.rawItem), { method: "DELETE", headers: mutationMatchHeaders(entry.rawItem) });
+      await cacheItems([{ ...entry.rawItem, deleted: {} }]);
+      results.push({ deleted: entry.item });
+    } catch (error) {
+      const failure = {
+        dryRun: false,
+        confirmed: true,
+        count: preflight.length,
+        failed: true,
+        failedIndex: index,
+        error: error.message,
+        partialResults: results
+      };
+      await writeMutationAudit("onedrive_batch_delete", {
+        status: "failed",
+        targets: preflight.map((entry) => itemAuditSummary(entry.rawItem)),
+        partialResults: results.map((result) => ({ deleted: itemAuditSummary(result.deleted) })),
+        failedIndex: index,
+        error: safeErrorInfo(error)
+      });
+      return failure;
+    }
+  }
+  await writeMutationAudit("onedrive_batch_delete", {
+    status: "success",
+    targets: preflight.map((entry) => itemAuditSummary(entry.rawItem)),
+    results: results.map((result) => ({ deleted: itemAuditSummary(result.deleted) }))
+  });
+  return { dryRun: false, confirmed: true, count: results.length, results };
 }
 
 async function getRawInfo(args = {}) {
@@ -3706,6 +3758,16 @@ async function updateFile(args = {}) {
   } catch (error) {
     if (args.force !== true) throw new Error(`Could not read checkout manifest ${manifestPath}. Pass force: true only when intentionally overwriting without checkout metadata.`);
   }
+  if (manifest && args.force !== true) {
+    const manifestProblems = [];
+    if (manifest.version !== 1) manifestProblems.push("version");
+    if (manifest.remotePath && cleanPath(manifest.remotePath) !== cleanPath(remote)) manifestProblems.push("remotePath");
+    if (manifest.localPath && resolve(manifest.localPath) !== localPath) manifestProblems.push("localPath");
+    if (manifestPath && updateManifestPath(localPath, manifestPath) !== manifestPath) manifestProblems.push("manifestPath");
+    if (manifestProblems.length) {
+      throw new Error(`Checkout manifest does not match this commit request (${manifestProblems.join(", ")}). Re-checkout or pass force: true if you intend to override.`);
+    }
+  }
 
   const current = await getRawInfo({ path: remote });
   if (args.conflictCheck !== false && manifest?.item && args.force !== true) {
@@ -3737,6 +3799,16 @@ async function updateFile(args = {}) {
     ifMatch: args.conflictCheck !== false && args.force !== true ? manifest?.item?.eTag : undefined
   });
   const verified = args.verify !== false ? await getInfo({ path: remote }) : null;
+  if (manifest && args.force !== true) {
+    const updatedManifest = {
+      ...manifest,
+      committedAt: new Date().toISOString(),
+      remotePath: remote,
+      localPath,
+      item: verified || uploaded.item
+    };
+    await writeFile(manifestPath, JSON.stringify(updatedManifest, null, 2));
+  }
   return {
     mode: "commit",
     remotePath: remote,
@@ -3938,13 +4010,20 @@ async function uploadLarge(args = {}, fileStat) {
       }
       uploaded = end + 1;
       if (response?.id) finalItem = response;
+      if (!response?.id && Array.isArray(response?.nextExpectedRanges)) {
+        const nextStart = Number(String(response.nextExpectedRanges[0] || "").split("-")[0]);
+        if (Number.isFinite(nextStart) && nextStart !== uploaded) {
+          throw new Error(`Upload session expected next byte ${nextStart}, but local upload position is ${uploaded}.`);
+        }
+      }
       position += bytesRead;
     }
   } finally {
     await handle.close();
   }
 
-  if (finalItem) await cacheItems([finalItem]);
+  if (!finalItem) throw new Error("Upload session completed local chunks but Microsoft Graph did not return a final drive item.");
+  await cacheItems([finalItem]);
   return {
     item: simplifyItem(finalItem),
     localPath: args.localPath,
@@ -4081,8 +4160,9 @@ async function rename(args = {}) {
     };
   }
   try {
-    const result = await graph(itemBase(args), {
+    const result = await graph(itemMutationBase(current), {
       method: "PATCH",
+      headers: mutationMatchHeaders(current),
       body: JSON.stringify({ name: newName })
     });
     await cacheMovedOrRenamedItem(current, result);
@@ -4140,8 +4220,9 @@ async function moveItem(args = {}) {
     };
   }
   try {
-    const result = await graph(itemBase(args), {
+    const result = await graph(itemMutationBase(current), {
       method: "PATCH",
+      headers: mutationMatchHeaders(current),
       body: JSON.stringify(body)
     });
     await cacheMovedOrRenamedItem(current, result);
@@ -4222,7 +4303,7 @@ async function copyItem(args = {}) {
     };
   }
   try {
-    const response = await graph(`${itemBase(args)}/copy`, {
+    const response = await graph(`${itemMutationBase(current)}/copy`, {
       method: "POST",
       returnResponse: true,
       body: JSON.stringify({
@@ -4240,17 +4321,22 @@ async function copyItem(args = {}) {
       source: item,
       monitorUrl
     };
+    if (args.waitForCompletion && monitorUrl) {
+      try {
+        result.monitor = await pollCopyMonitor(monitorUrl, args.timeoutSeconds ?? 60);
+      } catch (error) {
+        result.monitorError = error.message;
+      }
+    }
     await writeMutationAudit("onedrive_copy", {
-      status: "success",
+      status: result.monitorError ? "accepted-monitor-failed" : "success",
       target: itemAuditSummary(current),
       before: itemAuditSummary(current),
       destination: parentReference,
       newName: args.newName || null,
+      monitorError: result.monitorError,
       graphRequestId: response.graphRequestId
     });
-    if (args.waitForCompletion && monitorUrl) {
-      result.monitor = await pollCopyMonitor(monitorUrl, args.timeoutSeconds ?? 60);
-    }
     return result;
   } catch (error) {
     await writeMutationAudit("onedrive_copy", {
@@ -4271,7 +4357,7 @@ async function createSharingLink(args = {}) {
   if (current.root) throw new Error("Create sharing link refuses to operate on the OneDrive root.");
   assertExpectedItem(current, args, "Create sharing link");
   const includePermissionDiff = args.includePermissionDiff !== false;
-  const beforePermissions = includePermissionDiff ? await permissionList(args, "compact") : null;
+  const beforePermissions = includePermissionDiff ? await permissionList({ itemId: current.id }, "compact") : null;
   const preview = {
     dryRun: args.dryRun !== false,
     confirmed: args.confirmed === true,
@@ -4308,11 +4394,11 @@ async function createSharingLink(args = {}) {
     body.retainInheritedPermissions = args.retainInheritedPermissions;
   }
   try {
-    const result = await graph(`${itemBase(args)}/createLink`, {
+    const result = await graph(`${itemMutationBase(current)}/createLink`, {
       method: "POST",
       body: JSON.stringify(body)
     });
-    const afterPermissions = includePermissionDiff ? await permissionList(args, "compact") : null;
+    const afterPermissions = includePermissionDiff ? await permissionList({ itemId: current.id }, "compact") : null;
     const permissionDiff = includePermissionDiff ? diffPermissions(beforePermissions, afterPermissions) : null;
     await writeMutationAudit("onedrive_create_sharing_link", {
       status: "success",
@@ -4493,8 +4579,8 @@ async function batchRevokePermissions(args = {}) {
   }
 
   const results = [];
-  try {
-    for (const entry of preflight) {
+  for (const [index, entry] of preflight.entries()) {
+    try {
       const response = await graph(`${itemIdBase(entry.rawItem.id)}/permissions/${encodeURIComponent(entry.targetArgs.permissionId)}`, {
         method: "DELETE",
         returnResponse: true
@@ -4507,26 +4593,35 @@ async function batchRevokePermissions(args = {}) {
         permissionId: entry.targetArgs.permissionId,
         ...(entry.includePermissions ? { beforePermissions: entry.beforePermissions, afterPermissions, permissionDiff } : {})
       });
+    } catch (error) {
+      await writeMutationAudit("onedrive_batch_revoke_permissions", {
+        status: "failed",
+        targets: preflight.map((entry) => itemAuditSummary(entry.rawItem)),
+        partialResults: results.map((result) => ({ item: itemAuditSummary(result.item), permissionId: result.permissionId })),
+        failedIndex: index,
+        error: safeErrorInfo(error)
+      });
+      return {
+        dryRun: false,
+        confirmed: true,
+        failed: true,
+        failedIndex: index,
+        error: error.message,
+        count: preflight.length,
+        partialResults: results
+      };
     }
-    await writeMutationAudit("onedrive_batch_revoke_permissions", {
-      status: "success",
-      targets: preflight.map((entry) => itemAuditSummary(entry.rawItem)),
-      results: results.map((result) => ({
-        item: itemAuditSummary(result.item),
-        permissionId: result.permissionId,
-        permissionDiff: result.permissionDiff ? permissionDiffAuditSummary(result.permissionDiff) : undefined
-      }))
-    });
-    return { dryRun: false, confirmed: true, count: results.length, results };
-  } catch (error) {
-    await writeMutationAudit("onedrive_batch_revoke_permissions", {
-      status: "failed",
-      targets: preflight.map((entry) => itemAuditSummary(entry.rawItem)),
-      partialResults: results.map((result) => ({ item: itemAuditSummary(result.item), permissionId: result.permissionId })),
-      error: safeErrorInfo(error)
-    });
-    throw error;
   }
+  await writeMutationAudit("onedrive_batch_revoke_permissions", {
+    status: "success",
+    targets: preflight.map((entry) => itemAuditSummary(entry.rawItem)),
+    results: results.map((result) => ({
+      item: itemAuditSummary(result.item),
+      permissionId: result.permissionId,
+      permissionDiff: result.permissionDiff ? permissionDiffAuditSummary(result.permissionDiff) : undefined
+    }))
+  });
+  return { dryRun: false, confirmed: true, count: results.length, results };
 }
 
 async function preflightMoveItem(item = {}, destination) {
@@ -4598,36 +4693,47 @@ async function batchMove(args = {}) {
   }
 
   const results = [];
-  try {
-    for (const entry of preflight) {
+  for (const [index, entry] of preflight.entries()) {
+    try {
       const body = { parentReference: { id: destination.id } };
       if (entry.targetArgs.newName) body.name = entry.targetArgs.newName;
       const result = await graph(itemIdBase(entry.rawItem.id), {
         method: "PATCH",
+        headers: mutationMatchHeaders(entry.rawItem),
         body: JSON.stringify(body)
       });
       results.push({ before: entry.item, moved: simplifyItem(result), newName: entry.targetArgs.newName || null });
+    } catch (error) {
+      await writeMutationAudit("onedrive_batch_move", {
+        status: "failed",
+        destination,
+        targets: preflight.map((entry) => itemAuditSummary(entry.rawItem)),
+        partialResults: results.map((result) => ({ before: itemAuditSummary(result.before), after: itemAuditSummary(result.moved) })),
+        failedIndex: index,
+        error: safeErrorInfo(error)
+      });
+      return {
+        dryRun: false,
+        confirmed: true,
+        failed: true,
+        failedIndex: index,
+        error: error.message,
+        destination,
+        count: preflight.length,
+        partialResults: results
+      };
     }
-    await writeMutationAudit("onedrive_batch_move", {
-      status: "success",
-      destination,
-      targets: preflight.map((entry) => itemAuditSummary(entry.rawItem)),
-      results: results.map((result) => ({
-        before: itemAuditSummary(result.before),
-        after: itemAuditSummary(result.moved)
-      }))
-    });
-    return { dryRun: false, confirmed: true, destination, count: results.length, results };
-  } catch (error) {
-    await writeMutationAudit("onedrive_batch_move", {
-      status: "failed",
-      destination,
-      targets: preflight.map((entry) => itemAuditSummary(entry.rawItem)),
-      partialResults: results.map((result) => ({ before: itemAuditSummary(result.before), after: itemAuditSummary(result.moved) })),
-      error: safeErrorInfo(error)
-    });
-    throw error;
   }
+  await writeMutationAudit("onedrive_batch_move", {
+    status: "success",
+    destination,
+    targets: preflight.map((entry) => itemAuditSummary(entry.rawItem)),
+    results: results.map((result) => ({
+      before: itemAuditSummary(result.before),
+      after: itemAuditSummary(result.moved)
+    }))
+  });
+  return { dryRun: false, confirmed: true, destination, count: results.length, results };
 }
 
 async function deleteItem(args = {}) {
@@ -4656,7 +4762,7 @@ async function deleteItem(args = {}) {
     };
   }
   try {
-    await graph(itemBase(args), { method: "DELETE" });
+    await graph(itemMutationBase(rawItem), { method: "DELETE", headers: mutationMatchHeaders(rawItem) });
     await cacheItems([{ ...rawItem, deleted: {} }]);
     await writeMutationAudit("onedrive_delete", {
       status: "success",
@@ -4897,7 +5003,7 @@ async function handleRequest(message) {
       sendResult(id, {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "onedrive", version: "0.1.0" }
+        serverInfo: { name: "onedrive", version: pluginManifest.version || "0.1.0" }
       });
       return;
     }
