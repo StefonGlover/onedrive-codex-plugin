@@ -3,7 +3,7 @@
 import { execFileSync } from "node:child_process";
 import { createReadStream, createWriteStream, readFileSync } from "node:fs";
 import { appendFile, copyFile, mkdir, open, readFile, realpath, rename as renameFile, rm, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, extname, join, relative, resolve } from "node:path";
+import { basename, dirname, extname, join, parse, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
@@ -3316,20 +3316,49 @@ async function batchPermissions(args = {}) {
   };
 }
 
+function uniqueBatchLocalPath(destinationFolder, name, index, usedTargets) {
+  const parsed = parse(name || `onedrive-download-${index + 1}`);
+  const base = parsed.name || "onedrive-download";
+  const ext = parsed.ext || "";
+  let suffix = 1;
+  let candidate;
+  do {
+    const fileName = suffix === 1 ? `${base}${ext}` : `${base} (${suffix})${ext}`;
+    candidate = resolve(join(destinationFolder, fileName));
+    suffix += 1;
+  } while (usedTargets.has(candidate));
+  usedTargets.add(candidate);
+  return candidate;
+}
+
 async function batchDownload(args = {}) {
   const destinationFolder = args.destinationFolder ? resolve(args.destinationFolder) : null;
   if (destinationFolder) await assertNotLocalOneDriveSyncPathForWrite(destinationFolder, "Batch download", args);
+  const plannedTargets = new Set();
   const results = [];
   for (const [index, item] of (args.items || []).entries()) {
     try {
-      if (item.localPath) await assertNotLocalOneDriveSyncPathForWrite(resolve(item.localPath), "Batch download", args);
+      const explicitLocalPath = item.localPath ? resolve(item.localPath) : null;
+      if (explicitLocalPath) await assertNotLocalOneDriveSyncPathForWrite(explicitLocalPath, "Batch download", args);
       const info = await getInfo(item);
-      const localPath = item.localPath
-        ? item.localPath
+      const localPath = explicitLocalPath
+        ? explicitLocalPath
         : destinationFolder
-          ? join(destinationFolder, info.name || `onedrive-download-${index + 1}`)
+          ? uniqueBatchLocalPath(destinationFolder, info.name, index, plannedTargets)
           : undefined;
-      results.push(await download({ ...item, localPath, overwrite: item.overwrite ?? args.overwrite, allowLocalOneDriveSyncPath: args.allowLocalOneDriveSyncPath }));
+      if (localPath) {
+        await assertNotLocalOneDriveSyncPathForWrite(localPath, "Batch download", args);
+        if (explicitLocalPath) {
+          if (plannedTargets.has(localPath)) throw new Error(`Batch download target is used more than once: ${localPath}`);
+          plannedTargets.add(localPath);
+        }
+      }
+      results.push(await downloadResolvedItem(info, {
+        itemId: info.id,
+        localPath,
+        overwrite: item.overwrite ?? args.overwrite,
+        allowLocalOneDriveSyncPath: args.allowLocalOneDriveSyncPath
+      }));
     } catch (error) {
       results.push({ target: item, error: error.message });
     }
@@ -3597,6 +3626,10 @@ async function readText(args = {}) {
 async function download(args = {}) {
   if (args.localPath) await assertNotLocalOneDriveSyncPathForWrite(resolve(args.localPath), "Download", args);
   const info = await getInfo(args);
+  return await downloadResolvedItem(info, args);
+}
+
+async function downloadResolvedItem(info, args = {}) {
   const target = args.localPath ? resolve(args.localPath) : join(downloadRoot, info.name || basename(cleanPath(args.path || args.itemId || "download")));
   await assertNotLocalOneDriveSyncPathForWrite(target, "Download", args);
   if (args.overwrite !== true) {
@@ -3608,7 +3641,8 @@ async function download(args = {}) {
     }
   }
   await mkdir(dirname(target), { recursive: true });
-  const downloaded = await graphDownloadToFile(contentPath(args), target);
+  const contentArgs = info.id ? { itemId: info.id } : args;
+  const downloaded = await graphDownloadToFile(contentPath(contentArgs), target);
   return { item: info, localPath: target, bytesWritten: downloaded.bytesWritten };
 }
 

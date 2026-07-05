@@ -104,6 +104,22 @@ const graph = createServer((req, res) => {
     return text(res, 200, "root note mock content\n");
   }
 
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/dup-a") {
+    return json(res, 200, item("dup-a", "same-name.txt", { parentReference: { path: "/drive/root:/Folder A" } }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/dup-b") {
+    return json(res, 200, item("dup-b", "same-name.txt", { parentReference: { path: "/drive/root:/Folder B" } }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/dup-a/content") {
+    return text(res, 200, "duplicate a\n");
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/dup-b/content") {
+    return text(res, 200, "duplicate b\n");
+  }
+
   if (req.method === "GET" && path === "/v1.0/me/drive/root:/root-note.txt:/content") {
     return text(res, 200, "root note mock content\n");
   }
@@ -1057,6 +1073,22 @@ try {
     const added = requests.slice(before);
     assert(added.length === 0, "batch_download should reject unsafe local path before Graph", { added });
     return { error: result.value.results[0].error };
+  });
+
+  await check("batch_download gives duplicate generated filenames unique targets", async () => {
+    const destinationFolder = join(mockHome, "batch-download-dupes");
+    const result = await tool("onedrive_batch_download", {
+      items: [{ itemId: "dup-a" }, { itemId: "dup-b" }],
+      destinationFolder
+    });
+    assert(!result.isError, "batch_download should succeed", result);
+    const paths = result.value.results.map((entry) => entry.localPath);
+    assert(paths.length === 2 && new Set(paths).size === 2, "batch_download local paths should be unique", result.value);
+    assert(paths[0].endsWith("same-name.txt"), "first duplicate should keep original filename", { paths });
+    assert(paths[1].endsWith("same-name (2).txt"), "second duplicate should get deterministic suffix", { paths });
+    assert(readFileSync(paths[0], "utf8") === "duplicate a\n", "first duplicate content mismatch", { paths });
+    assert(readFileSync(paths[1], "utf8") === "duplicate b\n", "second duplicate content mismatch", { paths });
+    return { paths };
   });
 
   await check("batch_move live action requires confirmation and expected identity before Graph", async () => {
