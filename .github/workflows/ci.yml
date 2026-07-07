@@ -30,9 +30,15 @@ jobs:
           node --check scripts/mock-graph-test.mjs
           node --check scripts/prepackage-check.mjs
           node --check scripts/beta-test.mjs
+          zsh -n scripts/configure.zsh
 
       - name: Run mocked Microsoft Graph tests
         run: node scripts/mock-graph-test.mjs
 
       - name: Run prepackage guard
-        run: node scripts/prepackage-check.mjs
+        run: |
+          node scripts/prepackage-check.mjs
+          if node scripts/prepackage-check.mjs --installed; then
+            echo "prepackage-check --installed without a path should fail" >&2
+            exit 1
+          fi

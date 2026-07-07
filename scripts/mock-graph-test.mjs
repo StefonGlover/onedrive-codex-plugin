@@ -205,6 +205,25 @@ const graph = createServer(async (req, res) => {
     });
   }
 
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/cycle-pager/children") {
+    return json(res, 200, {
+      value: [item("cycle-link", "cycle-link.txt")],
+      "@odata.nextLink": `http://127.0.0.1:${graph.address().port}${req.url}`
+    });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/empty-pager") {
+    return json(res, 200, item("empty-pager", "empty-pager", { folder: { childCount: 0 }, file: undefined }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/empty-pager/children") {
+    const page = Number(url.searchParams.get("page") || "0");
+    return json(res, 200, {
+      value: [],
+      "@odata.nextLink": `http://127.0.0.1:${graph.address().port}/v1.0/me/drive/items/empty-pager/children?page=${page + 1}`
+    });
+  }
+
   if (req.method === "DELETE" && path === "/v1.0/me/drive/items/delete-target") {
     count("delete");
     return empty(res, 204, { "request-id": "mock-delete-request" });
@@ -216,6 +235,10 @@ const graph = createServer(async (req, res) => {
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/copy-evil") {
     return json(res, 200, item("copy-evil", "copy-evil.txt"));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/copy-http-sharepoint") {
+    return json(res, 200, item("copy-http-sharepoint", "copy-http-sharepoint.txt"));
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/copy-src/permissions") {
@@ -290,7 +313,7 @@ const graph = createServer(async (req, res) => {
     return json(res, 403, {
       error: {
         code: "accessDenied",
-        message: "mock invite failure",
+        message: "mock invite failure for person@example.test object 11111111-1111-1111-1111-111111111111 at https://example.test/invite?token=secret Bearer abc.def.ghi",
         innerError: { "request-id": "mock-invite-fail-request" }
       }
     });
@@ -315,6 +338,31 @@ const graph = createServer(async (req, res) => {
     return empty(res, 204, { "request-id": "mock-revoke-request" });
   }
 
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/revoke-a") {
+    return json(res, 200, item("revoke-a", "revoke-a.txt"));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/revoke-a/permissions") {
+    return json(res, 200, {
+      value: [{ id: "perm-a", roles: ["read"], link: { type: "view", scope: "anonymous", webUrl: "https://example.test/revoke/a" } }]
+    });
+  }
+
+  if (req.method === "DELETE" && path === "/v1.0/me/drive/items/revoke-a/permissions/perm-a") {
+    count("revoke-perm-a");
+    return empty(res, 204, { "request-id": "mock-revoke-a-request" });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/revoke-b") {
+    return json(res, 200, item("revoke-b", "revoke-b.txt"));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/revoke-b/permissions") {
+    return json(res, 200, {
+      value: [{ id: "perm-owner-b", roles: ["owner"], grantedTo: { user: { displayName: "Mock User", email: "mock@example.test" } } }]
+    });
+  }
+
   if (req.method === "GET" && path === "/v1.0/me/drive/items/quarterly-report") {
     return json(res, 200, item("quarterly-report", "Quarterly Report.docx", {
       parentReference: { path: "/drive/root:/Folder B" },
@@ -334,6 +382,21 @@ const graph = createServer(async (req, res) => {
 
   if (req.method === "GET" && path === "/v1.0/me/drive/root") {
     return json(res, 200, { id: "root", name: "root", root: {}, folder: {} });
+  }
+
+  if (req.method === "POST" && path === "/v1.0/me/drive/items/root:/trusted-session.txt:/createUploadSession") {
+    count("trusted-upload-session");
+    return json(res, 200, { uploadUrl: `http://127.0.0.1:${graph.address().port}/v1.0/mock/upload-session/trusted` });
+  }
+
+  if (req.method === "PUT" && path === "/v1.0/mock/upload-session/trusted") {
+    count("trusted-upload-session-put");
+    return json(res, 201, item("trusted-session", "trusted-session.txt"));
+  }
+
+  if (req.method === "POST" && path === "/v1.0/me/drive/items/root:/evil-session.txt:/createUploadSession") {
+    count("evil-upload-session");
+    return json(res, 200, { uploadUrl: "https://evil.example.test/upload/session" });
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/root/children") {
@@ -459,15 +522,19 @@ const graph = createServer(async (req, res) => {
 
   if (req.method === "POST" && path === "/v1.0/me/drive/items/copy-src/copy") {
     count("copy");
-    return empty(res, 202, { Location: `http://127.0.0.1:${graph.address().port}/monitor/copy`, "request-id": "mock-copy-request" });
+    return empty(res, 202, { Location: `http://127.0.0.1:${graph.address().port}/monitor/copy?token=copy-secret`, "request-id": "mock-copy-request" });
   }
 
   if (req.method === "POST" && path === "/v1.0/me/drive/items/copy-evil/copy") {
     return empty(res, 202, { Location: "https://evil.example.test/monitor/copy" });
   }
 
+  if (req.method === "POST" && path === "/v1.0/me/drive/items/copy-http-sharepoint/copy") {
+    return empty(res, 202, { Location: "http://tenant.sharepoint.com/monitor/copy?token=copy-secret" });
+  }
+
   if (req.method === "GET" && path === "/monitor/copy") {
-    return empty(res, 303, { Location: `http://127.0.0.1:${graph.address().port}/v1.0/me/drive/items/copied` });
+    return empty(res, 303, { Location: `http://127.0.0.1:${graph.address().port}/v1.0/me/drive/items/copied?downloadToken=secret` });
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/root:/Documents/Pictures:") {
@@ -719,6 +786,21 @@ try {
     return { graphRequestsAdded: requests.length - before };
   });
 
+  await check("repeated nextLink returns controlled pagination cycle error", async () => {
+    const result = await tool("onedrive_list_all", { itemId: "cycle-pager", maxItems: 5 });
+    assert(result.isError, "pagination cycle should fail");
+    assert(String(result.value).includes("pagination cycle detected"), "cycle error should be specific", result);
+    assert(!String(result.value).includes("safeDisplayPath"), "cycle error should not expose a ReferenceError", result);
+    return { response: result.value };
+  });
+
+  await check("scan stops unique empty pagination chains with a page cap", async () => {
+    const result = await tool("onedrive_scan", { itemId: "empty-pager", maxItems: 1, maxFolders: 1 });
+    assert(result.isError, "empty pagination chain should fail with a controlled cap");
+    assert(String(result.value).includes("pagination exceeded"), "page cap error should be specific", result);
+    return { response: result.value };
+  });
+
   await check("raw list and search limits are clamped server-side", async () => {
     const beforeList = requests.length;
     const listResult = await tool("onedrive_list", { path: "/", limit: 99999 });
@@ -893,10 +975,13 @@ try {
     assert(counters.get("copy") === 1, "copy should POST exactly once", { copyCount: counters.get("copy") });
     assert(result.value.monitor?.status === 303, "copy monitor did not preserve 303", result.value.monitor);
     assert(result.value.monitor?.resourceLocation?.includes("/v1.0/me/drive/items/copied"), "missing resource location", result.value.monitor);
+    assert(!result.value.monitorUrl?.includes("copy-secret"), "copy response should not expose monitor query tokens", result.value);
+    assert(!result.value.monitor?.monitorUrl?.includes("copy-secret"), "copy monitor output should not expose monitor query tokens", result.value.monitor);
+    assert(!result.value.monitor?.resourceLocation?.includes("downloadToken"), "copy resource location should not expose query tokens", result.value.monitor);
     return result.value.monitor;
   });
 
-  await check("copy monitor rejects untrusted external URLs", async () => {
+  await check("copy monitor rejects untrusted and insecure external URLs", async () => {
     const result = await tool("onedrive_copy", {
       itemId: "copy-evil",
       dryRun: false,
@@ -908,7 +993,18 @@ try {
     assert(!result.isError, "copy acceptance should not be converted into a failed mutation", result);
     assert(result.value.accepted === true, "copy should still report accepted mutation", result.value);
     assert(result.value.monitorError?.includes("untrusted copy monitor URL"), "unexpected monitor rejection", result.value);
-    return { monitorError: result.value.monitorError };
+    const insecure = await tool("onedrive_copy", {
+      itemId: "copy-http-sharepoint",
+      dryRun: false,
+      confirmed: true,
+      expectedName: "copy-http-sharepoint.txt",
+      waitForCompletion: true,
+      timeoutSeconds: 5
+    });
+    assert(!insecure.isError, "insecure monitor acceptance should not be converted into a failed mutation", insecure);
+    assert(insecure.value.monitorError?.includes("untrusted copy monitor URL"), "insecure external monitor should be rejected", insecure.value);
+    assert(!insecure.value.monitorError?.includes("copy-secret"), "monitor rejection should not echo query tokens", insecure.value);
+    return { monitorError: result.value.monitorError, insecureMonitorError: insecure.value.monitorError };
   });
 
   await check("sharing dry-run includes before permission audit", async () => {
@@ -1022,6 +1118,10 @@ try {
     });
     assert(failed.isError, "failed invite should return tool error", failed);
     assert(String(failed.value).includes("mock invite failure"), "invite failure should surface Graph message", failed);
+    assert(!String(failed.value).includes("person@example.test"), "invite failure should redact recipient email", failed);
+    assert(!String(failed.value).includes("11111111-1111-1111-1111-111111111111"), "invite failure should redact object identifiers", failed);
+    assert(!String(failed.value).includes("https://example.test"), "invite failure should redact URLs", failed);
+    assert(!String(failed.value).includes("abc.def.ghi"), "invite failure should redact bearer-looking tokens", failed);
     return { sendInvitation: inviteBody.sendInvitation, failure: String(failed.value) };
   });
 
@@ -1112,6 +1212,23 @@ try {
     return { errors: result.value.errors };
   });
 
+  await check("batch revoke validates permission existence even when permissions are omitted from output", async () => {
+    const beforeRevokeCount = counters.get("revoke-perm-a") || 0;
+    const result = await tool("onedrive_batch_revoke_permissions", {
+      items: [
+        { itemId: "revoke-a", permissionId: "perm-a", expectedId: "revoke-a" },
+        { itemId: "revoke-b", permissionId: "missing-permission", expectedId: "revoke-b" }
+      ],
+      includePermissions: false,
+      dryRun: false,
+      confirmed: true
+    });
+    assert(!result.isError, "batch revoke preflight failure should be structured", result);
+    assert(result.value.preflightFailed === true, "batch revoke should fail preflight before mutation", result.value);
+    assert((counters.get("revoke-perm-a") || 0) === beforeRevokeCount, "batch revoke should not partially revoke when includePermissions is false", { beforeRevokeCount, afterRevokeCount: counters.get("revoke-perm-a") || 0 });
+    return { errors: result.value.errors };
+  });
+
   await check("download refuses local OneDrive sync destination by default", async () => {
     const result = await tool("onedrive_download", {
       itemId: "delete-target",
@@ -1151,6 +1268,32 @@ try {
     assert(added.some((request) => request.method === "PUT" && request.path === "/v1.0/me/drive/root:/empty-session.txt:/content"), "simple upload endpoint was not used", { added });
     assert(!added.some((request) => request.url.includes("createUploadSession")), "zero-byte upload should not create an upload session", { added });
     return { uploadMode: result.value.uploadMode, bytesUploaded: result.value.bytesUploaded };
+  });
+
+  await check("upload session URLs are trusted before sending file bytes", async () => {
+    const localPath = join(mockHome, "work", "session-upload.txt");
+    mkdirSync(dirname(localPath), { recursive: true });
+    writeFileSync(localPath, "session upload body", "utf8");
+    const trusted = await tool("onedrive_upload", {
+      localPath,
+      remotePath: "trusted-session.txt",
+      uploadMode: "session",
+      chunkSize: 327680
+    });
+    assert(!trusted.isError, "trusted same-origin upload session should succeed", trusted);
+    assert(counters.get("trusted-upload-session-put") === 1, "trusted upload session should PUT one chunk", { count: counters.get("trusted-upload-session-put") });
+
+    const beforePut = counters.get("trusted-upload-session-put") || 0;
+    const evil = await tool("onedrive_upload", {
+      localPath,
+      remotePath: "evil-session.txt",
+      uploadMode: "session",
+      chunkSize: 327680
+    });
+    assert(evil.isError, "untrusted upload session should fail");
+    assert(String(evil.value).includes("untrusted upload session URL"), "unexpected untrusted upload error", evil);
+    assert((counters.get("trusted-upload-session-put") || 0) === beforePut, "untrusted upload should not send chunks to mock upload endpoint", { beforePut, afterPut: counters.get("trusted-upload-session-put") || 0 });
+    return { trusted: trusted.value.uploadMode, evil: evil.value };
   });
 
   await check("document PDF export writes converted content", async () => {
@@ -1398,6 +1541,23 @@ try {
     return { paths: cache.pathsByLower };
   });
 
+  await check("batch_move updates metadata cache path keys", async () => {
+    await tool("onedrive_cache_clear");
+    const info = await tool("onedrive_get_info", { itemId: "root-note" });
+    assert(!info.isError, "get_info should seed cache before batch move", info);
+    const moved = await tool("onedrive_batch_move", {
+      items: [{ itemId: "root-note", expectedId: "root-note" }],
+      destinationParentItemId: "folder-a",
+      dryRun: false,
+      confirmed: true
+    });
+    assert(!moved.isError, "batch_move should succeed", moved);
+    const cache = JSON.parse(readFileSync(join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json"), "utf8"));
+    assert(!Object.hasOwn(cache.pathsByLower, "root-note.txt"), "batch_move should remove stale source cache path", cache.pathsByLower);
+    assert(cache.pathsByLower["folder a/root-note.txt"] === "root-note", "batch_move should cache destination path", cache.pathsByLower);
+    return { paths: cache.pathsByLower };
+  });
+
   await check("large_files evaluates scanned files beyond returned scan result cap", async () => {
     const result = await tool("onedrive_large_files", {
       itemId: "bulk-large",
@@ -1577,6 +1737,9 @@ try {
     assert(!serialized.includes("invite-secret"), "audit should not include invite password", entries);
     assert(!serialized.includes("Please review"), "audit should not include invitation message", entries);
     assert(!serialized.includes("person@example.test"), "audit should not include recipient email", entries);
+    assert(!serialized.includes("11111111-1111-1111-1111-111111111111"), "audit should not include object identifiers echoed in errors", entries);
+    assert(!serialized.includes("https://example.test/invite"), "audit should not include URLs echoed in errors", entries);
+    assert(!serialized.includes("abc.def.ghi"), "audit should not include bearer-looking tokens echoed in errors", entries);
     return { count: entries.length, tools };
   });
 

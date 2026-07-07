@@ -10,8 +10,14 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, "..");
 const args = process.argv.slice(2);
 const installedIndex = args.indexOf("--installed");
-const installedRoot = installedIndex >= 0 ? resolve(args[installedIndex + 1] || "") : null;
 const problems = [];
+const installedArgument = installedIndex >= 0 ? args[installedIndex + 1] : null;
+const installedRoot = installedIndex >= 0 && installedArgument && !installedArgument.startsWith("--")
+  ? resolve(installedArgument)
+  : null;
+if (installedIndex >= 0 && !installedRoot) {
+  problems.push("--installed requires a path argument.");
+}
 const ignoredPackageDirs = new Set([".git", "work", "downloads", "onedrive-beta", "node_modules", "dist", "build", "coverage"]);
 const ignoredPackageFiles = new Set([".DS_Store"]);
 const ignoredPackageFileExtensions = new Set([".log", ".tmp", ".temp", ".bak", ".swp"]);
@@ -122,6 +128,7 @@ async function packageFileSet(root) {
 async function checkInstalledDrift() {
   if (!installedRoot) return;
   if (!existsSync(installedRoot)) return fail(`Installed root does not exist: ${installedRoot}`);
+  if (installedRoot === pluginRoot) return fail("--installed must point to a separate installed plugin cache, not the source root.");
   const sourceFiles = await packageFileSet(pluginRoot);
   const installedFiles = await packageFileSet(installedRoot);
   const sourceSet = new Set(sourceFiles);

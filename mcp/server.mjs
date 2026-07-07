@@ -1644,7 +1644,7 @@ async function doctor(args = {}) {
     try {
       addCheck(name, "pass", await fn());
     } catch (error) {
-      addCheck(name, "fail", { error: error.message });
+      addCheck(name, "fail", { error: safeToolErrorMessage(error) });
     }
   };
 
@@ -1949,12 +1949,28 @@ function graphUrl(path, options = {}) {
 function assertTrustedCopyMonitorUrl(monitorUrl) {
   const base = new URL(graphBaseUrl());
   const target = new URL(monitorUrl, base);
+  if (target.origin === base.origin) return target.toString();
   const host = target.hostname.toLowerCase();
   const trustedMicrosoftHost = host === "my.microsoftpersonalcontent.com"
     || host.endsWith(".microsoftpersonalcontent.com")
     || host.endsWith(".sharepoint.com");
-  if (target.origin !== base.origin && !trustedMicrosoftHost) {
+  if (target.protocol !== "https:" || !trustedMicrosoftHost) {
     throw new Error(`Refusing to poll untrusted copy monitor URL: ${target.origin}${target.pathname}`);
+  }
+  return target.toString();
+}
+
+function assertTrustedUploadSessionUrl(uploadUrl) {
+  const base = new URL(graphBaseUrl());
+  const target = new URL(uploadUrl, base);
+  if (target.origin === base.origin) return target.toString();
+  const host = target.hostname.toLowerCase();
+  const trustedMicrosoftHost = host.endsWith(".up.1drv.com")
+    || host.endsWith(".up.1drv.ms")
+    || host.endsWith(".sharepoint.com")
+    || host.endsWith(".microsoftpersonalcontent.com");
+  if (target.protocol !== "https:" || !trustedMicrosoftHost) {
+    throw new Error(`Refusing to upload file contents to an untrusted upload session URL: ${target.origin}${target.pathname}`);
   }
   return target.toString();
 }
@@ -2317,10 +2333,24 @@ function permissionDiffAuditSummary(diff = {}) {
 
 function safeErrorInfo(error) {
   return {
-    message: error?.message || String(error),
+    message: redactAuditText(error?.message || String(error)),
     graphRequestId: error?.graphRequestId || lastGraphRequestId || undefined,
     graphStatus: error?.graphStatus
   };
+}
+
+function redactAuditText(text = "") {
+  return String(text)
+    .replace(/https?:\/\/[^\s")]+/gi, "[redacted-url]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted-email]")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, "[redacted-id]")
+    .replace(/\b(access[_-]?token|refresh[_-]?token|id[_-]?token|secret)\s*[:=]\s*([^\s,;)]+)/gi, "$1=[redacted]")
+    .replace(/\b(email|alias|objectId|recipient)\s*[:=]\s*([^\s,;)]+)/gi, "$1=[redacted]");
+}
+
+function safeToolErrorMessage(error) {
+  return redactAuditText(error?.message || String(error));
 }
 
 function sanitizeAuditValue(value) {
@@ -2518,6 +2548,15 @@ async function collectPages(firstPath, maxItems, format = "compact", formatter =
   return { items, nextLink, deltaLink, truncated, count: items.length };
 }
 
+function safeDisplayPath(value = "") {
+  try {
+    const url = new URL(value, graphBaseUrl());
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return String(value).split("?")[0];
+  }
+}
+
 async function listAll(args = {}) {
   const maxItems = clampInteger(args.maxItems, 1000, 1, 5000);
   const params = new URLSearchParams();
@@ -2611,6 +2650,8 @@ async function scan(args = {}) {
     counters.foldersVisited += 1;
     let nextPath = `/me/drive/items/${encodeURIComponent(folder.id)}/children?${params.toString()}`;
     const seenPages = new Set();
+    let pagesFetched = 0;
+    const maxPagesPerFolder = Math.max(1, maxItems + 100);
 
     while (nextPath) {
       if (counters.itemsScanned >= maxItems) {
@@ -2620,7 +2661,11 @@ async function scan(args = {}) {
       if (seenPages.has(nextPath)) {
         throw new Error(`Microsoft Graph pagination cycle detected while scanning ${folder.remotePath || folder.name || folder.id}.`);
       }
+      if (pagesFetched >= maxPagesPerFolder) {
+        throw new Error(`Microsoft Graph pagination exceeded ${maxPagesPerFolder} pages while scanning ${folder.remotePath || folder.name || folder.id}.`);
+      }
       seenPages.add(nextPath);
+      pagesFetched += 1;
       const page = await graph(nextPath);
       const cacheableItems = [];
       for (const item of page.value || []) {
@@ -3037,7 +3082,7 @@ async function find(args = {}) {
         folderHints
       });
     } catch (error) {
-      searchRuns.push({ strategy: "exactPath", path: query, error: error.message });
+      searchRuns.push({ strategy: "exactPath", path: query, error: safeToolErrorMessage(error) });
     }
   }
 
@@ -3061,7 +3106,7 @@ async function find(args = {}) {
         });
       }
     } catch (error) {
-      searchRuns.push({ term, error: error.message });
+      searchRuns.push({ term, error: safeToolErrorMessage(error) });
     }
   }
 
@@ -3116,7 +3161,7 @@ async function find(args = {}) {
           ranked = rankedFindCandidates(candidates);
           if ((ranked[0]?.score || 0) >= (args.minConfidenceForSearchOnly ?? 78) && ranked.length >= maxResults) break;
         } catch (error) {
-          scanRuns.push({ folder: folder || "root", reason: plan.reason, error: error.message });
+          scanRuns.push({ folder: folder || "root", reason: plan.reason, error: safeToolErrorMessage(error) });
         }
       }
       ranked = rankedFindCandidates(candidates);
@@ -3306,7 +3351,7 @@ async function cacheRefresh(args = {}) {
       mode: "scan",
       scan: result,
       cache: await syncStatus(),
-      deltaError: error.message,
+      deltaError: safeToolErrorMessage(error),
       note: "Rebuilt the metadata cache from a bounded scan, but could not get a fresh deltaLink."
     };
   }
@@ -3350,7 +3395,7 @@ async function batchGetInfo(args = {}) {
     count: responses.length,
     items: responses.map((response) => response.ok
       ? formatDriveItem(response.body, args.format || "compact")
-      : { error: response.body?.error?.message || response.error || `HTTP ${response.status}`, status: response.status, target: response.request.target })
+      : { error: redactAuditText(response.body?.error?.message || response.error || `HTTP ${response.status}`), status: response.status, target: response.request.target })
   };
 }
 
@@ -3365,7 +3410,7 @@ async function batchPermissions(args = {}) {
           permissions: (response.body?.value || []).map((permission) => simplifyPermission(permission, args.format)),
           count: (response.body?.value || []).length
         }
-      : { error: response.body?.error?.message || response.error || `HTTP ${response.status}`, status: response.status, target: response.request.target })
+      : { error: redactAuditText(response.body?.error?.message || response.error || `HTTP ${response.status}`), status: response.status, target: response.request.target })
   };
 }
 
@@ -3413,7 +3458,7 @@ async function batchDownload(args = {}) {
         allowLocalOneDriveSyncPath: args.allowLocalOneDriveSyncPath
       }));
     } catch (error) {
-      results.push({ target: item, error: error.message });
+      results.push({ target: item, error: safeToolErrorMessage(error) });
     }
   }
   return { count: results.length, results };
@@ -3452,7 +3497,7 @@ async function batchDelete(args = {}) {
       assertExpectedItem(rawItem, item, "Delete");
       preflight.push({ targetArgs: item, rawItem, item: simplifyItem(rawItem) });
     } catch (error) {
-      preflightErrors.push({ index, target: item, error: error.message });
+      preflightErrors.push({ index, target: item, error: safeToolErrorMessage(error) });
     }
   }
   if (preflightErrors.length) {
@@ -3488,7 +3533,7 @@ async function batchDelete(args = {}) {
         count: preflight.length,
         failed: true,
         failedIndex: index,
-        error: error.message,
+        error: safeToolErrorMessage(error),
         partialResults: results
       };
       await writeMutationAudit("onedrive_batch_delete", {
@@ -3796,7 +3841,7 @@ async function preview(args = {}) {
       const previewText = exported.buffer.toString("utf8").replace(/\uFFFD$/u, "");
       return { item: info, preview: previewText, bytes: exported.bytesRead, truncated: exported.truncated, source: "graph-text-export" };
     } catch (error) {
-      return { item: info, preview: null, source: "metadata", exportError: error.message, note: "Graph text export was not available for this file." };
+      return { item: info, preview: null, source: "metadata", exportError: safeToolErrorMessage(error), note: "Graph text export was not available for this file." };
     }
   }
 
@@ -4096,7 +4141,7 @@ async function uploadLarge(args = {}, fileStat) {
       const end = position + bytesRead - 1;
       let response;
       try {
-        response = await graph(session.uploadUrl, {
+        response = await graph(assertTrustedUploadSessionUrl(session.uploadUrl), {
           method: "PUT",
           skipAuth: true,
           body,
@@ -4106,7 +4151,7 @@ async function uploadLarge(args = {}, fileStat) {
           maxRetries: 4
         });
       } catch (error) {
-        throw new Error(`Upload session failed for byte range ${position}-${end}/${fileStat.size}: ${error.message}`);
+        throw new Error(`Upload session failed for byte range ${position}-${end}/${fileStat.size}: ${safeToolErrorMessage(error)}`);
       }
       uploaded = end + 1;
       if (response?.id) finalItem = response;
@@ -4160,7 +4205,7 @@ async function createUploadSession(sessionTarget, conflictBehavior, ifMatch) {
           ...(body ? { body: JSON.stringify(body) } : {})
         });
       } catch (error) {
-        errors.push(`${endpoint}: ${error.message}`);
+        errors.push(`${endpoint}: ${safeToolErrorMessage(error)}`);
       }
     }
   }
@@ -4350,6 +4395,7 @@ async function moveItem(args = {}) {
 
 async function pollCopyMonitor(monitorUrl, timeoutSeconds = 60) {
   const trustedMonitorUrl = assertTrustedCopyMonitorUrl(monitorUrl);
+  const safeMonitorUrl = safeDisplayPath(trustedMonitorUrl);
   const deadline = Date.now() + timeoutSeconds * 1000;
   let last = null;
   while (Date.now() < deadline) {
@@ -4359,16 +4405,16 @@ async function pollCopyMonitor(monitorUrl, timeoutSeconds = 60) {
       return {
         complete: true,
         status: response.status,
-        resourceLocation: response.headers.get("location"),
-        monitorUrl: trustedMonitorUrl
+        resourceLocation: response.headers.get("location") ? safeDisplayPath(response.headers.get("location")) : null,
+        monitorUrl: safeMonitorUrl
       };
     }
     if (response.ok && last?.status && !["notStarted", "running", "inProgress"].includes(String(last.status))) {
-      return { complete: true, status: response.status, monitorUrl: trustedMonitorUrl, monitor: last };
+      return { complete: true, status: response.status, monitorUrl: safeMonitorUrl, monitor: sanitizeAuditValue(last) };
     }
     await sleep(2000);
   }
-  return { complete: false, timeoutSeconds, monitorUrl: trustedMonitorUrl, monitor: last };
+  return { complete: false, timeoutSeconds, monitorUrl: safeMonitorUrl, monitor: sanitizeAuditValue(last) };
 }
 
 async function copyItem(args = {}) {
@@ -4419,13 +4465,13 @@ async function copyItem(args = {}) {
       accepted: response.status === 202 || response.ok,
       status: response.status,
       source: item,
-      monitorUrl
+      monitorUrl: monitorUrl ? safeDisplayPath(monitorUrl) : null
     };
     if (args.waitForCompletion && monitorUrl) {
       try {
         result.monitor = await pollCopyMonitor(monitorUrl, args.timeoutSeconds ?? 60);
       } catch (error) {
-        result.monitorError = error.message;
+        result.monitorError = safeToolErrorMessage(error);
       }
     }
     await writeMutationAudit("onedrive_copy", {
@@ -4685,13 +4731,13 @@ async function preflightRevokePermission(args = {}, options = {}) {
   if (current.root) throw new Error("Revoke permission refuses to operate on the OneDrive root.");
   assertExpectedItem(current, args, "Revoke permission");
   const includePermissions = options.includePermissions !== false;
-  const beforePermissions = includePermissions ? await permissionList({ itemId: current.id }, "compact") : [];
-  if (includePermissions) assertPermissionPresent(beforePermissions, args.permissionId);
+  const permissionsForPreflight = await permissionList({ itemId: current.id }, "compact");
+  assertPermissionPresent(permissionsForPreflight, args.permissionId);
   return {
     targetArgs: args,
     rawItem: current,
     item: simplifyItem(current),
-    beforePermissions,
+    beforePermissions: includePermissions ? permissionsForPreflight : [],
     includePermissions
   };
 }
@@ -4793,7 +4839,7 @@ async function batchRevokePermissions(args = {}) {
     try {
       preflight.push(await preflightRevokePermission(item, { includePermissions: args.includePermissions }));
     } catch (error) {
-      preflightErrors.push({ index, target: item, error: error.message });
+      preflightErrors.push({ index, target: item, error: safeToolErrorMessage(error) });
     }
   }
   if (preflightErrors.length) {
@@ -4850,7 +4896,7 @@ async function batchRevokePermissions(args = {}) {
         confirmed: true,
         failed: true,
         failedIndex: index,
-        error: error.message,
+        error: safeToolErrorMessage(error),
         count: preflight.length,
         partialResults: results
       };
@@ -4907,7 +4953,7 @@ async function batchMove(args = {}) {
     try {
       preflight.push(await preflightMoveItem(item, destination));
     } catch (error) {
-      preflightErrors.push({ index, target: item, error: error.message });
+      preflightErrors.push({ index, target: item, error: safeToolErrorMessage(error) });
     }
   }
   if (preflightErrors.length) {
@@ -4946,6 +4992,7 @@ async function batchMove(args = {}) {
         headers: mutationMatchHeaders(entry.rawItem),
         body: JSON.stringify(body)
       });
+      await cacheMovedOrRenamedItem(entry.rawItem, result);
       results.push({ before: entry.item, moved: simplifyItem(result), newName: entry.targetArgs.newName || null });
     } catch (error) {
       await writeMutationAudit("onedrive_batch_move", {
@@ -4961,7 +5008,7 @@ async function batchMove(args = {}) {
         confirmed: true,
         failed: true,
         failedIndex: index,
-        error: error.message,
+        error: safeToolErrorMessage(error),
         destination,
         count: preflight.length,
         partialResults: results
@@ -5121,7 +5168,7 @@ async function callTool(name, args = {}) {
           status.accessTokenAvailable = true;
         } catch (error) {
           status.accessTokenAvailable = false;
-          status.tokenCheckError = error.message;
+          status.tokenCheckError = safeToolErrorMessage(error);
         }
       }
       return textResult(status);
@@ -5269,7 +5316,7 @@ async function handleRequest(message) {
     if (method?.startsWith("notifications/")) return;
     if (id !== undefined) sendError(id, -32601, `Method not found: ${method}`);
   } catch (error) {
-    if (id !== undefined) sendResult(id, textResult(error.message, true));
+    if (id !== undefined) sendResult(id, textResult(safeToolErrorMessage(error), true));
     else console.error(error);
   }
 }
