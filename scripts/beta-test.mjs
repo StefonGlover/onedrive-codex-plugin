@@ -10,17 +10,184 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, "..");
 const serverPath = join(pluginRoot, "mcp", "server.mjs");
 const workspace = process.cwd();
-const cliArgs = Object.fromEntries(process.argv.slice(2).map((arg) => {
-  const [key, ...rest] = arg.replace(/^--/, "").split("=");
-  return [key, rest.length ? rest.join("=") : true];
-}));
-const keepWork = Boolean(cliArgs["keep-work"]);
-const doctorOnly = Boolean(cliArgs["doctor-only"]);
-const cleanupStale = Boolean(cliArgs["cleanup-stale"]);
-const cleanupConfirmed = Boolean(cliArgs.confirmed || cliArgs.delete);
-const cleanupStaleDays = Number(cliArgs["stale-days"] || 1);
+const betaFolderPrefix = "Codex OneDrive Plugin Beta Test codex-beta-";
+const maxCleanupStaleDays = 1_000_000;
+
+function parseCliArgs(argv = []) {
+  return Object.fromEntries(argv.map((arg) => {
+    const [key, ...rest] = arg.replace(/^--/, "").split("=");
+    return [key, rest.length ? rest.join("=") : true];
+  }));
+}
+
+function parseBooleanFlag(value, name, defaultValue = false) {
+  if (value === undefined) return defaultValue;
+  if (typeof value === "boolean") return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off", ""].includes(normalized)) return false;
+  throw new Error(`--${name} expects a boolean value, got ${value}.`);
+}
+
+function boundedInteger(value, defaultValue, minimum, maximum) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return defaultValue;
+  return Math.min(Math.max(Math.trunc(parsed), minimum), maximum);
+}
+
+function parseBoundedIntegerFlag(value, name, defaultValue, minimum, maximum) {
+  if (value === undefined) return defaultValue;
+  if (typeof value === "boolean" || String(value).trim() === "") {
+    throw new Error(`--${name} expects an integer between ${minimum} and ${maximum}.`);
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new Error(`--${name} expects an integer between ${minimum} and ${maximum}, got ${value}.`);
+  }
+  return parsed;
+}
+
+function parseNonNegativeNumberFlag(value, name, defaultValue, maximum = Number.MAX_VALUE) {
+  if (value === undefined) return defaultValue;
+  if (typeof value === "boolean" || String(value).trim() === "") {
+    throw new Error(`--${name} expects a non-negative number.`);
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > maximum) {
+    throw new Error(`--${name} expects a non-negative finite number no greater than ${maximum}, got ${value}.`);
+  }
+  return parsed;
+}
+
+function throws(fn) {
+  try {
+    fn();
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+function betaFolderLooksStale(item = {}, cutoffMs) {
+  if (!item.folder || !String(item.name || "").startsWith(betaFolderPrefix)) return false;
+  const modified = Date.parse(item.lastModifiedDateTime || item.createdDateTime || "");
+  return Number.isFinite(modified) && modified <= cutoffMs;
+}
+
+function uniqueBetaFolderCandidates(items = [], maxResults = 100) {
+  const seen = new Set();
+  const candidates = [];
+  for (const item of items) {
+    if (!item?.id || !item.folder || !String(item.name || "").startsWith(betaFolderPrefix) || seen.has(item.id)) continue;
+    seen.add(item.id);
+    candidates.push(item);
+    if (candidates.length >= maxResults) break;
+  }
+  return candidates;
+}
+
+function errorText(value) {
+  if (value instanceof Error) return value.message;
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function clearlyTransientReadError(value) {
+  const message = errorText(value).trim();
+  const wrapped = message.match(/^Microsoft Graph transport error after \d+ attempts?:\s*(.+)$/i);
+  if (wrapped) return clearlyTransientReadError(wrapped[1]);
+  return /^fetch failed$/i.test(message)
+    || /\b(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|UND_ERR_[A-Z_]+)\b/i.test(message)
+    || /(?:socket hang up|other side closed|network connection (?:was )?lost|temporary failure in name resolution)/i.test(message)
+    || /Substrate Search/i.test(message);
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function retryTransientReadCall(name, call, options = {}) {
+  const maxAttempts = boundedInteger(options.maxAttempts, 3, 1, 5);
+  const baseDelayMs = boundedInteger(options.baseDelayMs, 250, 0, 5000);
+  const onRetry = options.onRetry || (() => {});
+  let lastResult;
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const result = await call();
+      lastResult = { ...result, attempts: attempt };
+      if (!result.isError || !clearlyTransientReadError(result.value) || attempt === maxAttempts) return lastResult;
+      onRetry({ tool: name, attempt, reason: errorText(result.value) });
+    } catch (error) {
+      lastError = error;
+      if (!clearlyTransientReadError(error) || attempt === maxAttempts) throw error;
+      onRetry({ tool: name, attempt, reason: errorText(error) });
+    }
+    await wait(baseDelayMs * attempt);
+  }
+  if (lastResult) return lastResult;
+  throw lastError || new Error(`${name} failed without a result.`);
+}
+
+const cliArgs = parseCliArgs(process.argv.slice(2));
+const keepWork = parseBooleanFlag(cliArgs["keep-work"], "keep-work");
+const doctorOnly = parseBooleanFlag(cliArgs["doctor-only"], "doctor-only");
+const cleanupStale = parseBooleanFlag(cliArgs["cleanup-stale"], "cleanup-stale");
+const cleanupConfirmed = parseBooleanFlag(cliArgs.confirmed, "confirmed") || parseBooleanFlag(cliArgs.delete, "delete");
+const cleanupStaleDays = parseNonNegativeNumberFlag(cliArgs["stale-days"], "stale-days", 1, maxCleanupStaleDays);
+const cleanupMaxItems = parseBoundedIntegerFlag(cliArgs["cleanup-max-items"], "cleanup-max-items", 500, 1, 5000);
+const cleanupMaxResults = parseBoundedIntegerFlag(cliArgs["cleanup-max-results"], "cleanup-max-results", 100, 1, 500);
+const cleanupPageSize = parseBoundedIntegerFlag(cliArgs["cleanup-page-size"], "cleanup-page-size", 100, 1, 200);
+const cleanupVerifyConcurrency = parseBoundedIntegerFlag(cliArgs["cleanup-verify-concurrency"], "cleanup-verify-concurrency", 4, 1, 8);
+const readRetryAttempts = parseBoundedIntegerFlag(cliArgs["read-retry-attempts"], "read-retry-attempts", 3, 1, 5);
+const readRetryDelayMs = parseBoundedIntegerFlag(cliArgs["read-retry-delay-ms"], "read-retry-delay-ms", 250, 0, 5000);
 const tenantMatrix = cliArgs["tenant-matrix"];
-const tenantMatrixLive = Boolean(cliArgs["tenant-matrix-live"]);
+const tenantMatrixLive = parseBooleanFlag(cliArgs["tenant-matrix-live"], "tenant-matrix-live");
+const selfCheck = parseBooleanFlag(cliArgs["self-check"], "self-check");
+
+if (selfCheck) {
+  const now = Date.now();
+  const stale = { id: "stale", name: `${betaFolderPrefix}old`, folder: {}, lastModifiedDateTime: new Date(now - 2 * 86_400_000).toISOString() };
+  const fresh = { id: "fresh", name: `${betaFolderPrefix}new`, folder: {}, lastModifiedDateTime: new Date(now).toISOString() };
+  const candidates = uniqueBetaFolderCandidates([stale, stale, fresh, { id: "file", name: `${betaFolderPrefix}file` }], 10);
+  let transientAttempts = 0;
+  const transientResult = await retryTransientReadCall("probe", async () => {
+    transientAttempts += 1;
+    return transientAttempts === 1
+      ? { isError: true, value: "Microsoft Graph transport error after 3 attempts: fetch failed" }
+      : { isError: false, value: { ok: true } };
+  }, { maxAttempts: 3, baseDelayMs: 0 });
+  let deterministicAttempts = 0;
+  const deterministicResult = await retryTransientReadCall("probe", async () => {
+    deterministicAttempts += 1;
+    return { isError: true, value: "Microsoft Graph error: itemNotFound" };
+  }, { maxAttempts: 3, baseDelayMs: 0 });
+  const checks = {
+    explicitFalseFlag: parseBooleanFlag("false", "probe", true) === false,
+    explicitTrueFlag: parseBooleanFlag("true", "probe") === true,
+    negativeStaleDaysRejected: throws(() => parseNonNegativeNumberFlag("-1", "stale-days", 1)),
+    nonFiniteStaleDaysRejected: throws(() => parseNonNegativeNumberFlag("NaN", "stale-days", 1)),
+    overflowingStaleDaysRejected: throws(() => parseNonNegativeNumberFlag("1e308", "stale-days", 1, maxCleanupStaleDays)),
+    fractionalIntegerFlagRejected: throws(() => parseBoundedIntegerFlag("1.5", "cleanup-page-size", 100, 1, 200)),
+    outOfRangeIntegerFlagRejected: throws(() => parseBoundedIntegerFlag("201", "cleanup-page-size", 100, 1, 200)),
+    staleClassification: betaFolderLooksStale(stale, now - 86_400_000) && !betaFolderLooksStale(fresh, now - 86_400_000),
+    unknownTimestampNotStale: !betaFolderLooksStale({ id: "unknown-age", name: `${betaFolderPrefix}unknown`, folder: {} }, now),
+    candidateDeduplication: candidates.length === 2 && candidates[0].id === "stale" && candidates[1].id === "fresh",
+    transientFetchFailure: clearlyTransientReadError("fetch failed"),
+    classifiedTransportFailure: clearlyTransientReadError("Microsoft Graph transport error after 3 attempts: fetch failed"),
+    deterministicErrorNotTransient: !clearlyTransientReadError("Microsoft Graph error: itemNotFound"),
+    transientReadRetried: transientAttempts === 2 && transientResult.isError === false && transientResult.attempts === 2,
+    deterministicReadNotRetried: deterministicAttempts === 1 && deterministicResult.isError === true && deterministicResult.attempts === 1
+  };
+  const ok = Object.values(checks).every(Boolean);
+  console.log(JSON.stringify({ ok, checks }, null, 2));
+  process.exit(ok ? 0 : 1);
+}
+
 const unique = `codex-beta-${Date.now()}-${process.pid}`;
 const outDir = join(workspace, "work", "onedrive-beta", unique);
 const localUpload = join(outDir, "upload-source.txt");
@@ -70,12 +237,35 @@ let nextId = 1;
 let buffer = "";
 const pending = new Map();
 const stderr = [];
+const toolRetryEvents = [];
 let childExited = false;
+let childExitError = null;
+
+function rejectPendingRequests(error) {
+  for (const [id, waiter] of pending.entries()) {
+    pending.delete(id);
+    clearTimeout(waiter.timeout);
+    waiter.reject(error);
+  }
+}
+
 const childExit = new Promise((resolve) => {
-  child.once("exit", () => {
+  child.once("exit", (code, signal) => {
     childExited = true;
+    childExitError = new Error(`OneDrive MCP child exited before completing pending requests (code=${code ?? "null"}, signal=${signal || "none"}).`);
+    rejectPendingRequests(childExitError);
     resolve();
   });
+});
+
+child.once("error", (error) => {
+  childExitError = new Error(`Could not start OneDrive MCP child: ${error.message}`);
+  rejectPendingRequests(childExitError);
+});
+
+child.stdin.on("error", (error) => {
+  childExitError ||= new Error(`OneDrive MCP child stdin failed: ${error.message}`);
+  rejectPendingRequests(childExitError);
 });
 
 child.stderr.on("data", (chunk) => stderr.push(chunk.toString()));
@@ -98,6 +288,9 @@ child.stdout.on("data", (chunk) => {
 });
 
 function request(method, params = {}) {
+  if (childExited || childExitError || !child.stdin.writable) {
+    return Promise.reject(childExitError || new Error("OneDrive MCP child is not available."));
+  }
   const id = nextId++;
   const payload = { jsonrpc: "2.0", id, method, params };
   const promise = new Promise((resolve, reject) => {
@@ -109,11 +302,27 @@ function request(method, params = {}) {
     }, 120_000);
     pending.set(id, { resolve, reject, timeout });
   });
-  child.stdin.write(`${JSON.stringify(payload)}\n`);
+  try {
+    child.stdin.write(`${JSON.stringify(payload)}\n`, (error) => {
+      if (!error) return;
+      const waiter = pending.get(id);
+      if (!waiter) return;
+      pending.delete(id);
+      clearTimeout(waiter.timeout);
+      waiter.reject(new Error(`Could not write ${method} request to OneDrive MCP child: ${error.message}`));
+    });
+  } catch (error) {
+    const waiter = pending.get(id);
+    if (waiter) {
+      pending.delete(id);
+      clearTimeout(waiter.timeout);
+      waiter.reject(error);
+    }
+  }
   return promise;
 }
 
-async function tool(name, args = {}) {
+async function toolOnce(name, args = {}) {
   const response = await request("tools/call", { name, arguments: args });
   if (response.error) throw new Error(response.error.message);
   const text = response.result?.content?.[0]?.text ?? "";
@@ -124,6 +333,46 @@ async function tool(name, args = {}) {
     // Keep string responses as-is.
   }
   return { isError: Boolean(response.result?.isError), value, raw: response };
+}
+
+const retryableReadOnlyTools = new Set([
+  "onedrive_config",
+  "onedrive_doctor",
+  "onedrive_me",
+  "onedrive_drive",
+  "onedrive_presets",
+  "onedrive_list",
+  "onedrive_list_all",
+  "onedrive_scan",
+  "onedrive_search",
+  "onedrive_search_all",
+  "onedrive_find",
+  "onedrive_find_all",
+  "onedrive_delta",
+  "onedrive_sync_status",
+  "onedrive_get_info",
+  "onedrive_read_text",
+  "onedrive_preview",
+  "onedrive_permissions",
+  "onedrive_batch_get_info",
+  "onedrive_batch_permissions",
+  "onedrive_recent",
+  "onedrive_large_files",
+  "onedrive_duplicates",
+  "onedrive_shared_by_me",
+  "onedrive_public_links"
+]);
+
+async function tool(name, args = {}) {
+  const maxAttempts = retryableReadOnlyTools.has(name)
+    ? readRetryAttempts
+    : 1;
+  const baseDelayMs = readRetryDelayMs;
+  return await retryTransientReadCall(name, () => toolOnce(name, args), {
+    maxAttempts,
+    baseDelayMs,
+    onRetry: (event) => toolRetryEvents.push(event)
+  });
 }
 
 function assertOk(name, result) {
@@ -148,24 +397,43 @@ async function toolWithPreview(name, args = {}) {
   return await tool(name, { ...args, previewToken });
 }
 
-function betaFolderLooksStale(item = {}, cutoffMs) {
-  if (!item.folder || !String(item.name || "").startsWith("Codex OneDrive Plugin Beta Test codex-beta-")) return false;
-  const modified = Date.parse(item.lastModifiedDateTime || item.createdDateTime || "");
-  return Number.isFinite(modified) ? modified <= cutoffMs : true;
-}
-
 async function cleanupStaleBetaFolders() {
   const cutoffMs = Date.now() - Math.max(0, cleanupStaleDays) * 24 * 60 * 60 * 1000;
-  const scan = assertOk("cleanup stale scan", await tool("onedrive_scan", {
-    nameContains: "Codex OneDrive Plugin Beta Test codex-beta-",
-    includeFiles: false,
-    includeFolders: true,
-    maxItems: Number(cliArgs["cleanup-max-items"] || 5000),
-    maxFolders: Number(cliArgs["cleanup-max-folders"] || 1000),
-    maxResults: Number(cliArgs["cleanup-max-results"] || 100),
+  const searchQuery = String(cliArgs["cleanup-search-query"] || "Codex OneDrive Plugin Beta Test codex-beta");
+  const searchMaxItems = cleanupMaxItems;
+  const maxResults = cleanupMaxResults;
+  const verificationConcurrency = cleanupVerifyConcurrency;
+  const search = assertOk("cleanup stale search", await tool("onedrive_search_all", {
+    query: searchQuery,
+    pageSize: cleanupPageSize,
+    maxItems: searchMaxItems,
     format: "full"
   }));
-  const candidates = (scan.items || []).filter((item) => betaFolderLooksStale(item, cutoffMs));
+  const discovered = uniqueBetaFolderCandidates(search.items || [], maxResults);
+  const candidates = [];
+  const verificationSkips = [];
+  for (let offset = 0; offset < discovered.length; offset += verificationConcurrency) {
+    const batch = discovered.slice(offset, offset + verificationConcurrency);
+    const verifiedBatch = await Promise.all(batch.map(async (candidate) => {
+      const info = await tool("onedrive_get_info", { itemId: candidate.id, format: "full" });
+      if (!info.isError) return info.value;
+      const message = errorText(info.value);
+      if (/\bitemNotFound\b/i.test(message)) {
+        verificationSkips.push({ id: candidate.id, name: candidate.name, reason: "itemNotFound" });
+        return null;
+      }
+      throw new Error(`cleanup stale verification returned error for ${candidate.name}: ${message}`);
+    }));
+    for (const candidate of verifiedBatch) {
+      if (!candidate) continue;
+      const modified = Date.parse(candidate.lastModifiedDateTime || candidate.createdDateTime || "");
+      if (!Number.isFinite(modified)) {
+        verificationSkips.push({ id: candidate.id, name: candidate.name, reason: "missingOrInvalidTimestamp" });
+        continue;
+      }
+      if (betaFolderLooksStale(candidate, cutoffMs)) candidates.push(candidate);
+    }
+  }
   const deleted = [];
   if (cleanupConfirmed) {
     for (const candidate of candidates) {
@@ -182,6 +450,16 @@ async function cleanupStaleBetaFolders() {
     mode: cleanupConfirmed ? "delete" : "dry-run",
     cutoff: new Date(cutoffMs).toISOString(),
     staleDays: cleanupStaleDays,
+    discovery: {
+      tool: "onedrive_search_all",
+      query: searchQuery,
+      returned: search.items?.length || 0,
+      truncated: Boolean(search.truncated),
+      maxItems: searchMaxItems,
+      folderCandidates: discovered.length,
+      verificationConcurrency,
+      verificationSkips
+    },
     candidateCount: candidates.length,
     deletedCount: deleted.length,
     candidates: candidates.map((item) => ({ id: item.id, name: item.name, lastModifiedDateTime: item.lastModifiedDateTime })),
@@ -249,6 +527,7 @@ const results = {
   folderName,
   checks: [],
   cleanup: null,
+  retryEvents: toolRetryEvents,
   stderr: ""
 };
 
