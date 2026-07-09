@@ -1,470 +1,90 @@
 {
-  "decision": "Warn",
-  "confidence": "Medium",
+  "decision": "Pass for personal OneDrive beta; Warn for broad tenant rollout",
+  "confidence": "High for tested scope",
   "date": "2026-07-09",
   "repository": "<plugin-root>",
-  "scope": "full plugin repo plus live OneDrive beta",
-  "mode": "stabilization",
+  "scope": [
+    "OneDrive plugin source",
+    "installed cache 0.1.0+codex.20260709154653",
+    "mock Microsoft Graph suite",
+    "adversarial concurrency verifier",
+    "CLI guards",
+    "personal-account live beta"
+  ],
   "summary": [
-    "Local and installed-cache gates passed after fixes: syntax checks, setup script syntax, mocked Graph suite, prepackage guard, and installed-cache drift guard.",
-    "Live OneDrive beta passed with 75 checks, 0 failures, temporary folder cleanup confirmed, and local beta work cleaned.",
-    "Search/indexing improvements now include batched metadata-cache writes, resumable delta nextLink cursors, cache-refresh progress, duplicate folder-hint pruning, bounded concurrent fallback scans, exact-cache-hit confirmation, and faster local content-index matching.",
-    "High-risk live delete/share/revoke/restore operations require dry-run previewToken proof, and batch delete/move/revoke failures return explicit partial-remote-state warnings.",
-    "Decision is Warn because full Microsoft 365/work-school live CRUD coverage was not available; tenant-matrix script support was added and smoke-tested in read-only mode."
+    "All discovered and reproduced defects from this beta run were fixed or turned into explicit safe behavior.",
+    "Official mocked Microsoft Graph suite passes on Node 26 and Node 20: 108 checks, 0 failures.",
+    "Independent fixed-hash verifier passes: 10/10 adversarial categories, 0 failures, no residue.",
+    "Installed-build live personal OneDrive beta passed 75/75 with temporary folder cleanup confirmed.",
+    "Installed-build read-only tenant matrix passed for common, consumers, and organizations.",
+    "Broad tenant rollout remains Warn because full work/school Microsoft 365 CRUD was not available in this account."
   ],
-  "detected_stack": {
-    "languages": ["JavaScript", "zsh", "JSON", "Markdown"],
-    "frameworks": ["MCP server", "Microsoft Graph"],
-    "package_managers": [],
-    "test_tools": ["custom Node mock Graph regression script", "custom live beta script", "prepackage guard"],
-    "ci": ["GitHub Actions"],
-    "workspaces": []
-  },
-  "quality_oracle": {
-    "sources": [
-      "README.md",
-      "skills/onedrive/SKILL.md",
-      ".codex-plugin/plugin.json",
-      ".mcp.json",
-      ".github/workflows/ci.yml",
-      "scripts/mock-graph-test.mjs",
-      "scripts/beta-test.mjs",
-      "scripts/prepackage-check.mjs",
-      "mcp/server.mjs"
-    ],
-    "assumptions": [
-      "The README safety model, MCP schemas, mock suite, prepackage guard, and live beta script define expected beta behavior.",
-      "Existing uncommitted changes in mcp/server.mjs and scripts/mock-graph-test.mjs were active work and were not reverted."
-    ]
-  },
-  "critical_paths": [
+  "fixes": [
     {
-      "path": "OneDrive auth and token handling",
-      "status": "verified",
-      "evidence": "Live beta covered config/token check, device auth pending path, and memory-only logout without deleting Keychain token."
+      "area": "search speed",
+      "summary": "Canonical-first search, adaptive normal find stop, exhaustive find_all, batched search cache writes, and actual Graph search page accounting."
     },
     {
-      "path": "Core file operations",
-      "status": "verified",
-      "evidence": "Mock suite and live beta covered list, scan, find, read, preview, download, upload, write, create folder, rename, move, copy, batch move, batch delete, and update_file."
+      "area": "cache correctness",
+      "summary": "Compact atomic writes, process/interprocess locks, generation-aware reloads, and cache version 3 cursor migration."
     },
     {
-      "path": "Sharing and permission safety",
-      "status": "verified",
-      "evidence": "Mock suite and live beta covered dry-run defaults, confirmations, expected identities, create link, invite, revoke, batch revoke, sharing audits, and audit logs."
+      "area": "delta sync",
+      "summary": "Delta-origin scoped cursor persistence, parent-ID hydration for pathless records, and unresolved path reporting."
     },
     {
-      "path": "Release and packaging",
-      "status": "verified",
-      "evidence": "Manifest parsing, MCP schema inspection, prepackage guard, negative installed guard, and CI workflow review passed locally."
+      "area": "content index",
+      "summary": "cTag/eTag handling preserves metadata-only renames and invalidates conservatively when content freshness is uncertain."
+    },
+    {
+      "area": "local outputs",
+      "summary": "Concurrent downloads, exports, update checkouts, backups, and audit exports reserve unique paths or fail safely without clobbering."
+    },
+    {
+      "area": "audit/auth",
+      "summary": "Per-tool request IDs, failed-call localWarnings, audit locking, and device-login supersession are isolated under concurrency."
+    },
+    {
+      "area": "utilities",
+      "summary": "Bounded cleanup, timestamp-safe stale handling, strict CLI flag parsing, benchmark error exits, and installed-cache guard validation."
     }
   ],
-  "commands": [
-    {
-      "command": "python3 <qa-release-gatekeeper>/scripts/qa_repo_probe.py <plugin-root> --json",
-      "cwd": "<plugin-root>",
-      "result": "pass",
-      "exit_code": 0,
-      "notes": "Probe identified a git repo with initial dirty files mcp/server.mjs and scripts/mock-graph-test.mjs."
-    },
-    {
-      "command": "node --check mcp/server.mjs",
-      "cwd": "<plugin-root>",
-      "result": "pass",
-      "exit_code": 0,
-      "notes": "Server syntax passed after fixes."
-    },
-    {
-      "command": "node --check scripts/mock-graph-test.mjs",
-      "cwd": "<plugin-root>",
-      "result": "pass",
-      "exit_code": 0,
-      "notes": "Mock test script syntax passed after fixes."
-    },
-    {
-      "command": "node --check scripts/prepackage-check.mjs",
-      "cwd": "<plugin-root>",
-      "result": "pass",
-      "exit_code": 0,
-      "notes": "Prepackage guard syntax passed."
-    },
-    {
-      "command": "node --check scripts/beta-test.mjs",
-      "cwd": "<plugin-root>",
-      "result": "pass",
-      "exit_code": 0,
-      "notes": "Live beta script syntax passed."
-    },
-    {
-      "command": "zsh -n scripts/configure.zsh",
-      "cwd": "<plugin-root>",
-      "result": "pass",
-      "exit_code": 0,
-      "notes": "Setup script syntax passed."
-    },
-    {
-      "command": "node scripts/mock-graph-test.mjs",
-      "cwd": "<plugin-root>",
-      "result": "pass",
-      "exit_code": 0,
-      "notes": "85 checks, 0 failures after fixes."
-    },
-    {
-      "command": "node scripts/prepackage-check.mjs",
-      "cwd": "<plugin-root>",
-      "result": "pass",
-      "exit_code": 0,
-      "notes": "24 files checked."
-    },
-    {
-      "command": "if node scripts/prepackage-check.mjs --installed; then echo unexpected-pass; exit 1; else echo expected-fail; fi",
-      "cwd": "<plugin-root>",
-      "result": "pass",
-      "exit_code": 0,
-      "notes": "Missing --installed path now fails as expected."
-    },
-    {
-      "command": "git diff --check",
-      "cwd": "<plugin-root>",
-      "result": "pass",
-      "exit_code": 0,
-      "notes": "No whitespace errors."
-    },
-    {
-      "command": "local CI-equivalent command bundle",
-      "cwd": "<plugin-root>",
-      "result": "pass",
-      "exit_code": 0,
-      "notes": "JSON manifests, syntax checks, zsh syntax, mock suite, prepackage guard, and negative prepackage guard passed."
-    },
-    {
-      "command": "node scripts/beta-test.mjs",
-      "cwd": "<plugin-root>",
-      "result": "pass",
-      "exit_code": 0,
-      "notes": "75 checks, 0 failures; temporary folder Codex OneDrive Plugin Beta Test codex-beta-1783570238004-84416 deleted; local work cleaned."
-    },
-    {
-      "command": "node scripts/beta-test.mjs --doctor-only",
-      "cwd": "<plugin-root>",
-      "result": "pass",
-      "exit_code": 0,
-      "notes": "5 checks, 0 failures."
-    },
-    {
-      "command": "node scripts/beta-test.mjs --cleanup-stale --stale-days=9999 --cleanup-max-items=100 --cleanup-max-folders=20 --cleanup-max-results=5",
-      "cwd": "<plugin-root>",
-      "result": "pass",
-      "exit_code": 0,
-      "notes": "Dry-run cleanup mode passed with 0 stale candidates."
-    },
-    {
-      "command": "node scripts/beta-test.mjs --tenant-matrix=consumers",
-      "cwd": "<plugin-root>",
-      "result": "pass",
-      "exit_code": 0,
-      "notes": "Read-only tenant matrix passed for consumers."
-    },
-    {
-      "command": "node scripts/benchmark.mjs --query=\"project plan\" --maxItems=20 --maxFolders=5 --maxFiles=3 --maxBytesPerFile=4096",
-      "cwd": "<plugin-root>",
-      "result": "pass",
-      "exit_code": 0,
-      "notes": "Progress events emitted; bounded read-only benchmark passed."
-    }
+  "gates": [
+    { "name": "syntax", "status": "pass", "evidence": "node --check for server and scripts" },
+    { "name": "whitespace", "status": "pass", "evidence": "git diff --check" },
+    { "name": "prepackage", "status": "pass", "evidence": "24 files checked" },
+    { "name": "installed drift", "status": "pass", "evidence": "source vs installed cache 0.1.0+codex.20260709154653, 24 files checked" },
+    { "name": "beta self-check", "status": "pass", "evidence": "15/15 utility checks" },
+    { "name": "benchmark self-check", "status": "pass", "evidence": "7/7 utility checks" },
+    { "name": "mock suite Node 26", "status": "pass", "evidence": "108/108" },
+    { "name": "mock suite Node 20", "status": "pass", "evidence": "108/108" },
+    { "name": "independent verifier", "status": "pass", "evidence": "10/10 adversarial categories; hashes stable; no residue" },
+    { "name": "negative CLI guards", "status": "pass", "evidence": "invalid stale days, cleanup page size, retry attempts, booleans, and installed-cache paths rejected" },
+    { "name": "installed live beta", "status": "pass", "evidence": "75/75; 58/58 tools; isolated folder deleted" },
+    { "name": "installed tenant matrix", "status": "pass", "evidence": "common 5/5, consumers 5/5, organizations 5/5" },
+    { "name": "installed cleanup dry-run", "status": "pass", "evidence": "stale-days=0; no beta folder candidates" },
+    { "name": "installed benchmark smoke", "status": "pass", "evidence": "read-only benchmark completed; cache/index writes stayed local" },
+    { "name": "managed storage modes", "status": "pass", "evidence": "directories 0700; cache/index/audit files 0600" }
   ],
-  "gate_results": [
-    {
-      "gate": "syntax",
-      "status": "pass",
-      "exit_code": 0,
-      "evidence": "node --check for server and Node scripts plus zsh -n scripts/configure.zsh."
-    },
-    {
-      "gate": "mock tests",
-      "status": "pass",
-      "exit_code": 0,
-      "evidence": "node scripts/mock-graph-test.mjs, 85 checks, 0 failures."
-    },
-    {
-      "gate": "live beta",
-      "status": "pass",
-      "exit_code": 0,
-      "evidence": "node scripts/beta-test.mjs, 75 checks, 0 failures, cleanup confirmed."
-    },
-    {
-      "gate": "beta utility modes",
-      "status": "pass",
-      "exit_code": 0,
-      "evidence": "doctor-only, stale cleanup dry-run, and consumers tenant matrix passed."
-    },
-    {
-      "gate": "prepackage",
-      "status": "pass",
-      "exit_code": 0,
-      "evidence": "node scripts/prepackage-check.mjs, 24 files checked."
-    },
-    {
-      "gate": "negative prepackage",
-      "status": "pass",
-      "exit_code": 0,
-      "evidence": "Missing --installed path fails as expected."
-    },
-    {
-      "gate": "CI review",
-      "status": "pass",
-      "exit_code": null,
-      "evidence": "Workflow now includes setup script syntax and negative prepackage guard; local CI-equivalent bundle passed."
-    }
+  "independent_verifier_coverage": [
+    "same-process and cross-process metadata/content-index retention",
+    "atomic JSON visibility under concurrent reads",
+    "same-name download/export reservation and checkout collision refusal",
+    "UUID default audit exports",
+    "root and scoped delta hydration with no cursor poisoning",
+    "cTag rename reuse and omitted-cTag invalidation",
+    "exhaustive find_all term execution and paginated search-call accounting",
+    "failed mutation localWarnings, concurrent request-ID isolation, and device-login supersession"
   ],
-  "findings": [
-    {
-      "id": "QA-001",
-      "taxonomy": "confirmed finding",
-      "severity": "Medium",
-      "status": "fixed",
-      "area": "CI/release",
-      "title": "Prepackage --installed false-pass without a target path",
-      "evidence": "Reproduced node scripts/prepackage-check.mjs --installed exiting 0 before the fix and reporting installedRoot as the source root.",
-      "reproduction": "node scripts/prepackage-check.mjs --installed",
-      "files": [
-        "scripts/prepackage-check.mjs",
-        ".github/workflows/ci.yml"
-      ],
-      "quality_characteristics": ["Reliability", "Portability", "Maintainability"],
-      "recommendation": "Require a non-empty installed path, reject source-root comparisons, and cover the negative case in CI.",
-      "applied_fix": "Added argument validation, source-root rejection, setup script syntax check, and CI negative guard.",
-      "auto_fixable": true,
-      "auto_fixed": true,
-      "fix_confidence": "high",
-      "requires_user_approval": false,
-      "regression_test_added": true,
-      "verification_status": "verified",
-      "residual_risk": "Installed-cache comparison passed for the current installed cache; package/release flows should rerun it for their target cache.",
-      "release_impact": "Could give false release confidence during installed-cache drift checks."
-    },
-    {
-      "id": "QA-002",
-      "taxonomy": "confirmed finding",
-      "severity": "Medium",
-      "status": "fixed",
-      "area": "security",
-      "title": "Tool-visible Graph errors could expose sensitive identifiers",
-      "evidence": "MCP behavior review and mock invite failure showed Graph error text could reach clients with recipient email, object ID, URL, and bearer-looking text.",
-      "reproduction": "node scripts/mock-graph-test.mjs with invite-fail Graph error fixture",
-      "files": [
-        "mcp/server.mjs",
-        "scripts/mock-graph-test.mjs"
-      ],
-      "quality_characteristics": ["Security", "Interaction capability", "Maintainability"],
-      "recommendation": "Redact tool-facing and structured error outputs while preserving useful status/code/request-id context.",
-      "applied_fix": "Added safeToolErrorMessage/redactAuditText use across top-level and structured error result paths; expanded mock redaction assertions.",
-      "auto_fixable": true,
-      "auto_fixed": true,
-      "fix_confidence": "medium",
-      "requires_user_approval": false,
-      "regression_test_added": true,
-      "verification_status": "verified",
-      "residual_risk": "Redaction is pattern-based and may need future patterns for unusual provider-specific secrets.",
-      "release_impact": "Reduced privacy exposure in tool errors and mutation audit outputs."
-    },
-    {
-      "id": "QA-003",
-      "taxonomy": "confirmed finding",
-      "severity": "Medium",
-      "status": "fixed",
-      "area": "security",
-      "title": "Copy monitor URLs could expose query tokens and allowed insecure external trusted hosts",
-      "evidence": "copy monitor output returned raw monitor/resource locations and assertTrustedCopyMonitorUrl did not require HTTPS for external trusted hosts.",
-      "reproduction": "Mock copy Location and 303 Location containing query tokens",
-      "files": [
-        "mcp/server.mjs",
-        "scripts/mock-graph-test.mjs"
-      ],
-      "quality_characteristics": ["Security", "Functional suitability"],
-      "recommendation": "Require HTTPS for external trusted monitor hosts and strip query strings from returned monitor references.",
-      "applied_fix": "Enforced HTTPS for external copy monitor hosts, sanitized returned monitor/resource references, and added mock regressions.",
-      "auto_fixable": true,
-      "auto_fixed": true,
-      "fix_confidence": "high",
-      "requires_user_approval": false,
-      "regression_test_added": true,
-      "verification_status": "verified",
-      "residual_risk": "Returned host/path remains visible for supportability.",
-      "release_impact": "Reduced risk of exposing temporary operation URLs."
-    },
-    {
-      "id": "QA-004",
-      "taxonomy": "confirmed finding",
-      "severity": "Medium",
-      "status": "fixed",
-      "area": "reliability",
-      "title": "Recursive scan could follow unique empty pagination chains without progress",
-      "evidence": "scan() had cycle detection but no per-folder page cap, unlike collectPages().",
-      "reproduction": "Mock empty-pager endpoint returning value: [] with unique nextLinks",
-      "files": [
-        "mcp/server.mjs",
-        "scripts/mock-graph-test.mjs"
-      ],
-      "quality_characteristics": ["Reliability", "Performance efficiency"],
-      "recommendation": "Add a per-folder page cap and controlled error.",
-      "applied_fix": "Added maxPagesPerFolder cap and mock regression.",
-      "auto_fixable": true,
-      "auto_fixed": true,
-      "fix_confidence": "high",
-      "requires_user_approval": false,
-      "regression_test_added": true,
-      "verification_status": "verified",
-      "residual_risk": "Very large folders remain bounded by configured caps and may need user tuning.",
-      "release_impact": "Reduced risk of runaway scans on malformed or pathological pagination."
-    }
+  "residual_risks": [
+    "Microsoft Graph batch live operations remain non-atomic by design; the plugin preflights, warns, and reports partial-state failures.",
+    "Full live CRUD was verified only against the available personal OneDrive account. Work/school tenant CRUD should be rerun before broad release.",
+    "Pattern-based redaction may need future expansion for new provider error shapes."
   ],
-  "risks": [
-    {
-      "area": "compatibility",
-      "description": "No package.json or package-manager script entrypoint exists; CI and README use direct script commands.",
-      "confidence": "medium",
-      "recommended_action": "Consider adding a package script or document the direct commands as the canonical release gate."
-    },
-    {
-      "area": "functional",
-      "description": "Ambiguous target selectors can be supplied together, with precedence handled by code rather than rejected by schema.",
-      "confidence": "medium",
-      "recommended_action": "Reject multiple source/destination selectors or document deterministic precedence."
-    },
-    {
-      "area": "data",
-      "description": "Batch live operations preflight all entries but cannot be atomic against Microsoft Graph; mid-loop failures may leave partial remote state.",
-      "confidence": "medium",
-      "recommended_action": "Use the explicit partial-state warning in live responses and prefer single-item operations for the highest-risk changes."
-    },
-    {
-      "area": "compatibility",
-      "description": "Full live beta was run against the current signed-in personal account only; read-only tenant matrix was smoke-tested for consumers.",
-      "confidence": "medium",
-      "recommended_action": "Run live beta in representative personal and work/school accounts before broader release."
-    }
-  ],
-  "risk_acceptance": [
-    {
-      "risk": "Warn decision residual risks: full live CRUD covered the current personal account only, and tenant-specific Microsoft Graph behavior can differ.",
-      "impact": "medium",
-      "likelihood": "medium",
-      "mitigation": "Keep dry-run defaults, previewToken proof, expected identity requirements, audit logging, explicit batch partial-state warnings, and tenant matrix support.",
-      "workaround": "Use single-item operations for high-risk mutations and review dry-run previews before live changes.",
-      "rollback": "Revert the changed files and reinstall or refresh the previous plugin cache if distributed.",
-      "required_acceptor": "release owner"
-    }
-  ],
-  "changes": [
-    {
-      "file": ".github/workflows/ci.yml",
-      "summary": "Added setup script syntax check and negative --installed guard."
-    },
-    {
-      "file": "scripts/prepackage-check.mjs",
-      "summary": "Added --installed argument validation and source-root rejection."
-    },
-    {
-      "file": "mcp/server.mjs",
-      "summary": "Added tool-facing error redaction, stricter trusted upload/copy URL handling, sanitized copy monitor output, scan page cap, selector validation, Keychain logout confirmation, update-file audit attribution, list_all truncation fix, find_all scan short-circuiting, content-index refresh prioritization, metadata-cache write batching, delta nextLink continuation, cache-refresh progress, previewToken proof, and batch partial-state warnings."
-    },
-    {
-      "file": "scripts/mock-graph-test.mjs",
-      "summary": "Added regressions for redaction, copy monitor safety, scan pagination cap, selector ambiguity, logout confirmation, list pagination, update-file audit/preflight, capped content-index refresh, batch revoke preflight, upload-session trust, batch move cache behavior, previewToken live flows, and batch delete/move/revoke second-item failures."
-    },
-    {
-      "file": "scripts/beta-test.mjs",
-      "summary": "Added previewToken handling for live high-risk operations plus doctor-only, stale cleanup, and tenant-matrix modes."
-    },
-    {
-      "file": "scripts/benchmark.mjs",
-      "summary": "Added progress events during long benchmark phases."
-    },
-    {
-      "file": "qa-report.md",
-      "summary": "Added human-readable QA release gate report."
-    },
-    {
-      "file": "qa-report.json",
-      "summary": "Added JSON-friendly QA release gate report."
-    }
-  ],
-  "tests_added": [
-    {
-      "file": "scripts/mock-graph-test.mjs",
-      "coverage": "Sensitive Graph error redaction in tool responses and audit entries."
-    },
-    {
-      "file": "scripts/mock-graph-test.mjs",
-      "coverage": "Copy monitor query stripping and insecure external monitor rejection."
-    },
-    {
-      "file": "scripts/mock-graph-test.mjs",
-      "coverage": "Recursive scan page cap on unique empty pagination chains."
-    },
-    {
-      "file": ".github/workflows/ci.yml",
-      "coverage": "Negative prepackage --installed behavior and setup script syntax."
-    },
-    {
-      "file": "scripts/mock-graph-test.mjs",
-      "coverage": "Batch delete, batch move, and batch revoke second-item live failures with partial-state warnings."
-    },
-    {
-      "file": "scripts/mock-graph-test.mjs",
-      "coverage": "Preview-token proof for high-risk live sharing, revoke, delete, and batch operations."
-    }
-  ],
-  "skipped_checks": [
-    {
-      "check": "separate installed-cache drift comparison",
-      "reason": "Installed-cache drift comparison passed for the current installed cache; packaging from a separate checkout should run it again before publishing.",
-      "risk": "medium"
-    },
-    {
-      "check": "remote GitHub Actions run",
-      "reason": "CI was simulated locally; no remote workflow was triggered.",
-      "risk": "low"
-    },
-    {
-      "check": "multi-tenant live beta matrix",
-      "reason": "Read-only tenant matrix support was smoke-tested for consumers, but full live CRUD was not run against a Microsoft 365/work-school tenant.",
-      "risk": "medium"
-    }
-  ],
-  "subagents": [
-    {
-      "role": "CI/release/test reviewer",
-      "scope": "package scripts, workflows, prepackage guard, beta/mock scripts",
-      "result": "Found prepackage --installed false-pass and setup script CI coverage gap; both fixed."
-    },
-    {
-      "role": "MCP behavior reviewer",
-      "scope": "mcp/server.mjs reliability/security paths",
-      "result": "Found Graph error redaction, copy monitor URL, and scan pagination cap issues; all fixed with regressions."
-    }
-  ],
-  "residual_risk": [
-    "Warn requires release-owner acceptance that full live CRUD covered the current personal OneDrive account only.",
-    "Node 20 CI target was not run locally; local Node version was v26.0.0.",
-    "Batch live operations remain inherently non-atomic in Microsoft Graph; partial-state warnings and second-item-failure coverage are now explicit."
-  ],
-  "release_recommendations": [
-    "Release only after explicit acceptance of the Warn residual risks.",
-    "Run scripts/prepackage-check.mjs --installed /absolute/path/to/installed/cache from a separate source/package context before publishing."
-  ],
-  "rollback_recommendations": [
-    "Rollback by reverting the changed files and reinstalling or refreshing the previous plugin cache if already distributed."
-  ],
-  "monitoring_recommendations": [
-    "Use onedrive_audit_recent after first real workflows to inspect mutation audit entries.",
-    "Watch for Graph provider error messages that may need additional redaction patterns."
-  ],
-  "next_actions": [
-    "Run a second full live beta on a Microsoft 365/work-school tenant before broad release.",
-    "Exercise --tenant-matrix-live only with explicit test accounts for each tenant endpoint.",
-    "Track cache-refresh timings on larger drives now that write batching and delta continuation are implemented.",
-    "Run installed-cache drift comparison against a distinct packaged target before publishing from another checkout."
-  ]
+  "install_result": {
+    "installed_cache": "<personal-cache>/onedrive/0.1.0+codex.20260709154653",
+    "drift_check": "pass, 24 files checked",
+    "final_stale_cleanup": "pass, 0 beta folder candidates",
+    "local_test_residue": "cleaned from source and installed cache"
+  }
 }

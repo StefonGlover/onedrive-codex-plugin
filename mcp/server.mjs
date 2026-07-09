@@ -2,13 +2,14 @@
 
 import { execFileSync } from "node:child_process";
 import { createReadStream, createWriteStream, readFileSync } from "node:fs";
-import { appendFile, copyFile, mkdir, open, readFile, realpath, rename as renameFile, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, chmod, copyFile, mkdir, open, readFile, realpath, rename as renameFile, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, parse, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createHash, randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, "..");
@@ -21,10 +22,13 @@ const downloadRoot = join(storageRoot, "downloads");
 const cacheRoot = resolve(process.env.ONEDRIVE_CACHE_ROOT || localConfig.cacheRoot || join(storageRoot, "cache"));
 const cachePath = join(cacheRoot, "metadata-cache.json");
 const contentIndexPath = join(cacheRoot, "content-index.json");
+const metadataCacheLockPath = join(cacheRoot, "metadata-cache.lock");
+const contentIndexLockPath = join(cacheRoot, "content-index.lock");
 const updateRoot = join(storageRoot, "updates");
 const backupRoot = join(storageRoot, "backups");
 const auditRoot = join(storageRoot, "audit");
 const auditPath = join(auditRoot, "mutations.jsonl");
+const auditLockPath = join(auditRoot, "mutations.lock");
 const localOneDriveSyncRoots = [
   { path: join(homedir(), "Library", "CloudStorage", "OneDrive"), prefix: false },
   { path: join(homedir(), "Library", "CloudStorage", "OneDrive-"), prefix: true },
@@ -32,6 +36,7 @@ const localOneDriveSyncRoots = [
   { path: join(homedir(), "OneDrive - "), prefix: true }
 ];
 const textFileLimit = 5 * 1024 * 1024;
+const maxTextFileReadLimit = 10 * 1024 * 1024;
 const defaultMaxIndexedFileSize = 512 * 1024;
 const simpleUploadLimit = 250 * 1024 * 1024;
 const uploadChunkUnit = 320 * 1024;
@@ -94,15 +99,22 @@ const officeKinds = {
 
 let tokenCache = null;
 let pendingDevice = null;
+let tokenRefreshPromise = null;
+let authGeneration = 0;
+let deviceLoginGeneration = 0;
 let metadataCacheMemory = null;
 let contentIndexMemory = null;
-let lastGraphRequestId = null;
-let metadataCacheBatchDepth = 0;
-let metadataCacheDirty = false;
+let metadataCacheLoadPromise = null;
+let contentIndexLoadPromise = null;
+let metadataCacheFileVersion = null;
+let contentIndexFileVersion = null;
+let metadataMutationQueue = Promise.resolve();
+let contentIndexMutationQueue = Promise.resolve();
 
 const previewTokens = new Map();
 const previewTokenTtlMs = 15 * 60 * 1000;
 const partialBatchMutationWarning = "Batch live mutations are preflighted but not atomic; if a later item fails, earlier remote changes may already have taken effect.";
+const toolCallContext = new AsyncLocalStorage();
 
 const outputFormatSchema = {
   type: "string",
@@ -364,7 +376,7 @@ const tools = [
   },
   {
     name: "onedrive_find",
-    description: "Cache-assisted remote-first file finder. Uses metadata cache when available, runs live Graph searches, ranks matches in memory, and optionally falls back to bounded recursive scans.",
+    description: "Cache-assisted remote-first file finder. Runs the canonical Graph query first, expands terms adaptively with bounded concurrency, ranks matches in memory, and optionally falls back to bounded recursive scans.",
     inputSchema: {
       type: "object",
       required: ["query"],
@@ -383,6 +395,13 @@ const tools = [
         includeFolders: { type: "boolean", default: false },
         maxResults: { type: "integer", minimum: 1, maximum: 50, default: 10 },
         maxSearchTerms: { type: "integer", minimum: 1, maximum: 12, default: 8 },
+        searchConcurrency: {
+          type: "integer",
+          minimum: 1,
+          maximum: 4,
+          default: 2,
+          description: "Bounded concurrency for adaptive Graph search-term expansion after the canonical query."
+        },
         searchPageSize: { type: "integer", minimum: 1, maximum: 200, default: 50 },
         searchMaxItemsPerTerm: { type: "integer", minimum: 1, maximum: 500, default: 100 },
         scanFallback: { type: "boolean", default: true },
@@ -427,7 +446,7 @@ const tools = [
   },
   {
     name: "onedrive_find_all",
-    description: "Broader cache-assisted remote-first file locator for larger OneDrive searches. Searches common folders first, forces bounded scan fallback when needed, and returns more ranked matches.",
+    description: "Broader cache-assisted remote-first file locator. Uses adaptive bounded-concurrency Graph term expansion, common-folder hints, and bounded scan fallback when needed.",
     inputSchema: {
       type: "object",
       required: ["query"],
@@ -445,6 +464,14 @@ const tools = [
         },
         includeFolders: { type: "boolean", default: false },
         maxResults: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+        maxSearchTerms: { type: "integer", minimum: 1, maximum: 12, default: 8 },
+        searchConcurrency: {
+          type: "integer",
+          minimum: 1,
+          maximum: 4,
+          default: 2,
+          description: "Bounded concurrency for adaptive Graph search-term expansion after the canonical query."
+        },
         scanMaxItems: { type: "integer", minimum: 1, maximum: 50000, default: 10000 },
         scanMaxFolders: { type: "integer", minimum: 1, maximum: 10000, default: 2000 },
         scanMaxDepth: { type: "integer", minimum: 0, maximum: 50, default: 25 },
@@ -1661,120 +1688,433 @@ function publicConfig() {
 
 function emptyMetadataCache() {
   return {
-    version: 1,
+    version: 3,
     createdAt: new Date().toISOString(),
     updatedAt: null,
     deltaLink: null,
     deltaNextLink: null,
+    deltaTarget: null,
     scanRoot: null,
+    pathRootsById: {},
     itemCount: 0,
     itemsById: {},
     pathsByLower: {}
   };
 }
 
-async function loadMetadataCache() {
-  if (metadataCacheMemory) return metadataCacheMemory;
+async function ensurePrivateDirectory(path) {
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  await chmod(path, 0o700);
+}
+
+async function hardenPrivateFile(path) {
+  try {
+    await chmod(path, 0o600);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+}
+
+async function writePrivateFile(path, data, options = {}) {
+  await writeFile(path, data, { ...options, mode: 0o600 });
+  await hardenPrivateFile(path);
+}
+
+async function writePrivateFileAtomic(path, data, options = {}) {
+  await ensurePrivateDirectory(dirname(path));
+  const temporaryPath = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
+  let handle;
+  try {
+    handle = await open(temporaryPath, "wx", 0o600);
+    await handle.writeFile(data, options);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await renameFile(temporaryPath, path);
+    await hardenPrivateFile(path);
+  } finally {
+    await handle?.close().catch(() => null);
+    await rm(temporaryPath, { force: true }).catch(() => null);
+  }
+}
+
+function collisionPath(path, suffix) {
+  const parsed = parse(path);
+  return join(parsed.dir, `${parsed.name} (${suffix})${parsed.ext}`);
+}
+
+async function reserveLocalDestination(preferredPath, options = {}) {
+  const preferred = resolve(preferredPath);
+  await ensurePrivateDirectory(dirname(preferred));
+  if (options.overwrite === true) return { path: preferred, reserved: false };
+  const allowAlternate = options.allowAlternate === true;
+  for (let suffix = 1; suffix <= 10_000; suffix += 1) {
+    const candidate = suffix === 1 ? preferred : collisionPath(preferred, suffix);
+    try {
+      const handle = await open(candidate, "wx", 0o600);
+      await handle.close();
+      return { path: candidate, reserved: true };
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      if (!allowAlternate) {
+        throw new Error(`Local file already exists: ${preferred}. Pass overwrite: true to replace it.`);
+      }
+    }
+  }
+  throw new Error(`Could not reserve a unique local destination near ${preferred}.`);
+}
+
+async function localFileVersion(path) {
+  try {
+    const fileStat = await stat(path);
+    return `${fileStat.dev}:${fileStat.ino}:${fileStat.size}:${fileStat.mtimeMs}`;
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+async function withFileLock(lockPath, fn, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 10_000;
+  const staleMs = options.staleMs ?? 60_000;
+  const startedAt = Date.now();
+  await ensurePrivateDirectory(dirname(lockPath));
+  let handle;
+  while (!handle) {
+    try {
+      handle = await open(lockPath, "wx", 0o600);
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      try {
+        const lockStat = await stat(lockPath);
+        if (Date.now() - lockStat.mtimeMs > staleMs) {
+          await rm(lockPath, { force: true });
+          continue;
+        }
+      } catch (statError) {
+        if (statError.code !== "ENOENT") throw statError;
+        continue;
+      }
+      if (Date.now() - startedAt >= timeoutMs) throw new Error(`Timed out waiting for local storage lock: ${lockPath}`);
+      await sleep(Math.min(100, 10 + Math.floor((Date.now() - startedAt) / 10)));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    await handle.close().catch(() => null);
+    await rm(lockPath, { force: true }).catch(() => null);
+  }
+}
+
+async function runSerialized(queueName, fn) {
+  const previous = queueName === "metadata" ? metadataMutationQueue : contentIndexMutationQueue;
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  if (queueName === "metadata") metadataMutationQueue = previous.catch(() => null).then(() => current);
+  else contentIndexMutationQueue = previous.catch(() => null).then(() => current);
+  await previous.catch(() => null);
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+function normalizeMetadataCache(parsed = {}) {
+  const cache = {
+    ...emptyMetadataCache(),
+    ...parsed,
+    version: 3,
+    itemsById: parsed.itemsById || {},
+    pathsByLower: parsed.pathsByLower || {},
+    pathRootsById: parsed.pathRootsById || {}
+  };
+  if ((cache.deltaLink || cache.deltaNextLink) && !parsed.deltaTarget) {
+    cache.deltaLink = null;
+    cache.deltaNextLink = null;
+    cache.deltaTarget = null;
+  }
+  return cache;
+}
+
+async function readMetadataCacheFromDisk() {
+  await ensurePrivateDirectory(cacheRoot);
   try {
     const parsed = JSON.parse(await readFile(cachePath, "utf8"));
-    metadataCacheMemory = {
-      ...emptyMetadataCache(),
-      ...parsed,
-      itemsById: parsed.itemsById || {},
-      pathsByLower: parsed.pathsByLower || {}
-    };
-  } catch {
-    metadataCacheMemory = emptyMetadataCache();
+    await hardenPrivateFile(cachePath);
+    return normalizeMetadataCache(parsed);
+  } catch (error) {
+    if (error?.code === "ENOENT") return emptyMetadataCache();
+    throw error;
   }
-  return metadataCacheMemory;
+}
+
+async function loadMetadataCache() {
+  if (!metadataCacheLoadPromise) {
+    metadataCacheLoadPromise = (async () => {
+      try {
+        const diskVersion = await localFileVersion(cachePath);
+        if (metadataCacheMemory && diskVersion === metadataCacheFileVersion) return metadataCacheMemory;
+        await withFileLock(metadataCacheLockPath, async () => {
+          const lockedVersion = await localFileVersion(cachePath);
+          if (metadataCacheMemory && lockedVersion === metadataCacheFileVersion) return;
+          metadataCacheMemory = await readMetadataCacheFromDisk();
+          metadataCacheFileVersion = await localFileVersion(cachePath);
+        });
+      } catch (error) {
+        recordLocalWarning("metadata cache read", error);
+        metadataCacheMemory = emptyMetadataCache();
+        metadataCacheFileVersion = null;
+      } finally {
+        metadataCacheLoadPromise = null;
+      }
+      return metadataCacheMemory;
+    })();
+  }
+  return await metadataCacheLoadPromise;
 }
 
 async function saveMetadataCache(cache) {
   cache.updatedAt = new Date().toISOString();
   cache.itemCount = Object.keys(cache.itemsById || {}).length;
-  await mkdir(cacheRoot, { recursive: true });
-  await writeFile(cachePath, JSON.stringify(cache, null, 2));
+  await ensurePrivateDirectory(cacheRoot);
+  await writePrivateFileAtomic(cachePath, JSON.stringify(cache));
   metadataCacheMemory = cache;
-  metadataCacheDirty = false;
+  metadataCacheFileVersion = await localFileVersion(cachePath);
+  const store = toolCallContext.getStore();
+  if (store) store.metadataCacheWrites = (store.metadataCacheWrites || 0) + 1;
   return cache;
 }
 
 async function withMetadataCacheBatch(fn) {
-  metadataCacheBatchDepth += 1;
-  try {
-    return await fn();
-  } finally {
-    metadataCacheBatchDepth -= 1;
-    if (metadataCacheBatchDepth === 0 && metadataCacheDirty) {
-      await saveMetadataCache(await loadMetadataCache());
-    }
-  }
+  return await fn();
 }
 
 function cachePathKey(remotePath = "") {
   return cleanPath(remotePath).toLowerCase();
 }
 
-function cachePutSimplified(cache, item) {
-  if (!item?.id) return;
-  if (item.deleted) {
-    cacheRemoveItemAndDescendants(cache, item);
-    return;
+function mergeDefinedMetadata(previous = {}, incoming = {}) {
+  const merged = { ...(previous || {}) };
+  for (const [key, value] of Object.entries(incoming || {})) {
+    if (value === undefined) continue;
+    if ((key === "file" || key === "folder") && value && typeof value === "object") {
+      merged[key] = mergeDefinedMetadata(previous?.[key] || {}, value);
+    } else {
+      merged[key] = value;
+    }
   }
-  const simplified = item.remotePath !== undefined ? item : simplifyItem(item);
-  const previous = cache.itemsById?.[simplified.id];
-  if (previous?.remotePath && previous.remotePath !== simplified.remotePath) {
+  return merged;
+}
+
+function remoteParentPath(remotePath = "") {
+  const clean = cleanPath(remotePath);
+  const separator = clean.lastIndexOf("/");
+  return separator < 0 ? "" : clean.slice(0, separator);
+}
+
+function cachedParentRemotePath(cache, parentId) {
+  if (!parentId) return null;
+  const parent = cache.itemsById?.[parentId];
+  if (parent?.remotePath !== undefined) return cleanPath(parent.remotePath);
+  if (Object.hasOwn(cache.pathRootsById || {}, parentId)) return cleanPath(cache.pathRootsById[parentId] || "");
+  if (cache.scanRoot?.id === parentId) return cleanPath(cache.scanRoot.remotePath || "");
+  return null;
+}
+
+function graphParentPath(remotePath = "") {
+  const clean = cleanPath(remotePath);
+  return `/drive/root:${clean ? `/${clean}` : ""}`;
+}
+
+function resolveCachedItemPath(cache, incoming, previous) {
+  if (incoming.remotePath !== undefined) return cleanPath(incoming.remotePath);
+  const name = incoming.name || previous?.name;
+  if (!name) return null;
+  const parentId = incoming.parentId;
+  const parentPath = cachedParentRemotePath(cache, parentId);
+  if (parentPath !== null) return [parentPath, name].filter(Boolean).join("/");
+  const sameKnownParent = parentId && previous?.parentId && parentId === previous.parentId;
+  const noNewParentEvidence = !parentId;
+  if (previous?.remotePath && (sameKnownParent || noNewParentEvidence)) {
+    return [remoteParentPath(previous.remotePath), name].filter(Boolean).join("/");
+  }
+  return null;
+}
+
+function updateCachedDescendantPaths(cache, previousPath, nextPath) {
+  const oldPath = cleanPath(previousPath || "");
+  if (!oldPath) return [];
+  const oldLower = cachePathKey(oldPath);
+  const changes = [];
+  for (const [id, cached] of Object.entries(cache.itemsById || {})) {
+    const cachedPath = cleanPath(cached.remotePath || "");
+    const cachedLower = cachePathKey(cachedPath);
+    if (!cachedPath || !cachedLower.startsWith(`${oldLower}/`)) continue;
+    const previous = { ...cached };
+    delete cache.pathsByLower[cachedLower];
+    if (nextPath === null) {
+      delete cached.remotePath;
+      delete cached.path;
+    } else {
+      const suffix = cachedPath.slice(oldPath.length).replace(/^\/+/, "");
+      cached.remotePath = [cleanPath(nextPath), suffix].filter(Boolean).join("/");
+      cached.path = graphParentPath(remoteParentPath(cached.remotePath));
+      cache.pathsByLower[cachePathKey(cached.remotePath)] = id;
+    }
+    changes.push({ current: cached, previous, removed: [] });
+  }
+  return changes;
+}
+
+function cachePutSimplified(cache, item) {
+  if (!item?.id) return { current: null, previous: null, removed: [], descendants: [] };
+  if (item.deleted) {
+    return { current: null, previous: cache.itemsById?.[item.id] || null, removed: cacheRemoveItemAndDescendants(cache, item), descendants: [] };
+  }
+  const simplified = Object.hasOwn(item, "remotePath") ? item : simplifyItem(item);
+  const previous = cache.itemsById?.[simplified.id] || null;
+  const current = mergeDefinedMetadata(previous || {}, simplified);
+  const eTagChanged = simplified.eTag !== undefined
+    && previous?.eTag !== undefined
+    && simplified.eTag !== previous.eTag;
+  if (eTagChanged && simplified.cTag === undefined) delete current.cTag;
+  if (eTagChanged && simplified.file?.hashes === undefined && current.file) delete current.file.hashes;
+  const resolvedPath = resolveCachedItemPath(cache, simplified, previous);
+  if (resolvedPath === null) {
+    delete current.remotePath;
+    delete current.path;
+  } else {
+    current.remotePath = resolvedPath;
+    current.path = simplified.path || graphParentPath(remoteParentPath(resolvedPath));
+  }
+  const removed = [];
+  if (previous?.remotePath && previous.remotePath !== current.remotePath) {
     delete cache.pathsByLower[cachePathKey(previous.remotePath)];
   }
-  const pathKey = simplified.remotePath ? cachePathKey(simplified.remotePath) : null;
+  const pathKey = current.remotePath ? cachePathKey(current.remotePath) : null;
   const existingIdForPath = pathKey ? cache.pathsByLower[pathKey] : null;
-  if (existingIdForPath && existingIdForPath !== simplified.id) {
-    delete cache.itemsById[existingIdForPath];
+  if (existingIdForPath && existingIdForPath !== current.id) {
+    const displaced = cache.itemsById[existingIdForPath];
+    if (displaced) removed.push(...cacheRemoveItemAndDescendants(cache, displaced));
   }
-  cache.itemsById[simplified.id] = simplified;
-  if (pathKey) cache.pathsByLower[pathKey] = simplified.id;
+  const descendants = previous?.folder && previous.remotePath !== current.remotePath
+    ? updateCachedDescendantPaths(cache, previous.remotePath, current.remotePath ?? null)
+    : [];
+  cache.itemsById[current.id] = current;
+  if (pathKey) cache.pathsByLower[pathKey] = current.id;
+  return { current, previous, removed, descendants };
 }
 
 function cacheRemoveItemAndDescendants(cache, item) {
   const old = cache.itemsById?.[item.id] || (item.remotePath ? item : null);
   const remotePath = old?.remotePath || item.remotePath;
   const lowerPath = remotePath ? cachePathKey(remotePath) : null;
-  for (const [id, cached] of Object.entries(cache.itemsById || {})) {
-    const cachedLower = cached.remotePath ? cachePathKey(cached.remotePath) : "";
-    if (id === item.id || (lowerPath && (cachedLower === lowerPath || cachedLower.startsWith(`${lowerPath}/`)))) {
-      if (cached.remotePath) delete cache.pathsByLower[cachePathKey(cached.remotePath)];
-      delete cache.itemsById[id];
+  const removed = [];
+  const removedIds = new Set([item.id]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [id, cached] of Object.entries(cache.itemsById || {})) {
+      if (removedIds.has(id)) continue;
+      const cachedLower = cached.remotePath ? cachePathKey(cached.remotePath) : "";
+      if ((lowerPath && (cachedLower === lowerPath || cachedLower.startsWith(`${lowerPath}/`))) || removedIds.has(cached.parentId)) {
+        removedIds.add(id);
+        changed = true;
+      }
     }
   }
+  for (const id of removedIds) {
+    const cached = cache.itemsById?.[id];
+    if (!cached) continue;
+    removed.push(cached);
+    if (cached.remotePath) delete cache.pathsByLower[cachePathKey(cached.remotePath)];
+    delete cache.itemsById[id];
+  }
   if (lowerPath) delete cache.pathsByLower[lowerPath];
+  return removed;
+}
+
+function resolveUnresolvedCachedPaths(cache) {
+  const changes = [];
+  const maxPasses = Math.max(1, Object.keys(cache.itemsById || {}).length);
+  for (let pass = 0; pass < maxPasses; pass += 1) {
+    let resolvedThisPass = 0;
+    for (const item of Object.values(cache.itemsById || {})) {
+      if (item.remotePath !== undefined || !item.name || !item.parentId) continue;
+      const parentPath = cachedParentRemotePath(cache, item.parentId);
+      if (parentPath === null) continue;
+      const previous = { ...item };
+      item.remotePath = [parentPath, item.name].filter(Boolean).join("/");
+      item.path = graphParentPath(parentPath);
+      const pathKey = cachePathKey(item.remotePath);
+      const displacedId = cache.pathsByLower[pathKey];
+      const removed = [];
+      if (displacedId && displacedId !== item.id && cache.itemsById[displacedId]) {
+        removed.push(...cacheRemoveItemAndDescendants(cache, cache.itemsById[displacedId]));
+      }
+      cache.pathsByLower[pathKey] = item.id;
+      changes.push({ current: item, previous, removed });
+      resolvedThisPass += 1;
+    }
+    if (!resolvedThisPass) break;
+  }
+  return changes;
 }
 
 async function cacheItems(items = [], metadata = {}) {
   const hasMetadata = metadata.deltaLink !== undefined
     || metadata.deltaNextLink !== undefined
-    || metadata.scanRoot !== undefined;
+    || metadata.deltaTarget !== undefined
+    || metadata.scanRoot !== undefined
+    || metadata.pathRoot !== undefined;
   if (!items.length && !hasMetadata) return await loadMetadataCache();
-  const cache = await loadMetadataCache();
-  for (const item of items) cachePutSimplified(cache, item);
-  if (metadata.deltaLink !== undefined) {
-    cache.deltaLink = metadata.deltaLink || null;
-    if (metadata.deltaLink) cache.deltaNextLink = null;
-  }
-  if (metadata.deltaNextLink !== undefined) cache.deltaNextLink = metadata.deltaNextLink || null;
-  if (metadata.scanRoot !== undefined) cache.scanRoot = metadata.scanRoot;
-  if (metadataCacheBatchDepth > 0) {
-    metadataCacheDirty = true;
-    return cache;
-  }
-  return await saveMetadataCache(cache);
+  return await runSerialized("metadata", async () => await withFileLock(metadataCacheLockPath, async () => {
+    let cache;
+    try {
+      cache = await readMetadataCacheFromDisk();
+    } catch (error) {
+      recordLocalWarning("metadata cache read", error);
+      cache = metadataCacheMemory || emptyMetadataCache();
+    }
+    if (metadata.pathRoot?.id) {
+      cache.pathRootsById ||= {};
+      cache.pathRootsById[metadata.pathRoot.id] = cleanPath(metadata.pathRoot.remotePath || "");
+    }
+    if (metadata.scanRoot !== undefined) {
+      cache.scanRoot = metadata.scanRoot;
+      if (metadata.scanRoot?.id) {
+        cache.pathRootsById ||= {};
+        cache.pathRootsById[metadata.scanRoot.id] = cleanPath(metadata.scanRoot.remotePath || "");
+      }
+    }
+    const changes = [];
+    for (const item of items) {
+      const change = cachePutSimplified(cache, item);
+      changes.push(change, ...(change.descendants || []));
+    }
+    changes.push(...resolveUnresolvedCachedPaths(cache));
+    await reconcileContentIndexWithMetadata(changes);
+    if (metadata.deltaLink !== undefined) {
+      cache.deltaLink = metadata.deltaLink || null;
+      if (metadata.deltaLink) cache.deltaNextLink = null;
+    }
+    if (metadata.deltaNextLink !== undefined) cache.deltaNextLink = metadata.deltaNextLink || null;
+    if (metadata.deltaTarget !== undefined) cache.deltaTarget = metadata.deltaTarget || null;
+    return await saveMetadataCache(cache);
+  }));
 }
 
 async function clearMetadataCache() {
-  metadataCacheMemory = emptyMetadataCache();
-  metadataCacheDirty = false;
-  await mkdir(cacheRoot, { recursive: true });
-  await writeFile(cachePath, JSON.stringify(metadataCacheMemory, null, 2));
-  return metadataCacheMemory;
+  return await runSerialized("metadata", async () => await withFileLock(metadataCacheLockPath, async () => {
+    metadataCacheMemory = emptyMetadataCache();
+    metadataCacheLoadPromise = null;
+    await ensurePrivateDirectory(cacheRoot);
+    await writePrivateFileAtomic(cachePath, JSON.stringify(metadataCacheMemory));
+    metadataCacheFileVersion = await localFileVersion(cachePath);
+    return metadataCacheMemory;
+  }));
 }
 
 function emptyContentIndex() {
@@ -1788,40 +2128,144 @@ function emptyContentIndex() {
 }
 
 async function loadContentIndex() {
-  if (contentIndexMemory) return contentIndexMemory;
+  if (!contentIndexLoadPromise) {
+    contentIndexLoadPromise = (async () => {
+      try {
+        const diskVersion = await localFileVersion(contentIndexPath);
+        if (contentIndexMemory && diskVersion === contentIndexFileVersion) return contentIndexMemory;
+        await withFileLock(contentIndexLockPath, async () => {
+          const lockedVersion = await localFileVersion(contentIndexPath);
+          if (contentIndexMemory && lockedVersion === contentIndexFileVersion) return;
+          contentIndexMemory = await readContentIndexFromDisk();
+          contentIndexFileVersion = await localFileVersion(contentIndexPath);
+        });
+      } catch (error) {
+        recordLocalWarning("content index read", error);
+        contentIndexMemory = emptyContentIndex();
+        contentIndexFileVersion = null;
+      } finally {
+        contentIndexLoadPromise = null;
+      }
+      return contentIndexMemory;
+    })();
+  }
+  return await contentIndexLoadPromise;
+}
+
+async function readContentIndexFromDisk() {
+  await ensurePrivateDirectory(cacheRoot);
   try {
     const parsed = JSON.parse(await readFile(contentIndexPath, "utf8"));
-    contentIndexMemory = {
+    await hardenPrivateFile(contentIndexPath);
+    return {
       ...emptyContentIndex(),
       ...parsed,
       entriesById: parsed.entriesById || {}
     };
-  } catch {
-    contentIndexMemory = emptyContentIndex();
+  } catch (error) {
+    if (error?.code === "ENOENT") return emptyContentIndex();
+    throw error;
   }
-  return contentIndexMemory;
 }
 
-async function saveContentIndex(index) {
+async function writeContentIndex(index) {
   index.updatedAt = new Date().toISOString();
   index.itemCount = Object.keys(index.entriesById || {}).length;
-  await mkdir(cacheRoot, { recursive: true });
-  await writeFile(contentIndexPath, JSON.stringify(index, null, 2));
+  await ensurePrivateDirectory(cacheRoot);
+  await writePrivateFileAtomic(contentIndexPath, JSON.stringify(index));
   contentIndexMemory = index;
+  contentIndexFileVersion = await localFileVersion(contentIndexPath);
   return index;
 }
 
+async function saveContentIndex(index) {
+  return await runSerialized("content", async () => await withFileLock(contentIndexLockPath, async () => {
+    let latest;
+    try {
+      latest = await readContentIndexFromDisk();
+    } catch (error) {
+      recordLocalWarning("content index read", error);
+      latest = contentIndexMemory || emptyContentIndex();
+    }
+    const merged = {
+      ...latest,
+      entriesById: {
+        ...(latest.entriesById || {}),
+        ...(index.entriesById || {})
+      }
+    };
+    return await writeContentIndex(merged);
+  }));
+}
+
 async function clearContentIndex() {
-  contentIndexMemory = emptyContentIndex();
-  await mkdir(cacheRoot, { recursive: true });
-  await writeFile(contentIndexPath, JSON.stringify(contentIndexMemory, null, 2));
-  return contentIndexMemory;
+  return await runSerialized("content", async () => await withFileLock(contentIndexLockPath, async () => {
+    contentIndexMemory = emptyContentIndex();
+    contentIndexLoadPromise = null;
+    await ensurePrivateDirectory(cacheRoot);
+    await writePrivateFileAtomic(contentIndexPath, JSON.stringify(contentIndexMemory));
+    contentIndexFileVersion = await localFileVersion(contentIndexPath);
+    return contentIndexMemory;
+  }));
+}
+
+function indexedItemMetadataChanged(left = {}, right = {}) {
+  return left.id !== right.id
+    || left.name !== right.name
+    || left.remotePath !== right.remotePath
+    || left.path !== right.path
+    || left.webUrl !== right.webUrl
+    || left.size !== right.size
+    || left.createdDateTime !== right.createdDateTime
+    || left.lastModifiedDateTime !== right.lastModifiedDateTime
+    || left.eTag !== right.eTag
+    || left.cTag !== right.cTag
+    || left.parentId !== right.parentId
+    || left.driveId !== right.driveId
+    || Boolean(left.deleted) !== Boolean(right.deleted);
+}
+
+async function reconcileContentIndexWithMetadata(changes = []) {
+  if (!changes.length) return;
+  await runSerialized("content", async () => await withFileLock(contentIndexLockPath, async () => {
+    let index;
+    try {
+      index = await readContentIndexFromDisk();
+    } catch (error) {
+      recordLocalWarning("content index read", error);
+      index = contentIndexMemory || emptyContentIndex();
+    }
+    let changed = false;
+    for (const change of changes) {
+      for (const removed of change?.removed || []) {
+        if (removed?.id && Object.hasOwn(index.entriesById, removed.id)) {
+          delete index.entriesById[removed.id];
+          changed = true;
+        }
+      }
+      const current = change?.current;
+      if (!current?.id) continue;
+      const entry = index.entriesById[current.id];
+      if (!entry) continue;
+      if (!contentIndexEntryFresh(entry, current)) {
+        delete index.entriesById[current.id];
+        changed = true;
+        continue;
+      }
+      if (indexedItemMetadataChanged(entry.item, current)) {
+        entry.item = current;
+        changed = true;
+      }
+    }
+    contentIndexMemory = index;
+    if (changed) await writeContentIndex(index);
+  }));
 }
 
 function contentIndexEntryFresh(entry, item) {
-  return entry
-    && entry.eTag === item.eTag
-    && entry.cTag === item.cTag
+  if (!entry) return false;
+  if (entry.cTag && item.cTag) return entry.cTag === item.cTag;
+  return entry.eTag === item.eTag
     && entry.lastModifiedDateTime === item.lastModifiedDateTime
     && entry.size === item.size;
 }
@@ -2052,10 +2496,15 @@ async function contentIndexRefresh(args = {}) {
     }
   });
 
-  await saveContentIndex(index);
+  const updatedEntries = Object.fromEntries(
+    candidates
+      .filter((item) => index.entriesById[item.id])
+      .map((item) => [item.id, index.entriesById[item.id]])
+  );
+  const persistedIndex = await saveContentIndex({ entriesById: updatedEntries });
   return {
     ...results,
-    itemCount: index.itemCount,
+    itemCount: persistedIndex.itemCount,
     durationMs: elapsedMs(startedAt),
     settings: {
       maxBytesPerFile: clampInteger(args.maxBytesPerFile, settings.maxIndexedFileSize, 1024, textFileLimit),
@@ -2068,10 +2517,11 @@ async function contentIndexRefresh(args = {}) {
 }
 
 async function cacheMovedOrRenamedItem(previous, current) {
-  if (previous?.folder) {
-    await cacheItems([{ ...simplifyItem(previous), deleted: {} }]);
-  }
-  await cacheItems([current]);
+  await bestEffortLocalWrite("metadata cache update", async () => await cacheItems([current]));
+}
+
+function unresolvedPathItems(cache) {
+  return Object.values(cache.itemsById || {}).filter((item) => item?.id && !item.deleted && item.remotePath === undefined);
 }
 
 async function syncStatus(args = {}) {
@@ -2080,6 +2530,7 @@ async function syncStatus(args = {}) {
   const settings = pluginSettings();
   const items = Object.values(cache.itemsById || {});
   const contentEntries = Object.values(contentIndex.entriesById || {});
+  const unresolvedItems = unresolvedPathItems(cache);
   const cacheAgeSeconds = cache.updatedAt ? Math.max(0, Math.round((Date.now() - Date.parse(cache.updatedAt)) / 1000)) : null;
   return {
     cachePath,
@@ -2094,7 +2545,12 @@ async function syncStatus(args = {}) {
     cacheFresh: cacheAgeSeconds === null ? false : settings.cacheTtlSeconds === 0 || cacheAgeSeconds <= settings.cacheTtlSeconds,
     deltaLinkAvailable: Boolean(cache.deltaLink),
     deltaNextLinkAvailable: Boolean(cache.deltaNextLink),
+    deltaTarget: cache.deltaTarget || null,
     scanRoot: cache.scanRoot,
+    unresolvedPathCount: unresolvedItems.length,
+    unresolvedPathSamples: args.includeSamples
+      ? unresolvedItems.slice(0, 10).map((item) => ({ id: item.id, name: item.name, parentId: item.parentId }))
+      : undefined,
     contentIndex: {
       itemCount: contentEntries.length,
       updatedAt: contentIndex.updatedAt,
@@ -2232,13 +2688,18 @@ async function postForm(url, params) {
 }
 
 async function startDeviceLogin(args = {}) {
+  const generation = authGeneration;
+  const deviceGeneration = ++deviceLoginGeneration;
   const cfg = config(args);
   requireClientId(cfg);
   const { body: result, tenant } = await postFormWithConsumerFallback("device", cfg, {
     client_id: cfg.clientId,
     scope: cfg.scopes
   });
-  pendingDevice = { ...result, tenant, scopes: cfg.scopes, startedAt: Date.now() };
+  if (generation !== authGeneration || deviceGeneration !== deviceLoginGeneration) {
+    throw new Error("OneDrive authentication state changed while device login was starting. Start login again.");
+  }
+  pendingDevice = { ...result, tenant, scopes: cfg.scopes, startedAt: Date.now(), deviceGeneration };
   return {
     userCode: result.user_code,
     verificationUri: result.verification_uri,
@@ -2252,9 +2713,15 @@ async function startDeviceLogin(args = {}) {
 }
 
 async function pollDeviceLogin(args = {}) {
-  const deviceCode = args.deviceCode || pendingDevice?.device_code;
+  const generation = authGeneration;
+  const pending = pendingDevice;
+  const deviceCode = args.deviceCode || pending?.device_code;
   if (!deviceCode) throw new Error("No pending device code. Run onedrive_auth_device_start first.");
-  const cfg = config({ tenant: pendingDevice?.tenant, scopes: pendingDevice?.scopes });
+  if (pending && args.deviceCode && args.deviceCode !== pending.device_code) {
+    throw new Error("The supplied device code does not match the active OneDrive device-login session. Start login again.");
+  }
+  const deviceGeneration = pending?.deviceGeneration ?? deviceLoginGeneration;
+  const cfg = config({ tenant: pending?.tenant, scopes: pending?.scopes });
   requireClientId(cfg);
   const tokenParams = {
     grant_type: "urn:ietf:params:oauth:grant-type:device_code",
@@ -2271,6 +2738,11 @@ async function pollDeviceLogin(args = {}) {
     throw error;
   });
   const result = tokenResponse.body || tokenResponse;
+  if (generation !== authGeneration
+    || deviceGeneration !== deviceLoginGeneration
+    || (pending && pendingDevice?.deviceGeneration !== deviceGeneration)) {
+    throw new Error("OneDrive authentication state changed while device login was pending. Start login again.");
+  }
   if (result.authorizationPending) return result;
   tokenCache = normalizeToken(result);
   setKeychainToken(tokenCache, cfg);
@@ -2284,7 +2756,7 @@ async function pollDeviceLogin(args = {}) {
   };
 }
 
-async function refreshAccessToken(refreshToken, cfg = config()) {
+async function refreshAccessToken(refreshToken, cfg = config(), generation = authGeneration) {
   requireClientId(cfg);
   const { body: result, tenant } = await postFormWithConsumerFallback("token", cfg, {
     grant_type: "refresh_token",
@@ -2292,6 +2764,9 @@ async function refreshAccessToken(refreshToken, cfg = config()) {
     refresh_token: refreshToken,
     scope: cfg.scopes
   });
+  if (generation !== authGeneration) {
+    throw new Error("OneDrive authentication state changed while the access token was refreshing. Try again if access is still intended.");
+  }
   tokenCache = normalizeToken({ ...result, auth_tenant: tenant, refresh_token: result.refresh_token || refreshToken });
   setKeychainToken(tokenCache, cfg);
   return tokenCache;
@@ -2311,8 +2786,17 @@ async function getAccessToken() {
     return current.access_token;
   }
   if (!current.refresh_token) throw new Error("Stored token has no refresh token. Run device-code login again.");
-  const refreshed = await refreshAccessToken(current.refresh_token, cfg);
-  return refreshed.access_token;
+  if (!tokenRefreshPromise) {
+    const generation = authGeneration;
+    tokenRefreshPromise = refreshAccessToken(current.refresh_token, cfg, generation);
+  }
+  const refresh = tokenRefreshPromise;
+  try {
+    const refreshed = await refresh;
+    return refreshed.access_token;
+  } finally {
+    if (tokenRefreshPromise === refresh) tokenRefreshPromise = null;
+  }
 }
 
 function sleep(ms) {
@@ -2362,7 +2846,7 @@ function isReplayableBody(body) {
 function retryCountForRequest(fetchOptions, explicitMaxRetries) {
   if (explicitMaxRetries === 0) return 0;
   const method = String(fetchOptions.method || "GET").toUpperCase();
-  if (method === "GET" || method === "HEAD") return explicitMaxRetries ?? 3;
+  if (method === "GET" || method === "HEAD") return explicitMaxRetries ?? 4;
   if (explicitMaxRetries !== undefined && isReplayableBody(fetchOptions.body)) return explicitMaxRetries;
   return 0;
 }
@@ -2401,7 +2885,9 @@ async function fetchWithRetry(url, options = {}, retryOptions = {}) {
         if (error.name === "AbortError" || error.name === "TimeoutError") {
           throw new Error(`Request timed out after ${timeoutMs}ms: ${url}`);
         }
-        throw error;
+        const transportError = new Error(`Microsoft Graph transport error after ${attempt + 1} attempts: ${error.message || String(error)}`);
+        transportError.cause = error;
+        throw transportError;
       }
       await sleep(Math.min(1000 * 2 ** attempt, 8000));
       continue;
@@ -2419,6 +2905,20 @@ function graphRequestId(headers, body) {
     || body?.error?.innerError?.["request-id"]
     || body?.error?.innerError?.requestId
     || null;
+}
+
+function currentGraphRequestId(options = {}) {
+  const store = toolCallContext.getStore();
+  return options.mutation === true
+    ? store?.lastMutationGraphRequestId || null
+    : store?.lastGraphRequestId || null;
+}
+
+function rememberGraphRequestId(requestId, options = {}) {
+  const store = toolCallContext.getStore();
+  if (!store) return;
+  store.lastGraphRequestId = requestId || null;
+  if (options.mutation === true) store.lastMutationGraphRequestId = requestId || null;
 }
 
 function microsoftGraphError(body, response) {
@@ -2481,7 +2981,9 @@ function assertTrustedUploadSessionUrl(uploadUrl) {
 }
 
 async function graph(path, options = {}) {
-  const { returnResponse = false, maxRetries, skipAuth = false, ...fetchOptions } = options;
+  const { returnResponse = false, maxRetries, skipAuth = false, isMutation, ...fetchOptions } = options;
+  const method = String(fetchOptions.method || "GET").toUpperCase();
+  const mutationRequest = isMutation ?? !["GET", "HEAD", "OPTIONS"].includes(method);
   const accessToken = skipAuth ? null : await getAccessToken();
   const url = graphUrl(path, { skipAuth });
   const headers = {
@@ -2494,9 +2996,10 @@ async function graph(path, options = {}) {
     headers
   }, { maxRetries: retryCountForRequest(fetchOptions, maxRetries) });
   const body = await parseResponseBody(retriedResponse);
-  lastGraphRequestId = graphRequestId(retriedResponse.headers, body);
+  const requestId = graphRequestId(retriedResponse.headers, body);
+  rememberGraphRequestId(requestId, { mutation: mutationRequest });
   if (returnResponse) {
-    return { body, headers: retriedResponse.headers, status: retriedResponse.status, ok: retriedResponse.ok, graphRequestId: lastGraphRequestId };
+    return { body, headers: retriedResponse.headers, status: retriedResponse.status, ok: retriedResponse.ok, graphRequestId: requestId };
   }
   if (!retriedResponse.ok) {
     throw microsoftGraphError(body, retriedResponse);
@@ -2518,8 +3021,8 @@ async function graphDownloadToFile(path, target, options = {}) {
     const body = await parseResponseBody(response);
     throw microsoftGraphError(body, response);
   }
-  await mkdir(dirname(target), { recursive: true });
-  const temp = `${target}.part-${process.pid}-${Date.now()}`;
+  await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+  const temp = `${target}.part-${process.pid}-${randomUUID()}`;
   let bytesWritten = 0;
   try {
     if (response.body) {
@@ -2529,15 +3032,17 @@ async function graphDownloadToFile(path, target, options = {}) {
           controller.enqueue(chunk);
         }
       });
-      await pipeline(Readable.fromWeb(response.body.pipeThrough(counter)), createWriteStream(temp));
+      await pipeline(Readable.fromWeb(response.body.pipeThrough(counter)), createWriteStream(temp, { flags: "wx", mode: 0o600 }));
     } else {
       const buffer = Buffer.from(await response.arrayBuffer());
       bytesWritten = buffer.length;
-      await writeFile(temp, buffer);
+      await writePrivateFile(temp, buffer);
     }
     await renameFile(temp, target);
+    await hardenPrivateFile(target);
   } catch (error) {
     await rm(temp, { force: true });
+    if (options.reserved === true) await rm(target, { force: true });
     throw error;
   }
   return { bytesWritten: bytesWritten || contentLength(response) || 0 };
@@ -2925,7 +3430,7 @@ function permissionDiffAuditSummary(diff = {}) {
 function safeErrorInfo(error) {
   return {
     message: redactAuditText(error?.message || String(error)),
-    graphRequestId: error?.graphRequestId || lastGraphRequestId || undefined,
+    graphRequestId: error?.graphRequestId || currentGraphRequestId({ mutation: true }) || currentGraphRequestId() || undefined,
     graphStatus: error?.graphStatus
   };
 }
@@ -2942,6 +3447,21 @@ function redactAuditText(text = "") {
 
 function safeToolErrorMessage(error) {
   return redactAuditText(error?.message || String(error));
+}
+
+function recordLocalWarning(operation, error) {
+  const store = toolCallContext.getStore();
+  if (!store) return;
+  store.localWarnings.push({ operation, error: safeToolErrorMessage(error) });
+}
+
+async function bestEffortLocalWrite(operation, fn) {
+  try {
+    return await fn();
+  } catch (error) {
+    recordLocalWarning(operation, error);
+    return null;
+  }
 }
 
 function sanitizeAuditValue(value) {
@@ -2965,20 +3485,29 @@ async function writeMutationAudit(tool, entry) {
     timestamp: new Date().toISOString(),
     tool,
     ...entry,
-    graphRequestId: entry.graphRequestId || lastGraphRequestId || undefined
+    graphRequestId: entry.graphRequestId || currentGraphRequestId({ mutation: true }) || currentGraphRequestId() || undefined
   });
-  await mkdir(auditRoot, { recursive: true });
-  await appendFile(auditPath, `${JSON.stringify(record)}\n`, "utf8");
-  return record;
+  return await bestEffortLocalWrite("mutation audit write", async () => {
+    await withFileLock(auditLockPath, async () => {
+      await ensurePrivateDirectory(auditRoot);
+      await appendFile(auditPath, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
+      await hardenPrivateFile(auditPath);
+    });
+    return record;
+  });
 }
 
 async function auditRecent(args = {}) {
   let text = "";
-  try {
-    text = await readFile(auditPath, "utf8");
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-  }
+  await withFileLock(auditLockPath, async () => {
+    await ensurePrivateDirectory(auditRoot);
+    try {
+      text = await readFile(auditPath, "utf8");
+      await hardenPrivateFile(auditPath);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  });
   const limit = clampInteger(args.limit, 50, 1, 500);
   const since = args.since ? Date.parse(args.since) : null;
   const until = args.until ? Date.parse(args.until) : null;
@@ -3027,25 +3556,29 @@ async function auditRecent(args = {}) {
 
 async function auditExport(args = {}) {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const target = args.localPath ? resolve(args.localPath) : join(auditRoot, `export-${stamp}.jsonl`);
-  await assertNotLocalOneDriveSyncPathForWrite(target, "Audit export", args);
-  if (args.overwrite !== true) {
-    try {
-      await stat(target);
-      throw new Error(`Local file already exists: ${target}. Pass overwrite: true to replace it.`);
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-    }
-  }
-  await mkdir(dirname(target), { recursive: true });
+  const preferredTarget = args.localPath ? resolve(args.localPath) : join(auditRoot, `export-${stamp}-${randomUUID()}.jsonl`);
+  await assertNotLocalOneDriveSyncPathForWrite(preferredTarget, "Audit export", args);
+  const reservation = await reserveLocalDestination(preferredTarget, {
+    overwrite: args.overwrite === true,
+    allowAlternate: !args.localPath
+  });
+  const target = reservation.path;
   try {
-    await copyFile(auditPath, target);
+    await withFileLock(auditLockPath, async () => {
+      try {
+        await copyFile(auditPath, target);
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+        await writePrivateFile(target, "");
+      }
+    });
+    await hardenPrivateFile(target);
+    const written = await stat(target);
+    return { auditPath, localPath: target, bytesWritten: written.size };
   } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-    await writeFile(target, "");
+    if (reservation.reserved) await rm(target, { force: true });
+    throw error;
   }
-  const written = await stat(target);
-  return { auditPath, localPath: target, bytesWritten: written.size };
 }
 
 async function auditClear(args = {}) {
@@ -3056,7 +3589,7 @@ async function auditClear(args = {}) {
       requiredToClear: "Set confirmed: true after explicit user confirmation to clear the local mutation audit log."
     };
   }
-  await rm(auditPath, { force: true });
+  await withFileLock(auditLockPath, async () => await rm(auditPath, { force: true }));
   return { confirmed: true, auditPath, cleared: true };
 }
 
@@ -3110,6 +3643,8 @@ function simplifyItem(item) {
     name: source.name,
     remotePath: itemRemotePath(source),
     path: source.parentReference?.path,
+    parentId: source.parentReference?.id,
+    driveId: source.parentReference?.driveId,
     webUrl: source.webUrl,
     size: source.size,
     createdDateTime: source.createdDateTime,
@@ -3118,14 +3653,19 @@ function simplifyItem(item) {
     cTag: source.cTag,
     deleted: source.deleted,
     folder: source.folder ? { childCount: source.folder.childCount } : undefined,
-    file: source.file ? { mimeType: source.file.mimeType, hashes: source.file.hashes } : undefined
+    file: source.file ? {
+      mimeType: source.file.mimeType,
+      ...(source.file.hashes !== undefined ? { hashes: source.file.hashes } : {})
+    } : undefined
   };
 }
 
 function itemRemotePath(item) {
   if (!item?.name) return undefined;
-  const parentPath = item.parentReference?.path || "";
-  const rootMatch = parentPath.match(/^\/(?:drive|drives\/[^/]+)\/root:(.*)$/);
+  if (!item.parentReference && !item.root) return undefined;
+  const parentPath = item.parentReference?.path;
+  if (!parentPath && item.parentReference?.id) return undefined;
+  const rootMatch = String(parentPath || "").match(/^\/(?:drive|drives\/[^/]+)\/root:(.*)$/);
   const parentRemotePath = rootMatch
     ? decodeGraphPath(rootMatch[1].replace(/^\/+|\/+$/g, ""))
     : "";
@@ -3145,11 +3685,25 @@ async function list(args = {}) {
   params.set("$top", String(clampInteger(args.limit, 100, 1, 200)));
   params.set("$select", args.select || defaultSelect);
   const result = await graph(`${childrenPath(args)}?${params.toString()}`);
-  await cacheItems(result.value || []);
+  await bestEffortLocalWrite("metadata cache update", async () => await cacheItems(result.value || []));
   return { items: (result.value || []).map((item) => formatDriveItem(item, args.format)), nextLink: result["@odata.nextLink"] || null };
 }
 
-async function collectPages(firstPath, maxItems, format = "compact", formatter = formatDriveItem) {
+function isDeltaCursor(value) {
+  if (!value) return false;
+  try {
+    const base = new URL(graphBaseUrl());
+    const target = new URL(String(value), base);
+    const basePath = base.pathname.replace(/\/+$/, "");
+    const trustedPath = target.origin === base.origin
+      && (target.pathname === basePath || target.pathname.startsWith(`${basePath}/`));
+    return trustedPath && target.pathname.split("/").some((segment) => segment === "delta" || segment.startsWith("delta("));
+  } catch {
+    return false;
+  }
+}
+
+async function collectPages(firstPath, maxItems, format = "compact", formatter = formatDriveItem, options = {}) {
   return await withMetadataCacheBatch(async () => {
     const items = [];
     let nextPath = firstPath;
@@ -3158,30 +3712,62 @@ async function collectPages(firstPath, maxItems, format = "compact", formatter =
     let truncated = false;
     const seenPages = new Set();
     let pagesFetched = 0;
+    let unsafePageTruncation = false;
+    const pendingCacheItems = [];
+    let pendingCursorMetadata = {};
     const maxPages = Math.max(1, Math.ceil(maxItems / 1) + 100);
     while (nextPath && items.length < maxItems) {
       if (seenPages.has(nextPath)) throw new Error(`Microsoft Graph pagination cycle detected at ${safeDisplayPath(nextPath)}.`);
       if (pagesFetched >= maxPages) throw new Error(`Microsoft Graph pagination exceeded ${maxPages} pages before reaching the item limit.`);
       seenPages.add(nextPath);
       pagesFetched += 1;
-      const result = await graph(nextPath);
+      let result;
+      try {
+        result = await graph(nextPath);
+      } catch (error) {
+        error.graphPagesFetched = pagesFetched;
+        throw error;
+      }
       const pageItems = result.value || [];
       const remaining = maxItems - items.length;
       const acceptedItems = pageItems.slice(0, remaining);
       const pageTruncated = pageItems.length > remaining;
       const pageNextLink = result["@odata.nextLink"] || null;
       const pageDeltaLink = result["@odata.deltaLink"] || null;
-      await cacheItems(acceptedItems, {
-        deltaLink: !pageTruncated ? pageDeltaLink || undefined : undefined,
-        deltaNextLink: !pageTruncated && pageNextLink && !pageDeltaLink ? pageNextLink : undefined
-      });
+      const cursorMetadata = options.persistDeltaCursor === true && !pageTruncated && (pageDeltaLink || pageNextLink) ? {
+        deltaLink: pageDeltaLink || undefined,
+        deltaNextLink: pageNextLink && !pageDeltaLink ? pageNextLink : undefined,
+        deltaTarget: options.deltaTarget
+      } : {};
+      const cacheableItems = options.prepareCacheItems
+        ? await options.prepareCacheItems(acceptedItems)
+        : acceptedItems;
+      if (options.cacheResults !== false) pendingCacheItems.push(...cacheableItems);
+      if (Object.keys(cursorMetadata).length) pendingCursorMetadata = cursorMetadata;
       items.push(...acceptedItems.map((item) => formatter(item, format)));
-      nextLink = pageNextLink;
+      if (pageTruncated) {
+        unsafePageTruncation = true;
+        nextLink = null;
+      } else {
+        nextLink = pageNextLink;
+      }
       deltaLink = pageTruncated ? null : pageDeltaLink;
-      nextPath = nextLink && items.length < maxItems ? nextLink : null;
+      nextPath = !pageTruncated && nextLink && items.length < maxItems ? nextLink : null;
       truncated = truncated || pageTruncated || (Boolean(nextLink) && items.length >= maxItems);
     }
-    return { items, nextLink, deltaLink, truncated, count: items.length };
+    if (pendingCacheItems.length || Object.keys(pendingCursorMetadata).length) {
+      const deduplicatedCacheItems = [...new Map(pendingCacheItems.filter((item) => item?.id).map((item) => [item.id, item])).values()];
+      await bestEffortLocalWrite("metadata cache update", async () => await cacheItems(deduplicatedCacheItems, pendingCursorMetadata));
+    }
+    return {
+      items,
+      nextLink,
+      deltaLink,
+      truncated,
+      unsafePageTruncation,
+      pagesFetched,
+      count: items.length
+    };
   });
 }
 
@@ -3197,9 +3783,11 @@ function safeDisplayPath(value = "") {
 async function listAll(args = {}) {
   const maxItems = clampInteger(args.maxItems, 1000, 1, 5000);
   const params = new URLSearchParams();
-  params.set("$top", String(clampInteger(args.pageSize, 200, 1, 200)));
+  params.set("$top", String(Math.min(clampInteger(args.pageSize, 200, 1, 200), maxItems)));
   params.set("$select", args.select || defaultSelect);
-  return await collectPages(`${childrenPath(args)}?${params.toString()}`, maxItems, args.format);
+  return await collectPages(`${childrenPath(args)}?${params.toString()}`, maxItems, args.format, formatDriveItem, {
+    cacheResults: args.cacheResults !== false
+  });
 }
 
 function normalizeExtensions(extensions = []) {
@@ -3234,14 +3822,14 @@ function scanItemMatches(item, args = {}, extensionFilter = new Set()) {
 
 async function resolveScanRoot(args = {}) {
   if (args.itemId) {
-    const folder = await getRawInfo({ itemId: args.itemId });
+    const folder = await getRawInfo({ itemId: args.itemId, cacheResults: args.cacheResults });
     if (!folder.folder && !folder.root) throw new Error(`Scan target is not a folder: ${folder.name}`);
     return { id: folder.id, name: folder.name || "root", remotePath: itemRemotePath(folder) || "", target: `itemId:${folder.id}` };
   }
 
   const resolvedPath = resolvePresetPath(args);
   if (resolvedPath) {
-    const folder = await getRawInfo({ path: resolvedPath });
+    const folder = await getRawInfo({ path: resolvedPath, cacheResults: args.cacheResults });
     if (!folder.folder && !folder.root) throw new Error(`Scan target is not a folder: ${folder.name}`);
     return { id: folder.id, name: folder.name || resolvedPath, remotePath: resolvedPath, target: resolvedPath };
   }
@@ -3265,6 +3853,7 @@ async function scan(args = {}) {
 
     const queue = [{ id: root.id, name: root.name, remotePath: root.remotePath, depth: 0 }];
     const results = [];
+    const pendingCacheItems = [];
     const counters = {
       itemsScanned: 0,
       filesScanned: 0,
@@ -3337,7 +3926,7 @@ async function scan(args = {}) {
             });
           }
         }
-        await cacheItems(cacheableItems);
+        if (args.cacheResults !== false) pendingCacheItems.push(...cacheableItems);
         if (truncatedReason) break;
         nextPath = page["@odata.nextLink"] || null;
       }
@@ -3346,6 +3935,10 @@ async function scan(args = {}) {
     }
 
     if (!truncatedReason && queue.length) truncatedReason = "queueRemaining";
+    if (args.cacheResults !== false && pendingCacheItems.length) {
+      const deduplicatedCacheItems = [...new Map(pendingCacheItems.filter((item) => item?.id).map((item) => [item.id, item])).values()];
+      await bestEffortLocalWrite("metadata cache update", async () => await cacheItems(deduplicatedCacheItems));
+    }
     return {
       root,
       filters: {
@@ -3378,8 +3971,11 @@ async function search(args = {}) {
   const escaped = String(args.query).replace(/'/g, "''");
   const params = new URLSearchParams();
   params.set("$top", String(clampInteger(args.limit, 50, 1, 200)));
+  params.set("$select", defaultSelect);
   const result = await graph(`/me/drive/root/search(q='${encodeURIComponent(escaped)}')?${params.toString()}`);
-  await cacheItems(result.value || []);
+  if (args.cacheResults !== false) {
+    await bestEffortLocalWrite("metadata cache update", async () => await cacheItems(result.value || []));
+  }
   return { items: (result.value || []).map((item) => formatDriveItem(item, args.format)), nextLink: result["@odata.nextLink"] || null };
 }
 
@@ -3387,8 +3983,15 @@ async function searchAll(args = {}) {
   const escaped = String(args.query).replace(/'/g, "''");
   const maxItems = clampInteger(args.maxItems, 1000, 1, 5000);
   const params = new URLSearchParams();
-  params.set("$top", String(clampInteger(args.pageSize, 200, 1, 200)));
-  return await collectPages(`/me/drive/root/search(q='${encodeURIComponent(escaped)}')?${params.toString()}`, maxItems, args.format);
+  params.set("$top", String(Math.min(clampInteger(args.pageSize, 200, 1, 200), maxItems)));
+  params.set("$select", defaultSelect);
+  return await collectPages(
+    `/me/drive/root/search(q='${encodeURIComponent(escaped)}')?${params.toString()}`,
+    maxItems,
+    args.format,
+    formatDriveItem,
+    { cacheResults: args.cacheResults !== false }
+  );
 }
 
 const findStopWords = new Set([
@@ -3545,7 +4148,9 @@ function scoreFindCandidate(item, context = {}) {
     reasons.push("exact path");
   } else if (context.source === "search") {
     score += 18;
-    reasons.push(`Graph search: ${context.term}`);
+    reasons.push(context.canonicalSearch === true
+      ? "canonical Graph content/metadata match"
+      : `Graph search: ${context.term}`);
   } else if (context.source === "scan") {
     score += 12;
     reasons.push(`scan: ${context.folder || "root"}`);
@@ -3646,27 +4251,24 @@ function normalizeFolderHintKey(hint = "") {
 }
 
 function pruneFolderHints(hints = []) {
-  const unique = [];
+  const pruned = [];
   const seen = new Set();
   for (const hint of hints) {
     const clean = cleanPath(hint || "");
     const key = normalizeFolderHintKey(clean);
     if (seen.has(key)) continue;
     seen.add(key);
-    unique.push(clean);
-  }
-  const rootIncluded = unique.includes("");
-  const nonRoot = unique.filter((hint) => hint !== "");
-  const pruned = [];
-  for (const hint of nonRoot) {
-    const key = normalizeFolderHintKey(hint);
-    const covered = pruned.some((existing) => {
-      const existingKey = normalizeFolderHintKey(existing);
-      return existingKey && (key === existingKey || key.startsWith(`${existingKey}/`));
+    if (!key) {
+      pruned.push(clean);
+      continue;
+    }
+    const overlapsEarlierHint = pruned.some((earlier) => {
+      const earlierKey = normalizeFolderHintKey(earlier);
+      if (!earlierKey) return false;
+      return key.startsWith(`${earlierKey}/`) || earlierKey.startsWith(`${key}/`);
     });
-    if (!covered) pruned.push(hint);
+    if (!overlapsEarlierHint) pruned.push(clean);
   }
-  if (rootIncluded) pruned.push("");
   return pruned;
 }
 
@@ -3695,6 +4297,7 @@ function addFindCandidate(candidates, item, context) {
     : 0;
   const strongContentIndexMatch = context.source === "contentIndex"
     && (context.contentExactPhrase === true || (context.contentMatchedTokens || 0) >= 2 || contentCoverage >= 0.5);
+  const canonicalGraphMatch = context.source === "search" && context.canonicalSearch === true;
   const hasQueryRelevance = scored.matchedTokens > 0 || scored.reasons.some((reason) =>
     reason.startsWith("exact filename")
     || reason.startsWith("filename contains")
@@ -3702,7 +4305,7 @@ function addFindCandidate(candidates, item, context) {
     || reason.startsWith("date match")
     || reason.startsWith("requested extension")
     || reason.startsWith("likely file type")
-  ) || strongContentIndexMatch;
+  ) || strongContentIndexMatch || canonicalGraphMatch;
   if (context.source !== "exactPath" && !hasQueryRelevance) return;
   const existing = candidates.get(key);
   if (!existing || scored.score > existing.score) {
@@ -3812,6 +4415,12 @@ async function find(args = {}) {
   const candidates = new Map();
   const searchRuns = [];
   const scanRuns = [];
+  const pendingSearchCacheItems = [];
+  const searchConcurrency = clampInteger(args.searchConcurrency, 2, 1, 4);
+  const searchConfidenceThreshold = args.minConfidenceForSearchOnly ?? 78;
+  const executedSearchTerms = [];
+  const skippedSearchTerms = [];
+  let searchStopReason = null;
   let cacheCandidateCount = 0;
   let contentIndexCandidateCount = 0;
   let contentIndexDurationMs = 0;
@@ -3863,7 +4472,7 @@ async function find(args = {}) {
 
   if (query.includes("/")) {
     try {
-      const item = simplifyItem(await getRawInfo({ path: query }));
+      const item = simplifyItem(await getRawInfo({ path: query, cacheResults: args.useCache !== false }));
       addFindCandidate(candidates, item, {
         args,
         query,
@@ -3876,30 +4485,98 @@ async function find(args = {}) {
     }
   }
 
-  for (const term of searchTerms) {
+  const executeSearchTerm = async ({ term, index, stage }) => {
+    const termStartedAt = Date.now();
+    executedSearchTerms.push(term);
     try {
-      const searchStartedAt = Date.now();
       const result = await searchAll({
         query: term,
         pageSize: args.searchPageSize ?? 50,
         maxItems: args.searchMaxItemsPerTerm ?? 100,
-        format: "full"
+        format: "full",
+        cacheResults: false
       });
-      liveSearchDurationMs += elapsedMs(searchStartedAt);
-      searchRuns.push({ term, count: result.count, truncated: result.truncated });
-      for (const item of result.items || []) {
+      if (args.useCache !== false) pendingSearchCacheItems.push(...(result.items || []));
+      for (const [resultIndex, item] of (result.items || []).entries()) {
         addFindCandidate(candidates, item, {
           args,
           query,
           source: "search",
           term,
+          canonicalSearch: index === 0,
+          searchResultRank: resultIndex + 1,
           extensionInfo,
           scoringFolderHints
         });
       }
+      return {
+        term,
+        stage,
+        executed: true,
+        count: result.count,
+        truncated: result.truncated,
+        unsafePageTruncation: result.unsafePageTruncation,
+        graphSearchCalls: result.pagesFetched || 0,
+        durationMs: elapsedMs(termStartedAt)
+      };
     } catch (error) {
-      searchRuns.push({ term, error: safeToolErrorMessage(error) });
+      return {
+        term,
+        stage,
+        executed: true,
+        graphSearchCalls: error.graphPagesFetched || 0,
+        durationMs: elapsedMs(termStartedAt),
+        error: safeToolErrorMessage(error)
+      };
     }
+  };
+
+  const executeSearchWave = async (entries) => {
+    if (!entries.length) return;
+    const waveStartedAt = Date.now();
+    const runs = await mapWithConcurrency(entries, searchConcurrency, executeSearchTerm);
+    liveSearchDurationMs += elapsedMs(waveStartedAt);
+    searchRuns.push(...runs);
+  };
+
+  if (searchTerms.length) {
+    await executeSearchWave([{ term: searchTerms[0], index: 0, stage: "canonical" }]);
+    let nextSearchTermIndex = 1;
+    let bestLiveSearchScore = rankedFindCandidates(candidates).find(candidateHasLiveSource)?.score || 0;
+    if (args.executeAllSearchTerms !== true && bestLiveSearchScore >= searchConfidenceThreshold && nextSearchTermIndex < searchTerms.length) {
+      searchStopReason = "high-confidence-canonical";
+    } else {
+      while (nextSearchTermIndex < searchTerms.length) {
+        const wave = searchTerms
+          .slice(nextSearchTermIndex, nextSearchTermIndex + searchConcurrency)
+          .map((term, offset) => ({ term, index: nextSearchTermIndex + offset, stage: "expansion" }));
+        nextSearchTermIndex += wave.length;
+        await executeSearchWave(wave);
+        bestLiveSearchScore = rankedFindCandidates(candidates).find(candidateHasLiveSource)?.score || 0;
+        if (args.executeAllSearchTerms !== true && bestLiveSearchScore >= searchConfidenceThreshold && nextSearchTermIndex < searchTerms.length) {
+          searchStopReason = "high-confidence-expansion";
+          break;
+        }
+      }
+    }
+
+    for (const term of searchTerms.slice(executedSearchTerms.length)) {
+      skippedSearchTerms.push(term);
+      searchRuns.push({
+        term,
+        stage: "expansion",
+        executed: false,
+        skipped: searchStopReason || "adaptive-stop"
+      });
+    }
+  }
+  if (!searchStopReason) searchStopReason = "all-terms-executed";
+
+  if (args.useCache !== false && pendingSearchCacheItems.length) {
+    const uniqueSearchCacheItems = [...new Map(pendingSearchCacheItems.filter((item) => item?.id).map((item) => [item.id, item])).values()];
+    await bestEffortLocalWrite("metadata cache update", async () => await withMetadataCacheBatch(async () => {
+      await cacheItems(uniqueSearchCacheItems);
+    }));
   }
 
   let ranked = rankedFindCandidates(candidates);
@@ -3915,7 +4592,7 @@ async function find(args = {}) {
     ranked = rankedFindCandidates(candidates);
   }
   const bestLiveScore = ranked.find(candidateHasLiveSource)?.score || 0;
-  const shouldScan = args.scanFallback !== false && bestLiveScore < (args.minConfidenceForSearchOnly ?? 78);
+  const shouldScan = args.scanFallback !== false && bestLiveScore < searchConfidenceThreshold;
 
   if (shouldScan) {
     const scanNeedle = findScanNeedle(query);
@@ -3941,7 +4618,10 @@ async function find(args = {}) {
           const folder = folderHints[folderIndex];
           folderIndex += 1;
           try {
-            const root = await resolveScanRoot(folder ? { path: folder } : {});
+            const root = await resolveScanRoot({
+              ...(folder ? { path: folder } : {}),
+              cacheResults: args.useCache !== false
+            });
             const key = scanRootKey(root, folder);
             if (scannedFolderKeys.has(key)) {
               scanRuns.push({ folder: folder || "root", reason: plan.reason, skipped: "duplicate-root", root: { id: root.id, remotePath: root.remotePath } });
@@ -3971,7 +4651,8 @@ async function find(args = {}) {
               maxDepth: args.scanMaxDepth ?? 20,
               maxResults: Math.max(maxResults * 2, 20),
               stopAfterResults: true,
-              format: "full"
+              format: "full",
+              cacheResults: args.useCache !== false
             });
             return { target, result };
           } catch (error) {
@@ -4001,7 +4682,7 @@ async function find(args = {}) {
           }
         }
         ranked = rankedFindCandidates(candidates);
-        if ((ranked[0]?.score || 0) >= (args.minConfidenceForSearchOnly ?? 78) && ranked.length >= maxResults) break;
+        if ((ranked[0]?.score || 0) >= searchConfidenceThreshold && ranked.length >= maxResults) break;
       }
       ranked = rankedFindCandidates(candidates);
       if (ranked.length > 0) break;
@@ -4012,10 +4693,35 @@ async function find(args = {}) {
   if (shouldScan) {
     ranked = ranked.filter(candidateHasLiveSource);
   }
+  const noteParts = [];
+  if (cacheCandidateCount > 0) noteParts.push("Used the local metadata cache as a candidate source.");
+  if (contentIndexCandidateCount > 0) noteParts.push("Used matching entries from the local content index.");
+  if (executedSearchTerms.length > 0) {
+    noteParts.push(`Ran ${executedSearchTerms.length} live Graph search ${executedSearchTerms.length === 1 ? "term" : "terms"}.`);
+  }
+  if (skippedSearchTerms.length > 0) {
+    noteParts.push(`Skipped ${skippedSearchTerms.length} expansion ${skippedSearchTerms.length === 1 ? "term" : "terms"} after reaching the confidence threshold.`);
+  }
+  if (shouldScan) {
+    noteParts.push("Used bounded remote recursive scan fallback because live-search confidence remained below the threshold.");
+  } else if (args.scanFallback === false) {
+    noteParts.push("Recursive scan fallback was disabled.");
+  } else {
+    noteParts.push("Recursive scan fallback was not required by the configured confidence threshold.");
+  }
   return {
     query,
     strategy: "cache-assisted-remote-first",
     searchTerms,
+    searchPlan: {
+      mode: "adaptive-staged",
+      concurrency: searchConcurrency,
+      confidenceThreshold: searchConfidenceThreshold,
+      planned: searchTerms,
+      executed: executedSearchTerms,
+      skipped: skippedSearchTerms,
+      stopReason: searchStopReason
+    },
     inferred: {
       extensions: [...extensionInfo.inferred],
       strictExtensions: [...extensionInfo.strictInferred],
@@ -4038,8 +4744,13 @@ async function find(args = {}) {
       scanDurationMs,
       cacheConfirmDurationMs,
       cacheConfirmations,
-      graphSearchCalls: searchRuns.filter((run) => run.term).length,
-      scanAttempts: scanRuns.length
+      graphSearchCalls: searchRuns.reduce((sum, run) => sum + (run.graphSearchCalls || 0), 0),
+      searchTermsPlanned: searchTerms.length,
+      searchTermsExecuted: executedSearchTerms.length,
+      searchTermsSkipped: skippedSearchTerms.length,
+      searchStopReason,
+      scanAttempts: scanRuns.length,
+      metadataCacheWrites: toolCallContext.getStore()?.metadataCacheWrites || 0
     },
     searchRuns,
     scanRuns,
@@ -4050,9 +4761,7 @@ async function find(args = {}) {
       snippets: candidate.snippets?.slice(0, 2),
       sources: candidate.sources.slice(0, 5)
     })),
-    note: shouldScan
-      ? "Used metadata cache and local content index when available, live Graph searches, then bounded remote recursive scan fallback."
-      : "Search confidence was high enough to skip recursive fallback. Used metadata cache and local content index when available."
+    note: noteParts.join(" ")
   };
 }
 
@@ -4089,15 +4798,13 @@ async function findAll(args = {}) {
     scanMaxDepth: Math.min(args.scanMaxDepth ?? 25, 50),
     searchPageSize: Math.min(args.searchPageSize ?? 100, 200),
     searchMaxItemsPerTerm: Math.min(args.searchMaxItemsPerTerm ?? 250, 1000),
-    minConfidenceForSearchOnly: args.minConfidenceForSearchOnly ?? 78
+    minConfidenceForSearchOnly: args.minConfidenceForSearchOnly ?? 78,
+    executeAllSearchTerms: true
   });
   return {
     ...result,
     strategy: "broad-cache-assisted-remote-first",
-    folderPlan: broadFindFolderHints(query, args.folderHints || []).map((folder) => folder || "root"),
-    note: result.summary?.persistentCacheUsed || result.summary?.localIndexUsed
-      ? "Used metadata cache and local content index when available, live Graph results, common folders, and bounded remote recursive scan fallback as needed."
-      : "Searched live Graph results and common folders first, then used bounded remote recursive scan fallback as needed. No local index was used."
+    folderPlan: broadFindFolderHints(query, args.folderHints || []).map((folder) => folder || "root")
   };
 }
 
@@ -4107,41 +4814,138 @@ function formatDeltaItem(item, format = "compact") {
   return formatted ? { ...formatted, deleted: item.deleted ? item.deleted : undefined } : formatted;
 }
 
+async function resolveDeltaPathRoot(args = {}) {
+  try {
+    if (args.itemId) return await resolveScanRoot({ itemId: args.itemId, cacheResults: false });
+    const resolvedPath = resolvePresetPath(args);
+    if (resolvedPath) return await resolveScanRoot({ path: resolvedPath, cacheResults: false });
+    return await resolveScanRoot({ cacheResults: false });
+  } catch (error) {
+    recordLocalWarning("delta path-root resolution", error);
+    return null;
+  }
+}
+
+async function hydrateDeltaParentItems(items = [], pathRoot = null) {
+  if (!items.length) return items;
+  const cache = await loadMetadataCache();
+  const combined = new Map(items.filter((item) => item?.id).map((item) => [item.id, item]));
+  const supplemental = new Map();
+  const knownRootIds = new Set([
+    ...Object.keys(cache.pathRootsById || {}),
+    ...(cache.scanRoot?.id ? [cache.scanRoot.id] : []),
+    ...(pathRoot?.id ? [pathRoot.id] : [])
+  ]);
+  const maxHydratedParents = Math.min(100, Math.max(10, items.length * 2));
+
+  while (supplemental.size < maxHydratedParents) {
+    const missingParentIds = [];
+    for (const item of combined.values()) {
+      if (!item?.parentReference?.id || itemRemotePath(item) !== undefined) continue;
+      const parentId = item.parentReference.id;
+      if (knownRootIds.has(parentId)) continue;
+      const cachedParent = cache.itemsById?.[parentId];
+      if (cachedParent?.remotePath !== undefined) continue;
+      if (combined.has(parentId)) continue;
+      if (!missingParentIds.includes(parentId)) missingParentIds.push(parentId);
+      if (supplemental.size + missingParentIds.length >= maxHydratedParents) break;
+    }
+    if (!missingParentIds.length) break;
+    const fetched = await mapWithConcurrency(missingParentIds, 4, async (parentId) => {
+      try {
+        return await graph(`/me/drive/items/${encodeURIComponent(parentId)}?$select=${encodeURIComponent(defaultSelect)}`);
+      } catch (error) {
+        recordLocalWarning("delta parent path resolution", error);
+        return null;
+      }
+    });
+    let added = 0;
+    for (const parent of fetched) {
+      if (!parent?.id || combined.has(parent.id)) continue;
+      combined.set(parent.id, parent);
+      supplemental.set(parent.id, parent);
+      added += 1;
+    }
+    if (!added) break;
+  }
+  return [...supplemental.values(), ...items];
+}
+
 async function delta(args = {}) {
   const maxItems = clampInteger(args.maxItems, 1000, 1, 5000);
   let firstPath = args.nextLink || args.deltaLink;
-  let target = args.nextLink ? "nextLink" : args.deltaLink ? "deltaLink" : "root";
+  let target = args._deltaTarget || (args.nextLink ? "nextLink" : args.deltaLink ? "deltaLink" : "root");
+  let pathRoot = null;
+  if (firstPath && !isDeltaCursor(firstPath)) {
+    throw new Error("nextLink and deltaLink must be Microsoft Graph delta cursor URLs. Refusing a non-delta pagination cursor.");
+  }
   if (!firstPath) {
     const params = new URLSearchParams();
-    params.set("$top", String(clampInteger(args.pageSize, 200, 1, 200)));
+    params.set("$top", String(Math.min(clampInteger(args.pageSize, 200, 1, 200), maxItems)));
     if (args.itemId) {
       firstPath = `/me/drive/items/${encodeURIComponent(args.itemId)}/delta?${params.toString()}`;
-      target = "itemId";
+      target = `itemId:${args.itemId}`;
     } else {
       const resolvedPath = resolvePresetPath(args);
       if (resolvedPath) {
-        const folder = await getRawInfo({ path: resolvedPath });
-        if (!folder.folder && !folder.root) throw new Error(`Delta target is not a folder: ${folder.name}`);
-        firstPath = `/me/drive/items/${encodeURIComponent(folder.id)}/delta?${params.toString()}`;
+        pathRoot = await resolveDeltaPathRoot(args);
+        if (!pathRoot?.id) throw new Error(`Could not resolve delta target folder: ${resolvedPath}`);
+        firstPath = `/me/drive/items/${encodeURIComponent(pathRoot.id)}/delta?${params.toString()}`;
         target = resolvedPath;
       } else {
         firstPath = `/me/drive/root/delta?${params.toString()}`;
       }
     }
+    if (!pathRoot) pathRoot = await resolveDeltaPathRoot(args);
+    if (pathRoot) {
+      await bestEffortLocalWrite("metadata cache path-root update", async () => await cacheItems([], { pathRoot }));
+    }
   }
-  const result = await collectPages(firstPath, maxItems, args.format, formatDeltaItem);
+  const result = await collectPages(firstPath, maxItems, args.format, formatDeltaItem, {
+    cacheResults: true,
+    persistDeltaCursor: args._persistCursor === true,
+    deltaTarget: target,
+    prepareCacheItems: async (items) => await hydrateDeltaParentItems(items, pathRoot)
+  });
+  const cache = await loadMetadataCache();
+  const unresolvedPathCount = unresolvedPathItems(cache).length;
+  const resolvedItems = result.items.map((item) => {
+    if (!item?.id || item.deleted) return item;
+    const cached = cache.itemsById?.[item.id];
+    return cached ? formatSimplifiedItem(cached, args.format) : item;
+  });
   return {
     ...result,
+    items: resolvedItems,
     target,
-    note: result.deltaLink
-      ? "Save deltaLink to ask for changes since this point later."
-      : "Use nextLink to continue this delta scan before saving a deltaLink."
+    unresolvedPathCount,
+    note: result.unsafePageTruncation
+      ? "Microsoft Graph returned more items than could be accepted safely from one page. No continuation was returned because it would skip items; rerun with a larger maxItems."
+      : result.deltaLink
+        ? "Save deltaLink to ask for changes since this point later."
+        : "Use nextLink to continue this delta scan before saving a deltaLink."
   };
 }
 
 async function cacheRefresh(args = {}) {
   const startedAt = Date.now();
   const existing = await loadMetadataCache();
+  const invalidCursorMetadata = {};
+  if (existing.deltaLink && !isDeltaCursor(existing.deltaLink)) {
+    existing.deltaLink = null;
+    invalidCursorMetadata.deltaLink = null;
+  }
+  if (existing.deltaNextLink && !isDeltaCursor(existing.deltaNextLink)) {
+    existing.deltaNextLink = null;
+    invalidCursorMetadata.deltaNextLink = null;
+  }
+  if ((!existing.deltaLink && !existing.deltaNextLink) && existing.deltaTarget) {
+    existing.deltaTarget = null;
+    invalidCursorMetadata.deltaTarget = null;
+  }
+  if (Object.keys(invalidCursorMetadata).length) {
+    await cacheItems([], invalidCursorMetadata);
+  }
   const settings = pluginSettings();
   const mode = args.mode || "auto";
   const progress = [];
@@ -4151,8 +4955,9 @@ async function cacheRefresh(args = {}) {
   const requestedTarget = args.itemId
     ? `itemId:${args.itemId}`
     : (resolvePresetPath(args) || "root");
-  const cachedTarget = existing.scanRoot?.target || "root";
-  const targetMatchesCache = requestedTarget === cachedTarget;
+  const cachedTarget = existing.deltaTarget || existing.scanRoot?.target || "root";
+  const targetMatchesCache = requestedTarget === cachedTarget
+    && (!existing.deltaTarget || existing.deltaTarget === requestedTarget);
   if ((mode === "delta" || mode === "auto") && settings.deltaSyncEnabled && (existing.deltaNextLink || existing.deltaLink) && targetMatchesCache) {
     const continuingNextLink = Boolean(existing.deltaNextLink);
     addProgress(continuingNextLink ? "delta-resume-nextLink" : "delta-start", {
@@ -4162,7 +4967,9 @@ async function cacheRefresh(args = {}) {
       ...(continuingNextLink ? { nextLink: existing.deltaNextLink } : { deltaLink: existing.deltaLink }),
       pageSize: clampInteger(args.pageSize, 200, 1, 200),
       maxItems: clampInteger(args.maxItems, 10000, 1, 50000),
-      format: "full"
+      format: "full",
+      _persistCursor: true,
+      _deltaTarget: requestedTarget
     });
     addProgress(result.deltaLink ? "delta-complete" : "delta-incomplete", {
       count: result.count,
@@ -4205,7 +5012,12 @@ async function cacheRefresh(args = {}) {
     foldersVisited: result.summary?.foldersVisited,
     traversalTruncated: result.summary?.traversalTruncated
   });
-  await cacheItems([], { scanRoot: result.root });
+  await cacheItems([], {
+    scanRoot: result.root,
+    deltaLink: null,
+    deltaNextLink: null,
+    deltaTarget: requestedTarget
+  });
 
   try {
     if (settings.deltaSyncEnabled) {
@@ -4214,7 +5026,9 @@ async function cacheRefresh(args = {}) {
         ...args,
         pageSize: clampInteger(args.pageSize, 200, 1, 200),
         maxItems: clampInteger(args.maxItems, 10000, 1, 50000),
-        format: "full"
+        format: "full",
+        _persistCursor: true,
+        _deltaTarget: requestedTarget
       });
       const deltaComplete = Boolean(deltaResult.deltaLink);
       addProgress(deltaComplete ? "delta-prime-complete" : "delta-prime-incomplete", {
@@ -4260,40 +5074,97 @@ async function cacheRefresh(args = {}) {
   }
 }
 
+function batchResponseHeader(headers = {}, name) {
+  if (typeof headers?.get === "function") return headers.get(name);
+  const target = String(name).toLowerCase();
+  const entry = Object.entries(headers || {}).find(([key]) => key.toLowerCase() === target);
+  return entry?.[1] ?? null;
+}
+
+function batchRetryDelayMs(responses, attempt) {
+  const delays = responses.map((response) => {
+    const retryAfter = batchResponseHeader(response.headers, "retry-after");
+    if (retryAfter === null || retryAfter === undefined || retryAfter === "") return null;
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+    const dateMs = Date.parse(retryAfter);
+    return Number.isFinite(dateMs) ? Math.max(0, dateMs - Date.now()) : null;
+  }).filter((value) => value !== null);
+  if (delays.length) return Math.max(...delays);
+  return Math.min(1000 * 2 ** attempt, 8000);
+}
+
+function isReadOnlyBatchRequest(request = {}) {
+  return ["GET", "HEAD"].includes(String(request.method || "GET").toUpperCase());
+}
+
+function isTransientBatchResponse(response = {}) {
+  return response.status === 0 || [429, 500, 502, 503, 504].includes(response.status);
+}
+
 async function batchGraph(requests = []) {
   if (!requests.length) return [];
   if (requests.length > 20) throw new Error("Microsoft Graph batch requests support at most 20 subrequests.");
-  const result = await graph("/$batch", {
-    method: "POST",
-    body: JSON.stringify({
-      requests: requests.map((request, index) => ({
-        id: String(index + 1),
-        method: request.method || "GET",
-        url: String(request.url || "").replace(/^\/+/, ""),
-        ...(request.headers ? { headers: request.headers } : {}),
-        ...(request.body ? { body: request.body } : {})
-      }))
-    })
-  });
-  const responses = new Map((result.responses || []).map((response) => [response.id, response]));
-  return requests.map((request, index) => {
-    const response = responses.get(String(index + 1));
-    if (!response) return { ok: false, status: 0, error: "Missing batch response.", request };
-    return {
-      ok: response.status >= 200 && response.status < 300,
-      status: response.status,
-      body: response.body,
-      headers: response.headers,
-      request
-    };
-  });
+  const entries = requests.map((request, index) => ({ request, index, id: String(index + 1) }));
+  const finalResponses = new Array(requests.length);
+  let pending = entries;
+  const maxRetries = 3;
+
+  for (let attempt = 0; pending.length; attempt += 1) {
+    const allReadOnly = pending.every((entry) => isReadOnlyBatchRequest(entry.request));
+    const result = await graph("/$batch", {
+      method: "POST",
+      isMutation: !allReadOnly,
+      body: JSON.stringify({
+        requests: pending.map(({ request, id }) => ({
+          id,
+          method: request.method || "GET",
+          url: String(request.url || "").replace(/^\/+/, ""),
+          ...(request.headers ? { headers: request.headers } : {}),
+          ...(request.body !== undefined ? { body: request.body } : {})
+        }))
+      }),
+      ...(allReadOnly ? { maxRetries: 3 } : {})
+    });
+    const responses = new Map((result.responses || []).map((response) => [String(response.id), response]));
+    const retryEntries = [];
+    const retryResponses = [];
+
+    for (const entry of pending) {
+      const response = responses.get(entry.id);
+      const normalized = response ? {
+        ok: response.status >= 200 && response.status < 300,
+        status: response.status,
+        body: response.body,
+        headers: response.headers,
+        request: entry.request
+      } : {
+        ok: false,
+        status: 0,
+        error: "Missing batch response.",
+        request: entry.request
+      };
+      if (attempt < maxRetries && isReadOnlyBatchRequest(entry.request) && isTransientBatchResponse(normalized)) {
+        retryEntries.push(entry);
+        retryResponses.push(normalized);
+      } else {
+        finalResponses[entry.index] = normalized;
+      }
+    }
+
+    if (!retryEntries.length) break;
+    await sleep(batchRetryDelayMs(retryResponses, attempt));
+    pending = retryEntries;
+  }
+
+  return finalResponses;
 }
 
 async function batchGetInfo(args = {}) {
   const items = args.items || [];
   const responses = await batchGraph(items.map((target) => ({ url: itemBase(target), target })));
   const rawItems = responses.filter((response) => response.ok && response.body).map((response) => response.body);
-  await cacheItems(rawItems);
+  await bestEffortLocalWrite("metadata cache update", async () => await cacheItems(rawItems));
   return {
     count: responses.length,
     items: responses.map((response) => response.ok
@@ -4335,6 +5206,7 @@ function uniqueBatchLocalPath(destinationFolder, name, index, usedTargets) {
 async function batchDownload(args = {}) {
   const destinationFolder = args.destinationFolder ? resolve(args.destinationFolder) : null;
   if (destinationFolder) await assertNotLocalOneDriveSyncPathForWrite(destinationFolder, "Batch download", args);
+  const generatedDestinationFolder = destinationFolder || downloadRoot;
   const plannedTargets = new Set();
   const results = [];
   for (const [index, item] of (args.items || []).entries()) {
@@ -4344,9 +5216,7 @@ async function batchDownload(args = {}) {
       const info = await getInfo(item);
       const localPath = explicitLocalPath
         ? explicitLocalPath
-        : destinationFolder
-          ? uniqueBatchLocalPath(destinationFolder, info.name, index, plannedTargets)
-          : undefined;
+        : uniqueBatchLocalPath(generatedDestinationFolder, info.name, index, plannedTargets);
       if (localPath) {
         await assertNotLocalOneDriveSyncPathForWrite(localPath, "Batch download", args);
         if (explicitLocalPath) {
@@ -4445,7 +5315,7 @@ async function batchDelete(args = {}) {
   for (const [index, entry] of preflight.entries()) {
     try {
       await graph(itemMutationBase(entry.rawItem), { method: "DELETE", headers: mutationMatchHeaders(entry.rawItem) });
-      await cacheItems([{ ...entry.rawItem, deleted: {} }]);
+      await bestEffortLocalWrite("metadata cache update", async () => await cacheItems([{ ...entry.rawItem, deleted: {} }]));
       results.push({ deleted: entry.item });
     } catch (error) {
       const failure = {
@@ -4479,13 +5349,15 @@ async function batchDelete(args = {}) {
 async function getRawInfo(args = {}) {
   const resolved = itemArgsWithResolvedPath(args);
   if (!resolved.path && !resolved.itemId) throw new Error("Provide path, preset, or itemId.");
-  if (!args.includeDeletedItems) {
+  if (!args.includeDeletedItems && args.useCache === true) {
     const cached = resolved.itemId ? await cachedItemById(resolved.itemId) : await cachedItemByPath(resolved.path);
-    if (cached && args.useCache === true) return cached;
+    if (cached) return cached;
   }
   const suffix = args.includeDeletedItems && resolved.itemId ? "?includeDeletedItems=true" : "";
   const item = await graph(`${itemBase(args)}${suffix}`);
-  await cacheItems([item]);
+  if (args.cacheResults !== false) {
+    await bestEffortLocalWrite("metadata cache update", async () => await cacheItems([item]));
+  }
   return item;
 }
 
@@ -4578,7 +5450,12 @@ function isExplicitSharingPermission(permission = {}) {
   const roles = new Set(permission.roles || []);
   if (roles.has("owner")) return false;
   if (permission.link?.type || permission.link?.scope || permission.invitation) return true;
-  return Boolean(permission.grantedTo || permission.grantedToV2 || permission.grantedToIdentities?.length);
+  return Boolean(
+    permission.grantedTo
+    || permission.grantedToV2
+    || permission.grantedToIdentities?.length
+    || permission.grantedToIdentitiesV2?.length
+  );
 }
 
 function isOwnerPermission(permission = {}) {
@@ -4675,7 +5552,7 @@ async function resolveDestinationParent(args = {}) {
 
 async function readText(args = {}) {
   const info = await getInfo(args);
-  const maxBytes = clampInteger(args.maxBytes, textFileLimit, 1, textFileLimit);
+  const maxBytes = clampInteger(args.maxBytes, textFileLimit, 1, maxTextFileReadLimit);
   assertTextReadable(info, args);
   if (info.size && info.size > maxBytes) {
     throw new Error(`File is ${info.size} bytes, above maxBytes ${maxBytes}. Use onedrive_download instead.`);
@@ -4696,20 +5573,21 @@ async function download(args = {}) {
 }
 
 async function downloadResolvedItem(info, args = {}) {
-  const target = args.localPath ? resolve(args.localPath) : join(downloadRoot, info.name || basename(cleanPath(args.path || args.itemId || "download")));
-  await assertNotLocalOneDriveSyncPathForWrite(target, "Download", args);
-  if (args.overwrite !== true) {
-    try {
-      await stat(target);
-      throw new Error(`Local file already exists: ${target}. Pass overwrite: true to replace it.`);
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-    }
-  }
-  await mkdir(dirname(target), { recursive: true });
+  const preferredTarget = args.localPath ? resolve(args.localPath) : join(downloadRoot, info.name || basename(cleanPath(args.path || args.itemId || "download")));
+  await assertNotLocalOneDriveSyncPathForWrite(preferredTarget, "Download", args);
+  const reservation = await reserveLocalDestination(preferredTarget, {
+    overwrite: args.overwrite === true,
+    allowAlternate: !args.localPath || args._allowAlternateLocalPath === true
+  });
+  const target = reservation.path;
   const contentArgs = info.id ? { itemId: info.id } : args;
-  const downloaded = await graphDownloadToFile(contentPath(contentArgs), target);
-  return { item: info, localPath: target, bytesWritten: downloaded.bytesWritten };
+  try {
+    const downloaded = await graphDownloadToFile(contentPath(contentArgs), target, { reserved: reservation.reserved });
+    return { item: info, localPath: target, bytesWritten: downloaded.bytesWritten };
+  } catch (error) {
+    if (reservation.reserved) await rm(target, { force: true });
+    throw error;
+  }
 }
 
 function assertOfficeKind(info, kindName) {
@@ -4729,7 +5607,8 @@ async function downloadOffice(args = {}, kindName) {
   return await download({
     ...args,
     localPath: args.localPath || join(downloadRoot, kindName, info.name || `${kindName}-download`),
-    overwrite: args.overwrite
+    overwrite: args.overwrite,
+    _allowAlternateLocalPath: !args.localPath
   });
 }
 
@@ -4748,29 +5627,30 @@ async function downloadExport(args = {}, formatName) {
   if (args.localPath) await assertNotLocalOneDriveSyncPathForWrite(resolve(args.localPath), "Export", args);
   const info = await getInfo(args);
   if (info.folder) throw new Error(`Item is a folder, not an exportable document: ${info.name}`);
-  const target = args.localPath
+  const preferredTarget = args.localPath
     ? resolve(args.localPath)
     : join(downloadRoot, "export", exportFileName(info.name, format.extension));
-  await assertNotLocalOneDriveSyncPathForWrite(target, "Export", args);
-  if (args.overwrite !== true) {
-    try {
-      await stat(target);
-      throw new Error(`Local file already exists: ${target}. Pass overwrite: true to replace it.`);
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-    }
-  }
-  await mkdir(dirname(target), { recursive: true });
+  await assertNotLocalOneDriveSyncPathForWrite(preferredTarget, "Export", args);
+  const reservation = await reserveLocalDestination(preferredTarget, {
+    overwrite: args.overwrite === true,
+    allowAlternate: !args.localPath
+  });
+  const target = reservation.path;
   const params = new URLSearchParams();
   params.set("format", format.graphFormat);
-  const downloaded = await graphDownloadToFile(`${contentPath(args)}?${params.toString()}`, target);
-  return {
-    item: info,
-    localPath: target,
-    bytesWritten: downloaded.bytesWritten,
-    exportFormat: formatName,
-    note: `Exported using Microsoft Graph format=${format.graphFormat}. Some file types may not support ${format.label} conversion.`
-  };
+  try {
+    const downloaded = await graphDownloadToFile(`${contentPath(args)}?${params.toString()}`, target, { reserved: reservation.reserved });
+    return {
+      item: info,
+      localPath: target,
+      bytesWritten: downloaded.bytesWritten,
+      exportFormat: formatName,
+      note: `Exported using Microsoft Graph format=${format.graphFormat}. Some file types may not support ${format.label} conversion.`
+    };
+  } catch (error) {
+    if (reservation.reserved) await rm(target, { force: true });
+    throw error;
+  }
 }
 
 function truncateUtf8(text, maxBytes) {
@@ -4824,30 +5704,30 @@ async function updateFile(args = {}) {
     await assertNotLocalOneDriveSyncPathForWrite(localPath, "Checkout", args);
     const manifestPath = updateManifestPath(localPath, args.manifestPath);
     await assertNotLocalOneDriveSyncPathForWrite(manifestPath, "Checkout manifest", args);
-    if (args.overwriteManifest !== true) {
-      try {
-        await stat(manifestPath);
-        throw new Error(`Checkout manifest already exists: ${manifestPath}. Pass overwriteManifest: true to replace it.`);
-      } catch (error) {
-        if (error.code !== "ENOENT") throw error;
-      }
-    }
-    const downloaded = await download({
-      ...(args.itemId ? { itemId: args.itemId } : { path: remote }),
-      localPath,
-      overwrite: args.overwriteLocal === true,
-      allowLocalOneDriveSyncPath: args.allowLocalOneDriveSyncPath
+    const manifestReservation = await reserveLocalDestination(manifestPath, {
+      overwrite: args.overwriteManifest === true,
+      allowAlternate: false
     });
-    const manifest = {
-      version: 1,
-      checkedOutAt: new Date().toISOString(),
-      remotePath: remote,
-      item: downloaded.item,
-      localPath: downloaded.localPath
-    };
-    await mkdir(dirname(manifestPath), { recursive: true });
-    await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
-    return { mode: "checkout", ...downloaded, manifestPath };
+    try {
+      const downloaded = await download({
+        ...(args.itemId ? { itemId: args.itemId } : { path: remote }),
+        localPath,
+        overwrite: args.overwriteLocal === true,
+        allowLocalOneDriveSyncPath: args.allowLocalOneDriveSyncPath
+      });
+      const manifest = {
+        version: 1,
+        checkedOutAt: new Date().toISOString(),
+        remotePath: remote,
+        item: downloaded.item,
+        localPath: downloaded.localPath
+      };
+      await writePrivateFileAtomic(manifestPath, JSON.stringify(manifest));
+      return { mode: "checkout", ...downloaded, manifestPath };
+    } catch (error) {
+      if (manifestReservation.reserved) await rm(manifestPath, { force: true });
+      throw error;
+    }
   }
 
   if (args.mode !== "commit") throw new Error("mode must be checkout or commit.");
@@ -4889,8 +5769,8 @@ async function updateFile(args = {}) {
   let backup = null;
   if (args.createBackup !== false) {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const backupPath = join(backupRoot, `${stamp}-${basename(remote)}`);
-    backup = await download({ path: remote, localPath: backupPath, overwrite: true });
+    const backupPath = join(backupRoot, `${stamp}-${randomUUID()}-${basename(remote)}`);
+    backup = await download({ path: remote, localPath: backupPath, overwrite: false });
   }
 
   const uploaded = await upload({
@@ -4901,7 +5781,9 @@ async function updateFile(args = {}) {
     ifMatch: args.conflictCheck !== false && args.force !== true ? manifest?.item?.eTag : undefined,
     auditTool: "onedrive_update_file"
   });
-  const verified = args.verify !== false ? await getInfo({ path: remote }) : null;
+  const verified = args.verify !== false
+    ? await bestEffortLocalWrite("post-commit remote verification", async () => await getInfo({ path: remote }))
+    : null;
   if (manifest && args.force !== true) {
     const updatedManifest = {
       ...manifest,
@@ -4910,7 +5792,7 @@ async function updateFile(args = {}) {
       localPath,
       item: verified || uploaded.item
     };
-    await writeFile(manifestPath, JSON.stringify(updatedManifest, null, 2));
+    await bestEffortLocalWrite("update manifest write", async () => await writePrivateFile(manifestPath, JSON.stringify(updatedManifest, null, 2)));
   }
   return {
     mode: "commit",
@@ -4920,6 +5802,7 @@ async function updateFile(args = {}) {
     backup,
     uploaded,
     verified,
+    verificationIncomplete: args.verify !== false && !verified,
     note: "Committed local edits after checkout-manifest conflict checks."
   };
 }
@@ -4928,7 +5811,7 @@ async function recent(args = {}) {
   const params = new URLSearchParams();
   params.set("$top", String(clampInteger(args.limit, 50, 1, 200)));
   const result = await graph(`/me/drive/recent?${params.toString()}`);
-  await cacheItems(result.value || []);
+  await bestEffortLocalWrite("metadata cache update", async () => await cacheItems(result.value || []));
   return { items: (result.value || []).map((item) => formatDriveItem(item, args.format)), count: (result.value || []).length };
 }
 
@@ -5012,28 +5895,68 @@ async function sharingAudit(args = {}, publicOnly = false) {
     format: "full"
   });
   const matches = [];
-  await mapWithConcurrency(scanResult.items || [], 4, async (item) => {
-    const limit = clampInteger(args.limit, 50, 1, 200);
-    if (matches.length >= limit) return;
+  const candidates = scanResult.items || [];
+  const limit = clampInteger(args.limit, 50, 1, 200);
+  let auditedCount = 0;
+  let errorCount = 0;
+  let matchingItemCount = 0;
+  const errors = [];
+  for (let offset = 0; offset < candidates.length && matches.length < limit; offset += 20) {
+    const chunk = candidates.slice(offset, offset + 20);
+    let batch;
     try {
-      const audit = await permissionList({ itemId: item.id }, "compact");
-      const permissions = publicOnly
-        ? audit.filter((permission) => permission.permissionKind === "anonymous_link")
-        : audit.filter((permission) => args.includeOwnerPermissions === true ? !permission.inheritedFrom : isExplicitSharingPermission(permission));
-      if (permissions.length && matches.length < limit) {
-        matches.push({ item: formatSimplifiedItem(item, "compact"), permissions, count: permissions.length });
-      }
-    } catch {
-      // Permission scans should be best-effort across many items.
+      batch = await batchPermissions({
+        items: chunk.map((item) => ({ itemId: item.id })),
+        format: "compact"
+      });
+    } catch (error) {
+      errorCount += chunk.length;
+      if (errors.length < 10) errors.push({ error: safeToolErrorMessage(error), itemIds: chunk.map((item) => item.id) });
+      continue;
     }
-  });
+    for (const [index, result] of (batch.items || []).entries()) {
+      const item = chunk[index];
+      if (!item) continue;
+      if (result.error) {
+        errorCount += 1;
+        if (errors.length < 10) errors.push({ itemId: item.id, status: result.status, error: result.error });
+        continue;
+      }
+      auditedCount += 1;
+      const permissions = publicOnly
+        ? result.permissions.filter((permission) => permission.permissionKind === "anonymous_link")
+        : result.permissions.filter((permission) => args.includeOwnerPermissions === true ? !permission.inheritedFrom : isExplicitSharingPermission(permission));
+      if (permissions.length) {
+        matchingItemCount += 1;
+        if (matches.length < limit) {
+          matches.push({ item: formatSimplifiedItem(item, "compact"), permissions, count: permissions.length });
+        }
+      }
+    }
+  }
+  const unauditedCount = Math.max(0, candidates.length - auditedCount - errorCount);
+  const unseenCandidateCount = Math.max(0, (scanResult.summary?.matched || candidates.length) - candidates.length);
+  const scanResultTruncated = Boolean(scanResult.summary?.resultTruncated);
+  const resultTruncated = matchingItemCount > matches.length || unauditedCount > 0 || scanResultTruncated;
+  const incomplete = Boolean(scanResult.summary?.traversalTruncated || scanResultTruncated || unseenCandidateCount || errorCount || resultTruncated);
   return {
     scanSummary: scanResult.summary,
     count: matches.length,
     itemsReturned: matches.length,
     scanItemsReturned: scanResult.summary.returned,
+    candidateCount: candidates.length,
+    auditedCount,
+    errorCount,
+    unauditedCount,
+    unseenCandidateCount,
+    matchingItemCount,
+    resultTruncated,
+    incomplete,
+    errors,
     items: matches,
-    note: publicOnly
+    note: incomplete
+      ? "Sharing audit is incomplete because traversal was bounded, permission reads failed, or the result limit was reached. Review the audit counters and errors."
+      : publicOnly
       ? "Returned items with anonymous sharing links."
       : (args.includeOwnerPermissions === true
         ? "Returned items with explicit sharing permissions plus owner grants."
@@ -5067,7 +5990,7 @@ async function upload(args = {}) {
           ...(args.ifMatch ? { "If-Match": args.ifMatch } : {})
         }
       });
-      await cacheItems([result]);
+      await bestEffortLocalWrite("metadata cache update", async () => await cacheItems([result]));
       response = { item: simplifyItem(result), localPath, bytesUploaded: fileStat.size, uploadMode: "simple" };
     }
     await writeMutationAudit(auditTool, {
@@ -5148,7 +6071,7 @@ async function uploadLarge(args = {}, fileStat) {
   }
 
   if (!finalItem) throw new Error("Upload session completed local chunks but Microsoft Graph did not return a final drive item.");
-  await cacheItems([finalItem]);
+  await bestEffortLocalWrite("metadata cache update", async () => await cacheItems([finalItem]));
   return {
     item: simplifyItem(finalItem),
     localPath: args.localPath,
@@ -5200,7 +6123,7 @@ async function writeText(args = {}) {
       body: Buffer.from(args.content, "utf8"),
       headers: { "Content-Type": "text/plain; charset=utf-8" }
     });
-    await cacheItems([result]);
+    await bestEffortLocalWrite("metadata cache update", async () => await cacheItems([result]));
     const response = { item: simplifyItem(result), bytesUploaded: Buffer.byteLength(args.content, "utf8") };
     await writeMutationAudit("onedrive_write_text", {
       status: "success",
@@ -5243,7 +6166,7 @@ async function createFolder(args = {}) {
         "@microsoft.graph.conflictBehavior": args.conflictBehavior || "fail"
       })
     });
-    await cacheItems([result]);
+    await bestEffortLocalWrite("metadata cache update", async () => await cacheItems([result]));
     const item = simplifyItem(result);
     await writeMutationAudit("onedrive_create_folder", {
       status: "success",
@@ -5556,8 +6479,10 @@ async function createSharingLink(args = {}) {
       method: "POST",
       body: JSON.stringify(body)
     });
-    const afterPermissions = includePermissionDiff ? await permissionList({ itemId: current.id }, "compact") : null;
-    const permissionDiff = includePermissionDiff ? diffPermissions(beforePermissions, afterPermissions) : null;
+    const afterPermissions = includePermissionDiff
+      ? await bestEffortLocalWrite("post-mutation permission verification", async () => await permissionList({ itemId: current.id }, "compact"))
+      : null;
+    const permissionDiff = includePermissionDiff && afterPermissions ? diffPermissions(beforePermissions, afterPermissions) : null;
     await writeMutationAudit("onedrive_create_sharing_link", {
       status: "success",
       target: itemAuditSummary(current),
@@ -5569,14 +6494,15 @@ async function createSharingLink(args = {}) {
         retainInheritedPermissions: body.retainInheritedPermissions
       },
       beforePermissions: includePermissionDiff ? beforePermissions.map(permissionAuditSummary) : undefined,
-      afterPermissions: includePermissionDiff ? afterPermissions.map(permissionAuditSummary) : undefined,
-      permissionDiff: includePermissionDiff ? permissionDiffAuditSummary(permissionDiff) : undefined
+      afterPermissions: includePermissionDiff && afterPermissions ? afterPermissions.map(permissionAuditSummary) : undefined,
+      permissionDiff: includePermissionDiff && permissionDiff ? permissionDiffAuditSummary(permissionDiff) : undefined
     });
     return {
       dryRun: false,
       confirmed: true,
       item: simplifyItem(current),
       permission: result,
+      verificationIncomplete: includePermissionDiff && !afterPermissions,
       ...(includePermissionDiff ? {
         beforePermissions,
         afterPermissions,
@@ -5706,15 +6632,17 @@ async function invitePermission(args = {}) {
       method: "POST",
       body: JSON.stringify(body)
     });
-    const afterPermissions = includePermissionDiff ? await permissionList({ itemId: current.id }, "compact") : null;
-    const permissionDiff = includePermissionDiff ? diffPermissions(beforePermissions, afterPermissions) : null;
+    const afterPermissions = includePermissionDiff
+      ? await bestEffortLocalWrite("post-mutation permission verification", async () => await permissionList({ itemId: current.id }, "compact"))
+      : null;
+    const permissionDiff = includePermissionDiff && afterPermissions ? diffPermissions(beforePermissions, afterPermissions) : null;
     await writeMutationAudit("onedrive_invite_permission", {
       status: "success",
       target: itemAuditSummary(current),
       invite: inviteAuditSummary(safeInvite),
       beforePermissions: includePermissionDiff ? beforePermissions.map(permissionAuditSummary) : undefined,
-      afterPermissions: includePermissionDiff ? afterPermissions.map(permissionAuditSummary) : undefined,
-      permissionDiff: includePermissionDiff ? permissionDiffAuditSummary(permissionDiff) : undefined
+      afterPermissions: includePermissionDiff && afterPermissions ? afterPermissions.map(permissionAuditSummary) : undefined,
+      permissionDiff: includePermissionDiff && permissionDiff ? permissionDiffAuditSummary(permissionDiff) : undefined
     });
     return {
       dryRun: false,
@@ -5722,6 +6650,7 @@ async function invitePermission(args = {}) {
       item: simplifyItem(current),
       invite: safeInvite,
       permissions: Array.isArray(result.value) ? result.value.map((permission) => simplifyPermission(permission, args.format)) : result,
+      verificationIncomplete: includePermissionDiff && !afterPermissions,
       ...(includePermissionDiff ? {
         beforePermissions,
         afterPermissions,
@@ -5824,15 +6753,17 @@ async function revokePermission(args = {}) {
       returnResponse: true
     });
     if (!response.ok) throw microsoftGraphError(response.body, { headers: response.headers, status: response.status, statusText: "Revoke permission failed" });
-    const afterPermissions = preflight.includePermissions ? await permissionList({ itemId: preflight.rawItem.id }, "compact") : null;
-    const permissionDiff = preflight.includePermissions ? diffPermissions(preflight.beforePermissions, afterPermissions) : null;
+    const afterPermissions = preflight.includePermissions
+      ? await bestEffortLocalWrite("post-mutation permission verification", async () => await permissionList({ itemId: preflight.rawItem.id }, "compact"))
+      : null;
+    const permissionDiff = preflight.includePermissions && afterPermissions ? diffPermissions(preflight.beforePermissions, afterPermissions) : null;
     await writeMutationAudit("onedrive_revoke_permission", {
       status: "success",
       target: itemAuditSummary(preflight.rawItem),
       permissionId: args.permissionId,
       beforePermissions: preflight.includePermissions ? preflight.beforePermissions.map(permissionAuditSummary) : undefined,
-      afterPermissions: preflight.includePermissions ? afterPermissions.map(permissionAuditSummary) : undefined,
-      permissionDiff: preflight.includePermissions ? permissionDiffAuditSummary(permissionDiff) : undefined,
+      afterPermissions: preflight.includePermissions && afterPermissions ? afterPermissions.map(permissionAuditSummary) : undefined,
+      permissionDiff: preflight.includePermissions && permissionDiff ? permissionDiffAuditSummary(permissionDiff) : undefined,
       graphRequestId: response.graphRequestId
     });
     return {
@@ -5840,6 +6771,7 @@ async function revokePermission(args = {}) {
       confirmed: true,
       item: preflight.item,
       permissionId: args.permissionId,
+      verificationIncomplete: preflight.includePermissions && !afterPermissions,
       ...(preflight.includePermissions ? {
         beforePermissions: preflight.beforePermissions,
         afterPermissions,
@@ -5965,11 +6897,14 @@ async function batchRevokePermissions(args = {}) {
         returnResponse: true
       });
       if (!response.ok) throw microsoftGraphError(response.body, { headers: response.headers, status: response.status, statusText: "Batch revoke permission failed" });
-      const afterPermissions = entry.includePermissions ? await permissionList({ itemId: entry.rawItem.id }, "compact") : null;
-      const permissionDiff = entry.includePermissions ? diffPermissions(entry.beforePermissions, afterPermissions) : null;
+      const afterPermissions = entry.includePermissions
+        ? await bestEffortLocalWrite("post-mutation permission verification", async () => await permissionList({ itemId: entry.rawItem.id }, "compact"))
+        : null;
+      const permissionDiff = entry.includePermissions && afterPermissions ? diffPermissions(entry.beforePermissions, afterPermissions) : null;
       results.push({
         item: entry.item,
         permissionId: entry.targetArgs.permissionId,
+        verificationIncomplete: entry.includePermissions && !afterPermissions,
         ...(entry.includePermissions ? { beforePermissions: entry.beforePermissions, afterPermissions, permissionDiff } : {})
       });
     } catch (error) {
@@ -6159,7 +7094,7 @@ async function deleteItem(args = {}) {
   if (previewTokenRequired) return previewTokenRequired;
   try {
     await graph(itemMutationBase(rawItem), { method: "DELETE", headers: mutationMatchHeaders(rawItem) });
-    await cacheItems([{ ...rawItem, deleted: {} }]);
+    await bestEffortLocalWrite("metadata cache update", async () => await cacheItems([{ ...rawItem, deleted: {} }]));
     await writeMutationAudit("onedrive_delete", {
       status: "success",
       target: itemAuditSummary(rawItem),
@@ -6261,7 +7196,13 @@ async function restoreDeleted(args = {}) {
 }
 
 function textResult(value, isError = false) {
-  const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  const localWarnings = toolCallContext.getStore()?.localWarnings || [];
+  const payload = localWarnings.length
+    ? (value && typeof value === "object" && !Array.isArray(value)
+        ? { ...value, localWarnings }
+        : { message: value, localWarnings })
+    : value;
+  const text = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
   return { content: [{ type: "text", text }], isError };
 }
 
@@ -6293,8 +7234,11 @@ async function callTool(name, args = {}) {
     case "onedrive_auth_device_poll":
       return textResult(await pollDeviceLogin(args));
     case "onedrive_logout": {
+      authGeneration += 1;
+      deviceLoginGeneration += 1;
       tokenCache = null;
       pendingDevice = null;
+      tokenRefreshPromise = null;
       if (args.deleteKeychainToken === true && args.confirmed !== true) {
         return textResult({
           memoryCleared: true,
@@ -6439,7 +7383,19 @@ async function handleRequest(message) {
         sendResult(id, textResult(validation.error, true));
         return;
       }
-      sendResult(id, await callTool(params.name, validation.args || {}));
+      const result = await toolCallContext.run({
+        localWarnings: [],
+        lastGraphRequestId: null,
+        lastMutationGraphRequestId: null,
+        metadataCacheWrites: 0
+      }, async () => {
+        try {
+          return await callTool(params.name, validation.args || {});
+        } catch (error) {
+          return textResult(safeToolErrorMessage(error), true);
+        }
+      });
+      sendResult(id, result);
       return;
     }
     if (method?.startsWith("notifications/")) return;

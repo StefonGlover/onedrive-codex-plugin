@@ -164,18 +164,20 @@ Use absolute paths in `storageRoot` and `cacheRoot` if you override them. Enviro
 - Tool arguments are validated before handlers run, including required fields, unknown properties, enum values, numeric bounds, array bounds, and target `anyOf` rules.
 - Text reads are bounded to 5 MB by default.
 - Text reads use MIME/extension checks and refuse likely binary files unless `force: true` is set.
-- Downloads go to `~/.codex/onedrive-plugin/downloads` unless `localPath` is provided.
+- Downloads go to `~/.codex/onedrive-plugin/downloads` unless `localPath` is provided. Concurrent default downloads, exports, update checkouts, backups, and audit exports reserve unique local paths instead of racing on the same filename.
 - Downloads and uploads refuse local OneDrive sync-folder paths by default. Use `allowLocalOneDriveSyncPath: true` only for an explicit local sync-folder workflow.
 - Uploads use simple upload for smaller files and upload sessions for large files, or when `uploadMode: "session"` is requested.
 - List, search, find, scan, and delta tools return compact item summaries by default; pass `format: "full"` for richer metadata.
 - Normal list, search, scan, delta, and metadata calls opportunistically maintain a local metadata cache at `~/.codex/onedrive-plugin/cache/metadata-cache.json`.
-- `onedrive_sync_status` reports cache age, item count, delta cursor availability, resumable delta next-link availability, and plugin storage locations.
-- `onedrive_cache_refresh` rebuilds the cache from a bounded recursive scan and uses delta refreshes when a previous cursor exists. Cache refresh batches metadata-cache writes during scans, persists incomplete delta `nextLink` cursors for continuation, and returns progress milestones. `onedrive_cache_clear` clears the cache.
-- `onedrive_content_index_refresh` is the explicit content-reading step. It indexes supported cached text-like files into `content-index.json`, stores normalized text/tokens for faster local lookup, reuses entries when ETag/cTag/mtime/size are unchanged, and applies file-size, extension, concurrency, and per-item failure limits.
+- Plugin-managed storage, cache, audit, download, export, and update-workflow directories are restricted to the current user (`0700`), and locally persisted metadata, extracted content, audit records, downloads, exports, and update manifests are restricted to the current user (`0600`). Existing managed cache/index/audit files are hardened when loaded or rewritten.
+- `onedrive_sync_status` reports cache age, item count, delta cursor availability, resumable delta next-link availability, unresolved path count, and plugin storage locations.
+- Metadata cache, content index, and audit files are written with compact atomic JSON/JSONL updates, interprocess locks, and reload-on-write freshness checks. Version 3 cache migration clears unscoped legacy cursors so stale ordinary pagination state cannot masquerade as delta state.
+- `onedrive_cache_refresh` rebuilds the cache from a bounded recursive scan and uses delta refreshes when a previous cursor exists for the same root. Cache refresh batches metadata-cache writes during scans, persists only delta-origin `nextLink` cursors for continuation, reconciles pathless delta records through cached parent IDs, and returns progress milestones. Ordinary list/search pagination cannot seed delta state. `onedrive_cache_clear` clears the cache.
+- `onedrive_content_index_refresh` is the explicit content-reading step. It indexes supported cached text-like files into `content-index.json`, stores normalized text/tokens for faster local lookup, reuses entries when ETag/cTag/mtime/size are unchanged, and applies file-size, extension, concurrency, and per-item failure limits. Explicit metadata deletes and changed fingerprints evict stale entries; moves and renames update indexed metadata; unchanged explicit cTags preserve content entries across metadata-only renames, while changed or omitted content tags with changed ETags invalidate conservatively. Bounded partial scans do not globally prune unseen entries.
 - `onedrive_content_search` searches only the local content index and returns lightweight metadata plus snippets. It does not call Microsoft Graph or read file bodies.
 - `onedrive_find` and `onedrive_find_all` can merge local content-index hits into ranking, but they never fetch or parse full content themselves. Build or refresh the index first when content search is needed.
-- `onedrive_find` is the preferred file lookup helper. It uses the local metadata cache when available, confirms exact strong cache hits with live metadata, runs live Graph search variants, ranks results in memory, and can fall back to bounded recursive remote scans. Fallback scans prune duplicate folder hints, resolve duplicate scan roots, and can use low concurrency through `scanConcurrency`. Cache-only hits must still have query relevance and are not treated as authoritative when live evidence cannot confirm them. Pass `useCache: false` for a fully live lookup.
-- `onedrive_find_all` is the broader locator for “look everywhere” requests. It searches common folders first and uses larger bounded scan caps, with cache acceleration and the same duplicate-hint pruning when available.
+- `onedrive_find` is the preferred file lookup helper. It uses the local metadata cache when available, confirms exact strong cache hits with live metadata, runs the canonical Graph query first, and expands additional terms in bounded concurrent waves only while confidence remains low. Canonical Graph results can represent filename, metadata, or file-content matches; unrelated expansion-only results remain gated. Results expose the planned, executed, and skipped search terms. `graphSearchCalls` reports actual Graph search pages fetched, not just term count. Tune expansion with `searchConcurrency` and fallback scans with `scanConcurrency`. Fallback scans prune duplicate and nested folder hints regardless of input order. Cache-only hits must still have query relevance and are not treated as authoritative when live evidence cannot confirm them. Pass `useCache: false` for a fully live lookup with no metadata-cache reads or writes.
+- `onedrive_find_all` is the broader locator for “look everywhere” requests. It searches every planned term instead of stopping after the first confident canonical result, searches common folders first, and uses larger bounded scan caps, with cache acceleration and the same duplicate-hint pruning when available.
 - `onedrive_preview` returns bounded text previews for text files and Graph-supported document text exports without reading unbounded remote content into memory.
 - `onedrive_update_file` provides a checkout/commit edit workflow with a local manifest, eTag/cTag/size/mtime conflict checks, optional backup, and post-commit verification. Checkout refuses to overwrite an existing manifest unless `overwriteManifest: true` is provided.
 - `onedrive_batch_get_info` and `onedrive_batch_permissions` use Microsoft Graph batching for up to 20 items. Batch download/delete/move tools provide one result per item with dry-run support where destructive.
@@ -189,18 +191,19 @@ Use absolute paths in `storageRoot` and `cacheRoot` if you override them. Enviro
 - `onedrive_get_info` supports `includeDeletedItems: true` when targeting an item ID; Microsoft documents this as OneDrive Personal-only.
 - `onedrive_restore_deleted` defaults to dry-run and requires a deleted item ID. Live restore may require `Files.ReadWrite.All` for personal OneDrive.
 - Live remote mutations are recorded in a local JSONL audit log at `~/.codex/onedrive-plugin/audit/mutations.jsonl`. Audit entries include safe item summaries, before/after summaries when available, permission diffs when relevant, Graph request IDs when available, and safe error details for failed live mutations. They do not log tokens, authorization headers, file contents, raw request bodies, sharing-link web URLs, passwords, invite messages, or recipient identifiers.
+- A successful remote mutation remains a success if local cache/audit bookkeeping or a best-effort post-mutation verification later fails. The response reports `localWarnings` and, where applicable, `verificationIncomplete`; do not repeat the mutation merely to repair that follow-up state.
 - `onedrive_audit_recent` reads recent audit entries, `onedrive_audit_export` exports the JSONL log to a local file, and `onedrive_audit_clear` requires `confirmed: true`.
-- Graph requests retry transient `429`, `500`, `502`, `503`, and `504` responses with `Retry-After` support.
+- Graph requests retry transient `429`, `500`, `502`, `503`, and `504` responses with `Retry-After` support. Read-only requests also retry transient transport failures, and Microsoft Graph batch helpers retry only the transient individual subrequests while preserving result order.
 
 ## Performance Architecture
 
 The plugin separates cheap metadata discovery from expensive content reads:
 
 - Metadata cache: stores IDs, drive/item metadata, paths, web URLs, MIME/type hints, size, timestamps, ETag/cTag, and file/folder status. This avoids repeated full recursive scans when cached metadata is fresh enough for the workflow.
-- Delta sync: `onedrive_cache_refresh` prefers stored Microsoft Graph delta cursors when the requested root matches the cached root. If Graph returns a delta `nextLink` before the final `deltaLink`, the plugin stores that incomplete cursor and resumes it on the next refresh. It falls back to a bounded scan when no cursor exists, the target changed, delta is disabled, or Graph rejects the cursor.
-- Search ranking: `onedrive_find` combines exact path/filename evidence, live Graph search, confirmed metadata-cache matches, folder hints, file-type hints, recency-ish modified metadata, and optional content-index hits. Results include reasons so ranking is debuggable.
-- Content index: indexing is opt-in and explicit. It supports bounded text-like files by default, stores normalized text/tokens for faster repeated queries, keeps only bounded top matches during local content search, and can optionally try Graph `format=text` export for Office-like files. Large files, unsupported binaries, failed exports, and files over the cap are skipped or reported without aborting the whole refresh.
-- Graph optimization: once an item is discovered, the plugin prefers item IDs for follow-up reads/mutations, follows pagination with cycle/page caps, uses `$batch` where useful, retries transient throttling/service errors, and honors `Retry-After`.
+- Delta sync: `onedrive_cache_refresh` prefers stored Microsoft Graph delta cursors when the requested root matches the cached root. If Graph returns a delta `nextLink` before the final `deltaLink`, the plugin stores that incomplete cursor and resumes it on the next refresh. It resolves pathless delta records from cached parent IDs where possible, reports unresolved path counts for parents it cannot hydrate, repaths descendants after folder moves/renames, removes deleted descendants, and rejects legacy non-delta cursors. It falls back to a bounded scan when no cursor exists, the target changed, delta is disabled, or Graph rejects the cursor.
+- Search ranking: `onedrive_find` combines exact path/filename evidence, canonical live Graph content/metadata matches, confirmed metadata-cache matches, folder hints, file-type hints, recency-ish modified metadata, and optional content-index hits. Adaptive term execution stops expansion after a confident live result for normal `find`; `find_all` executes all planned terms for exhaustive locator requests. Results include reasons and request-plan counters so ranking and latency are debuggable.
+- Content index: indexing is opt-in and explicit. It supports bounded text-like files by default, stores normalized text/tokens for faster repeated queries, keeps only bounded top matches during local content search, and can optionally try Graph `format=text` export for Office-like files. Large files, unsupported binaries, failed exports, and files over the cap are skipped or reported without aborting the whole refresh. Cache reconciliation removes demonstrably stale entries without treating a bounded partial scan as a complete-drive deletion signal.
+- Graph optimization: once an item is discovered, the plugin prefers item IDs for follow-up reads/mutations, follows pagination with cycle/page caps, uses `$batch` where useful, retries transient throttling/service errors (including transient batch subresponses), and honors `Retry-After`.
 
 The largest performance risk is any broad recursive scan or content-index refresh over a large OneDrive tree. Keep `maxItems`, `maxFolders`, `maxDepth`, `maxFiles`, and `maxBytesPerFile` bounded, and warm the metadata cache before broad repeated searches.
 
@@ -240,12 +243,12 @@ For a simple before/after benchmark, compare:
 The bundled benchmark script runs those steps through the MCP server with bounded caps:
 
 ```bash
-scripts/benchmark.mjs --query="project plan" --maxItems=1500 --maxFolders=250 --maxFiles=50
+scripts/benchmark.mjs --query="project plan" --maxItems=1500 --maxFolders=250 --maxFiles=50 --searchConcurrency=2
 ```
 
 Add `--clear` when you intentionally want to clear local metadata/content caches before the cold run. The script performs read-only Microsoft Graph operations, writes local cache/index files, and emits progress events to stderr while keeping the final summary JSON on stdout.
 
-Expected improvement: warm metadata searches avoid most repeated recursive scans; delta refreshes fetch only changes after the initial scan; content searches avoid live file reads after the index is built. Actual speed depends on Microsoft Graph latency, OneDrive size, throttling, and configured caps.
+Expected improvement: confident canonical matches use one Graph search instead of running every generated term; lower-confidence queries expand terms with bounded concurrency. Warm metadata searches avoid most repeated recursive scans, delta refreshes fetch only changes after the initial scan, and content searches avoid live file reads after the index is built. Benchmark summaries report planned, executed, and skipped terms. Actual speed depends on Microsoft Graph latency, OneDrive size, throttling, and configured caps.
 
 ## Safe Example Prompts
 
@@ -263,7 +266,7 @@ Run the mocked Microsoft Graph regression suite first. It does not touch OneDriv
 scripts/mock-graph-test.mjs
 ```
 
-Run the benchmark script when comparing cold search, warm cache search, indexed content search, and selected preview timing:
+Run the benchmark script when comparing cold search, warm cache search, indexed content search, and selected preview timing. The script exits nonzero if any MCP tool step reports an error:
 
 ```bash
 scripts/benchmark.mjs --query="project plan"
@@ -289,7 +292,7 @@ scripts/beta-test.mjs
 
 The test creates a clearly named temporary OneDrive folder, exercises CRUD and safety behavior, deletes only that test folder during cleanup, and removes local temporary work on success. Pass `--keep-work` to keep local artifacts for debugging.
 
-Find old beta-test folders without deleting them:
+Find old beta-test folders without deleting them. Cleanup discovery uses bounded Graph search followed by item verification, so it does not recursively scan the entire drive. Candidates with missing or invalid timestamps are skipped, and invalid/overflowing cleanup limits are rejected before any delete:
 
 ```bash
 scripts/beta-test.mjs --cleanup-stale --stale-days=1
@@ -330,6 +333,9 @@ The GitHub Actions workflow in `.github/workflows/ci.yml` runs syntax checks, th
 - Invite recipients: https://learn.microsoft.com/en-us/graph/api/driveitem-invite
 - Drive recipient resource: https://learn.microsoft.com/en-us/graph/api/resources/driverecipient
 - Delta sync: https://learn.microsoft.com/en-us/graph/api/driveitem-delta
+- Search drive items: https://learn.microsoft.com/en-us/graph/api/driveitem-search
+- JSON batching: https://learn.microsoft.com/en-us/graph/json-batching
+- driveItem resource fields: https://learn.microsoft.com/en-us/graph/api/resources/driveitem
 - List permissions: https://learn.microsoft.com/en-us/graph/api/driveitem-list-permissions
 - Get driveItem: https://learn.microsoft.com/en-us/graph/api/driveitem-get
 - Restore deleted item: https://learn.microsoft.com/en-us/graph/api/driveitem-restore

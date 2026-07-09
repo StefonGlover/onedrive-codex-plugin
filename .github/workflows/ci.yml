@@ -35,7 +35,21 @@ jobs:
           node --check scripts/mock-graph-test.mjs
           node --check scripts/prepackage-check.mjs
           node --check scripts/beta-test.mjs
+          node --check scripts/benchmark.mjs
           zsh -n scripts/configure.zsh
+
+      - name: Run utility self-checks
+        run: |
+          node scripts/beta-test.mjs --self-check
+          node scripts/benchmark.mjs --self-check
+          if node scripts/beta-test.mjs --self-check --stale-days=-1; then
+            echo "beta-test should reject negative --stale-days" >&2
+            exit 1
+          fi
+          if node scripts/beta-test.mjs --self-check --cleanup-page-size=invalid; then
+            echo "beta-test should reject invalid numeric cleanup controls" >&2
+            exit 1
+          fi
 
       - name: Run mocked Microsoft Graph tests
         run: node scripts/mock-graph-test.mjs
@@ -45,5 +59,9 @@ jobs:
           node scripts/prepackage-check.mjs
           if node scripts/prepackage-check.mjs --installed; then
             echo "prepackage-check --installed without a path should fail" >&2
+            exit 1
+          fi
+          if node scripts/prepackage-check.mjs --installed=/definitely/missing/onedrive-cache; then
+            echo "prepackage-check should parse and reject a missing --installed=/path" >&2
             exit 1
           fi

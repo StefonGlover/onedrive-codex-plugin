@@ -9,13 +9,19 @@ import { spawnSync } from "node:child_process";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, "..");
 const args = process.argv.slice(2);
-const installedIndex = args.indexOf("--installed");
 const problems = [];
-const installedArgument = installedIndex >= 0 ? args[installedIndex + 1] : null;
-const installedRoot = installedIndex >= 0 && installedArgument && !installedArgument.startsWith("--")
+const installedFlags = args.filter((arg) => arg === "--installed" || arg.startsWith("--installed="));
+if (installedFlags.length > 1) problems.push("--installed may only be provided once.");
+const installedIndex = args.indexOf("--installed");
+const installedEquals = args.find((arg) => arg.startsWith("--installed="));
+const installedRequested = installedIndex >= 0 || installedEquals !== undefined;
+const installedArgument = installedEquals !== undefined
+  ? installedEquals.slice("--installed=".length)
+  : installedIndex >= 0 ? args[installedIndex + 1] : null;
+const installedRoot = installedRequested && installedArgument && !installedArgument.startsWith("--")
   ? resolve(installedArgument)
   : null;
-if (installedIndex >= 0 && !installedRoot) {
+if (installedRequested && !installedRoot) {
   problems.push("--installed requires a path argument.");
 }
 const ignoredPackageDirs = new Set([".git", "work", "downloads", "onedrive-beta", "node_modules", "dist", "build", "coverage"]);
