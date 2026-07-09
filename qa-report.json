@@ -1,14 +1,16 @@
 {
   "decision": "Warn",
   "confidence": "Medium",
-  "date": "2026-07-07",
+  "date": "2026-07-09",
   "repository": "<plugin-root>",
   "scope": "full plugin repo plus live OneDrive beta",
   "mode": "stabilization",
   "summary": [
-    "Local CI-equivalent gates passed after fixes: manifest parsing, syntax checks, setup script syntax, mocked Graph suite, prepackage guard, negative prepackage guard, and diff whitespace.",
-    "Live OneDrive beta passed after fixes with 75 checks, 0 failures, temporary folder cleanup confirmed, and local beta work cleaned.",
-    "Decision is Warn because non-blocking medium risks remain around ambiguous selectors, non-atomic batch mutations, and single-account live beta coverage."
+    "Local and installed-cache gates passed after fixes: syntax checks, setup script syntax, mocked Graph suite, prepackage guard, and installed-cache drift guard.",
+    "Live OneDrive beta passed with 75 checks, 0 failures, temporary folder cleanup confirmed, and local beta work cleaned.",
+    "Search/indexing improvements now include batched metadata-cache writes, resumable delta nextLink cursors, cache-refresh progress, duplicate folder-hint pruning, bounded concurrent fallback scans, exact-cache-hit confirmation, and faster local content-index matching.",
+    "High-risk live delete/share/revoke/restore operations require dry-run previewToken proof, and batch delete/move/revoke failures return explicit partial-remote-state warnings.",
+    "Decision is Warn because full Microsoft 365/work-school live CRUD coverage was not available; tenant-matrix script support was added and smoke-tested in read-only mode."
   ],
   "detected_stack": {
     "languages": ["JavaScript", "zsh", "JSON", "Markdown"],
@@ -105,14 +107,14 @@
       "cwd": "<plugin-root>",
       "result": "pass",
       "exit_code": 0,
-      "notes": "70 checks, 0 failures after fixes."
+      "notes": "85 checks, 0 failures after fixes."
     },
     {
       "command": "node scripts/prepackage-check.mjs",
       "cwd": "<plugin-root>",
       "result": "pass",
       "exit_code": 0,
-      "notes": "23 files checked."
+      "notes": "24 files checked."
     },
     {
       "command": "if node scripts/prepackage-check.mjs --installed; then echo unexpected-pass; exit 1; else echo expected-fail; fi",
@@ -140,7 +142,35 @@
       "cwd": "<plugin-root>",
       "result": "pass",
       "exit_code": 0,
-      "notes": "75 checks, 0 failures; temporary folder Codex OneDrive Plugin Beta Test codex-beta-1783466428468-59354 deleted; local work cleaned."
+      "notes": "75 checks, 0 failures; temporary folder Codex OneDrive Plugin Beta Test codex-beta-1783570238004-84416 deleted; local work cleaned."
+    },
+    {
+      "command": "node scripts/beta-test.mjs --doctor-only",
+      "cwd": "<plugin-root>",
+      "result": "pass",
+      "exit_code": 0,
+      "notes": "5 checks, 0 failures."
+    },
+    {
+      "command": "node scripts/beta-test.mjs --cleanup-stale --stale-days=9999 --cleanup-max-items=100 --cleanup-max-folders=20 --cleanup-max-results=5",
+      "cwd": "<plugin-root>",
+      "result": "pass",
+      "exit_code": 0,
+      "notes": "Dry-run cleanup mode passed with 0 stale candidates."
+    },
+    {
+      "command": "node scripts/beta-test.mjs --tenant-matrix=consumers",
+      "cwd": "<plugin-root>",
+      "result": "pass",
+      "exit_code": 0,
+      "notes": "Read-only tenant matrix passed for consumers."
+    },
+    {
+      "command": "node scripts/benchmark.mjs --query=\"project plan\" --maxItems=20 --maxFolders=5 --maxFiles=3 --maxBytesPerFile=4096",
+      "cwd": "<plugin-root>",
+      "result": "pass",
+      "exit_code": 0,
+      "notes": "Progress events emitted; bounded read-only benchmark passed."
     }
   ],
   "gate_results": [
@@ -154,7 +184,7 @@
       "gate": "mock tests",
       "status": "pass",
       "exit_code": 0,
-      "evidence": "node scripts/mock-graph-test.mjs, 70 checks, 0 failures."
+      "evidence": "node scripts/mock-graph-test.mjs, 85 checks, 0 failures."
     },
     {
       "gate": "live beta",
@@ -163,10 +193,16 @@
       "evidence": "node scripts/beta-test.mjs, 75 checks, 0 failures, cleanup confirmed."
     },
     {
+      "gate": "beta utility modes",
+      "status": "pass",
+      "exit_code": 0,
+      "evidence": "doctor-only, stale cleanup dry-run, and consumers tenant matrix passed."
+    },
+    {
       "gate": "prepackage",
       "status": "pass",
       "exit_code": 0,
-      "evidence": "node scripts/prepackage-check.mjs, 23 files checked."
+      "evidence": "node scripts/prepackage-check.mjs, 24 files checked."
     },
     {
       "gate": "negative prepackage",
@@ -204,7 +240,7 @@
       "requires_user_approval": false,
       "regression_test_added": true,
       "verification_status": "verified",
-      "residual_risk": "A real separate installed-cache comparison still requires a distinct installed target path.",
+      "residual_risk": "Installed-cache comparison passed for the current installed cache; package/release flows should rerun it for their target cache.",
       "release_impact": "Could give false release confidence during installed-cache drift checks."
     },
     {
@@ -300,21 +336,21 @@
       "area": "data",
       "description": "Batch live operations preflight all entries but cannot be atomic against Microsoft Graph; mid-loop failures may leave partial remote state.",
       "confidence": "medium",
-      "recommended_action": "Add second-item-fails mock tests and make partial-state warnings explicit in user-facing output."
+      "recommended_action": "Use the explicit partial-state warning in live responses and prefer single-item operations for the highest-risk changes."
     },
     {
       "area": "compatibility",
-      "description": "Live beta was run against the current signed-in account only, not a full matrix of personal and Microsoft 365 tenants.",
+      "description": "Full live beta was run against the current signed-in personal account only; read-only tenant matrix was smoke-tested for consumers.",
       "confidence": "medium",
       "recommended_action": "Run live beta in representative personal and work/school accounts before broader release."
     }
   ],
   "risk_acceptance": [
     {
-      "risk": "Warn decision residual risks: ambiguous selector precedence, partial batch remote side effects, and single-account live beta coverage.",
+      "risk": "Warn decision residual risks: full live CRUD covered the current personal account only, and tenant-specific Microsoft Graph behavior can differ.",
       "impact": "medium",
       "likelihood": "medium",
-      "mitigation": "Keep dry-run defaults, expected identity requirements, audit logging, and targeted follow-up tests.",
+      "mitigation": "Keep dry-run defaults, previewToken proof, expected identity requirements, audit logging, explicit batch partial-state warnings, and tenant matrix support.",
       "workaround": "Use single-item operations for high-risk mutations and review dry-run previews before live changes.",
       "rollback": "Revert the changed files and reinstall or refresh the previous plugin cache if distributed.",
       "required_acceptor": "release owner"
@@ -331,11 +367,19 @@
     },
     {
       "file": "mcp/server.mjs",
-      "summary": "Added tool-facing error redaction, stricter trusted upload/copy URL handling, sanitized copy monitor output, and scan page cap."
+      "summary": "Added tool-facing error redaction, stricter trusted upload/copy URL handling, sanitized copy monitor output, scan page cap, selector validation, Keychain logout confirmation, update-file audit attribution, list_all truncation fix, find_all scan short-circuiting, content-index refresh prioritization, metadata-cache write batching, delta nextLink continuation, cache-refresh progress, previewToken proof, and batch partial-state warnings."
     },
     {
       "file": "scripts/mock-graph-test.mjs",
-      "summary": "Added regressions for redaction, copy monitor safety, scan pagination cap, batch revoke preflight, upload-session trust, and batch move cache behavior."
+      "summary": "Added regressions for redaction, copy monitor safety, scan pagination cap, selector ambiguity, logout confirmation, list pagination, update-file audit/preflight, capped content-index refresh, batch revoke preflight, upload-session trust, batch move cache behavior, previewToken live flows, and batch delete/move/revoke second-item failures."
+    },
+    {
+      "file": "scripts/beta-test.mjs",
+      "summary": "Added previewToken handling for live high-risk operations plus doctor-only, stale cleanup, and tenant-matrix modes."
+    },
+    {
+      "file": "scripts/benchmark.mjs",
+      "summary": "Added progress events during long benchmark phases."
     },
     {
       "file": "qa-report.md",
@@ -362,12 +406,20 @@
     {
       "file": ".github/workflows/ci.yml",
       "coverage": "Negative prepackage --installed behavior and setup script syntax."
+    },
+    {
+      "file": "scripts/mock-graph-test.mjs",
+      "coverage": "Batch delete, batch move, and batch revoke second-item live failures with partial-state warnings."
+    },
+    {
+      "file": "scripts/mock-graph-test.mjs",
+      "coverage": "Preview-token proof for high-risk live sharing, revoke, delete, and batch operations."
     }
   ],
   "skipped_checks": [
     {
       "check": "separate installed-cache drift comparison",
-      "reason": "No distinct installed target path was supplied for scripts/prepackage-check.mjs --installed /path/to/cache.",
+      "reason": "Installed-cache drift comparison passed for the current installed cache; packaging from a separate checkout should run it again before publishing.",
       "risk": "medium"
     },
     {
@@ -377,7 +429,7 @@
     },
     {
       "check": "multi-tenant live beta matrix",
-      "reason": "Live beta used the currently signed-in account only.",
+      "reason": "Read-only tenant matrix support was smoke-tested for consumers, but full live CRUD was not run against a Microsoft 365/work-school tenant.",
       "risk": "medium"
     }
   ],
@@ -394,9 +446,9 @@
     }
   ],
   "residual_risk": [
-    "Warn requires release-owner acceptance for ambiguous target selectors, partial live batch side effects, and single-account live beta coverage.",
+    "Warn requires release-owner acceptance that full live CRUD covered the current personal OneDrive account only.",
     "Node 20 CI target was not run locally; local Node version was v26.0.0.",
-    "A distinct installed-cache drift target was not provided."
+    "Batch live operations remain inherently non-atomic in Microsoft Graph; partial-state warnings and second-item-failure coverage are now explicit."
   ],
   "release_recommendations": [
     "Release only after explicit acceptance of the Warn residual risks.",
@@ -410,9 +462,9 @@
     "Watch for Graph provider error messages that may need additional redaction patterns."
   ],
   "next_actions": [
-    "Reject or document ambiguous target selector combinations.",
-    "Add second-item-fails tests for batch delete, move, and revoke partial-state reporting.",
-    "Run installed-cache drift comparison against a distinct packaged target.",
-    "Run live beta against representative personal and work/school accounts before a broader release."
+    "Run a second full live beta on a Microsoft 365/work-school tenant before broad release.",
+    "Exercise --tenant-matrix-live only with explicit test accounts for each tenant endpoint.",
+    "Track cache-refresh timings on larger drives now that write batching and delta continuation are implemented.",
+    "Run installed-cache drift comparison against a distinct packaged target before publishing from another checkout."
   ]
 }

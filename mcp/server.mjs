@@ -8,17 +8,22 @@ import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { createHash, randomUUID } from "node:crypto";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, "..");
 const pluginManifest = JSON.parse(readFileSync(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"));
-const configPath = join(homedir(), ".codex", "onedrive-plugin", "config.json");
-const downloadRoot = join(homedir(), ".codex", "onedrive-plugin", "downloads");
-const cacheRoot = join(homedir(), ".codex", "onedrive-plugin", "cache");
+const defaultStorageRoot = join(homedir(), ".codex", "onedrive-plugin");
+const configPath = join(defaultStorageRoot, "config.json");
+const localConfig = readLocalConfig();
+const storageRoot = resolve(process.env.ONEDRIVE_STORAGE_ROOT || localConfig.storageRoot || defaultStorageRoot);
+const downloadRoot = join(storageRoot, "downloads");
+const cacheRoot = resolve(process.env.ONEDRIVE_CACHE_ROOT || localConfig.cacheRoot || join(storageRoot, "cache"));
 const cachePath = join(cacheRoot, "metadata-cache.json");
-const updateRoot = join(homedir(), ".codex", "onedrive-plugin", "updates");
-const backupRoot = join(homedir(), ".codex", "onedrive-plugin", "backups");
-const auditRoot = join(homedir(), ".codex", "onedrive-plugin", "audit");
+const contentIndexPath = join(cacheRoot, "content-index.json");
+const updateRoot = join(storageRoot, "updates");
+const backupRoot = join(storageRoot, "backups");
+const auditRoot = join(storageRoot, "audit");
 const auditPath = join(auditRoot, "mutations.jsonl");
 const localOneDriveSyncRoots = [
   { path: join(homedir(), "Library", "CloudStorage", "OneDrive"), prefix: false },
@@ -26,8 +31,8 @@ const localOneDriveSyncRoots = [
   { path: join(homedir(), "OneDrive"), prefix: false },
   { path: join(homedir(), "OneDrive - "), prefix: true }
 ];
-const localConfig = readLocalConfig();
 const textFileLimit = 5 * 1024 * 1024;
+const defaultMaxIndexedFileSize = 512 * 1024;
 const simpleUploadLimit = 250 * 1024 * 1024;
 const uploadChunkUnit = 320 * 1024;
 const defaultUploadChunkSize = 10 * 1024 * 1024;
@@ -90,7 +95,14 @@ const officeKinds = {
 let tokenCache = null;
 let pendingDevice = null;
 let metadataCacheMemory = null;
+let contentIndexMemory = null;
 let lastGraphRequestId = null;
+let metadataCacheBatchDepth = 0;
+let metadataCacheDirty = false;
+
+const previewTokens = new Map();
+const previewTokenTtlMs = 15 * 60 * 1000;
+const partialBatchMutationWarning = "Batch live mutations are preflighted but not atomic; if a later item fails, earlier remote changes may already have taken effect.";
 
 const outputFormatSchema = {
   type: "string",
@@ -105,6 +117,10 @@ const presetSchema = {
 const relativePathSchema = {
   type: "string",
   description: "Path appended below the selected preset."
+};
+const previewTokenSchema = {
+  type: "string",
+  description: "Token returned by the immediately preceding dry-run preview for this exact high-risk operation."
 };
 const pathTargetProperties = {
   path: { type: "string", description: "Item path relative to OneDrive root." },
@@ -197,7 +213,12 @@ const tools = [
     inputSchema: {
       type: "object",
       properties: {
-        deleteKeychainToken: { type: "boolean", default: false }
+        deleteKeychainToken: { type: "boolean", default: false },
+        confirmed: {
+          type: "boolean",
+          default: false,
+          description: "Must be true after explicit user confirmation to delete the Keychain refresh token."
+        }
       },
       additionalProperties: false
     }
@@ -368,6 +389,13 @@ const tools = [
         scanMaxItems: { type: "integer", minimum: 1, maximum: 10000, default: 1500 },
         scanMaxFolders: { type: "integer", minimum: 1, maximum: 2000, default: 250 },
         scanMaxDepth: { type: "integer", minimum: 0, maximum: 50, default: 20 },
+        scanConcurrency: {
+          type: "integer",
+          minimum: 1,
+          maximum: 4,
+          default: 2,
+          description: "Low-concurrency fallback scan fan-out across top folder hints."
+        },
         minConfidenceForSearchOnly: {
           type: "integer",
           minimum: 0,
@@ -379,6 +407,18 @@ const tools = [
           type: "boolean",
           default: true,
           description: "Use the local metadata cache as a fast ranking source before live Graph search."
+        },
+        useContentIndex: {
+          type: "boolean",
+          default: true,
+          description: "Use the local content index if it has already been built. This never fetches file contents during find."
+        },
+        contentMaxResults: {
+          type: "integer",
+          minimum: 0,
+          maximum: 50,
+          default: 10,
+          description: "Maximum indexed-content matches to merge into ranked results."
         },
         format: outputFormatSchema
       },
@@ -408,6 +448,13 @@ const tools = [
         scanMaxItems: { type: "integer", minimum: 1, maximum: 50000, default: 10000 },
         scanMaxFolders: { type: "integer", minimum: 1, maximum: 10000, default: 2000 },
         scanMaxDepth: { type: "integer", minimum: 0, maximum: 50, default: 25 },
+        scanConcurrency: {
+          type: "integer",
+          minimum: 1,
+          maximum: 4,
+          default: 2,
+          description: "Low-concurrency fallback scan fan-out across top folder hints."
+        },
         searchPageSize: { type: "integer", minimum: 1, maximum: 200, default: 100 },
         searchMaxItemsPerTerm: { type: "integer", minimum: 1, maximum: 1000, default: 250 },
         useCache: {
@@ -415,6 +462,12 @@ const tools = [
           default: true,
           description: "Use the local metadata cache as a fast ranking source before live Graph search."
         },
+        useContentIndex: {
+          type: "boolean",
+          default: true,
+          description: "Use the local content index if it has already been built. This never fetches file contents during find_all."
+        },
+        contentMaxResults: { type: "integer", minimum: 0, maximum: 100, default: 25 },
         format: outputFormatSchema
       },
       additionalProperties: false
@@ -459,7 +512,8 @@ const tools = [
         maxItems: { type: "integer", minimum: 1, maximum: 50000, default: 10000 },
         maxFolders: { type: "integer", minimum: 1, maximum: 10000, default: 2000 },
         maxDepth: { type: "integer", minimum: 0, maximum: 50, default: 25 },
-        includeFolders: { type: "boolean", default: true }
+        includeFolders: { type: "boolean", default: true },
+        replaceCache: { type: "boolean", default: false, description: "When true, clear existing metadata before the scan. Defaults to merge so bounded scans do not shrink a fuller cache." }
       },
       additionalProperties: false
     }
@@ -467,6 +521,62 @@ const tools = [
   {
     name: "onedrive_cache_clear",
     description: "Clear the local OneDrive metadata cache.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false }
+  },
+  {
+    name: "onedrive_content_index_refresh",
+    description: "Build or refresh the optional local text content index from cached metadata or one selected file. This is the explicit expensive content-reading step.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...pathTargetProperties,
+        refreshMetadata: {
+          type: "boolean",
+          default: false,
+          description: "When true, rebuild metadata with onedrive_cache_refresh before indexing cached files."
+        },
+        maxFiles: { type: "integer", minimum: 1, maximum: 1000, default: 100 },
+        maxBytesPerFile: { type: "integer", minimum: 1024, maximum: 5242880, default: defaultMaxIndexedFileSize },
+        concurrencyLimit: { type: "integer", minimum: 1, maximum: 8, default: 2 },
+        extensions: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional extension allow-list. Defaults to configured supported indexed file types."
+        },
+        includeOfficeExport: {
+          type: "boolean",
+          default: false,
+          description: "When true, try Microsoft Graph text export for Office-like files. Unsupported file types fail per item, not the whole refresh."
+        },
+        force: {
+          type: "boolean",
+          default: false,
+          description: "Re-extract unchanged files instead of reusing index entries with matching ETag/cTag/mtime/size."
+        },
+        scanMaxItems: { type: "integer", minimum: 1, maximum: 50000, default: 10000 },
+        scanMaxFolders: { type: "integer", minimum: 1, maximum: 10000, default: 2000 },
+        scanMaxDepth: { type: "integer", minimum: 0, maximum: 50, default: 25 }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_content_search",
+    description: "Search the optional local text content index and return lightweight metadata plus snippets. Does not call Microsoft Graph.",
+    inputSchema: {
+      type: "object",
+      required: ["query"],
+      properties: {
+        query: { type: "string", minLength: 1 },
+        maxResults: { type: "integer", minimum: 1, maximum: 100, default: 20 },
+        format: outputFormatSchema
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_content_index_clear",
+    description: "Clear the optional local OneDrive content index.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false }
   },
   {
@@ -800,6 +910,7 @@ const tools = [
           default: false,
           description: "Must be true after explicit user confirmation because this can expose access to a file or folder."
         },
+        previewToken: previewTokenSchema,
         expectedName: { type: "string", description: "Optional safety check: item name must match." },
         expectedId: { type: "string", description: "Optional safety check: item ID must match." }
       },
@@ -840,6 +951,7 @@ const tools = [
           default: false,
           description: "Must be true after explicit user confirmation because this grants access to a file or folder."
         },
+        previewToken: previewTokenSchema,
         expectedName: { type: "string", description: "Optional safety check: item name must match." },
         expectedId: { type: "string", description: "Optional safety check: item ID must match." }
       },
@@ -867,6 +979,7 @@ const tools = [
           default: false,
           description: "Must be true after explicit user confirmation because this removes sharing access."
         },
+        previewToken: previewTokenSchema,
         expectedName: { type: "string", description: "Optional safety check: item name must match." },
         expectedId: { type: "string", description: "Optional safety check: item ID must match." }
       },
@@ -903,7 +1016,8 @@ const tools = [
           type: "boolean",
           default: false,
           description: "Must be true after explicit user confirmation for live batch permission revocation."
-        }
+        },
+        previewToken: previewTokenSchema
       },
       additionalProperties: false
     }
@@ -926,6 +1040,7 @@ const tools = [
           default: false,
           description: "Must be true after explicit user confirmation because this restores a deleted item."
         },
+        previewToken: previewTokenSchema,
         expectedId: { type: "string", description: "Optional safety check: itemId must match." }
       },
       additionalProperties: false
@@ -1042,7 +1157,8 @@ const tools = [
           }
         },
         dryRun: { type: "boolean", default: true },
-        confirmed: { type: "boolean", default: false }
+        confirmed: { type: "boolean", default: false },
+        previewToken: previewTokenSchema
       },
       additionalProperties: false
     }
@@ -1165,7 +1281,8 @@ const tools = [
         maxItems: { type: "integer", minimum: 1, maximum: 5000, default: 1000 },
         maxFolders: { type: "integer", minimum: 1, maximum: 1000, default: 250 },
         maxDepth: { type: "integer", minimum: 0, maximum: 50, default: 15 },
-        includeFolders: { type: "boolean", default: true }
+        includeFolders: { type: "boolean", default: true },
+        includeOwnerPermissions: { type: "boolean", default: false, description: "When true, include owner/self grants in addition to external sharing permissions." }
       },
       additionalProperties: false
     }
@@ -1192,7 +1309,13 @@ const tools = [
     inputSchema: {
       type: "object",
       properties: {
-        limit: { type: "integer", minimum: 1, maximum: 500, default: 50 }
+        limit: { type: "integer", minimum: 1, maximum: 500, default: 50 },
+        tool: { type: "string", description: "Optional exact tool name filter, such as onedrive_upload." },
+        status: { type: "string", description: "Optional mutation status filter, such as success or failed." },
+        pathContains: { type: "string", description: "Optional case-insensitive filter matched against target, before, and after paths/names." },
+        since: { type: "string", description: "Optional ISO timestamp; only entries at or after this time are returned." },
+        until: { type: "string", description: "Optional ISO timestamp; only entries at or before this time are returned." },
+        newestFirst: { type: "boolean", default: true, description: "Return newest entries first. Set false to preserve log order." }
       },
       additionalProperties: false
     }
@@ -1239,6 +1362,7 @@ const tools = [
           default: false,
           description: "Must be true after explicit user confirmation because this deletes a file or folder."
         },
+        previewToken: previewTokenSchema,
         expectedName: { type: "string", description: "Optional safety check: item name must match before deleting." },
         expectedId: { type: "string", description: "Optional safety check: item ID must match before deleting." }
       },
@@ -1340,13 +1464,16 @@ function validateSchemaValue(value, schema = {}, path = "$") {
       if (child.value !== undefined || Object.hasOwn(normalized, key)) normalized[key] = child.value;
     }
     if (schema.anyOf?.length) {
-      const branchMatches = schema.anyOf.some((branch) => (branch.required || []).every((key) => Object.hasOwn(normalized, key)));
-      if (!branchMatches) {
-        const options = schema.anyOf
-          .map((branch) => (branch.required || []).join(" + "))
-          .filter(Boolean)
-          .join(" or ");
-        details.push(validationDetail(path, `Must include one target option: ${options}.`));
+      const branchLabels = schema.anyOf
+        .map((branch) => (branch.required || []).join(" + "))
+        .filter(Boolean);
+      const branchMatches = schema.anyOf.filter((branch) =>
+        (branch.required || []).every((key) => Object.hasOwn(normalized, key))
+      );
+      if (branchMatches.length === 0) {
+        details.push(validationDetail(path, `Must include one target option: ${branchLabels.join(" or ")}.`));
+      } else if (branchMatches.length > 1) {
+        details.push(validationDetail(path, `Must include exactly one target option: ${branchLabels.join(" or ")}.`));
       }
     }
   }
@@ -1383,6 +1510,48 @@ function config(overrides = {}) {
   const scopes = overrides.scopes || process.env.ONEDRIVE_SCOPES || localConfig.scopes || "offline_access User.Read Files.ReadWrite";
   const keychainService = process.env.ONEDRIVE_KEYCHAIN_SERVICE || localConfig.keychainService || "Codex OneDrive";
   return { clientId, tenant, scopes, keychainService };
+}
+
+function boolSetting(value, defaultValue) {
+  if (value === undefined || value === null || value === "") return defaultValue;
+  if (typeof value === "boolean") return value;
+  return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
+}
+
+function intSetting(value, defaultValue, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return defaultValue;
+  return Math.min(Math.max(Math.trunc(number), min), max);
+}
+
+function listSetting(value, defaultValue) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") return value.split(/[,\s]+/).filter(Boolean);
+  return defaultValue;
+}
+
+function pluginSettings() {
+  const cfg = localConfig.settings || {};
+  const indexing = localConfig.indexing || {};
+  const supportedIndexedFileTypes = normalizeExtensions(listSetting(
+    process.env.ONEDRIVE_INDEX_EXTENSIONS || indexing.supportedExtensions || cfg.supportedIndexedFileTypes,
+    [".txt", ".md", ".csv", ".json", ".jsonl", ".xml", ".yaml", ".yml", ".html", ".css", ".js", ".mjs", ".ts", ".tsx", ".py", ".sql", ".log"]
+  ));
+  return {
+    storageRoot,
+    cacheRoot,
+    cachePath,
+    contentIndexPath,
+    maxScanDepth: intSetting(process.env.ONEDRIVE_MAX_SCAN_DEPTH ?? cfg.maxScanDepth, 25, 0, 50),
+    maxIndexedFileSize: intSetting(process.env.ONEDRIVE_MAX_INDEXED_FILE_SIZE ?? indexing.maxFileSize ?? cfg.maxIndexedFileSize, defaultMaxIndexedFileSize, 1024, textFileLimit),
+    supportedIndexedFileTypes: [...supportedIndexedFileTypes],
+    cacheTtlSeconds: intSetting(process.env.ONEDRIVE_CACHE_TTL_SECONDS ?? cfg.cacheTtlSeconds, 900, 0, 30 * 24 * 60 * 60),
+    concurrencyLimit: intSetting(process.env.ONEDRIVE_CONCURRENCY_LIMIT ?? cfg.concurrencyLimit, 2, 1, 8),
+    deltaSyncEnabled: boolSetting(process.env.ONEDRIVE_DELTA_SYNC_ENABLED ?? cfg.deltaSyncEnabled, true),
+    contentIndexEnabled: boolSetting(process.env.ONEDRIVE_CONTENT_INDEX_ENABLED ?? indexing.enabled ?? cfg.contentIndexEnabled, true),
+    includeOfficeTextExport: boolSetting(process.env.ONEDRIVE_INDEX_OFFICE_EXPORT ?? indexing.includeOfficeTextExport, false),
+    fullReindexCommand: "onedrive_content_index_refresh({ force: true, refreshMetadata: true })"
+  };
 }
 
 function pathPresets() {
@@ -1485,7 +1654,8 @@ function publicConfig() {
     keychainService: cfg.keychainService,
     keychainTokenConfigured: Boolean(stored?.refresh_token),
     configPath,
-    pathPresets: pathPresets()
+    pathPresets: pathPresets(),
+    settings: pluginSettings()
   };
 }
 
@@ -1495,6 +1665,7 @@ function emptyMetadataCache() {
     createdAt: new Date().toISOString(),
     updatedAt: null,
     deltaLink: null,
+    deltaNextLink: null,
     scanRoot: null,
     itemCount: 0,
     itemsById: {},
@@ -1524,7 +1695,20 @@ async function saveMetadataCache(cache) {
   await mkdir(cacheRoot, { recursive: true });
   await writeFile(cachePath, JSON.stringify(cache, null, 2));
   metadataCacheMemory = cache;
+  metadataCacheDirty = false;
   return cache;
+}
+
+async function withMetadataCacheBatch(fn) {
+  metadataCacheBatchDepth += 1;
+  try {
+    return await fn();
+  } finally {
+    metadataCacheBatchDepth -= 1;
+    if (metadataCacheBatchDepth === 0 && metadataCacheDirty) {
+      await saveMetadataCache(await loadMetadataCache());
+    }
+  }
 }
 
 function cachePathKey(remotePath = "") {
@@ -1566,19 +1750,321 @@ function cacheRemoveItemAndDescendants(cache, item) {
 }
 
 async function cacheItems(items = [], metadata = {}) {
-  if (!items.length && !metadata.deltaLink && !metadata.scanRoot) return await loadMetadataCache();
+  const hasMetadata = metadata.deltaLink !== undefined
+    || metadata.deltaNextLink !== undefined
+    || metadata.scanRoot !== undefined;
+  if (!items.length && !hasMetadata) return await loadMetadataCache();
   const cache = await loadMetadataCache();
   for (const item of items) cachePutSimplified(cache, item);
-  if (metadata.deltaLink) cache.deltaLink = metadata.deltaLink;
+  if (metadata.deltaLink !== undefined) {
+    cache.deltaLink = metadata.deltaLink || null;
+    if (metadata.deltaLink) cache.deltaNextLink = null;
+  }
+  if (metadata.deltaNextLink !== undefined) cache.deltaNextLink = metadata.deltaNextLink || null;
   if (metadata.scanRoot !== undefined) cache.scanRoot = metadata.scanRoot;
+  if (metadataCacheBatchDepth > 0) {
+    metadataCacheDirty = true;
+    return cache;
+  }
   return await saveMetadataCache(cache);
 }
 
 async function clearMetadataCache() {
   metadataCacheMemory = emptyMetadataCache();
+  metadataCacheDirty = false;
   await mkdir(cacheRoot, { recursive: true });
   await writeFile(cachePath, JSON.stringify(metadataCacheMemory, null, 2));
   return metadataCacheMemory;
+}
+
+function emptyContentIndex() {
+  return {
+    version: 1,
+    createdAt: new Date().toISOString(),
+    updatedAt: null,
+    itemCount: 0,
+    entriesById: {}
+  };
+}
+
+async function loadContentIndex() {
+  if (contentIndexMemory) return contentIndexMemory;
+  try {
+    const parsed = JSON.parse(await readFile(contentIndexPath, "utf8"));
+    contentIndexMemory = {
+      ...emptyContentIndex(),
+      ...parsed,
+      entriesById: parsed.entriesById || {}
+    };
+  } catch {
+    contentIndexMemory = emptyContentIndex();
+  }
+  return contentIndexMemory;
+}
+
+async function saveContentIndex(index) {
+  index.updatedAt = new Date().toISOString();
+  index.itemCount = Object.keys(index.entriesById || {}).length;
+  await mkdir(cacheRoot, { recursive: true });
+  await writeFile(contentIndexPath, JSON.stringify(index, null, 2));
+  contentIndexMemory = index;
+  return index;
+}
+
+async function clearContentIndex() {
+  contentIndexMemory = emptyContentIndex();
+  await mkdir(cacheRoot, { recursive: true });
+  await writeFile(contentIndexPath, JSON.stringify(contentIndexMemory, null, 2));
+  return contentIndexMemory;
+}
+
+function contentIndexEntryFresh(entry, item) {
+  return entry
+    && entry.eTag === item.eTag
+    && entry.cTag === item.cTag
+    && entry.lastModifiedDateTime === item.lastModifiedDateTime
+    && entry.size === item.size;
+}
+
+function officeExportIndexable(item = {}) {
+  const extension = extname(item.name || "").toLowerCase();
+  const mimeType = (item.file?.mimeType || "").toLowerCase();
+  return Object.values(officeKinds).some((kind) => kind.extensions.has(extension) || kind.mimeTypes.has(mimeType));
+}
+
+function contentIndexableReason(item = {}, args = {}) {
+  if (!item?.file || item.folder) return { ok: false, reason: "not-file" };
+  const settings = pluginSettings();
+  const maxBytes = clampInteger(args.maxBytesPerFile, settings.maxIndexedFileSize, 1024, textFileLimit);
+  if (item.size && item.size > maxBytes) return { ok: false, reason: "too-large" };
+  const allowedExtensions = normalizeExtensions(args.extensions?.length ? args.extensions : settings.supportedIndexedFileTypes);
+  const extension = extname(item.name || "").toLowerCase();
+  if (allowedExtensions.has(extension) || isLikelyTextItem(item)) return { ok: true, source: "text-read" };
+  if ((args.includeOfficeExport === true || settings.includeOfficeTextExport) && officeExportIndexable(item)) {
+    return { ok: true, source: "graph-text-export" };
+  }
+  return { ok: false, reason: "unsupported-type" };
+}
+
+async function extractIndexText(item, args = {}) {
+  const settings = pluginSettings();
+  const maxBytes = clampInteger(args.maxBytesPerFile, settings.maxIndexedFileSize, 1024, textFileLimit);
+  const indexable = contentIndexableReason(item, args);
+  if (!indexable.ok) throw new Error(indexable.reason);
+  const target = { itemId: item.id };
+  const sourcePath = indexable.source === "graph-text-export"
+    ? `${contentPath(target)}?${new URLSearchParams({ format: "text" }).toString()}`
+    : contentPath(target);
+  const limited = await graphLimitedBuffer(sourcePath, maxBytes);
+  if (indexable.source === "text-read") assertNoBinaryNulls(limited.buffer);
+  return {
+    text: limited.buffer.toString("utf8").replace(/\uFFFD$/u, ""),
+    bytesRead: limited.bytesRead,
+    truncated: limited.truncated,
+    source: indexable.source
+  };
+}
+
+function contentIndexTextFields(text = "") {
+  return {
+    normalizedText: normalizeFindText(text),
+    tokens: findTokens(text)
+  };
+}
+
+function contentSearchContext(query) {
+  return {
+    query,
+    normalizedQuery: normalizeFindText(query),
+    tokens: findImportantTokens(query)
+  };
+}
+
+function compareContentMatches(left, right) {
+  if (right.score !== left.score) return right.score - left.score;
+  return String(left.item?.name || "").localeCompare(String(right.item?.name || ""));
+}
+
+function insertTopContentMatch(matches, candidate, maxResults) {
+  matches.push(candidate);
+  matches.sort(compareContentMatches);
+  if (matches.length > maxResults) matches.pop();
+}
+
+function contentMatchForQuery(entry, queryOrContext) {
+  const context = typeof queryOrContext === "object" && queryOrContext
+    ? queryOrContext
+    : contentSearchContext(queryOrContext);
+  const text = String(entry.text || "");
+  const normalizedText = entry.normalizedText || normalizeFindText(text);
+  const normalizedQuery = context.normalizedQuery;
+  const tokens = context.tokens || [];
+  const textTokenSet = new Set(Array.isArray(entry.tokens) ? entry.tokens : findTokens(text));
+  const tokenMatches = tokens.filter((token) => textTokenSet.has(token));
+  if (!normalizedQuery && !tokenMatches.length) return null;
+  const exactPhrase = normalizedQuery
+    ? (/\s|[-.]/.test(normalizedQuery) ? normalizedText.includes(normalizedQuery) : textTokenSet.has(normalizedQuery))
+    : false;
+  const exactIndex = exactPhrase ? normalizedText.indexOf(normalizedQuery) : -1;
+  if (exactIndex < 0 && tokenMatches.length === 0) return null;
+
+  const lowerText = text.toLowerCase();
+  const rawNeedle = exactIndex >= 0 ? normalizedQuery : tokenMatches[0];
+  const rawIndex = rawNeedle ? lowerText.indexOf(rawNeedle.toLowerCase()) : -1;
+  const start = rawIndex >= 0 ? Math.max(0, rawIndex - 80) : 0;
+  const end = rawIndex >= 0 ? Math.min(text.length, rawIndex + rawNeedle.length + 120) : Math.min(text.length, 200);
+  const snippet = text.slice(start, end).replace(/\s+/g, " ").trim();
+  const coverage = tokens.length ? tokenMatches.length / tokens.length : 0;
+  return {
+    score: (exactIndex >= 0 ? 70 : 35) + Math.round(coverage * 35),
+    matchedTokens: tokenMatches.length,
+    snippet,
+    reasons: [
+      exactIndex >= 0 ? "indexed content phrase" : "indexed content tokens",
+      ...(tokenMatches.length ? [`content token matches: ${tokenMatches.slice(0, 5).join(", ")}`] : [])
+    ]
+  };
+}
+
+async function contentSearch(args = {}) {
+  const startedAt = Date.now();
+  const query = String(args.query || "").trim();
+  if (!query) throw new Error("query is required.");
+  const maxResults = clampInteger(args.maxResults, 20, 1, 100);
+  const index = await loadContentIndex();
+  const context = contentSearchContext(query);
+  const matches = [];
+  let matched = 0;
+  for (const entry of Object.values(index.entriesById || {})) {
+    const match = contentMatchForQuery(entry, context);
+    if (!match) continue;
+    matched += 1;
+    insertTopContentMatch(matches, {
+      item: entry.item,
+      score: match.score,
+      matchedTokens: match.matchedTokens,
+      snippet: match.snippet,
+      reasons: match.reasons,
+      source: entry.source,
+      indexedAt: entry.indexedAt,
+      truncated: entry.truncated
+    }, maxResults);
+  }
+  return {
+    query,
+    indexPath: contentIndexPath,
+    itemCount: index.itemCount || 0,
+    matched,
+    returned: matches.length,
+    durationMs: elapsedMs(startedAt),
+    items: matches.map((match) => ({
+      ...formatSimplifiedItem(match.item, args.format),
+      score: match.score,
+      matchedTokens: match.matchedTokens,
+      reasons: match.reasons,
+      snippet: match.snippet,
+      source: match.source,
+      indexedAt: match.indexedAt,
+      truncated: match.truncated
+    }))
+  };
+}
+
+async function contentIndexRefresh(args = {}) {
+  const startedAt = Date.now();
+  const settings = pluginSettings();
+  if (!settings.contentIndexEnabled) throw new Error("Content indexing is disabled by configuration.");
+  if (args.refreshMetadata === true) {
+    await cacheRefresh({
+      ...args,
+      mode: "scan",
+      maxItems: clampInteger(args.scanMaxItems, 10000, 1, 50000),
+      maxFolders: clampInteger(args.scanMaxFolders, 2000, 1, 10000),
+      maxDepth: clampInteger(args.scanMaxDepth, settings.maxScanDepth, 0, 50)
+    });
+  }
+
+  const maxFiles = clampInteger(args.maxFiles, 100, 1, 1000);
+  let sourceItems = [];
+  if (args.itemId || args.path || args.preset) {
+    sourceItems = [simplifyItem(await getRawInfo(args))];
+  } else {
+    sourceItems = await cachedItems();
+  }
+
+  const index = await loadContentIndex();
+  const eligibleItems = sourceItems
+    .filter((item) => item?.id && !item.deleted)
+    .filter((item) => contentIndexableReason(item, args).ok);
+  const candidates = eligibleItems
+    .map((item) => ({
+      item,
+      fresh: Boolean(args.force !== true && contentIndexEntryFresh(index.entriesById[item.id], item))
+    }))
+    .sort((left, right) => Number(left.fresh) - Number(right.fresh))
+    .slice(0, maxFiles)
+    .map((entry) => entry.item);
+  const results = {
+    indexPath: contentIndexPath,
+    considered: sourceItems.length,
+    eligible: eligibleItems.length,
+    selected: candidates.length,
+    indexed: 0,
+    reused: 0,
+    skipped: sourceItems.length - candidates.length,
+    graphContentReadsAttempted: 0,
+    failed: 0,
+    failures: []
+  };
+
+  await mapWithConcurrency(candidates, clampInteger(args.concurrencyLimit, settings.concurrencyLimit, 1, 8), async (item) => {
+    const existing = index.entriesById[item.id];
+    if (args.force !== true && contentIndexEntryFresh(existing, item)) {
+      index.entriesById[item.id] = { ...existing, item };
+      results.reused += 1;
+      return;
+    }
+    try {
+      results.graphContentReadsAttempted += 1;
+      const extracted = await extractIndexText(item, args);
+      const textFields = contentIndexTextFields(extracted.text);
+      index.entriesById[item.id] = {
+        item,
+        text: extracted.text,
+        normalizedText: textFields.normalizedText,
+        tokens: textFields.tokens,
+        indexedAt: new Date().toISOString(),
+        source: extracted.source,
+        bytesRead: extracted.bytesRead,
+        textBytes: Buffer.byteLength(extracted.text, "utf8"),
+        truncated: extracted.truncated,
+        eTag: item.eTag,
+        cTag: item.cTag,
+        lastModifiedDateTime: item.lastModifiedDateTime,
+        size: item.size
+      };
+      results.indexed += 1;
+    } catch (error) {
+      results.failed += 1;
+      if (results.failures.length < 10) {
+        results.failures.push({ id: item.id, name: item.name, error: safeToolErrorMessage(error) });
+      }
+    }
+  });
+
+  await saveContentIndex(index);
+  return {
+    ...results,
+    itemCount: index.itemCount,
+    durationMs: elapsedMs(startedAt),
+    settings: {
+      maxBytesPerFile: clampInteger(args.maxBytesPerFile, settings.maxIndexedFileSize, 1024, textFileLimit),
+      supportedIndexedFileTypes: args.extensions?.length ? [...normalizeExtensions(args.extensions)] : settings.supportedIndexedFileTypes,
+      includeOfficeExport: args.includeOfficeExport === true || settings.includeOfficeTextExport,
+      concurrencyLimit: clampInteger(args.concurrencyLimit, settings.concurrencyLimit, 1, 8)
+    },
+    note: "Content indexing reads file bodies only during this explicit refresh. Normal find/search calls reuse the local index and do not fetch content."
+  };
 }
 
 async function cacheMovedOrRenamedItem(previous, current) {
@@ -1590,16 +2076,31 @@ async function cacheMovedOrRenamedItem(previous, current) {
 
 async function syncStatus(args = {}) {
   const cache = await loadMetadataCache();
+  const contentIndex = await loadContentIndex();
+  const settings = pluginSettings();
   const items = Object.values(cache.itemsById || {});
+  const contentEntries = Object.values(contentIndex.entriesById || {});
+  const cacheAgeSeconds = cache.updatedAt ? Math.max(0, Math.round((Date.now() - Date.parse(cache.updatedAt)) / 1000)) : null;
   return {
     cachePath,
+    contentIndexPath,
     downloadRoot,
     updateRoot,
     backupRoot,
+    storageRoot,
     itemCount: items.length,
     updatedAt: cache.updatedAt,
+    cacheAgeSeconds,
+    cacheFresh: cacheAgeSeconds === null ? false : settings.cacheTtlSeconds === 0 || cacheAgeSeconds <= settings.cacheTtlSeconds,
     deltaLinkAvailable: Boolean(cache.deltaLink),
+    deltaNextLinkAvailable: Boolean(cache.deltaNextLink),
     scanRoot: cache.scanRoot,
+    contentIndex: {
+      itemCount: contentEntries.length,
+      updatedAt: contentIndex.updatedAt,
+      enabled: settings.contentIndexEnabled
+    },
+    settings,
     samples: args.includeSamples ? items.slice(0, 10).map((item) => formatSimplifiedItem(item, "compact")) : undefined
   };
 }
@@ -1816,6 +2317,10 @@ async function getAccessToken() {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function elapsedMs(startedAt) {
+  return Math.max(0, Date.now() - startedAt);
 }
 
 function fetchTimeoutMs() {
@@ -2124,6 +2629,15 @@ function assertSafeItemName(name = "", label = "name") {
   return trimmed;
 }
 
+function assertAtMostOneSelector(args = {}, label, selectors = []) {
+  const provided = selectors.filter((selector) =>
+    selector.keys.every((key) => Object.hasOwn(args, key) && args[key] !== undefined && args[key] !== null && args[key] !== "")
+  );
+  if (provided.length > 1) {
+    throw new Error(`${label} must use at most one selector: ${selectors.map((selector) => selector.label).join(" or ")}.`);
+  }
+}
+
 function pathName(path = "") {
   return basename(cleanPath(path));
 }
@@ -2279,6 +2793,83 @@ function hasExpectedIdentity(args = {}) {
   return Boolean(args.expectedName || args.expectedId);
 }
 
+function stablePreviewValue(value) {
+  if (Array.isArray(value)) return value.map(stablePreviewValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, stablePreviewValue(value[key])])
+      .filter(([, child]) => child !== undefined)
+  );
+}
+
+function previewProofHash(tool, proof = {}) {
+  return createHash("sha256")
+    .update(tool)
+    .update("\n")
+    .update(JSON.stringify(stablePreviewValue(proof)))
+    .digest("hex");
+}
+
+function cleanupPreviewTokens(now = Date.now()) {
+  for (const [token, entry] of previewTokens.entries()) {
+    if (!entry || entry.expiresAt <= now) previewTokens.delete(token);
+  }
+}
+
+function issuePreviewToken(tool, proof = {}) {
+  cleanupPreviewTokens();
+  const token = randomUUID();
+  const expiresAt = Date.now() + previewTokenTtlMs;
+  previewTokens.set(token, {
+    tool,
+    proofHash: previewProofHash(tool, proof),
+    expiresAt
+  });
+  return {
+    previewToken: token,
+    previewTokenExpiresAt: new Date(expiresAt).toISOString()
+  };
+}
+
+function previewWithToken(preview, tool, proof = {}) {
+  if (preview?.dryRun !== true) return preview;
+  return {
+    ...preview,
+    ...issuePreviewToken(tool, proof)
+  };
+}
+
+function consumePreviewToken(tool, proof = {}, token) {
+  cleanupPreviewTokens();
+  if (!token) return { ok: false, reason: "missing" };
+  const entry = previewTokens.get(token);
+  if (!entry) return { ok: false, reason: "not_found_or_expired" };
+  if (entry.tool !== tool || entry.proofHash !== previewProofHash(tool, proof)) {
+    return { ok: false, reason: "mismatch" };
+  }
+  previewTokens.delete(token);
+  return { ok: true };
+}
+
+function previewTokenRequiredResult(preview, tool, proof, token, requiredField) {
+  const result = consumePreviewToken(tool, proof, token);
+  if (result.ok) return null;
+  return {
+    ...preview,
+    dryRun: false,
+    confirmed: true,
+    previewTokenRequired: true,
+    previewTokenStatus: result.reason,
+    [requiredField]: "Run a dry-run preview for this exact operation and pass the returned previewToken with dryRun: false and confirmed: true."
+  };
+}
+
+function batchMutationWarnings(extra = []) {
+  return [partialBatchMutationWarning, ...extra.filter(Boolean)];
+}
+
 function itemAuditSummary(item) {
   const simplified = item?.remotePath !== undefined ? item : simplifyItem(item);
   if (!simplified) return null;
@@ -2388,9 +2979,19 @@ async function auditRecent(args = {}) {
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
-  const limit = args.limit ?? 50;
-  const entries = text.trim()
-    ? text.trim().split("\n").slice(-limit).map((line) => {
+  const limit = clampInteger(args.limit, 50, 1, 500);
+  const since = args.since ? Date.parse(args.since) : null;
+  const until = args.until ? Date.parse(args.until) : null;
+  if (args.since && Number.isNaN(since)) throw new Error("since must be an ISO timestamp.");
+  if (args.until && Number.isNaN(until)) throw new Error("until must be an ISO timestamp.");
+  const pathNeedle = args.pathContains ? String(args.pathContains).toLowerCase() : "";
+  const entryPathText = (entry) => JSON.stringify({
+    target: entry.target,
+    before: entry.before,
+    after: entry.after
+  }).toLowerCase();
+  let entries = text.trim()
+    ? text.trim().split("\n").map((line) => {
         try {
           return JSON.parse(line);
         } catch {
@@ -2398,7 +2999,30 @@ async function auditRecent(args = {}) {
         }
       })
     : [];
-  return { auditPath, count: entries.length, entries };
+  entries = entries.filter((entry) => {
+    if (args.tool && entry.tool !== args.tool) return false;
+    if (args.status && entry.status !== args.status) return false;
+    const timestamp = entry.timestamp ? Date.parse(entry.timestamp) : null;
+    if (since !== null && (!timestamp || timestamp < since)) return false;
+    if (until !== null && (!timestamp || timestamp > until)) return false;
+    if (pathNeedle && !entryPathText(entry).includes(pathNeedle)) return false;
+    return true;
+  });
+  if (args.newestFirst !== false) entries.reverse();
+  entries = entries.slice(0, limit);
+  return {
+    auditPath,
+    count: entries.length,
+    filters: {
+      tool: args.tool || null,
+      status: args.status || null,
+      pathContains: args.pathContains || null,
+      since: args.since || null,
+      until: args.until || null,
+      newestFirst: args.newestFirst !== false
+    },
+    entries
+  };
 }
 
 async function auditExport(args = {}) {
@@ -2474,29 +3098,36 @@ async function uploadSessionTarget(remotePath) {
 
 function simplifyItem(item) {
   if (!item) return item;
+  const source = item.remoteItem ? {
+    ...item.remoteItem,
+    id: item.remoteItem.id || item.id,
+    name: item.remoteItem.name || item.name,
+    webUrl: item.remoteItem.webUrl || item.webUrl,
+    parentReference: item.remoteItem.parentReference || item.parentReference
+  } : item;
   return {
-    id: item.id,
-    name: item.name,
-    remotePath: itemRemotePath(item),
-    path: item.parentReference?.path,
-    webUrl: item.webUrl,
-    size: item.size,
-    createdDateTime: item.createdDateTime,
-    lastModifiedDateTime: item.lastModifiedDateTime,
-    eTag: item.eTag,
-    cTag: item.cTag,
-    deleted: item.deleted,
-    folder: item.folder ? { childCount: item.folder.childCount } : undefined,
-    file: item.file ? { mimeType: item.file.mimeType, hashes: item.file.hashes } : undefined
+    id: source.id,
+    name: source.name,
+    remotePath: itemRemotePath(source),
+    path: source.parentReference?.path,
+    webUrl: source.webUrl,
+    size: source.size,
+    createdDateTime: source.createdDateTime,
+    lastModifiedDateTime: source.lastModifiedDateTime,
+    eTag: source.eTag,
+    cTag: source.cTag,
+    deleted: source.deleted,
+    folder: source.folder ? { childCount: source.folder.childCount } : undefined,
+    file: source.file ? { mimeType: source.file.mimeType, hashes: source.file.hashes } : undefined
   };
 }
 
 function itemRemotePath(item) {
   if (!item?.name) return undefined;
   const parentPath = item.parentReference?.path || "";
-  const rootMarker = "/drive/root:";
-  const parentRemotePath = parentPath.startsWith(rootMarker)
-    ? decodeGraphPath(parentPath.slice(rootMarker.length).replace(/^\/+|\/+$/g, ""))
+  const rootMatch = parentPath.match(/^\/(?:drive|drives\/[^/]+)\/root:(.*)$/);
+  const parentRemotePath = rootMatch
+    ? decodeGraphPath(rootMatch[1].replace(/^\/+|\/+$/g, ""))
     : "";
   return [parentRemotePath, item.name].filter(Boolean).join("/");
 }
@@ -2519,33 +3150,39 @@ async function list(args = {}) {
 }
 
 async function collectPages(firstPath, maxItems, format = "compact", formatter = formatDriveItem) {
-  const items = [];
-  let nextPath = firstPath;
-  let nextLink = null;
-  let deltaLink = null;
-  let truncated = false;
-  const seenPages = new Set();
-  let pagesFetched = 0;
-  const maxPages = Math.max(1, Math.ceil(maxItems / 1) + 100);
-  while (nextPath && items.length < maxItems) {
-    if (seenPages.has(nextPath)) throw new Error(`Microsoft Graph pagination cycle detected at ${safeDisplayPath(nextPath)}.`);
-    if (pagesFetched >= maxPages) throw new Error(`Microsoft Graph pagination exceeded ${maxPages} pages before reaching the item limit.`);
-    seenPages.add(nextPath);
-    pagesFetched += 1;
-    const result = await graph(nextPath);
-    const pageItems = result.value || [];
-    const remaining = maxItems - items.length;
-    const acceptedItems = pageItems.slice(0, remaining);
-    const pageTruncated = pageItems.length > remaining;
-    truncated = truncated || pageTruncated;
-    await cacheItems(acceptedItems, { deltaLink: !pageTruncated ? result["@odata.deltaLink"] || undefined : undefined });
-    items.push(...acceptedItems.map((item) => formatter(item, format)));
-    nextLink = result["@odata.nextLink"] || null;
-    deltaLink = pageTruncated ? null : result["@odata.deltaLink"] || null;
-    nextPath = nextLink && items.length < maxItems ? nextLink : null;
-    truncated = truncated || Boolean(nextLink);
-  }
-  return { items, nextLink, deltaLink, truncated, count: items.length };
+  return await withMetadataCacheBatch(async () => {
+    const items = [];
+    let nextPath = firstPath;
+    let nextLink = null;
+    let deltaLink = null;
+    let truncated = false;
+    const seenPages = new Set();
+    let pagesFetched = 0;
+    const maxPages = Math.max(1, Math.ceil(maxItems / 1) + 100);
+    while (nextPath && items.length < maxItems) {
+      if (seenPages.has(nextPath)) throw new Error(`Microsoft Graph pagination cycle detected at ${safeDisplayPath(nextPath)}.`);
+      if (pagesFetched >= maxPages) throw new Error(`Microsoft Graph pagination exceeded ${maxPages} pages before reaching the item limit.`);
+      seenPages.add(nextPath);
+      pagesFetched += 1;
+      const result = await graph(nextPath);
+      const pageItems = result.value || [];
+      const remaining = maxItems - items.length;
+      const acceptedItems = pageItems.slice(0, remaining);
+      const pageTruncated = pageItems.length > remaining;
+      const pageNextLink = result["@odata.nextLink"] || null;
+      const pageDeltaLink = result["@odata.deltaLink"] || null;
+      await cacheItems(acceptedItems, {
+        deltaLink: !pageTruncated ? pageDeltaLink || undefined : undefined,
+        deltaNextLink: !pageTruncated && pageNextLink && !pageDeltaLink ? pageNextLink : undefined
+      });
+      items.push(...acceptedItems.map((item) => formatter(item, format)));
+      nextLink = pageNextLink;
+      deltaLink = pageTruncated ? null : pageDeltaLink;
+      nextPath = nextLink && items.length < maxItems ? nextLink : null;
+      truncated = truncated || pageTruncated || (Boolean(nextLink) && items.length >= maxItems);
+    }
+    return { items, nextLink, deltaLink, truncated, count: items.length };
+  });
 }
 
 function safeDisplayPath(value = "") {
@@ -2614,125 +3251,127 @@ async function resolveScanRoot(args = {}) {
 }
 
 async function scan(args = {}) {
-  const pageSize = clampInteger(args.pageSize, 200, 1, 200);
-  const maxItems = clampInteger(args.maxItems, 10000, 1, 50000);
-  const maxResults = clampInteger(args.maxResults, 500, 1, 5000);
-  const maxDepth = clampInteger(args.maxDepth, 25, 0, 50);
-  const maxFolders = clampInteger(args.maxFolders, 1000, 1, 10000);
-  const extensionFilter = normalizeExtensions(args.extensions || []);
-  const root = await resolveScanRoot(args);
-  const params = new URLSearchParams();
-  params.set("$top", String(pageSize));
-  params.set("$select", args.select || defaultSelect);
+  return await withMetadataCacheBatch(async () => {
+    const pageSize = clampInteger(args.pageSize, 200, 1, 200);
+    const maxItems = clampInteger(args.maxItems, 10000, 1, 50000);
+    const maxResults = clampInteger(args.maxResults, 500, 1, 5000);
+    const maxDepth = clampInteger(args.maxDepth, 25, 0, 50);
+    const maxFolders = clampInteger(args.maxFolders, 1000, 1, 10000);
+    const extensionFilter = normalizeExtensions(args.extensions || []);
+    const root = args._resolvedRoot || await resolveScanRoot(args);
+    const params = new URLSearchParams();
+    params.set("$top", String(pageSize));
+    params.set("$select", args.select || defaultSelect);
 
-  const queue = [{ id: root.id, name: root.name, remotePath: root.remotePath, depth: 0 }];
-  const results = [];
-  const counters = {
-    itemsScanned: 0,
-    filesScanned: 0,
-    foldersScanned: 0,
-    foldersVisited: 0,
-    matched: 0
-  };
-  let truncatedReason = null;
+    const queue = [{ id: root.id, name: root.name, remotePath: root.remotePath, depth: 0 }];
+    const results = [];
+    const counters = {
+      itemsScanned: 0,
+      filesScanned: 0,
+      foldersScanned: 0,
+      foldersVisited: 0,
+      matched: 0
+    };
+    let truncatedReason = null;
 
-  while (queue.length) {
-    if (counters.itemsScanned >= maxItems) {
-      truncatedReason = "maxItems";
-      break;
-    }
-    if (counters.foldersVisited >= maxFolders) {
-      truncatedReason = "maxFolders";
-      break;
-    }
-
-    const folder = queue.shift();
-    counters.foldersVisited += 1;
-    let nextPath = `/me/drive/items/${encodeURIComponent(folder.id)}/children?${params.toString()}`;
-    const seenPages = new Set();
-    let pagesFetched = 0;
-    const maxPagesPerFolder = Math.max(1, maxItems + 100);
-
-    while (nextPath) {
+    while (queue.length) {
       if (counters.itemsScanned >= maxItems) {
         truncatedReason = "maxItems";
         break;
       }
-      if (seenPages.has(nextPath)) {
-        throw new Error(`Microsoft Graph pagination cycle detected while scanning ${folder.remotePath || folder.name || folder.id}.`);
+      if (counters.foldersVisited >= maxFolders) {
+        truncatedReason = "maxFolders";
+        break;
       }
-      if (pagesFetched >= maxPagesPerFolder) {
-        throw new Error(`Microsoft Graph pagination exceeded ${maxPagesPerFolder} pages while scanning ${folder.remotePath || folder.name || folder.id}.`);
-      }
-      seenPages.add(nextPath);
-      pagesFetched += 1;
-      const page = await graph(nextPath);
-      const cacheableItems = [];
-      for (const item of page.value || []) {
+
+      const folder = queue.shift();
+      counters.foldersVisited += 1;
+      let nextPath = `/me/drive/items/${encodeURIComponent(folder.id)}/children?${params.toString()}`;
+      const seenPages = new Set();
+      let pagesFetched = 0;
+      const maxPagesPerFolder = Math.max(1, maxItems + 100);
+
+      while (nextPath) {
         if (counters.itemsScanned >= maxItems) {
           truncatedReason = "maxItems";
           break;
         }
-        cacheableItems.push(item);
-        counters.itemsScanned += 1;
-        if (item.file) counters.filesScanned += 1;
-        if (item.folder) counters.foldersScanned += 1;
-        if (typeof args.onItem === "function") await args.onItem(item);
-
-        if (scanItemMatches(item, args, extensionFilter)) {
-          counters.matched += 1;
-          if (results.length < maxResults) {
-            results.push(formatDriveItem(item, args.format));
-          }
-          if (args.stopAfterResults === true && results.length >= maxResults) {
-            truncatedReason = "maxResults";
+        if (seenPages.has(nextPath)) {
+          throw new Error(`Microsoft Graph pagination cycle detected while scanning ${folder.remotePath || folder.name || folder.id}.`);
+        }
+        if (pagesFetched >= maxPagesPerFolder) {
+          throw new Error(`Microsoft Graph pagination exceeded ${maxPagesPerFolder} pages while scanning ${folder.remotePath || folder.name || folder.id}.`);
+        }
+        seenPages.add(nextPath);
+        pagesFetched += 1;
+        const page = await graph(nextPath);
+        const cacheableItems = [];
+        for (const item of page.value || []) {
+          if (counters.itemsScanned >= maxItems) {
+            truncatedReason = "maxItems";
             break;
           }
-        }
+          cacheableItems.push(item);
+          counters.itemsScanned += 1;
+          if (item.file) counters.filesScanned += 1;
+          if (item.folder) counters.foldersScanned += 1;
+          if (typeof args.onItem === "function") await args.onItem(item);
 
-        if (item.folder && folder.depth < maxDepth) {
-          queue.push({
-            id: item.id,
-            name: item.name,
-            remotePath: itemRemotePath(item),
-            depth: folder.depth + 1
-          });
+          if (scanItemMatches(item, args, extensionFilter)) {
+            counters.matched += 1;
+            if (results.length < maxResults) {
+              results.push(formatDriveItem(item, args.format));
+            }
+            if (args.stopAfterResults === true && results.length >= maxResults) {
+              truncatedReason = "maxResults";
+              break;
+            }
+          }
+
+          if (item.folder && folder.depth < maxDepth) {
+            queue.push({
+              id: item.id,
+              name: item.name,
+              remotePath: itemRemotePath(item),
+              depth: folder.depth + 1
+            });
+          }
         }
+        await cacheItems(cacheableItems);
+        if (truncatedReason) break;
+        nextPath = page["@odata.nextLink"] || null;
       }
-      await cacheItems(cacheableItems);
+
       if (truncatedReason) break;
-      nextPath = page["@odata.nextLink"] || null;
     }
 
-    if (truncatedReason) break;
-  }
-
-  if (!truncatedReason && queue.length) truncatedReason = "queueRemaining";
-  return {
-    root,
-    filters: {
-      nameContains: args.nameContains || null,
-      extensions: [...extensionFilter],
-      includeFiles: args.includeFiles !== false,
-      includeFolders: args.includeFolders !== false,
-      maxDepth,
-      maxItems,
-      maxFolders,
-      maxResults
-    },
-    summary: {
-      ...counters,
-      returned: results.length,
-      resultTruncated: counters.matched > results.length,
-      traversalTruncated: Boolean(truncatedReason),
-      truncatedReason,
-      foldersQueued: queue.length
-    },
-    items: results,
-    note: truncatedReason
-      ? `Scan stopped at ${truncatedReason}. Increase the relevant cap or narrow the scan.`
-      : "Recursive scan completed within the requested caps."
-  };
+    if (!truncatedReason && queue.length) truncatedReason = "queueRemaining";
+    return {
+      root,
+      filters: {
+        nameContains: args.nameContains || null,
+        extensions: [...extensionFilter],
+        includeFiles: args.includeFiles !== false,
+        includeFolders: args.includeFolders !== false,
+        maxDepth,
+        maxItems,
+        maxFolders,
+        maxResults
+      },
+      summary: {
+        ...counters,
+        returned: results.length,
+        resultTruncated: counters.matched > results.length,
+        traversalTruncated: Boolean(truncatedReason),
+        truncatedReason,
+        foldersQueued: queue.length
+      },
+      items: results,
+      note: truncatedReason
+        ? `Scan stopped at ${truncatedReason}. Increase the relevant cap or narrow the scan.`
+        : "Recursive scan completed within the requested caps."
+    };
+  });
 }
 
 async function search(args = {}) {
@@ -2757,7 +3396,8 @@ const findStopWords = new Set([
   "locate", "me", "my", "named", "of", "on", "or", "please", "show", "the", "to", "where", "with"
 ]);
 const findGenericWords = new Set([
-  "called", "file", "files", "folder", "folders", "named", "document", "documents", "summary"
+  "called", "file", "files", "folder", "folders", "named", "document", "documents", "summary",
+  "codex", "onedrive", "plugin", "test"
 ]);
 const findKindHints = [
   {
@@ -2912,6 +3552,14 @@ function scoreFindCandidate(item, context = {}) {
   } else if (context.source === "cache") {
     score += 10;
     reasons.push("metadata cache");
+  } else if (context.source === "metadataConfirm") {
+    score += 12;
+    reasons.push("metadata cache confirmed live");
+  } else if (context.source === "contentIndex") {
+    score += Math.min(55, Math.max(20, context.contentScore || 20));
+    matchedTokens += context.contentMatchedTokens || 0;
+    reasons.push("indexed content");
+    if (context.contentReason) reasons.push(context.contentReason);
   }
 
   if (queryText && nameText === queryText) {
@@ -2959,7 +3607,11 @@ function scoreFindCandidate(item, context = {}) {
   }
 
   if (findItemType(item) === "folder") score -= 15;
-  if (item.remotePath && context.folderHints?.some((hint) => item.remotePath.toLowerCase().startsWith(`${hint.toLowerCase()}/`))) {
+  if (item.remotePath && context.scoringFolderHints?.some((hint) => {
+    const cleanHint = cleanPath(hint).toLowerCase();
+    const cleanItemPath = cleanPath(item.remotePath).toLowerCase();
+    return cleanHint && (cleanItemPath === cleanHint || cleanItemPath.startsWith(`${cleanHint}/`));
+  })) {
     score += 8;
     reasons.push("folder hint");
   }
@@ -2989,6 +3641,35 @@ function defaultFindFolderHints(query = "") {
   return [...new Set(hints)];
 }
 
+function normalizeFolderHintKey(hint = "") {
+  return cleanPath(hint).toLowerCase();
+}
+
+function pruneFolderHints(hints = []) {
+  const unique = [];
+  const seen = new Set();
+  for (const hint of hints) {
+    const clean = cleanPath(hint || "");
+    const key = normalizeFolderHintKey(clean);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(clean);
+  }
+  const rootIncluded = unique.includes("");
+  const nonRoot = unique.filter((hint) => hint !== "");
+  const pruned = [];
+  for (const hint of nonRoot) {
+    const key = normalizeFolderHintKey(hint);
+    const covered = pruned.some((existing) => {
+      const existingKey = normalizeFolderHintKey(existing);
+      return existingKey && (key === existingKey || key.startsWith(`${existingKey}/`));
+    });
+    if (!covered) pruned.push(hint);
+  }
+  if (rootIncluded) pruned.push("");
+  return pruned;
+}
+
 function findScanNeedle(query = "") {
   const tokens = findImportantTokens(query)
     .filter((token) => !["deck", "presentation", "powerpoint", "spreadsheet", "sheet", "pdf", "doc", "word"].includes(token))
@@ -3008,6 +3689,12 @@ function addFindCandidate(candidates, item, context) {
   if (!shouldIncludeFindItem(item, context.args, context.extensionInfo)) return;
   const key = findCandidateKey(item);
   const scored = scoreFindCandidate(item, context);
+  const queryTokens = findImportantTokens(context.query);
+  const contentCoverage = queryTokens.length && context.contentMatchedTokens
+    ? context.contentMatchedTokens / queryTokens.length
+    : 0;
+  const strongContentIndexMatch = context.source === "contentIndex"
+    && (context.contentExactPhrase === true || (context.contentMatchedTokens || 0) >= 2 || contentCoverage >= 0.5);
   const hasQueryRelevance = scored.matchedTokens > 0 || scored.reasons.some((reason) =>
     reason.startsWith("exact filename")
     || reason.startsWith("filename contains")
@@ -3015,7 +3702,7 @@ function addFindCandidate(candidates, item, context) {
     || reason.startsWith("date match")
     || reason.startsWith("requested extension")
     || reason.startsWith("likely file type")
-  );
+  ) || strongContentIndexMatch;
   if (context.source !== "exactPath" && !hasQueryRelevance) return;
   const existing = candidates.get(key);
   if (!existing || scored.score > existing.score) {
@@ -3023,11 +3710,13 @@ function addFindCandidate(candidates, item, context) {
       item,
       score: scored.score,
       reasons: scored.reasons,
+      snippets: context.snippet ? [context.snippet] : [],
       sources: [{ source: context.source, term: context.term, folder: context.folder }]
     });
   } else {
     existing.sources.push({ source: context.source, term: context.term, folder: context.folder });
     existing.reasons = [...new Set([...existing.reasons, ...scored.reasons])].slice(0, 6);
+    if (context.snippet && !existing.snippets.includes(context.snippet)) existing.snippets.push(context.snippet);
   }
 }
 
@@ -3039,10 +3728,78 @@ function rankedFindCandidates(candidates) {
 }
 
 function candidateHasLiveSource(candidate) {
-  return candidate.sources.some((source) => source.source && source.source !== "cache");
+  return candidate.sources.some((source) => ["exactPath", "search", "scan", "metadataConfirm"].includes(source.source));
+}
+
+function cacheConfirmationEligible(candidate, query = "") {
+  const normalizedQuery = normalizeFindText(query);
+  const nameText = normalizeFindText(candidate.item?.name || "");
+  const pathText = normalizeFindText(candidate.item?.remotePath || candidate.item?.path || "");
+  const queryLooksPathLike = String(query).includes("/");
+  if (normalizedQuery && nameText === normalizedQuery) return true;
+  if (queryLooksPathLike && normalizedQuery && pathText.includes(normalizedQuery)) return true;
+  const extension = findItemExtension(candidate.item);
+  return Boolean(extension && normalizedQuery.endsWith(extension) && nameText.includes(normalizedQuery));
+}
+
+async function confirmCachedFindCandidates(candidates, ranked, context = {}) {
+  const maxConfirmations = clampInteger(context.args?.cacheConfirmMaxItems, 5, 1, 20);
+  const minScore = clampInteger(context.args?.cacheConfirmMinScore, 60, 0, 200);
+  const targets = ranked
+    .filter((candidate) => !candidateHasLiveSource(candidate))
+    .filter((candidate) => candidate.item?.id && candidate.score >= minScore)
+    .filter((candidate) => candidate.sources.some((source) => source.source === "cache"))
+    .filter((candidate) => cacheConfirmationEligible(candidate, context.query))
+    .slice(0, maxConfirmations);
+  if (!targets.length) return { attempted: 0, confirmed: 0, errors: 0 };
+  let confirmed = 0;
+  let errors = 0;
+  let confirmedItems = [];
+  try {
+    const result = await batchGetInfo({
+      items: targets.map((candidate) => ({ itemId: candidate.item.id })),
+      format: "full"
+    });
+    for (const item of result.items || []) {
+      if (item.error) {
+        errors += 1;
+        continue;
+      }
+      confirmedItems.push(item);
+    }
+  } catch {
+    for (const candidate of targets) {
+      try {
+        confirmedItems.push(simplifyItem(await getRawInfo({ itemId: candidate.item.id })));
+      } catch {
+        errors += 1;
+      }
+    }
+  }
+  for (const item of confirmedItems) {
+    if (item.error) {
+      errors += 1;
+      continue;
+    }
+    confirmed += 1;
+    addFindCandidate(candidates, item, {
+      args: context.args,
+      query: context.query,
+      source: "metadataConfirm",
+      term: "batch-get-info",
+      extensionInfo: context.extensionInfo,
+      scoringFolderHints: context.scoringFolderHints
+    });
+  }
+  return { attempted: targets.length, confirmed, errors };
+}
+
+function scanRootKey(root = {}, fallbackFolder = "") {
+  return root.id || normalizeFolderHintKey(root.remotePath || fallbackFolder);
 }
 
 async function find(args = {}) {
+  const startedAt = Date.now();
   const query = String(args.query || "").trim();
   if (!query) throw new Error("query is required.");
 
@@ -3050,11 +3807,18 @@ async function find(args = {}) {
   const maxSearchTerms = Math.min(args.maxSearchTerms ?? 8, 12);
   const searchTerms = buildFindSearchTerms(query, maxSearchTerms);
   const extensionInfo = inferFindExtensions(query, args.extensions || []);
-  const folderHints = [...new Set([...(args.folderHints || []), ...defaultFindFolderHints(query), ""])];
+  const scoringFolderHints = pruneFolderHints(args.folderHints || []);
+  const folderHints = pruneFolderHints([...scoringFolderHints, ...defaultFindFolderHints(query), ""]);
   const candidates = new Map();
   const searchRuns = [];
   const scanRuns = [];
   let cacheCandidateCount = 0;
+  let contentIndexCandidateCount = 0;
+  let contentIndexDurationMs = 0;
+  let liveSearchDurationMs = 0;
+  let scanDurationMs = 0;
+  let cacheConfirmDurationMs = 0;
+  let cacheConfirmations = { attempted: 0, confirmed: 0, errors: 0 };
 
   if (args.useCache !== false) {
     const cacheList = await cachedItems();
@@ -3065,10 +3829,36 @@ async function find(args = {}) {
         source: "cache",
         term: "metadata-cache",
         extensionInfo,
-        folderHints
+        scoringFolderHints
       });
     }
     cacheCandidateCount = cacheList.length;
+  }
+
+  if (args.useContentIndex !== false && (args.contentMaxResults ?? 10) > 0) {
+    const contentStartedAt = Date.now();
+    const indexed = await contentSearch({
+      query,
+      maxResults: clampInteger(args.contentMaxResults, 10, 0, 100) || 1,
+      format: "full"
+    });
+    contentIndexDurationMs += elapsedMs(contentStartedAt);
+    contentIndexCandidateCount = indexed.items?.length || 0;
+    for (const match of indexed.items || []) {
+      addFindCandidate(candidates, match, {
+        args,
+        query,
+        source: "contentIndex",
+        term: "content-index",
+        extensionInfo,
+        scoringFolderHints,
+        contentScore: match.score,
+        contentMatchedTokens: match.matchedTokens || 1,
+        contentExactPhrase: match.reasons?.includes("indexed content phrase"),
+        contentReason: match.reasons?.[0],
+        snippet: match.snippet
+      });
+    }
   }
 
   if (query.includes("/")) {
@@ -3079,7 +3869,7 @@ async function find(args = {}) {
         query,
         source: "exactPath",
         extensionInfo,
-        folderHints
+        scoringFolderHints
       });
     } catch (error) {
       searchRuns.push({ strategy: "exactPath", path: query, error: safeToolErrorMessage(error) });
@@ -3088,12 +3878,14 @@ async function find(args = {}) {
 
   for (const term of searchTerms) {
     try {
+      const searchStartedAt = Date.now();
       const result = await searchAll({
         query: term,
         pageSize: args.searchPageSize ?? 50,
         maxItems: args.searchMaxItemsPerTerm ?? 100,
         format: "full"
       });
+      liveSearchDurationMs += elapsedMs(searchStartedAt);
       searchRuns.push({ term, count: result.count, truncated: result.truncated });
       for (const item of result.items || []) {
         addFindCandidate(candidates, item, {
@@ -3102,7 +3894,7 @@ async function find(args = {}) {
           source: "search",
           term,
           extensionInfo,
-          folderHints
+          scoringFolderHints
         });
       }
     } catch (error) {
@@ -3111,11 +3903,23 @@ async function find(args = {}) {
   }
 
   let ranked = rankedFindCandidates(candidates);
+  if (args.confirmCacheCandidates !== false) {
+    const confirmStartedAt = Date.now();
+    cacheConfirmations = await confirmCachedFindCandidates(candidates, ranked, {
+      args,
+      query,
+      extensionInfo,
+      scoringFolderHints
+    });
+    cacheConfirmDurationMs += elapsedMs(confirmStartedAt);
+    ranked = rankedFindCandidates(candidates);
+  }
   const bestLiveScore = ranked.find(candidateHasLiveSource)?.score || 0;
   const shouldScan = args.scanFallback !== false && bestLiveScore < (args.minConfidenceForSearchOnly ?? 78);
 
   if (shouldScan) {
     const scanNeedle = findScanNeedle(query);
+    const scanConcurrency = clampInteger(args.scanConcurrency, 2, 1, 4);
     const scanPlans = [
       { nameContains: scanNeedle, extensions: [...extensionInfo.effectiveForScan], reason: "targeted" }
     ];
@@ -3129,23 +3933,60 @@ async function find(args = {}) {
     for (const plan of scanPlans) {
       let remainingItems = Math.min(args.scanMaxItems ?? 1500, 10000);
       let remainingFolders = Math.min(args.scanMaxFolders ?? 250, 2000);
-      for (const folder of folderHints) {
-        if (remainingItems <= 0 || remainingFolders <= 0) break;
-        try {
-          const result = await scan({
-            path: folder,
-            nameContains: plan.nameContains,
-            extensions: plan.extensions,
-            includeFiles: true,
-            includeFolders: args.includeFolders === true,
-            maxItems: remainingItems,
-            maxFolders: remainingFolders,
-            maxDepth: args.scanMaxDepth ?? 20,
-            maxResults: Math.max(maxResults * 2, 20),
-            stopAfterResults: true,
-            format: "full"
-          });
-          scanRuns.push({ folder: folder || "root", reason: plan.reason, nameContains: plan.nameContains || null, extensions: plan.extensions, summary: result.summary });
+      const scannedFolderKeys = new Set();
+      let folderIndex = 0;
+      while (folderIndex < folderHints.length && remainingItems > 0 && remainingFolders > 0) {
+        const targetBatch = [];
+        while (folderIndex < folderHints.length && targetBatch.length < scanConcurrency) {
+          const folder = folderHints[folderIndex];
+          folderIndex += 1;
+          try {
+            const root = await resolveScanRoot(folder ? { path: folder } : {});
+            const key = scanRootKey(root, folder);
+            if (scannedFolderKeys.has(key)) {
+              scanRuns.push({ folder: folder || "root", reason: plan.reason, skipped: "duplicate-root", root: { id: root.id, remotePath: root.remotePath } });
+              continue;
+            }
+            scannedFolderKeys.add(key);
+            targetBatch.push({ folder, root });
+          } catch (error) {
+            scanRuns.push({ folder: folder || "root", reason: plan.reason, error: safeToolErrorMessage(error) });
+          }
+        }
+        if (!targetBatch.length) continue;
+        const perScanMaxItems = Math.max(1, Math.ceil(remainingItems / targetBatch.length));
+        const perScanMaxFolders = Math.max(1, Math.ceil(remainingFolders / targetBatch.length));
+        const scanStartedAt = Date.now();
+        const batchResults = await mapWithConcurrency(targetBatch, scanConcurrency, async (target) => {
+          try {
+            const result = await scan({
+              path: target.folder,
+              _resolvedRoot: target.root,
+              nameContains: plan.nameContains,
+              extensions: plan.extensions,
+              includeFiles: true,
+              includeFolders: args.includeFolders === true,
+              maxItems: perScanMaxItems,
+              maxFolders: perScanMaxFolders,
+              maxDepth: args.scanMaxDepth ?? 20,
+              maxResults: Math.max(maxResults * 2, 20),
+              stopAfterResults: true,
+              format: "full"
+            });
+            return { target, result };
+          } catch (error) {
+            return { target, error };
+          }
+        });
+        scanDurationMs += elapsedMs(scanStartedAt);
+        for (const entry of batchResults) {
+          const folderLabel = entry.target.folder || "root";
+          if (entry.error) {
+            scanRuns.push({ folder: folderLabel, reason: plan.reason, error: safeToolErrorMessage(entry.error) });
+            continue;
+          }
+          const result = entry.result;
+          scanRuns.push({ folder: folderLabel, reason: plan.reason, nameContains: plan.nameContains || null, extensions: plan.extensions, summary: result.summary });
           remainingItems -= result.summary.itemsScanned || 0;
           remainingFolders -= result.summary.foldersVisited || 0;
           for (const item of result.items || []) {
@@ -3153,16 +3994,14 @@ async function find(args = {}) {
               args,
               query,
               source: "scan",
-              folder: folder || "root",
+              folder: folderLabel,
               extensionInfo,
-              folderHints
+              scoringFolderHints
             });
           }
-          ranked = rankedFindCandidates(candidates);
-          if ((ranked[0]?.score || 0) >= (args.minConfidenceForSearchOnly ?? 78) && ranked.length >= maxResults) break;
-        } catch (error) {
-          scanRuns.push({ folder: folder || "root", reason: plan.reason, error: safeToolErrorMessage(error) });
         }
+        ranked = rankedFindCandidates(candidates);
+        if ((ranked[0]?.score || 0) >= (args.minConfidenceForSearchOnly ?? 78) && ranked.length >= maxResults) break;
       }
       ranked = rankedFindCandidates(candidates);
       if (ranked.length > 0) break;
@@ -3189,9 +4028,18 @@ async function find(args = {}) {
       bestScore: ranked[0]?.score || 0,
       usedScanFallback: shouldScan,
       scanRuns: scanRuns.length,
-      localIndexUsed: false,
+      localIndexUsed: contentIndexCandidateCount > 0,
+      contentIndexCandidates: contentIndexCandidateCount,
       persistentCacheUsed: cacheCandidateCount > 0,
-      cacheCandidates: cacheCandidateCount
+      cacheCandidates: cacheCandidateCount,
+      durationMs: elapsedMs(startedAt),
+      contentIndexDurationMs,
+      liveSearchDurationMs,
+      scanDurationMs,
+      cacheConfirmDurationMs,
+      cacheConfirmations,
+      graphSearchCalls: searchRuns.filter((run) => run.term).length,
+      scanAttempts: scanRuns.length
     },
     searchRuns,
     scanRuns,
@@ -3199,11 +4047,12 @@ async function find(args = {}) {
       ...formatSimplifiedItem(candidate.item, args.format),
       score: candidate.score,
       reasons: candidate.reasons,
+      snippets: candidate.snippets?.slice(0, 2),
       sources: candidate.sources.slice(0, 5)
     })),
     note: shouldScan
-      ? "Used metadata cache when available, live Graph searches, then bounded remote recursive scan fallback."
-      : "Search confidence was high enough to skip recursive fallback. Used metadata cache when available."
+      ? "Used metadata cache and local content index when available, live Graph searches, then bounded remote recursive scan fallback."
+      : "Search confidence was high enough to skip recursive fallback. Used metadata cache and local content index when available."
   };
 }
 
@@ -3219,11 +4068,11 @@ function broadFindFolderHints(query = "", userHints = []) {
     "Microsoft Copilot Chat Files",
     ""
   ];
-  return [...new Set([
+  return pruneFolderHints([
     ...(userHints || []),
     ...defaultFindFolderHints(query),
     ...common
-  ].filter((hint) => hint !== undefined && hint !== null))];
+  ].filter((hint) => hint !== undefined && hint !== null));
 }
 
 async function findAll(args = {}) {
@@ -3240,14 +4089,14 @@ async function findAll(args = {}) {
     scanMaxDepth: Math.min(args.scanMaxDepth ?? 25, 50),
     searchPageSize: Math.min(args.searchPageSize ?? 100, 200),
     searchMaxItemsPerTerm: Math.min(args.searchMaxItemsPerTerm ?? 250, 1000),
-    minConfidenceForSearchOnly: 101
+    minConfidenceForSearchOnly: args.minConfidenceForSearchOnly ?? 78
   });
   return {
     ...result,
     strategy: "broad-cache-assisted-remote-first",
     folderPlan: broadFindFolderHints(query, args.folderHints || []).map((folder) => folder || "root"),
-    note: result.summary?.persistentCacheUsed
-      ? "Used metadata cache, live Graph results, common folders, and bounded remote recursive scan fallback as needed."
+    note: result.summary?.persistentCacheUsed || result.summary?.localIndexUsed
+      ? "Used metadata cache and local content index when available, live Graph results, common folders, and bounded remote recursive scan fallback as needed."
       : "Searched live Graph results and common folders first, then used bounded remote recursive scan fallback as needed. No local index was used."
   };
 }
@@ -3291,36 +4140,57 @@ async function delta(args = {}) {
 }
 
 async function cacheRefresh(args = {}) {
+  const startedAt = Date.now();
   const existing = await loadMetadataCache();
+  const settings = pluginSettings();
   const mode = args.mode || "auto";
+  const progress = [];
+  const addProgress = (stage, details = {}) => {
+    progress.push({ stage, elapsedMs: elapsedMs(startedAt), ...details });
+  };
   const requestedTarget = args.itemId
     ? `itemId:${args.itemId}`
     : (resolvePresetPath(args) || "root");
   const cachedTarget = existing.scanRoot?.target || "root";
   const targetMatchesCache = requestedTarget === cachedTarget;
-  if ((mode === "delta" || mode === "auto") && existing.deltaLink && targetMatchesCache) {
+  if ((mode === "delta" || mode === "auto") && settings.deltaSyncEnabled && (existing.deltaNextLink || existing.deltaLink) && targetMatchesCache) {
+    const continuingNextLink = Boolean(existing.deltaNextLink);
+    addProgress(continuingNextLink ? "delta-resume-nextLink" : "delta-start", {
+      cursor: continuingNextLink ? "deltaNextLink" : "deltaLink"
+    });
     const result = await delta({
-      deltaLink: existing.deltaLink,
+      ...(continuingNextLink ? { nextLink: existing.deltaNextLink } : { deltaLink: existing.deltaLink }),
       pageSize: clampInteger(args.pageSize, 200, 1, 200),
       maxItems: clampInteger(args.maxItems, 10000, 1, 50000),
       format: "full"
+    });
+    addProgress(result.deltaLink ? "delta-complete" : "delta-incomplete", {
+      count: result.count,
+      hasNextLink: Boolean(result.nextLink),
+      hasDeltaLink: Boolean(result.deltaLink)
     });
     return {
       mode: "delta",
       result,
       cache: await syncStatus(),
+      progress,
+      durationMs: elapsedMs(startedAt),
       note: result.deltaLink ? "Applied delta changes and stored the latest deltaLink." : "Delta scan is incomplete; run again with nextLink before treating cache as fresh."
     };
   }
 
   if (mode === "delta") {
-    if (!existing.deltaLink) {
-      throw new Error("No cached deltaLink exists yet. Run onedrive_cache_refresh with mode: scan or auto first.");
+    if (!settings.deltaSyncEnabled) {
+      throw new Error("Delta sync is disabled by configuration.");
+    }
+    if (!existing.deltaLink && !existing.deltaNextLink) {
+      throw new Error("No cached deltaLink or deltaNextLink exists yet. Run onedrive_cache_refresh with mode: scan or auto first.");
     }
     throw new Error(`Cached deltaLink is for ${cachedTarget}, not requested target ${requestedTarget}. Run onedrive_cache_refresh with mode: scan for this target.`);
   }
 
-  await clearMetadataCache();
+  if (args.replaceCache === true) await clearMetadataCache();
+  addProgress("scan-start", { target: requestedTarget, replaceCache: args.replaceCache === true });
   const result = await scan({
     ...args,
     format: "full",
@@ -3328,31 +4198,64 @@ async function cacheRefresh(args = {}) {
     includeFolders: args.includeFolders !== false,
     maxItems: clampInteger(args.maxItems, 10000, 1, 50000),
     maxFolders: clampInteger(args.maxFolders, 2000, 1, 10000),
-    maxDepth: clampInteger(args.maxDepth, 25, 0, 50)
+    maxDepth: clampInteger(args.maxDepth, settings.maxScanDepth, 0, 50)
+  });
+  addProgress("scan-complete", {
+    itemsScanned: result.summary?.itemsScanned,
+    foldersVisited: result.summary?.foldersVisited,
+    traversalTruncated: result.summary?.traversalTruncated
   });
   await cacheItems([], { scanRoot: result.root });
 
   try {
-    const deltaResult = await delta({
-      ...args,
-      pageSize: clampInteger(args.pageSize, 200, 1, 200),
-      maxItems: clampInteger(args.maxItems, 10000, 1, 50000),
-      format: "full"
-    });
-    return {
-      mode: "scan+delta",
-      scan: result,
-      delta: { count: deltaResult.count, deltaLink: deltaResult.deltaLink, nextLink: deltaResult.nextLink },
-      cache: await syncStatus(),
-      note: "Rebuilt the metadata cache from a bounded scan and attempted to store a fresh deltaLink."
-    };
-  } catch (error) {
+    if (settings.deltaSyncEnabled) {
+      addProgress("delta-prime-start");
+      const deltaResult = await delta({
+        ...args,
+        pageSize: clampInteger(args.pageSize, 200, 1, 200),
+        maxItems: clampInteger(args.maxItems, 10000, 1, 50000),
+        format: "full"
+      });
+      const deltaComplete = Boolean(deltaResult.deltaLink);
+      addProgress(deltaComplete ? "delta-prime-complete" : "delta-prime-incomplete", {
+        count: deltaResult.count,
+        hasNextLink: Boolean(deltaResult.nextLink),
+        hasDeltaLink: Boolean(deltaResult.deltaLink)
+      });
+      return {
+        mode,
+        effectiveMode: "scan",
+        scan: result,
+        deltaRefresh: { attempted: true, complete: deltaComplete, count: deltaResult.count, deltaLink: deltaResult.deltaLink, nextLink: deltaResult.nextLink },
+        cache: await syncStatus(),
+        progress,
+        durationMs: elapsedMs(startedAt),
+        note: deltaComplete
+          ? `${args.replaceCache === true ? "Rebuilt" : "Merged"} the metadata cache from a bounded scan and stored a fresh deltaLink.`
+          : `${args.replaceCache === true ? "Rebuilt" : "Merged"} the metadata cache from a bounded scan. Delta refresh returned nextLink but no final deltaLink yet.`
+      };
+    }
     return {
       mode: "scan",
+      effectiveMode: "scan",
       scan: result,
       cache: await syncStatus(),
+      progress,
+      durationMs: elapsedMs(startedAt),
+      note: `${args.replaceCache === true ? "Rebuilt" : "Merged"} the metadata cache from a bounded scan. Delta sync is disabled by configuration.`
+    };
+  } catch (error) {
+    addProgress("delta-prime-error", { error: safeToolErrorMessage(error) });
+    return {
+      mode: "scan",
+      effectiveMode: "scan",
+      scan: result,
+      cache: await syncStatus(),
+      deltaRefresh: { attempted: true, complete: false },
       deltaError: safeToolErrorMessage(error),
-      note: "Rebuilt the metadata cache from a bounded scan, but could not get a fresh deltaLink."
+      progress,
+      durationMs: elapsedMs(startedAt),
+      note: `${args.replaceCache === true ? "Rebuilt" : "Merged"} the metadata cache from a bounded scan, but could not get a fresh deltaLink.`
     };
   }
 }
@@ -3466,12 +4369,14 @@ async function batchDownload(args = {}) {
 
 async function batchDelete(args = {}) {
   const items = args.items || [];
+  const warnings = batchMutationWarnings();
   if (args.dryRun === false) {
     if (args.confirmed !== true) {
       return {
         dryRun: false,
         confirmed: false,
         count: items.length,
+        warnings,
         requiredToDelete: "Set dryRun: false and confirmed: true after explicit user confirmation."
       };
     }
@@ -3481,6 +4386,7 @@ async function batchDelete(args = {}) {
         dryRun: false,
         confirmed: true,
         count: items.length,
+        warnings,
         requiredToDelete: "Provide expectedName or expectedId for every item in a live batch delete.",
         missingExpectedCount: missingExpected.length
       };
@@ -3505,20 +4411,35 @@ async function batchDelete(args = {}) {
       dryRun: args.dryRun !== false,
       confirmed: args.confirmed === true,
       count: items.length,
+      warnings,
       preflightFailed: true,
       errors: preflightErrors,
       requiredToDelete: "Fix every preflight error before running a batch delete."
     };
   }
+  const previewProof = {
+    items: preflight.map((entry) => ({ id: entry.rawItem.id, name: entry.rawItem.name })),
+    operation: "batch-delete"
+  };
 
   if (args.dryRun !== false) {
     return {
       dryRun: true,
       confirmed: args.confirmed === true,
       count: preflight.length,
+      warnings,
+      ...issuePreviewToken("onedrive_batch_delete", previewProof),
       results: preflight.map((entry) => ({ wouldDelete: entry.item }))
     };
   }
+  const previewTokenRequired = previewTokenRequiredResult(
+    { dryRun: false, confirmed: true, count: preflight.length, warnings, results: preflight.map((entry) => ({ wouldDelete: entry.item })) },
+    "onedrive_batch_delete",
+    previewProof,
+    args.previewToken,
+    "requiredToDelete"
+  );
+  if (previewTokenRequired) return previewTokenRequired;
 
   const results = [];
   for (const [index, entry] of preflight.entries()) {
@@ -3531,6 +4452,7 @@ async function batchDelete(args = {}) {
         dryRun: false,
         confirmed: true,
         count: preflight.length,
+        warnings,
         failed: true,
         failedIndex: index,
         error: safeToolErrorMessage(error),
@@ -3551,7 +4473,7 @@ async function batchDelete(args = {}) {
     targets: preflight.map((entry) => itemAuditSummary(entry.rawItem)),
     results: results.map((result) => ({ deleted: itemAuditSummary(result.deleted) }))
   });
-  return { dryRun: false, confirmed: true, count: results.length, results };
+  return { dryRun: false, confirmed: true, count: results.length, warnings, results };
 }
 
 async function getRawInfo(args = {}) {
@@ -3591,15 +4513,31 @@ function compactIdentity(identity) {
 
 function simplifyPermission(permission, format = "compact") {
   if (format === "full") return permission;
+  const roles = new Set(permission.roles || []);
+  const permissionKind = roles.has("owner")
+    ? "owner"
+    : permission.inheritedFrom
+      ? "inherited"
+      : permission.link?.scope === "anonymous"
+        ? "anonymous_link"
+        : permission.link
+          ? "sharing_link"
+          : permission.invitation
+            ? "invitation"
+            : "direct";
+  const revocable = permissionKind !== "owner" && permissionKind !== "inherited";
+  const link = permission.link && (permission.link.type || permission.link.scope) ? {
+    type: permission.link.type,
+    scope: permission.link.scope,
+    webUrl: permission.link.webUrl,
+    preventsDownload: permission.link.preventsDownload
+  } : undefined;
   return {
     id: permission.id,
     roles: permission.roles,
-    link: permission.link ? {
-      type: permission.link.type,
-      scope: permission.link.scope,
-      webUrl: permission.link.webUrl,
-      preventsDownload: permission.link.preventsDownload
-    } : undefined,
+    permissionKind,
+    revocable,
+    link,
     grantedTo: compactIdentity(permission.grantedTo),
     grantedToV2: compactIdentity(permission.grantedToV2),
     grantedToIdentities: permission.grantedToIdentities?.map(compactIdentity),
@@ -3636,10 +4574,19 @@ function permissionKey(permission = {}) {
 
 function isExplicitSharingPermission(permission = {}) {
   if (permission.inheritedFrom) return false;
-  if (permission.link || permission.invitation) return true;
+  if (permission.permissionKind === "owner") return false;
   const roles = new Set(permission.roles || []);
   if (roles.has("owner")) return false;
+  if (permission.link?.type || permission.link?.scope || permission.invitation) return true;
   return Boolean(permission.grantedTo || permission.grantedToV2 || permission.grantedToIdentities?.length);
+}
+
+function isOwnerPermission(permission = {}) {
+  return permission.permissionKind === "owner" || new Set(permission.roles || []).has("owner");
+}
+
+function isRevocablePermission(permission = {}) {
+  return permission.revocable !== false && !isOwnerPermission(permission) && !permission.inheritedFrom;
 }
 
 function diffPermissions(before = [], after = []) {
@@ -3695,6 +4642,14 @@ function assertNoBinaryNulls(buffer) {
 }
 
 async function resolveDestinationParent(args = {}) {
+  assertAtMostOneSelector(args, "destination parent", [
+    { label: "destinationParentItemId", keys: ["destinationParentItemId"] },
+    { label: "destinationParentPath", keys: ["destinationParentPath"] },
+    { label: "destinationParentPreset", keys: ["destinationParentPreset"] },
+    { label: "parentItemId", keys: ["parentItemId"] },
+    { label: "parentPath", keys: ["parentPath"] },
+    { label: "parentPreset", keys: ["parentPreset"] }
+  ]);
   if (args.destinationParentItemId) return { id: args.destinationParentItemId };
   if (args.parentItemId) return { id: args.parentItemId };
   let parentPath = "";
@@ -3839,7 +4794,7 @@ async function preview(args = {}) {
       params.set("format", "text");
       const exported = await graphLimitedBuffer(`${contentPath(args)}?${params.toString()}`, maxBytes);
       const previewText = exported.buffer.toString("utf8").replace(/\uFFFD$/u, "");
-      return { item: info, preview: previewText, bytes: exported.bytesRead, truncated: exported.truncated, source: "graph-text-export" };
+      return { item: info, preview: previewText, bytes: Buffer.byteLength(previewText, "utf8"), bytesRead: exported.bytesRead, truncated: exported.truncated, source: "graph-text-export" };
     } catch (error) {
       return { item: info, preview: null, source: "metadata", exportError: safeToolErrorMessage(error), note: "Graph text export was not available for this file." };
     }
@@ -3849,7 +4804,7 @@ async function preview(args = {}) {
   const limited = await graphLimitedBuffer(contentPath(args), maxBytes);
   if (args.force !== true) assertNoBinaryNulls(limited.buffer);
   const previewText = limited.buffer.toString("utf8").replace(/\uFFFD$/u, "");
-  return { item: info, preview: previewText, bytes: limited.bytesRead, truncated: limited.truncated, source: "text-read" };
+  return { item: info, preview: previewText, bytes: Buffer.byteLength(previewText, "utf8"), bytesRead: limited.bytesRead, truncated: limited.truncated, source: "text-read" };
 }
 
 function updateManifestPath(localPath, manifestPath) {
@@ -3861,6 +4816,8 @@ async function updateFile(args = {}) {
   if (!remote) throw new Error("remotePath is required.");
 
   if (args.mode === "checkout") {
+    if (args.localPath) await assertNotLocalOneDriveSyncPathForWrite(resolve(args.localPath), "Checkout", args);
+    if (args.manifestPath) await assertNotLocalOneDriveSyncPathForWrite(resolve(args.manifestPath), "Checkout manifest", args);
     const info = await getInfo(args.itemId ? { itemId: args.itemId } : { path: remote });
     if (info.folder) throw new Error(`Cannot checkout a folder: ${info.name}`);
     const localPath = args.localPath ? resolve(args.localPath) : join(updateRoot, info.name || basename(remote));
@@ -3941,7 +4898,8 @@ async function updateFile(args = {}) {
     remotePath: remote,
     conflictBehavior: "replace",
     allowLocalOneDriveSyncPath: args.allowLocalOneDriveSyncPath,
-    ifMatch: args.conflictCheck !== false && args.force !== true ? manifest?.item?.eTag : undefined
+    ifMatch: args.conflictCheck !== false && args.force !== true ? manifest?.item?.eTag : undefined,
+    auditTool: "onedrive_update_file"
   });
   const verified = args.verify !== false ? await getInfo({ path: remote }) : null;
   if (manifest && args.force !== true) {
@@ -3991,7 +4949,15 @@ async function largeFiles(args = {}) {
     .sort((left, right) => (right.size || 0) - (left.size || 0))
     .slice(0, clampInteger(args.limit, 50, 1, 200))
     .map((item) => formatSimplifiedItem(item, args.format));
-  return { filters: { minBytes }, scanSummary: result.summary, count: files.length, items: files };
+  return {
+    filters: { minBytes },
+    scanSummary: result.summary,
+    count: files.length,
+    itemsReturned: files.length,
+    scanItemsReturned: result.summary.returned,
+    items: files,
+    note: "count/itemsReturned report files matching the large-file filter; scanSummary.returned reports the bounded traversal sample."
+  };
 }
 
 function duplicateKey(item) {
@@ -4027,7 +4993,14 @@ async function duplicates(args = {}) {
     }))
     .sort((left, right) => right.totalBytes - left.totalBytes)
     .slice(0, clampInteger(args.limit, 50, 1, 200));
-  return { scanSummary: result.summary, duplicateGroups: duplicates.length, groups: duplicates };
+  return {
+    scanSummary: result.summary,
+    duplicateGroups: duplicates.length,
+    groupsReturned: duplicates.length,
+    scanItemsReturned: result.summary.returned,
+    groups: duplicates,
+    note: "duplicateGroups/groupsReturned report duplicate groups after scanning; scanSummary.returned reports the bounded traversal sample."
+  };
 }
 
 async function sharingAudit(args = {}, publicOnly = false) {
@@ -4045,8 +5018,8 @@ async function sharingAudit(args = {}, publicOnly = false) {
     try {
       const audit = await permissionList({ itemId: item.id }, "compact");
       const permissions = publicOnly
-        ? audit.filter((permission) => permission.link?.scope === "anonymous")
-        : audit.filter(isExplicitSharingPermission);
+        ? audit.filter((permission) => permission.permissionKind === "anonymous_link")
+        : audit.filter((permission) => args.includeOwnerPermissions === true ? !permission.inheritedFrom : isExplicitSharingPermission(permission));
       if (permissions.length && matches.length < limit) {
         matches.push({ item: formatSimplifiedItem(item, "compact"), permissions, count: permissions.length });
       }
@@ -4057,8 +5030,14 @@ async function sharingAudit(args = {}, publicOnly = false) {
   return {
     scanSummary: scanResult.summary,
     count: matches.length,
+    itemsReturned: matches.length,
+    scanItemsReturned: scanResult.summary.returned,
     items: matches,
-    note: publicOnly ? "Returned items with anonymous sharing links." : "Returned items with explicit sharing permissions."
+    note: publicOnly
+      ? "Returned items with anonymous sharing links."
+      : (args.includeOwnerPermissions === true
+        ? "Returned items with explicit sharing permissions plus owner grants."
+        : "Returned items with explicit non-owner sharing permissions.")
   };
 }
 
@@ -4069,6 +5048,7 @@ async function upload(args = {}) {
   const fileStat = await stat(localPath);
   if (!fileStat.isFile()) throw new Error(`Not a file: ${localPath}`);
   const uploadMode = args.uploadMode || "auto";
+  const auditTool = args.auditTool || "onedrive_upload";
   try {
     let response;
     if (fileStat.size > 0 && (uploadMode === "session" || (uploadMode === "auto" && fileStat.size > simpleUploadLimit))) {
@@ -4090,7 +5070,7 @@ async function upload(args = {}) {
       await cacheItems([result]);
       response = { item: simplifyItem(result), localPath, bytesUploaded: fileStat.size, uploadMode: "simple" };
     }
-    await writeMutationAudit("onedrive_upload", {
+    await writeMutationAudit(auditTool, {
       status: "success",
       target: { remotePath: destinationPath },
       after: itemAuditSummary(response.item),
@@ -4099,7 +5079,7 @@ async function upload(args = {}) {
     });
     return response;
   } catch (error) {
-    await writeMutationAudit("onedrive_upload", {
+    await writeMutationAudit(auditTool, {
       status: "failed",
       target: { remotePath: destinationPath },
       localPath,
@@ -4242,6 +5222,11 @@ async function writeText(args = {}) {
 
 async function createFolder(args = {}) {
   const name = assertSafeItemName(args.name, "name");
+  assertAtMostOneSelector(args, "folder parent", [
+    { label: "parentItemId", keys: ["parentItemId"] },
+    { label: "parentPath", keys: ["parentPath"] },
+    { label: "parentPreset", keys: ["parentPreset"] }
+  ]);
   const endpoint = args.parentItemId
     ? `/me/drive/items/${encodeURIComponent(args.parentItemId)}/children`
     : childrenPath({
@@ -4504,25 +5489,46 @@ async function createSharingLink(args = {}) {
   assertExpectedItem(current, args, "Create sharing link");
   const includePermissionDiff = args.includePermissionDiff !== false;
   const beforePermissions = includePermissionDiff ? await permissionList({ itemId: current.id }, "compact") : null;
+  const warnings = [];
+  const requestedScope = args.scope || "anonymous";
+  if (requestedScope === "organization") {
+    try {
+      const driveInfo = await graph("/me/drive");
+      if (driveInfo.driveType === "personal") {
+        warnings.push("Organization-scoped links are not meaningful on personal OneDrive drives; Microsoft Graph may reject or reinterpret this scope.");
+      }
+    } catch {
+      warnings.push("Could not verify drive type before previewing organization-scoped link creation.");
+    }
+  }
   const preview = {
     dryRun: args.dryRun !== false,
     confirmed: args.confirmed === true,
     wouldCreate: {
       item: simplifyItem(current),
       type: args.type || "view",
-      scope: args.scope || "anonymous",
+      scope: requestedScope,
       passwordProvided: Boolean(args.password),
       expirationDateTime: args.expirationDateTime,
       retainInheritedPermissions: args.retainInheritedPermissions
     },
+    warnings,
     ...(includePermissionDiff ? {
       beforePermissions,
       beforePermissionCount: beforePermissions.length
     } : {})
   };
+  const previewProof = {
+    item: { id: current.id, name: current.name },
+    type: args.type || "view",
+    scope: requestedScope,
+    password: args.password,
+    expirationDateTime: args.expirationDateTime,
+    retainInheritedPermissions: args.retainInheritedPermissions
+  };
   if (args.dryRun !== false || args.confirmed !== true) {
     return {
-      ...preview,
+      ...previewWithToken(preview, "onedrive_create_sharing_link", previewProof),
       requiredToCreate: "Set dryRun: false and confirmed: true after explicit user confirmation."
     };
   }
@@ -4534,6 +5540,8 @@ async function createSharingLink(args = {}) {
       requiredToCreate: "Provide expectedName or expectedId for live sharing-link creation."
     };
   }
+  const previewTokenRequired = previewTokenRequiredResult(preview, "onedrive_create_sharing_link", previewProof, args.previewToken, "requiredToCreate");
+  if (previewTokenRequired) return previewTokenRequired;
   const body = {
     type: args.type || "view",
     scope: args.scope || "anonymous"
@@ -4666,9 +5674,20 @@ async function invitePermission(args = {}) {
       beforePermissionCount: beforePermissions.length
     } : {})
   };
+  const previewProof = {
+    item: { id: current.id, name: current.name },
+    recipients: body.recipients,
+    role: body.roles[0],
+    sendInvitation: body.sendInvitation,
+    requireSignIn: body.requireSignIn,
+    message: args.message,
+    password: args.password,
+    expirationDateTime: args.expirationDateTime,
+    retainInheritedPermissions: args.retainInheritedPermissions
+  };
   if (args.dryRun !== false || args.confirmed !== true) {
     return {
-      ...preview,
+      ...previewWithToken(preview, "onedrive_invite_permission", previewProof),
       requiredToInvite: "Set dryRun: false and confirmed: true after explicit user confirmation."
     };
   }
@@ -4680,6 +5699,8 @@ async function invitePermission(args = {}) {
       requiredToInvite: "Provide expectedName or expectedId for live permission invitation."
     };
   }
+  const previewTokenRequired = previewTokenRequiredResult(preview, "onedrive_invite_permission", previewProof, args.previewToken, "requiredToInvite");
+  if (previewTokenRequired) return previewTokenRequired;
   try {
     const result = await graph(`${itemMutationBase(current)}/invite`, {
       method: "POST",
@@ -4725,6 +5746,10 @@ function assertPermissionPresent(permissions = [], permissionId) {
   }
 }
 
+function findPermissionById(permissions = [], permissionId) {
+  return permissions.find((permission) => permission.id === permissionId) || null;
+}
+
 async function preflightRevokePermission(args = {}, options = {}) {
   requireNonRootTarget(args, "Revoke permission");
   const current = await getRawInfo(args);
@@ -4733,10 +5758,16 @@ async function preflightRevokePermission(args = {}, options = {}) {
   const includePermissions = options.includePermissions !== false;
   const permissionsForPreflight = await permissionList({ itemId: current.id }, "compact");
   assertPermissionPresent(permissionsForPreflight, args.permissionId);
+  const permission = findPermissionById(permissionsForPreflight, args.permissionId);
+  const revocable = isRevocablePermission(permission);
+  const warnings = revocable ? [] : [`Permission ${args.permissionId} is a ${permission?.permissionKind || "non-revocable"} permission and should not be revoked with this tool.`];
   return {
     targetArgs: args,
     rawItem: current,
     item: simplifyItem(current),
+    permission,
+    revocable,
+    warnings,
     beforePermissions: includePermissions ? permissionsForPreflight : [],
     includePermissions
   };
@@ -4749,16 +5780,23 @@ async function revokePermission(args = {}) {
     confirmed: args.confirmed === true,
     wouldRevoke: {
       item: preflight.item,
-      permissionId: args.permissionId
+      permissionId: args.permissionId,
+      permission: preflight.permission,
+      revocable: preflight.revocable
     },
+    warnings: preflight.warnings,
     ...(preflight.includePermissions ? {
       beforePermissions: preflight.beforePermissions,
       beforePermissionCount: preflight.beforePermissions.length
     } : {})
   };
+  const previewProof = {
+    item: { id: preflight.rawItem.id, name: preflight.rawItem.name },
+    permissionId: args.permissionId
+  };
   if (args.dryRun !== false || args.confirmed !== true) {
     return {
-      ...preview,
+      ...previewWithToken(preview, "onedrive_revoke_permission", previewProof),
       requiredToRevoke: "Set dryRun: false and confirmed: true after explicit user confirmation."
     };
   }
@@ -4770,6 +5808,16 @@ async function revokePermission(args = {}) {
       requiredToRevoke: "Provide expectedName or expectedId for live permission revocation."
     };
   }
+  if (!preflight.revocable) {
+    return {
+      ...preview,
+      dryRun: false,
+      confirmed: true,
+      requiredToRevoke: "Choose a revocable sharing permission. Owner and inherited permissions are refused."
+    };
+  }
+  const previewTokenRequired = previewTokenRequiredResult(preview, "onedrive_revoke_permission", previewProof, args.previewToken, "requiredToRevoke");
+  if (previewTokenRequired) return previewTokenRequired;
   try {
     const response = await graph(`${itemIdBase(preflight.rawItem.id)}/permissions/${encodeURIComponent(args.permissionId)}`, {
       method: "DELETE",
@@ -4812,12 +5860,14 @@ async function revokePermission(args = {}) {
 
 async function batchRevokePermissions(args = {}) {
   const items = args.items || [];
+  const warnings = batchMutationWarnings();
   if (args.dryRun === false) {
     if (args.confirmed !== true) {
       return {
         dryRun: false,
         confirmed: false,
         count: items.length,
+        warnings,
         requiredToRevoke: "Set dryRun: false and confirmed: true after explicit user confirmation."
       };
     }
@@ -4827,6 +5877,7 @@ async function batchRevokePermissions(args = {}) {
         dryRun: false,
         confirmed: true,
         count: items.length,
+        warnings,
         requiredToRevoke: "Provide expectedName or expectedId for every item in a live batch permission revoke.",
         missingExpectedCount: missingExpected.length
       };
@@ -4847,19 +5898,49 @@ async function batchRevokePermissions(args = {}) {
       dryRun: args.dryRun !== false,
       confirmed: args.confirmed === true,
       count: items.length,
+      warnings,
       preflightFailed: true,
       errors: preflightErrors,
       requiredToRevoke: "Fix every preflight error before running a batch permission revoke."
     };
   }
+  const nonRevocable = preflight
+    .map((entry, index) => entry.revocable ? null : { index, target: entry.targetArgs, permission: entry.permission, warnings: entry.warnings })
+    .filter(Boolean);
+  if (args.dryRun === false && nonRevocable.length) {
+    return {
+      dryRun: false,
+      confirmed: args.confirmed === true,
+      count: items.length,
+      warnings,
+      preflightFailed: true,
+      errors: nonRevocable.map((entry) => ({
+        index: entry.index,
+        target: entry.target,
+        error: entry.warnings.join(" ")
+      })),
+      requiredToRevoke: "Choose only revocable sharing permissions. Owner and inherited permissions are refused."
+    };
+  }
+  const previewProof = {
+    items: preflight.map((entry) => ({
+      id: entry.rawItem.id,
+      name: entry.rawItem.name,
+      permissionId: entry.targetArgs.permissionId
+    })),
+    operation: "batch-revoke"
+  };
 
   if (args.dryRun !== false) {
     return {
       dryRun: true,
       confirmed: args.confirmed === true,
       count: preflight.length,
+      warnings,
+      ...issuePreviewToken("onedrive_batch_revoke_permissions", previewProof),
       results: preflight.map((entry) => ({
-        wouldRevoke: { item: entry.item, permissionId: entry.targetArgs.permissionId },
+        wouldRevoke: { item: entry.item, permissionId: entry.targetArgs.permissionId, permission: entry.permission, revocable: entry.revocable },
+        warnings: entry.warnings,
         ...(entry.includePermissions ? {
           beforePermissions: entry.beforePermissions,
           beforePermissionCount: entry.beforePermissions.length
@@ -4867,6 +5948,14 @@ async function batchRevokePermissions(args = {}) {
       }))
     };
   }
+  const previewTokenRequired = previewTokenRequiredResult(
+    { dryRun: false, confirmed: true, count: preflight.length, warnings },
+    "onedrive_batch_revoke_permissions",
+    previewProof,
+    args.previewToken,
+    "requiredToRevoke"
+  );
+  if (previewTokenRequired) return previewTokenRequired;
 
   const results = [];
   for (const [index, entry] of preflight.entries()) {
@@ -4898,6 +5987,7 @@ async function batchRevokePermissions(args = {}) {
         failedIndex: index,
         error: safeToolErrorMessage(error),
         count: preflight.length,
+        warnings,
         partialResults: results
       };
     }
@@ -4911,7 +6001,7 @@ async function batchRevokePermissions(args = {}) {
       permissionDiff: result.permissionDiff ? permissionDiffAuditSummary(result.permissionDiff) : undefined
     }))
   });
-  return { dryRun: false, confirmed: true, count: results.length, results };
+  return { dryRun: false, confirmed: true, count: results.length, warnings, results };
 }
 
 async function preflightMoveItem(item = {}, destination) {
@@ -4925,12 +6015,14 @@ async function preflightMoveItem(item = {}, destination) {
 
 async function batchMove(args = {}) {
   const items = args.items || [];
+  const warnings = batchMutationWarnings();
   if (args.dryRun === false) {
     if (args.confirmed !== true) {
       return {
         dryRun: false,
         confirmed: false,
         count: items.length,
+        warnings,
         requiredToMove: "Set dryRun: false and confirmed: true after explicit user confirmation."
       };
     }
@@ -4940,6 +6032,7 @@ async function batchMove(args = {}) {
         dryRun: false,
         confirmed: true,
         count: items.length,
+        warnings,
         requiredToMove: "Provide expectedName or expectedId for every item in a live batch move.",
         missingExpectedCount: missingExpected.length
       };
@@ -4962,6 +6055,7 @@ async function batchMove(args = {}) {
       confirmed: args.confirmed === true,
       destination,
       count: items.length,
+      warnings,
       preflightFailed: true,
       errors: preflightErrors,
       requiredToMove: "Fix every preflight error before running a batch move."
@@ -4974,6 +6068,7 @@ async function batchMove(args = {}) {
       confirmed: args.confirmed === true,
       destination,
       count: preflight.length,
+      warnings,
       results: preflight.map((entry) => ({
         wouldMove: entry.item,
         destination,
@@ -5011,6 +6106,7 @@ async function batchMove(args = {}) {
         error: safeToolErrorMessage(error),
         destination,
         count: preflight.length,
+        warnings,
         partialResults: results
       };
     }
@@ -5024,7 +6120,7 @@ async function batchMove(args = {}) {
       after: itemAuditSummary(result.moved)
     }))
   });
-  return { dryRun: false, confirmed: true, destination, count: results.length, results };
+  return { dryRun: false, confirmed: true, destination, count: results.length, warnings, results };
 }
 
 async function deleteItem(args = {}) {
@@ -5033,8 +6129,9 @@ async function deleteItem(args = {}) {
   if (rawItem.root) throw new Error("Delete refuses to operate on the OneDrive root.");
   assertExpectedItem(rawItem, args, "Delete");
   const item = simplifyItem(rawItem);
+  const previewProof = { items: [{ id: rawItem.id, name: rawItem.name }], operation: "delete" };
   if (args.dryRun !== false) {
-    return { dryRun: true, wouldDelete: item };
+    return previewWithToken({ dryRun: true, wouldDelete: item }, "onedrive_delete", previewProof);
   }
   if (args.confirmed !== true) {
     return {
@@ -5052,6 +6149,14 @@ async function deleteItem(args = {}) {
       requiredToDelete: "Provide expectedName or expectedId for live deletes."
     };
   }
+  const previewTokenRequired = previewTokenRequiredResult(
+    { dryRun: false, confirmed: true, wouldDelete: item },
+    "onedrive_delete",
+    previewProof,
+    args.previewToken,
+    "requiredToDelete"
+  );
+  if (previewTokenRequired) return previewTokenRequired;
   try {
     await graph(itemMutationBase(rawItem), { method: "DELETE", headers: mutationMatchHeaders(rawItem) });
     await cacheItems([{ ...rawItem, deleted: {} }]);
@@ -5103,9 +6208,17 @@ async function restoreDeleted(args = {}) {
     },
     permissionNote: "OneDrive Personal restore may require Microsoft Graph delegated Files.ReadWrite.All in addition to the plugin's standard Files.ReadWrite scope."
   };
+  const previewProof = {
+    itemId: args.itemId,
+    destinationParentPath: args.destinationParentPath,
+    destinationParentItemId: args.destinationParentItemId,
+    destinationParentPreset: args.destinationParentPreset,
+    destinationParentRelativePath: args.destinationParentRelativePath,
+    newName: args.newName
+  };
   if (args.dryRun !== false || args.confirmed !== true) {
     return {
-      ...preview,
+      ...previewWithToken(preview, "onedrive_restore_deleted", previewProof),
       requiredToRestore: "Set dryRun: false and confirmed: true after explicit user confirmation."
     };
   }
@@ -5117,6 +6230,8 @@ async function restoreDeleted(args = {}) {
       requiredToRestore: "Provide expectedId for live restores."
     };
   }
+  const previewTokenRequired = previewTokenRequiredResult(preview, "onedrive_restore_deleted", previewProof, args.previewToken, "requiredToRestore");
+  if (previewTokenRequired) return previewTokenRequired;
   const body = {};
   if (args.destinationParentPath || args.destinationParentItemId || args.destinationParentPreset) {
     const parent = await resolveDestinationParent(args);
@@ -5180,6 +6295,14 @@ async function callTool(name, args = {}) {
     case "onedrive_logout": {
       tokenCache = null;
       pendingDevice = null;
+      if (args.deleteKeychainToken === true && args.confirmed !== true) {
+        return textResult({
+          memoryCleared: true,
+          keychainTokenDeleted: false,
+          confirmed: false,
+          requiredToDelete: "Set confirmed: true after explicit user confirmation to delete the OneDrive Keychain refresh token."
+        });
+      }
       return textResult({ memoryCleared: true, keychainTokenDeleted: args.deleteKeychainToken ? deleteKeychainToken() : false });
     }
     case "onedrive_me":
@@ -5212,6 +6335,12 @@ async function callTool(name, args = {}) {
       return textResult(await cacheRefresh(args));
     case "onedrive_cache_clear":
       return textResult(await clearMetadataCache());
+    case "onedrive_content_index_refresh":
+      return textResult(await contentIndexRefresh(args));
+    case "onedrive_content_search":
+      return textResult(await contentSearch(args));
+    case "onedrive_content_index_clear":
+      return textResult(await clearContentIndex());
     case "onedrive_get_info":
       return textResult(await getInfo(args));
     case "onedrive_read_text":

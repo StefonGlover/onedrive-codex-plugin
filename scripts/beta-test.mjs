@@ -10,7 +10,17 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, "..");
 const serverPath = join(pluginRoot, "mcp", "server.mjs");
 const workspace = process.cwd();
-const keepWork = process.argv.includes("--keep-work");
+const cliArgs = Object.fromEntries(process.argv.slice(2).map((arg) => {
+  const [key, ...rest] = arg.replace(/^--/, "").split("=");
+  return [key, rest.length ? rest.join("=") : true];
+}));
+const keepWork = Boolean(cliArgs["keep-work"]);
+const doctorOnly = Boolean(cliArgs["doctor-only"]);
+const cleanupStale = Boolean(cliArgs["cleanup-stale"]);
+const cleanupConfirmed = Boolean(cliArgs.confirmed || cliArgs.delete);
+const cleanupStaleDays = Number(cliArgs["stale-days"] || 1);
+const tenantMatrix = cliArgs["tenant-matrix"];
+const tenantMatrixLive = Boolean(cliArgs["tenant-matrix-live"]);
 const unique = `codex-beta-${Date.now()}-${process.pid}`;
 const outDir = join(workspace, "work", "onedrive-beta", unique);
 const localUpload = join(outDir, "upload-source.txt");
@@ -123,6 +133,117 @@ function assertOk(name, result) {
   return result.value;
 }
 
+async function previewTokenFor(name, args = {}) {
+  const previewArgs = { ...args };
+  delete previewArgs.dryRun;
+  delete previewArgs.confirmed;
+  delete previewArgs.previewToken;
+  const preview = assertOk(`${name} preview`, await tool(name, previewArgs));
+  if (!preview.previewToken) throw new Error(`${name} preview did not return a previewToken.`);
+  return preview.previewToken;
+}
+
+async function toolWithPreview(name, args = {}) {
+  const previewToken = await previewTokenFor(name, args);
+  return await tool(name, { ...args, previewToken });
+}
+
+function betaFolderLooksStale(item = {}, cutoffMs) {
+  if (!item.folder || !String(item.name || "").startsWith("Codex OneDrive Plugin Beta Test codex-beta-")) return false;
+  const modified = Date.parse(item.lastModifiedDateTime || item.createdDateTime || "");
+  return Number.isFinite(modified) ? modified <= cutoffMs : true;
+}
+
+async function cleanupStaleBetaFolders() {
+  const cutoffMs = Date.now() - Math.max(0, cleanupStaleDays) * 24 * 60 * 60 * 1000;
+  const scan = assertOk("cleanup stale scan", await tool("onedrive_scan", {
+    nameContains: "Codex OneDrive Plugin Beta Test codex-beta-",
+    includeFiles: false,
+    includeFolders: true,
+    maxItems: Number(cliArgs["cleanup-max-items"] || 5000),
+    maxFolders: Number(cliArgs["cleanup-max-folders"] || 1000),
+    maxResults: Number(cliArgs["cleanup-max-results"] || 100),
+    format: "full"
+  }));
+  const candidates = (scan.items || []).filter((item) => betaFolderLooksStale(item, cutoffMs));
+  const deleted = [];
+  if (cleanupConfirmed) {
+    for (const candidate of candidates) {
+      const result = assertOk("cleanup stale delete", await toolWithPreview("onedrive_delete", {
+        itemId: candidate.id,
+        expectedName: candidate.name,
+        dryRun: false,
+        confirmed: true
+      }));
+      deleted.push(result.deleted);
+    }
+  }
+  const details = {
+    mode: cleanupConfirmed ? "delete" : "dry-run",
+    cutoff: new Date(cutoffMs).toISOString(),
+    staleDays: cleanupStaleDays,
+    candidateCount: candidates.length,
+    deletedCount: deleted.length,
+    candidates: candidates.map((item) => ({ id: item.id, name: item.name, lastModifiedDateTime: item.lastModifiedDateTime })),
+    deleted: deleted.map((item) => ({ id: item.id, name: item.name }))
+  };
+  results.cleanup = details;
+  record("cleanup stale beta folders", "pass", details);
+}
+
+async function runOneTenantMatrixEntry(tenant) {
+  const childArgs = [fileURLToPath(import.meta.url)];
+  if (!tenantMatrixLive) childArgs.push("--doctor-only");
+  if (keepWork) childArgs.push("--keep-work");
+  const entry = spawn(process.execPath, childArgs, {
+    cwd: workspace,
+    env: { ...process.env, ONEDRIVE_TENANT: tenant },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  let stdout = "";
+  let stderrText = "";
+  entry.stdout.on("data", (chunk) => {
+    stdout += chunk.toString();
+  });
+  entry.stderr.on("data", (chunk) => {
+    stderrText += chunk.toString();
+  });
+  const exitCode = await new Promise((resolve) => entry.once("exit", (code) => resolve(code)));
+  let parsed = null;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    // Keep raw stdout below.
+  }
+  return {
+    tenant,
+    ok: exitCode === 0 && parsed?.summary?.failCount === 0 && !parsed?.error,
+    exitCode,
+    summary: parsed?.summary,
+    configuredTenant: parsed?.checks?.find((check) => check.name === "configured and token available")?.details?.tenant,
+    error: parsed?.error,
+    stdout: parsed ? undefined : stdout.trim(),
+    stderr: stderrText.trim() || undefined
+  };
+}
+
+async function runTenantMatrix() {
+  const tenants = String(tenantMatrix === true ? "common,consumers,organizations" : tenantMatrix)
+    .split(",")
+    .map((tenant) => tenant.trim())
+    .filter(Boolean);
+  const matrix = [];
+  for (const tenant of tenants) {
+    matrix.push(await runOneTenantMatrixEntry(tenant));
+  }
+  return {
+    mode: tenantMatrixLive ? "live-beta" : "doctor-only",
+    tenants,
+    ok: matrix.every((entry) => entry.ok),
+    matrix
+  };
+}
+
 const results = {
   unique,
   folderName,
@@ -136,6 +257,20 @@ function record(name, status, details = {}) {
 }
 
 let folder = null;
+
+if (tenantMatrix) {
+  child.kill("SIGTERM");
+  await Promise.race([
+    childExit,
+    new Promise((resolve) => setTimeout(resolve, 2_000))
+  ]);
+  if (!childExited) child.kill("SIGKILL");
+  const matrix = await runTenantMatrix();
+  await rm(outDir, { recursive: true, force: true });
+  console.log(JSON.stringify(matrix, null, 2));
+  process.exitCode = matrix.ok ? 0 : 1;
+  process.exit();
+}
 
 try {
   const init = await request("initialize", {
@@ -226,6 +361,12 @@ try {
     checks: doctor.checks?.map((check) => ({ name: check.name, status: check.status }))
   });
 
+  if (cleanupStale) {
+    await cleanupStaleBetaFolders();
+  } else if (doctorOnly) {
+    results.specialMode = "doctor-only";
+    record("doctor-only mode completed", "pass", { tenant: config.tenant });
+  } else {
   const me = assertOk("onedrive_me", await tool("onedrive_me"));
   record("profile read", me.userPrincipalName || me.mail ? "pass" : "fail", {
     displayName: me.displayName,
@@ -543,7 +684,7 @@ try {
     count: batchDeleteDryRun.count
   });
 
-  const batchDeleted = assertOk("batch delete live", await tool("onedrive_batch_delete", {
+  const batchDeleted = assertOk("batch delete live", await toolWithPreview("onedrive_batch_delete", {
     items: [{ itemId: batchDeleteTarget.item.id, expectedName: "batch-delete.txt" }],
     dryRun: false,
     confirmed: true
@@ -802,7 +943,7 @@ try {
     requiredToInvite: inviteMissingExpected.requiredToInvite
   });
 
-  const inviteLive = await tool("onedrive_invite_permission", {
+  const inviteLive = await toolWithPreview("onedrive_invite_permission", {
     itemId: copiedInfo.id,
     recipients: [{ email: inviteRecipient }],
     role: "read",
@@ -823,7 +964,7 @@ try {
     });
   }
 
-  const sharingLive = assertOk("sharing link live", await tool("onedrive_create_sharing_link", {
+  const sharingLive = assertOk("sharing link live", await toolWithPreview("onedrive_create_sharing_link", {
     itemId: copiedInfo.id,
     type: "view",
     scope: "anonymous",
@@ -866,7 +1007,7 @@ try {
     requiredToRevoke: revokeDryRun.requiredToRevoke
   });
 
-  const revoked = assertOk("revoke permission live", await tool("onedrive_revoke_permission", {
+  const revoked = assertOk("revoke permission live", await toolWithPreview("onedrive_revoke_permission", {
     itemId: copiedInfo.id,
     permissionId: sharingLive.permission.id,
     expectedName: copyFileName,
@@ -878,7 +1019,7 @@ try {
     diff: revoked.permissionDiff
   });
 
-  const sharingLiveBatch = assertOk("sharing link live for batch revoke", await tool("onedrive_create_sharing_link", {
+  const sharingLiveBatch = assertOk("sharing link live for batch revoke", await toolWithPreview("onedrive_create_sharing_link", {
     itemId: copiedInfo.id,
     type: "view",
     scope: "anonymous",
@@ -886,7 +1027,7 @@ try {
     dryRun: false,
     confirmed: true
   }));
-  const batchRevoked = assertOk("batch revoke permissions live", await tool("onedrive_batch_revoke_permissions", {
+  const batchRevoked = assertOk("batch revoke permissions live", await toolWithPreview("onedrive_batch_revoke_permissions", {
     items: [{ itemId: copiedInfo.id, permissionId: sharingLiveBatch.permission.id, expectedId: copiedInfo.id }],
     dryRun: false,
     confirmed: true
@@ -943,7 +1084,8 @@ try {
     itemId: folder.id,
     expectedName: folderName,
     dryRun: false,
-    confirmed: true
+    confirmed: true,
+    previewToken: dryRun.previewToken
   }));
   results.cleanup = { deleted: deleted.deleted?.name, id: deleted.deleted?.id };
   record("delete test folder cleanup", deleted.dryRun === false && deleted.deleted?.id === folder.id ? "pass" : "fail", results.cleanup);
@@ -995,11 +1137,12 @@ try {
 
   const logoutMemoryOnly = assertOk("logout memory only", await tool("onedrive_logout", { deleteKeychainToken: false }));
   record("logout clears memory without deleting Keychain token", logoutMemoryOnly.memoryCleared === true && logoutMemoryOnly.keychainTokenDeleted === false ? "pass" : "fail", logoutMemoryOnly);
+  }
 } catch (error) {
   results.error = error.stack || error.message;
   if (folder?.id) {
     try {
-      const cleanup = await tool("onedrive_delete", { itemId: folder.id, expectedName: folderName, dryRun: false, confirmed: true });
+      const cleanup = await toolWithPreview("onedrive_delete", { itemId: folder.id, expectedName: folderName, dryRun: false, confirmed: true });
       results.cleanup = { attemptedAfterError: true, result: cleanup.value, isError: cleanup.isError };
     } catch (cleanupError) {
       results.cleanup = { attemptedAfterError: true, error: cleanupError.message };

@@ -38,6 +38,16 @@ export ONEDRIVE_CLIENT_ID="your-public-client-app-id"
 export ONEDRIVE_TENANT="common"
 export ONEDRIVE_SCOPES="offline_access User.Read Files.ReadWrite"
 export ONEDRIVE_KEYCHAIN_SERVICE="Codex OneDrive"
+export ONEDRIVE_STORAGE_ROOT="$HOME/.codex/onedrive-plugin"
+export ONEDRIVE_CACHE_ROOT="$HOME/.codex/onedrive-plugin/cache"
+export ONEDRIVE_CACHE_TTL_SECONDS="900"
+export ONEDRIVE_MAX_SCAN_DEPTH="25"
+export ONEDRIVE_MAX_INDEXED_FILE_SIZE="524288"
+export ONEDRIVE_INDEX_EXTENSIONS=".txt,.md,.csv,.json,.jsonl,.xml,.yaml,.yml,.html,.css,.js,.mjs,.ts,.tsx,.py,.sql,.log"
+export ONEDRIVE_CONCURRENCY_LIMIT="2"
+export ONEDRIVE_DELTA_SYNC_ENABLED="true"
+export ONEDRIVE_CONTENT_INDEX_ENABLED="true"
+export ONEDRIVE_INDEX_OFFICE_EXPORT="false"
 ```
 
 `ONEDRIVE_TENANT` can be `common`, `consumers`, `organizations`, or a tenant ID. Use `common` for a plugin that may access either personal Microsoft accounts or work/school accounts.
@@ -55,6 +65,29 @@ You can also add friendly path aliases to the config file:
 ```
 
 Tools that accept `path` can also accept `preset` plus `relativePath`; upload/write tools accept `remotePreset` plus `remoteRelativePath`.
+
+Optional performance settings can also be placed in the config file:
+
+```json
+{
+  "storageRoot": "/absolute/path/to/onedrive-plugin",
+  "cacheRoot": "/absolute/path/to/onedrive-plugin/cache",
+  "settings": {
+    "cacheTtlSeconds": 900,
+    "maxScanDepth": 25,
+    "concurrencyLimit": 2,
+    "deltaSyncEnabled": true,
+    "contentIndexEnabled": true
+  },
+  "indexing": {
+    "maxFileSize": 524288,
+    "supportedExtensions": [".txt", ".md", ".csv", ".json", ".jsonl", ".xml", ".yaml", ".yml"],
+    "includeOfficeTextExport": false
+  }
+}
+```
+
+Use absolute paths in `storageRoot` and `cacheRoot` if you override them. Environment variables take precedence.
 
 ## Tools
 
@@ -77,6 +110,9 @@ Tools that accept `path` can also accept `preset` plus `relativePath`; upload/wr
 - `onedrive_sync_status`
 - `onedrive_cache_refresh`
 - `onedrive_cache_clear`
+- `onedrive_content_index_refresh`
+- `onedrive_content_search`
+- `onedrive_content_index_clear`
 - `onedrive_get_info`
 - `onedrive_read_text`
 - `onedrive_preview`
@@ -119,7 +155,8 @@ Tools that accept `path` can also accept `preset` plus `relativePath`; upload/wr
 - Remote mutations that move, rename, copy, expose, invite, restore, delete, or revoke access use a preview-first pattern.
 - Rename, move, copy, sharing-link creation, named-recipient invitation, permission revoke, restore, and delete default to dry-run where the operation has a dry-run mode.
 - Live rename, move, copy, sharing-link creation, named-recipient invitation, permission revoke, restore, and delete require `dryRun: false`, `confirmed: true`, and stable expected identity (`expectedName` or `expectedId`; restore requires `expectedId`).
-- Batch move and batch permission revoke preflight every item before any mutation and refuse partial execution when a preflight check fails.
+- Live sharing-link creation, named-recipient invitation, permission revoke, batch permission revoke, restore, delete, and batch delete also require the `previewToken` returned by the immediately preceding dry-run preview for the same resolved operation.
+- Batch delete, batch move, and batch permission revoke preflight every item before any mutation and refuse partial execution when a preflight check fails. Live batch responses include a warning that successful earlier items may already be changed if a later item fails.
 - Sharing-link creation supports Microsoft Graph link type/scope plus optional password and expiration, and can include a before/after permission diff so the caller can see what changed.
 - `onedrive_invite_permission` grants named users or groups access through Microsoft Graph `driveItem: invite`. It defaults to a silent direct grant (`sendInvitation: false`, `requireSignIn: true`); email invitations are opt-in with `sendInvitation: true` and optional `message`.
 - Permission revoke uses Microsoft Graph `DELETE /me/drive/items/{item-id}/permissions/{permission-id}` and includes before permissions by default; live revoke includes after permissions and a permission diff.
@@ -132,10 +169,13 @@ Tools that accept `path` can also accept `preset` plus `relativePath`; upload/wr
 - Uploads use simple upload for smaller files and upload sessions for large files, or when `uploadMode: "session"` is requested.
 - List, search, find, scan, and delta tools return compact item summaries by default; pass `format: "full"` for richer metadata.
 - Normal list, search, scan, delta, and metadata calls opportunistically maintain a local metadata cache at `~/.codex/onedrive-plugin/cache/metadata-cache.json`.
-- `onedrive_sync_status` reports cache age, item count, delta cursor availability, and plugin storage locations.
-- `onedrive_cache_refresh` rebuilds the cache from a bounded recursive scan and uses delta refreshes when a previous cursor exists. `onedrive_cache_clear` clears the cache.
-- `onedrive_find` is the preferred file lookup helper. It uses the local metadata cache when available, runs live Graph search variants, ranks results in memory, and can fall back to bounded recursive remote scans. Cache-only hits must still have query relevance and are confirmed with live evidence before they suppress fallback scanning. Pass `useCache: false` for a fully live lookup.
-- `onedrive_find_all` is the broader locator for “look everywhere” requests. It searches common folders first and uses larger bounded scan caps, with cache acceleration when available.
+- `onedrive_sync_status` reports cache age, item count, delta cursor availability, resumable delta next-link availability, and plugin storage locations.
+- `onedrive_cache_refresh` rebuilds the cache from a bounded recursive scan and uses delta refreshes when a previous cursor exists. Cache refresh batches metadata-cache writes during scans, persists incomplete delta `nextLink` cursors for continuation, and returns progress milestones. `onedrive_cache_clear` clears the cache.
+- `onedrive_content_index_refresh` is the explicit content-reading step. It indexes supported cached text-like files into `content-index.json`, stores normalized text/tokens for faster local lookup, reuses entries when ETag/cTag/mtime/size are unchanged, and applies file-size, extension, concurrency, and per-item failure limits.
+- `onedrive_content_search` searches only the local content index and returns lightweight metadata plus snippets. It does not call Microsoft Graph or read file bodies.
+- `onedrive_find` and `onedrive_find_all` can merge local content-index hits into ranking, but they never fetch or parse full content themselves. Build or refresh the index first when content search is needed.
+- `onedrive_find` is the preferred file lookup helper. It uses the local metadata cache when available, confirms exact strong cache hits with live metadata, runs live Graph search variants, ranks results in memory, and can fall back to bounded recursive remote scans. Fallback scans prune duplicate folder hints, resolve duplicate scan roots, and can use low concurrency through `scanConcurrency`. Cache-only hits must still have query relevance and are not treated as authoritative when live evidence cannot confirm them. Pass `useCache: false` for a fully live lookup.
+- `onedrive_find_all` is the broader locator for “look everywhere” requests. It searches common folders first and uses larger bounded scan caps, with cache acceleration and the same duplicate-hint pruning when available.
 - `onedrive_preview` returns bounded text previews for text files and Graph-supported document text exports without reading unbounded remote content into memory.
 - `onedrive_update_file` provides a checkout/commit edit workflow with a local manifest, eTag/cTag/size/mtime conflict checks, optional backup, and post-commit verification. Checkout refuses to overwrite an existing manifest unless `overwriteManifest: true` is provided.
 - `onedrive_batch_get_info` and `onedrive_batch_permissions` use Microsoft Graph batching for up to 20 items. Batch download/delete/move tools provide one result per item with dry-run support where destructive.
@@ -152,6 +192,61 @@ Tools that accept `path` can also accept `preset` plus `relativePath`; upload/wr
 - `onedrive_audit_recent` reads recent audit entries, `onedrive_audit_export` exports the JSONL log to a local file, and `onedrive_audit_clear` requires `confirmed: true`.
 - Graph requests retry transient `429`, `500`, `502`, `503`, and `504` responses with `Retry-After` support.
 
+## Performance Architecture
+
+The plugin separates cheap metadata discovery from expensive content reads:
+
+- Metadata cache: stores IDs, drive/item metadata, paths, web URLs, MIME/type hints, size, timestamps, ETag/cTag, and file/folder status. This avoids repeated full recursive scans when cached metadata is fresh enough for the workflow.
+- Delta sync: `onedrive_cache_refresh` prefers stored Microsoft Graph delta cursors when the requested root matches the cached root. If Graph returns a delta `nextLink` before the final `deltaLink`, the plugin stores that incomplete cursor and resumes it on the next refresh. It falls back to a bounded scan when no cursor exists, the target changed, delta is disabled, or Graph rejects the cursor.
+- Search ranking: `onedrive_find` combines exact path/filename evidence, live Graph search, confirmed metadata-cache matches, folder hints, file-type hints, recency-ish modified metadata, and optional content-index hits. Results include reasons so ranking is debuggable.
+- Content index: indexing is opt-in and explicit. It supports bounded text-like files by default, stores normalized text/tokens for faster repeated queries, keeps only bounded top matches during local content search, and can optionally try Graph `format=text` export for Office-like files. Large files, unsupported binaries, failed exports, and files over the cap are skipped or reported without aborting the whole refresh.
+- Graph optimization: once an item is discovered, the plugin prefers item IDs for follow-up reads/mutations, follows pagination with cycle/page caps, uses `$batch` where useful, retries transient throttling/service errors, and honors `Retry-After`.
+
+The largest performance risk is any broad recursive scan or content-index refresh over a large OneDrive tree. Keep `maxItems`, `maxFolders`, `maxDepth`, `maxFiles`, and `maxBytesPerFile` bounded, and warm the metadata cache before broad repeated searches.
+
+## Troubleshooting and Benchmarks
+
+Run a health check:
+
+```bash
+onedrive_doctor({ "checkRootList": true })
+```
+
+Inspect cache/index state:
+
+```bash
+onedrive_sync_status({ "includeSamples": true })
+```
+
+Refresh metadata using scan/delta:
+
+```bash
+onedrive_cache_refresh({ "mode": "auto", "maxItems": 10000, "maxFolders": 2000 })
+```
+
+Build the optional content index from cached metadata:
+
+```bash
+onedrive_content_index_refresh({ "maxFiles": 100, "maxBytesPerFile": 524288 })
+```
+
+For a simple before/after benchmark, compare:
+
+1. Cold search: clear cache, run `onedrive_find` with `useCache: false`.
+2. Warm metadata search: run `onedrive_cache_refresh`, then repeat `onedrive_find`.
+3. Content-indexed search: run `onedrive_content_index_refresh`, then run `onedrive_content_search` and `onedrive_find` for a phrase inside a file.
+4. Selected file read: use `onedrive_preview` or `onedrive_read_text` only after selecting a specific result.
+
+The bundled benchmark script runs those steps through the MCP server with bounded caps:
+
+```bash
+scripts/benchmark.mjs --query="project plan" --maxItems=1500 --maxFolders=250 --maxFiles=50
+```
+
+Add `--clear` when you intentionally want to clear local metadata/content caches before the cold run. The script performs read-only Microsoft Graph operations, writes local cache/index files, and emits progress events to stderr while keeping the final summary JSON on stdout.
+
+Expected improvement: warm metadata searches avoid most repeated recursive scans; delta refreshes fetch only changes after the initial scan; content searches avoid live file reads after the index is built. Actual speed depends on Microsoft Graph latency, OneDrive size, throttling, and configured caps.
+
 ## Safe Example Prompts
 
 - "Find the file named Project Plan, show me its item ID and current permissions, but do not change anything."
@@ -166,6 +261,12 @@ Run the mocked Microsoft Graph regression suite first. It does not touch OneDriv
 
 ```bash
 scripts/mock-graph-test.mjs
+```
+
+Run the benchmark script when comparing cold search, warm cache search, indexed content search, and selected preview timing:
+
+```bash
+scripts/benchmark.mjs --query="project plan"
 ```
 
 Run the prepackage guard before refreshing the plugin cache:
@@ -187,6 +288,26 @@ scripts/beta-test.mjs
 ```
 
 The test creates a clearly named temporary OneDrive folder, exercises CRUD and safety behavior, deletes only that test folder during cleanup, and removes local temporary work on success. Pass `--keep-work` to keep local artifacts for debugging.
+
+Find old beta-test folders without deleting them:
+
+```bash
+scripts/beta-test.mjs --cleanup-stale --stale-days=1
+```
+
+Delete the stale candidates only after reviewing the dry-run output:
+
+```bash
+scripts/beta-test.mjs --cleanup-stale --stale-days=1 --confirmed
+```
+
+Run read-only tenant health checks across personal/work-school tenant endpoints:
+
+```bash
+scripts/beta-test.mjs --tenant-matrix=common,consumers,organizations
+```
+
+Use `--tenant-matrix-live` only when you intentionally want to run the full live beta once per tenant entry.
 
 ## Plugin Gallery
 

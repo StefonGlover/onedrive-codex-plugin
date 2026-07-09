@@ -30,6 +30,7 @@ const requiredFiles = [
   ".codex-plugin/plugin.json",
   ".mcp.json",
   "mcp/server.mjs",
+  "scripts/benchmark.mjs",
   "scripts/beta-test.mjs",
   "scripts/mock-graph-test.mjs",
   "scripts/prepackage-check.mjs",
