@@ -6,6 +6,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import base64
+from io import BytesIO
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -13,6 +15,7 @@ from docx import Document
 from openpyxl import Workbook, load_workbook
 from pptx import Presentation
 from pptx.util import Inches
+from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,10 +70,23 @@ def main():
         slide = presentation.slides.add_slide(presentation.slide_layouts[6])
         box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(5), Inches(1))
         box.text = "Hello from PowerPoint"
+        disposable = slide.shapes.add_textbox(Inches(1), Inches(2), Inches(2), Inches(0.5))
+        disposable.text = "Delete me"
+        source_png_buffer = BytesIO()
+        Image.new("RGB", (8, 8), (37, 99, 235)).save(source_png_buffer, format="PNG")
+        source_png = source_png_buffer.getvalue()
+        picture = slide.shapes.add_picture(BytesIO(source_png), Inches(1), Inches(3), Inches(1), Inches(1))
         source_pptx = root / "real.pptx"
         presentation.save(source_pptx)
         edited_pptx = root / "edited-powerpoint.pptx"
-        powerpoint = edit(source_pptx, edited_pptx, "powerpoint", [{"type": "setShapeText", "slideIndex": 0, "shapeId": str(box.shape_id), "text": "Edited in OneDrive"}, {"type": "duplicateSlide", "slideIndex": 0}])
+        powerpoint = edit(source_pptx, edited_pptx, "powerpoint", [
+            {"type": "setShapeText", "slideIndex": 0, "shapeId": str(box.shape_id), "text": "Edited in OneDrive"},
+            {"type": "setTextStyle", "slideIndex": 0, "shapeId": str(box.shape_id), "bold": True, "fontSize": 24, "color": "2563EB"},
+            {"type": "addTextBox", "slideIndex": 0, "text": "Native text box", "x": 914400, "y": 4114800, "width": 2743200, "height": 457200},
+            {"type": "deleteShape", "slideIndex": 0, "shapeId": str(disposable.shape_id)},
+            {"type": "replaceImage", "slideIndex": 0, "shapeId": str(picture.shape_id), "base64": base64.b64encode(source_png).decode("ascii"), "contentType": "image/png"},
+            {"type": "duplicateSlide", "slideIndex": 0},
+        ])
 
         Document(edited_docx)
         load_workbook(edited_xlsx)
@@ -84,7 +100,7 @@ def main():
 
         checks["wordRealPackage"] = word["changeCount"] == 2 and rendered[".docx"]["bytes"] > 0
         checks["excelRealPackage"] = excel["changeCount"] == 4 and rendered[".xlsx"]["bytes"] > 0
-        checks["powerpointRealPackage"] = powerpoint["changeCount"] == 2 and rendered[".pptx"]["bytes"] > 0
+        checks["powerpointRealPackage"] = powerpoint["changeCount"] == 6 and rendered[".pptx"]["bytes"] > 0
         print(json.dumps({"ok": all(checks.values()), "checks": checks, "rendered": rendered}, indent=2))
         raise SystemExit(0 if all(checks.values()) else 1)
 

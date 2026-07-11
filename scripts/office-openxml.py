@@ -8,14 +8,18 @@ explicit package parts and copies every untouched ZIP member byte-for-byte.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import posixpath
 import re
 import sys
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 
 
@@ -307,45 +311,125 @@ def excel_cell_value(cell: ET.Element, shared: List[str]) -> Any:
         return raw
 
 
+def excel_tables_for_sheet(package: zipfile.ZipFile, sheet_part: str) -> List[Dict[str, Any]]:
+    relationships = rels_for_part(package, sheet_part)
+    tables = []
+    for relationship_id, relationship in relationships.items():
+        if not relationship.get("Type", "").endswith("/table"):
+            continue
+        target = relationship.get("Target", "")
+        part = resolved_relationship_target(sheet_part, target) if target else None
+        if not part or part not in package.namelist():
+            continue
+        root = xml_root(package, part)
+        columns_node = root.find(q("s", "tableColumns"))
+        style = root.find(q("s", "tableStyleInfo"))
+        tables.append({
+            "id": root.attrib.get("id"),
+            "name": root.attrib.get("name"),
+            "displayName": root.attrib.get("displayName"),
+            "ref": root.attrib.get("ref"),
+            "headerRowCount": int(root.attrib.get("headerRowCount", "1")),
+            "totalsRowCount": int(root.attrib.get("totalsRowCount", "0")),
+            "relationshipId": relationship_id,
+            "part": part,
+            "columns": [
+                {
+                    "id": column.attrib.get("id"),
+                    "name": column.attrib.get("name"),
+                    "totalsRowFunction": column.attrib.get("totalsRowFunction"),
+                    "totalsRowLabel": column.attrib.get("totalsRowLabel"),
+                }
+                for column in list(columns_node or [])
+            ],
+            "style": dict(style.attrib) if style is not None else None,
+        })
+    return tables
+
+
 def inspect_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str, Any]:
     workbook = xml_root(package, "xl/workbook.xml")
     relationships = rels_for_part(package, "xl/workbook.xml")
     shared = excel_shared_strings(package)
     max_cells = max(1, min(int(request.get("maxCells", 5000)), 50_000))
+    max_matches = max(1, min(int(request.get("maxMatches", 100)), 10_000))
     include_cells = request.get("includeCells", True)
+    include_tables = request.get("includeTables", True)
+    requested_sheets = {str(name) for name in request.get("sheetNames", []) if str(name)}
+    requested_range = str(request.get("address", "")).upper()
+    selected_addresses = {
+        address
+        for row in excel_range_addresses(requested_range)
+        for address in row
+    } if requested_range else None
+    search_text = str(request.get("searchText", ""))
+    match_case = bool(request.get("matchCase", False))
+    search_needle = search_text if match_case else search_text.lower()
     sheets = []
+    matches = []
     total_cells = 0
+    total_tables = 0
+    found_sheet_names = set()
     sheet_nodes = workbook.find(q("s", "sheets"))
     for sheet in list(sheet_nodes or []):
+        sheet_name = sheet.attrib.get("name", "")
+        if requested_sheets and sheet_name not in requested_sheets:
+            continue
+        found_sheet_names.add(sheet_name)
         rel_id = sheet.attrib.get(q("r", "id"))
         relationship = relationships.get(rel_id or "", {})
         target = relationship.get("Target", "")
         part = resolved_relationship_target("xl/workbook.xml", target) if target else None
         sheet_result: Dict[str, Any] = {
-            "name": sheet.attrib.get("name"),
+            "name": sheet_name,
             "sheetId": sheet.attrib.get("sheetId"),
             "relationshipId": rel_id,
             "state": sheet.attrib.get("state", "visible"),
             "part": part,
         }
         cells = []
-        if include_cells and part and part in package.namelist():
+        tables = excel_tables_for_sheet(package, part) if include_tables and part and part in package.namelist() else []
+        total_tables += len(tables)
+        if (include_cells or search_text) and part and part in package.namelist():
             root = xml_root(package, part)
             for cell in root.iter(q("s", "c")):
                 if total_cells >= max_cells:
                     break
+                address = cell.attrib.get("r")
+                if selected_addresses is not None and address not in selected_addresses:
+                    continue
                 formula = cell.find(q("s", "f"))
-                cells.append({
-                    "address": cell.attrib.get("r"),
-                    "value": excel_cell_value(cell, shared),
+                value = excel_cell_value(cell, shared)
+                formula_text = formula.text if formula is not None else None
+                if search_text:
+                    haystack = " ".join(str(value or "") for value in (value, formula_text))
+                    comparable = haystack if match_case else haystack.lower()
+                    if search_needle not in comparable:
+                        continue
+                result = {
+                    "address": address,
+                    "value": value,
                     "formula": formula.text if formula is not None else None,
                     "styleIndex": int(cell.attrib.get("s", "0")),
                     "type": cell.attrib.get("t"),
-                })
+                }
+                if include_cells:
+                    cells.append(result)
+                if search_text and len(matches) < max_matches:
+                    matches.append({"sheet": sheet_name, **result})
                 total_cells += 1
+                if search_text and len(matches) >= max_matches:
+                    break
         sheet_result["cells"] = cells
         sheet_result["cellCount"] = len(cells)
+        sheet_result["tables"] = tables
+        sheet_result["tableCount"] = len(tables)
         sheets.append(sheet_result)
+        if search_text and len(matches) >= max_matches:
+            break
+    missing_sheets = sorted(requested_sheets - found_sheet_names)
+    if missing_sheets:
+        raise OfficePackageError("Excel worksheet was not found: %s" % ", ".join(missing_sheets))
     defined_names = []
     names_node = workbook.find(q("s", "definedNames"))
     for name in list(names_node or []):
@@ -355,8 +439,17 @@ def inspect_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str
         "sheets": sheets,
         "sheetCount": len(sheets),
         "cellCount": total_cells,
+        "tableCount": total_tables,
         "definedNames": defined_names,
-        "truncated": total_cells >= max_cells,
+        "selectors": {
+            "sheetNames": sorted(requested_sheets),
+            "address": requested_range or None,
+            "searchText": search_text or None,
+            "matchCase": match_case,
+        },
+        "matches": matches,
+        "matchCount": len(matches),
+        "truncated": total_cells >= max_cells or (bool(search_text) and len(matches) >= max_matches),
     }
 
 
@@ -480,6 +573,36 @@ def inspect_package(path: Path, request: Dict[str, Any]) -> Dict[str, Any]:
                 content = inspect_excel(package, request)
             else:
                 content = inspect_powerpoint(package, request)
+            search_text = request.get("searchText")
+            if isinstance(search_text, str) and search_text:
+                needle = search_text if request.get("matchCase", False) else search_text.lower()
+                max_matches = max(1, min(int(request.get("maxMatches", 200)), 5000))
+                matches = []
+                if kind == "word":
+                    candidates = [
+                        *({"objectType": "paragraph", **entry} for entry in content.get("paragraphs", [])),
+                        *({"objectType": "contentControl", **entry} for entry in content.get("contentControls", [])),
+                        *({"objectType": "comment", **entry} for entry in content.get("comments", [])),
+                    ]
+                elif kind == "excel":
+                    candidates = [
+                        {"objectType": "cell", "sheet": sheet.get("name"), **cell}
+                        for sheet in content.get("sheets", []) for cell in sheet.get("cells", [])
+                    ]
+                else:
+                    candidates = []
+                    for slide in content.get("slides", []):
+                        candidates.extend({"objectType": "shape", "slideIndex": slide.get("index"), **shape} for shape in slide.get("shapes", []))
+                        if slide.get("notes"):
+                            candidates.append({"objectType": "notes", "slideIndex": slide.get("index"), "text": slide.get("notes")})
+                for candidate in candidates:
+                    text_value = str(candidate.get("text", candidate.get("value", "")) or "")
+                    haystack = text_value if request.get("matchCase", False) else text_value.lower()
+                    if needle in haystack:
+                        matches.append(candidate)
+                        if len(matches) >= max_matches:
+                            break
+                content["search"] = {"query": search_text, "matches": matches, "matchCount": len(matches), "truncated": len(matches) >= max_matches}
             content.update({
                 "package": {
                     "path": str(path),
@@ -587,12 +710,161 @@ def direct_parent(root: ET.Element, child: ET.Element) -> Optional[ET.Element]:
     return next((parent for parent in root.iter() if child in list(parent)), None)
 
 
+def word_relationship_part(part: str) -> str:
+    return posixpath.join(posixpath.dirname(part), "_rels", posixpath.basename(part) + ".rels")
+
+
+def word_relationship_root(package: zipfile.ZipFile, modifications: Dict[str, bytes], part: str) -> Tuple[str, ET.Element]:
+    rel_part = word_relationship_part(part)
+    if rel_part in modifications:
+        return rel_part, ET.fromstring(modifications[rel_part])
+    if rel_part in package.namelist():
+        return rel_part, ET.fromstring(package.read(rel_part))
+    return rel_part, ET.Element(q("pr", "Relationships"))
+
+
+def add_word_relationship(package: zipfile.ZipFile, modifications: Dict[str, bytes], part: str, rel_type: str, target: str, external: bool = False) -> str:
+    rel_part, root = word_relationship_root(package, modifications, part)
+    for relationship in root.findall(q("pr", "Relationship")):
+        if relationship.attrib.get("Type") == rel_type and relationship.attrib.get("Target") == target and (relationship.attrib.get("TargetMode") == "External") == external:
+            return relationship.attrib["Id"]
+    used_ids = {relationship.attrib.get("Id") for relationship in root.findall(q("pr", "Relationship"))}
+    number = 1
+    while "rId%d" % number in used_ids:
+        number += 1
+    rel_id = "rId%d" % number
+    attributes = {"Id": rel_id, "Type": rel_type, "Target": target}
+    if external:
+        attributes["TargetMode"] = "External"
+    ET.SubElement(root, q("pr", "Relationship"), attributes)
+    modifications[rel_part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    return rel_id
+
+
+def add_content_type_override(package: zipfile.ZipFile, modifications: Dict[str, bytes], part_name: str, content_type: str) -> None:
+    part = "[Content_Types].xml"
+    root = ET.fromstring(modifications.get(part, package.read(part)))
+    existing = next((entry for entry in root.findall(q("ct", "Override")) if entry.attrib.get("PartName") == part_name), None)
+    if existing is None:
+        ET.SubElement(root, q("ct", "Override"), {"PartName": part_name, "ContentType": content_type})
+    else:
+        existing.attrib["ContentType"] = content_type
+    modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def assert_word_has_no_tracked_changes(package: zipfile.ZipFile, modifications: Dict[str, bytes]) -> None:
+    tracked_tags = {q("w", name) for name in ("ins", "del", "moveFrom", "moveTo")}
+    parts = sorted(name for name in package.namelist() if re.fullmatch(r"word/(document|header\d+|footer\d+|footnotes|endnotes)\.xml", name))
+    for part in parts:
+        root = ET.fromstring(modifications.get(part, package.read(part)))
+        if any(node.tag in tracked_tags for node in root.iter()):
+            raise OfficePackageError("Word documents containing tracked changes are refused. Accept or reject tracked changes in Word before editing.")
+
+
+def new_word_table(rows: List[List[str]], style: Optional[str] = None) -> ET.Element:
+    if not rows or any(not row for row in rows):
+        raise OfficePackageError("Word insertTable requires at least one non-empty row.")
+    if len(rows) > 100 or max(len(row) for row in rows) > 50 or sum(len(row) for row in rows) > 5000:
+        raise OfficePackageError("Word insertTable exceeds the 100-row, 50-column, or 5,000-cell safety limit.")
+    width = max(len(row) for row in rows)
+    table = ET.Element(q("w", "tbl"))
+    if style:
+        props = ET.SubElement(table, q("w", "tblPr"))
+        ET.SubElement(props, q("w", "tblStyle"), {q("w", "val"): str(style)})
+    grid = ET.SubElement(table, q("w", "tblGrid"))
+    for _ in range(width):
+        ET.SubElement(grid, q("w", "gridCol"))
+    for values in rows:
+        row = ET.SubElement(table, q("w", "tr"))
+        for value in list(values) + [""] * (width - len(values)):
+            cell = ET.SubElement(row, q("w", "tc"))
+            cell.append(new_word_paragraph(value))
+    return table
+
+
 def edit_word(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[str, bytes], List[Dict[str, Any]]]:
     names = set(package.namelist())
     modifications: Dict[str, bytes] = {}
     changes: List[Dict[str, Any]] = []
+    if request.get("trackedChanges", "refuse") != "refuse":
+        raise OfficePackageError("trackedChanges must be refuse; preserving review semantics is not supported.")
+    assert_word_has_no_tracked_changes(package, modifications)
     for operation in request.get("operations", []):
         op_type = operation.get("type")
+        if op_type == "addHyperlink":
+            part = str(operation.get("part", "word/document.xml"))
+            root = word_part(package, modifications, part)
+            paragraphs = word_paragraphs(root)
+            index = int(operation.get("paragraphIndex", -1))
+            if index < 0 or index >= len(paragraphs):
+                raise OfficePackageError("Word paragraphIndex is out of range.")
+            target = str(operation.get("url", "")).strip()
+            parsed = urlparse(target)
+            if parsed.scheme.lower() not in {"http", "https", "mailto"} or (parsed.scheme.lower() in {"http", "https"} and not parsed.netloc):
+                raise OfficePackageError("Word addHyperlink url must use http, https, or mailto.")
+            rel_id = add_word_relationship(package, modifications, part, "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink", target, external=True)
+            hyperlink = ET.SubElement(paragraphs[index], q("w", "hyperlink"), {q("r", "id"): rel_id})
+            run = ET.SubElement(hyperlink, q("w", "r"))
+            run_props = ET.SubElement(run, q("w", "rPr"))
+            ET.SubElement(run_props, q("w", "rStyle"), {q("w", "val"): "Hyperlink"})
+            ET.SubElement(run, q("w", "t")).text = str(operation.get("text", ""))
+            changes.append({"operation": op_type, "part": part, "paragraphIndex": index, "text": operation.get("text", ""), "url": target})
+            modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            continue
+        if op_type == "addComment":
+            part = "word/document.xml"
+            root = word_part(package, modifications, part)
+            paragraphs = word_paragraphs(root)
+            index = int(operation.get("paragraphIndex", -1))
+            if index < 0 or index >= len(paragraphs):
+                raise OfficePackageError("Word paragraphIndex is out of range.")
+            comments_part = "word/comments.xml"
+            if comments_part in modifications:
+                comments_root = ET.fromstring(modifications[comments_part])
+            elif comments_part in names:
+                comments_root = ET.fromstring(package.read(comments_part))
+            else:
+                comments_root = ET.Element(q("w", "comments"))
+            used_ids = {int(node.attrib.get(q("w", "id"), "-1")) for node in comments_root.findall(q("w", "comment")) if node.attrib.get(q("w", "id"), "").isdigit()}
+            comment_id = max(used_ids, default=-1) + 1
+            author = str(operation.get("author", "Codex"))
+            attributes = {q("w", "id"): str(comment_id), q("w", "author"): author, q("w", "date"): datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
+            if operation.get("initials") is not None:
+                attributes[q("w", "initials")] = str(operation.get("initials"))
+            comment = ET.SubElement(comments_root, q("w", "comment"), attributes)
+            comment.append(new_word_paragraph(operation.get("text")))
+            modifications[comments_part] = ET.tostring(comments_root, encoding="utf-8", xml_declaration=True)
+            add_word_relationship(package, modifications, part, "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments", "comments.xml")
+            add_content_type_override(package, modifications, "/word/comments.xml", "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml")
+            paragraph = paragraphs[index]
+            start_index = 1 if len(paragraph) and paragraph[0].tag == q("w", "pPr") else 0
+            paragraph.insert(start_index, ET.Element(q("w", "commentRangeStart"), {q("w", "id"): str(comment_id)}))
+            paragraph.append(ET.Element(q("w", "commentRangeEnd"), {q("w", "id"): str(comment_id)}))
+            reference_run = ET.SubElement(paragraph, q("w", "r"))
+            ET.SubElement(reference_run, q("w", "commentReference"), {q("w", "id"): str(comment_id)})
+            changes.append({"operation": op_type, "part": part, "paragraphIndex": index, "commentId": str(comment_id), "author": author})
+            modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            continue
+        if op_type == "insertTable":
+            part = "word/document.xml"
+            root = word_part(package, modifications, part)
+            body = root.find(q("w", "body"))
+            if body is None:
+                raise OfficePackageError("Word document body is missing.")
+            table = new_word_table(operation.get("rows", []), operation.get("style"))
+            after = operation.get("afterParagraphIndex")
+            if after is None:
+                section = body.find(q("w", "sectPr"))
+                body.insert(list(body).index(section) if section is not None else len(body), table)
+            else:
+                paragraphs = word_paragraphs(root)
+                index = int(after)
+                if index < 0 or index >= len(paragraphs) or direct_parent(root, paragraphs[index]) is not body:
+                    raise OfficePackageError("Word afterParagraphIndex must identify a top-level document paragraph.")
+                body.insert(list(body).index(paragraphs[index]) + 1, table)
+            changes.append({"operation": op_type, "part": part, "afterParagraphIndex": after, "rowCount": len(operation.get("rows", [])), "columnCount": max(len(row) for row in operation.get("rows", []))})
+            modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            continue
         if op_type in {"setParagraphText", "setParagraphStyle", "insertParagraph"}:
             part = str(operation.get("part", "word/document.xml"))
             root = word_part(package, modifications, part)
@@ -814,12 +1086,96 @@ def set_excel_cell(cell: ET.Element, value: Any = None, formula: Optional[str] =
         ET.SubElement(inline, q("s", "t")).text = "" if value is None else str(value)
 
 
-def edit_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[str, bytes], List[Dict[str, Any]]]:
+def excel_style_with_number_format(
+    package: zipfile.ZipFile,
+    modifications: Dict[str, Optional[bytes]],
+    style_index: int,
+    format_code: str,
+) -> int:
+    styles_part = "xl/styles.xml"
+    if styles_part not in package.namelist():
+        raise OfficePackageError("Excel setNumberFormat requires an existing styles.xml part.")
+    if not format_code or len(format_code) > 255:
+        raise OfficePackageError("Excel formatCode must contain 1 to 255 characters.")
+    root = ET.fromstring(modifications.get(styles_part) or package.read(styles_part))
+    number_formats = root.find(q("s", "numFmts"))
+    if number_formats is None:
+        number_formats = ET.Element(q("s", "numFmts"), {"count": "0"})
+        root.insert(0, number_formats)
+    existing_format = next((entry for entry in list(number_formats) if entry.attrib.get("formatCode") == format_code), None)
+    if existing_format is None:
+        used_ids = {int(entry.attrib.get("numFmtId", "0")) for entry in list(number_formats)}
+        number_format_id = 164
+        while number_format_id in used_ids:
+            number_format_id += 1
+        existing_format = ET.SubElement(number_formats, q("s", "numFmt"), {
+            "numFmtId": str(number_format_id),
+            "formatCode": format_code,
+        })
+        number_formats.attrib["count"] = str(len(list(number_formats)))
+    number_format_id = existing_format.attrib["numFmtId"]
+    cell_formats = root.find(q("s", "cellXfs"))
+    formats = list(cell_formats or [])
+    if cell_formats is None or style_index < 0 or style_index >= len(formats):
+        raise OfficePackageError("Excel cell styleIndex is outside styles.xml cellXfs.")
+    desired_attributes = {**formats[style_index].attrib, "numFmtId": number_format_id, "applyNumberFormat": "1"}
+    existing_index = next((index for index, entry in enumerate(formats) if entry.attrib == desired_attributes), None)
+    if existing_index is not None:
+        return existing_index
+    new_format = ET.fromstring(ET.tostring(formats[style_index]))
+    new_format.attrib.clear()
+    new_format.attrib.update(desired_attributes)
+    cell_formats.append(new_format)
+    cell_formats.attrib["count"] = str(len(list(cell_formats)))
+    modifications[styles_part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    return len(formats)
+
+
+def apply_excel_recalculate(package: zipfile.ZipFile, modifications: Dict[str, Optional[bytes]]) -> Dict[str, Any]:
+    workbook_part = "xl/workbook.xml"
+    workbook = ET.fromstring(modifications.get(workbook_part) or package.read(workbook_part))
+    calculation = workbook.find(q("s", "calcPr"))
+    before = dict(calculation.attrib) if calculation is not None else None
+    if calculation is None:
+        calculation = ET.SubElement(workbook, q("s", "calcPr"))
+    calculation.attrib.update({"calcMode": "auto", "fullCalcOnLoad": "1", "forceFullCalc": "1"})
+    modifications[workbook_part] = ET.tostring(workbook, encoding="utf-8", xml_declaration=True)
+
+    removed_chain = "xl/calcChain.xml" in package.namelist()
+    if removed_chain:
+        modifications["xl/calcChain.xml"] = None
+    relationships_part = "xl/_rels/workbook.xml.rels"
+    if relationships_part in package.namelist():
+        relationships = ET.fromstring(modifications.get(relationships_part) or package.read(relationships_part))
+        removed_relationship = False
+        for relationship in list(relationships):
+            target = relationship.attrib.get("Target", "")
+            if relationship.attrib.get("Type", "").endswith("/calcChain") or resolved_relationship_target(workbook_part, target) == "xl/calcChain.xml":
+                relationships.remove(relationship)
+                removed_relationship = True
+        if removed_relationship:
+            modifications[relationships_part] = ET.tostring(relationships, encoding="utf-8", xml_declaration=True)
+    if "[Content_Types].xml" in package.namelist():
+        content_types = ET.fromstring(modifications.get("[Content_Types].xml") or package.read("[Content_Types].xml"))
+        removed_override = False
+        for entry in list(content_types):
+            if entry.attrib.get("PartName") == "/xl/calcChain.xml":
+                content_types.remove(entry)
+                removed_override = True
+        if removed_override:
+            modifications["[Content_Types].xml"] = ET.tostring(content_types, encoding="utf-8", xml_declaration=True)
+    return {"before": before, "after": dict(calculation.attrib), "removedCalcChain": removed_chain}
+
+
+def edit_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[str, Optional[bytes]], List[Dict[str, Any]]]:
     sheet_parts = excel_sheet_parts(package)
-    modifications: Dict[str, bytes] = {}
+    modifications: Dict[str, Optional[bytes]] = {}
     changes = []
     for operation in request.get("operations", []):
         op_type = operation.get("type")
+        if op_type == "recalculate":
+            changes.append({"operation": op_type, **apply_excel_recalculate(package, modifications)})
+            continue
         if op_type == "renameSheet":
             old_name = str(operation.get("sheet", ""))
             new_name = str(operation.get("newName", ""))
@@ -853,7 +1209,7 @@ def edit_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[
             modifications["xl/workbook.xml"] = ET.tostring(workbook, encoding="utf-8", xml_declaration=True)
             changes.append({"operation": op_type, "name": name, "before": before, "after": target.text})
             continue
-        if op_type not in {"setCell", "setFormula", "setRange", "clearRange", "setStyle"}:
+        if op_type not in {"setCell", "setFormula", "setRange", "clearRange", "setStyle", "setNumberFormat"}:
             raise OfficePackageError("Unsupported Excel operation: %s" % op_type)
         sheet_name = str(operation.get("sheet", ""))
         part = sheet_parts.get(sheet_name)
@@ -890,12 +1246,23 @@ def edit_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[
                     if operation.get("format", False):
                         cell.attrib.pop("s", None)
                 else:
-                    style_index = int(operation.get("styleIndex", -1))
-                    if style_index < 0:
-                        raise OfficePackageError("Excel styleIndex must be non-negative.")
-                    cell.attrib["s"] = str(style_index)
+                    if op_type == "setStyle":
+                        style_index = int(operation.get("styleIndex", -1))
+                        if style_index < 0:
+                            raise OfficePackageError("Excel styleIndex must be non-negative.")
+                        cell.attrib["s"] = str(style_index)
+                    else:
+                        cell.attrib["s"] = str(excel_style_with_number_format(
+                            package,
+                            modifications,
+                            int(cell.attrib.get("s", "0")),
+                            str(operation.get("formatCode", "")),
+                        ))
                 after_formula = cell.find(q("s", "f"))
-                changes.append({"operation": op_type, "sheet": sheet_name, "address": cell_address, "before": before, "after": {"value": excel_cell_value(cell, []), "formula": after_formula.text if after_formula is not None else None, "styleIndex": int(cell.attrib.get("s", "0"))}})
+                after = {"value": excel_cell_value(cell, []), "formula": after_formula.text if after_formula is not None else None, "styleIndex": int(cell.attrib.get("s", "0"))}
+                if op_type == "setNumberFormat":
+                    after["numberFormat"] = operation.get("formatCode")
+                changes.append({"operation": op_type, "sheet": sheet_name, "address": cell_address, "before": before, "after": after})
         modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
     return modifications, changes
 
@@ -911,6 +1278,175 @@ def ppt_current_slides(package: zipfile.ZipFile, modifications: Dict[str, Option
         rel = relationships.get(rel_id)
         result.append({"index": index, "node": node, "relationship": rel, "relationshipId": rel_id, "part": resolved_relationship_target("ppt/presentation.xml", rel.attrib.get("Target", "")) if rel is not None else None})
     return result
+
+
+PPT_IMAGE_CONTENT_TYPES = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/gif": "gif",
+    "image/bmp": "bmp",
+    "image/tiff": "tiff",
+}
+
+
+def ppt_shape_by_id(root: ET.Element, shape_id: str) -> Optional[ET.Element]:
+    for tag in (q("p", "sp"), q("p", "pic"), q("p", "graphicFrame"), q("p", "grpSp")):
+        for shape in root.iter(tag):
+            nv = shape.find(".//" + q("p", "cNvPr"))
+            if nv is not None and nv.attrib.get("id") == shape_id:
+                return shape
+    return None
+
+
+def ppt_add_text_box(root: ET.Element, operation: Dict[str, Any]) -> Dict[str, Any]:
+    shape_tree = root.find(".//" + q("p", "spTree"))
+    if shape_tree is None:
+        raise OfficePackageError("PowerPoint slide shape tree is missing.")
+    used_ids = {int(node.attrib["id"]) for node in root.iter(q("p", "cNvPr")) if node.attrib.get("id", "").isdigit()}
+    requested_id = operation.get("shapeId")
+    shape_id = int(requested_id) if requested_id is not None else max(used_ids or {1}) + 1
+    if shape_id < 1 or shape_id in used_ids:
+        raise OfficePackageError("PowerPoint addTextBox shapeId must be a unique positive integer on the slide.")
+    x = int(operation.get("x", 0))
+    y = int(operation.get("y", 0))
+    width = int(operation.get("width", 1_828_800))
+    height = int(operation.get("height", 457_200))
+    if width <= 0 or height <= 0:
+        raise OfficePackageError("PowerPoint addTextBox width and height must be positive.")
+    name = str(operation.get("name") or "TextBox %d" % shape_id)
+    shape = ET.Element(q("p", "sp"))
+    non_visual = ET.SubElement(shape, q("p", "nvSpPr"))
+    ET.SubElement(non_visual, q("p", "cNvPr"), {"id": str(shape_id), "name": name})
+    ET.SubElement(non_visual, q("p", "cNvSpPr"), {"txBox": "1"})
+    ET.SubElement(non_visual, q("p", "nvPr"))
+    shape_properties = ET.SubElement(shape, q("p", "spPr"))
+    transform = ET.SubElement(shape_properties, q("a", "xfrm"))
+    ET.SubElement(transform, q("a", "off"), {"x": str(x), "y": str(y)})
+    ET.SubElement(transform, q("a", "ext"), {"cx": str(width), "cy": str(height)})
+    geometry = ET.SubElement(shape_properties, q("a", "prstGeom"), {"prst": "rect"})
+    ET.SubElement(geometry, q("a", "avLst"))
+    ET.SubElement(shape_properties, q("a", "noFill"))
+    line = ET.SubElement(shape_properties, q("a", "ln"))
+    ET.SubElement(line, q("a", "noFill"))
+    text_body = ET.SubElement(shape, q("p", "txBody"))
+    ET.SubElement(text_body, q("a", "bodyPr"), {"wrap": "square"})
+    ET.SubElement(text_body, q("a", "lstStyle"))
+    paragraph = ET.SubElement(text_body, q("a", "p"))
+    run = ET.SubElement(paragraph, q("a", "r"))
+    ET.SubElement(run, q("a", "rPr"), {"lang": "en-US"})
+    text_node = ET.SubElement(run, q("a", "t"))
+    text_node.text = str(operation.get("text", ""))
+    if text_node.text[:1].isspace() or text_node.text[-1:].isspace():
+        text_node.attrib["{http://www.w3.org/XML/1998/namespace}space"] = "preserve"
+    ET.SubElement(paragraph, q("a", "endParaRPr"), {"lang": "en-US"})
+    shape_tree.append(shape)
+    return {"shapeId": str(shape_id), "name": name, "text": str(operation.get("text", "")), "geometry": {"x": x, "y": y, "width": width, "height": height}}
+
+
+def ppt_set_text_style(shape: ET.Element, operation: Dict[str, Any]) -> Dict[str, Any]:
+    style_keys = {"fontFamily", "fontSize", "bold", "italic", "underline", "color"}
+    if not any(key in operation for key in style_keys):
+        raise OfficePackageError("PowerPoint setTextStyle requires at least one style property.")
+    runs = [node for node in shape.iter() if node.tag in {q("a", "r"), q("a", "fld")}]
+    if not runs:
+        raise OfficePackageError("Selected PowerPoint shape has no editable text runs.")
+    color = operation.get("color")
+    if color is not None and not re.fullmatch(r"[0-9A-Fa-f]{6}", str(color)):
+        raise OfficePackageError("PowerPoint setTextStyle.color must be a six-digit RGB hex value.")
+    font_size = operation.get("fontSize")
+    if font_size is not None and not (1 <= float(font_size) <= 400):
+        raise OfficePackageError("PowerPoint setTextStyle.fontSize must be between 1 and 400 points.")
+    for run in runs:
+        props = run.find(q("a", "rPr"))
+        if props is None:
+            props = ET.Element(q("a", "rPr"))
+            run.insert(0, props)
+        if font_size is not None:
+            props.attrib["sz"] = str(round(float(font_size) * 100))
+        if operation.get("bold") is not None:
+            props.attrib["b"] = "1" if operation["bold"] else "0"
+        if operation.get("italic") is not None:
+            props.attrib["i"] = "1" if operation["italic"] else "0"
+        if operation.get("underline") is not None:
+            props.attrib["u"] = "sng" if operation["underline"] else "none"
+        if operation.get("fontFamily") is not None:
+            latin = props.find(q("a", "latin"))
+            if latin is None:
+                latin = ET.SubElement(props, q("a", "latin"))
+            latin.attrib["typeface"] = str(operation["fontFamily"])
+        if color is not None:
+            for child in list(props):
+                if child.tag in {q("a", "solidFill"), q("a", "gradFill"), q("a", "noFill"), q("a", "pattFill")}:
+                    props.remove(child)
+            fill = ET.Element(q("a", "solidFill"))
+            ET.SubElement(fill, q("a", "srgbClr"), {"val": str(color).upper()})
+            typeface_tags = {q("a", "latin"), q("a", "ea"), q("a", "cs"), q("a", "sym"), q("a", "hlinkClick"), q("a", "hlinkMouseOver")}
+            insert_at = next((index for index, child in enumerate(list(props)) if child.tag in typeface_tags), len(list(props)))
+            props.insert(insert_at, fill)
+    return {key: operation[key] for key in style_keys if key in operation}
+
+
+def ppt_replace_image(package: zipfile.ZipFile, modifications: Dict[str, Optional[bytes]], slide_part: str, slide_root: ET.Element, shape: ET.Element, operation: Dict[str, Any]) -> Dict[str, Any]:
+    if shape.tag != q("p", "pic"):
+        raise OfficePackageError("PowerPoint replaceImage requires a picture shape.")
+    content_type = str(operation.get("contentType", "")).lower()
+    extension = PPT_IMAGE_CONTENT_TYPES.get(content_type)
+    if not extension:
+        raise OfficePackageError("PowerPoint replaceImage contentType is unsupported.")
+    try:
+        payload = base64.b64decode(str(operation.get("base64", "")), validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise OfficePackageError("PowerPoint replaceImage.base64 is invalid.") from error
+    if not payload or len(payload) > 25 * 1024 * 1024:
+        raise OfficePackageError("PowerPoint replacement image must be between 1 byte and 25 MiB.")
+    signatures_match = {
+        "image/png": payload.startswith(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg": payload.startswith(b"\xff\xd8\xff"),
+        "image/gif": payload.startswith((b"GIF87a", b"GIF89a")),
+        "image/bmp": payload.startswith(b"BM"),
+        "image/tiff": payload.startswith((b"II*\x00", b"MM\x00*")),
+    }
+    if not signatures_match[content_type]:
+        raise OfficePackageError("PowerPoint replacement image bytes do not match contentType.")
+    blip = shape.find(".//" + q("a", "blip"))
+    if blip is None:
+        raise OfficePackageError("Selected PowerPoint picture has no embedded image reference.")
+    existing_numbers = [int(match.group(1)) for name in set(package.namelist()) | set(modifications) if (match := re.fullmatch(r"ppt/media/image(\d+)\.[A-Za-z0-9]+", name))]
+    media_part = "ppt/media/image%d.%s" % (max(existing_numbers or [0]) + 1, extension)
+    modifications[media_part] = payload
+    rels_name = posixpath.join(posixpath.dirname(slide_part), "_rels", posixpath.basename(slide_part) + ".rels")
+    if rels_name in modifications and modifications[rels_name] is not None:
+        rels_root = ET.fromstring(modifications[rels_name])
+    elif rels_name in package.namelist():
+        rels_root = ET.fromstring(package.read(rels_name))
+    else:
+        rels_root = ET.Element(q("pr", "Relationships"))
+    used_rids = {entry.attrib.get("Id") for entry in rels_root.findall(q("pr", "Relationship"))}
+    rid_number = 1
+    while "rId%d" % rid_number in used_rids:
+        rid_number += 1
+    new_rid = "rId%d" % rid_number
+    ET.SubElement(rels_root, q("pr", "Relationship"), {
+        "Id": new_rid,
+        "Type": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image",
+        "Target": "../media/%s" % posixpath.basename(media_part),
+    })
+    blip.attrib[q("r", "embed")] = new_rid
+    ET.register_namespace("", NS["pr"])
+    modifications[rels_name] = ET.tostring(rels_root, encoding="utf-8", xml_declaration=True)
+    content_types_name = "[Content_Types].xml"
+    if content_types_name not in package.namelist():
+        raise OfficePackageError("PowerPoint package is missing [Content_Types].xml.")
+    content_root = ET.fromstring(modifications.get(content_types_name) or package.read(content_types_name))
+    defaults = [node for node in list(content_root) if node.tag == q("ct", "Default") and node.attrib.get("Extension", "").lower() == extension]
+    if not any(node.attrib.get("ContentType") == content_type for node in defaults):
+        if defaults:
+            ET.SubElement(content_root, q("ct", "Override"), {"PartName": "/" + media_part, "ContentType": content_type})
+        else:
+            ET.SubElement(content_root, q("ct", "Default"), {"Extension": extension, "ContentType": content_type})
+    ET.register_namespace("", NS["ct"])
+    modifications[content_types_name] = ET.tostring(content_root, encoding="utf-8", xml_declaration=True)
+    return {"relationshipId": new_rid, "mediaPart": media_part, "contentType": content_type, "bytes": len(payload)}
 
 
 def edit_powerpoint(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[str, Optional[bytes]], List[Dict[str, Any]]]:
@@ -984,7 +1520,7 @@ def edit_powerpoint(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[
             ET.register_namespace("", NS["pr"])
             modifications[rels_name] = ET.tostring(rels_root, encoding="utf-8", xml_declaration=True)
             continue
-        if op_type not in {"replaceText", "setShapeText", "setShapeGeometry", "setTableCell", "setNotes"}:
+        if op_type not in {"replaceText", "setShapeText", "setShapeGeometry", "setTableCell", "setNotes", "addTextBox", "deleteShape", "setTextStyle", "replaceImage"}:
             raise OfficePackageError("Unsupported PowerPoint operation: %s" % op_type)
         requested_slide = operation.get("slideIndex")
         requested_shape = str(operation.get("shapeId")) if operation.get("shapeId") is not None else None
@@ -994,6 +1530,12 @@ def edit_powerpoint(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[
                 continue
             part = slide["part"]
             root = ET.fromstring(modifications.get(part, package.read(part)))
+            if op_type == "addTextBox":
+                created = ppt_add_text_box(root, operation)
+                changes.append({"operation": op_type, "slideIndex": slide["index"], **created})
+                modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+                operation_finished = True
+                break
             if op_type == "setNotes":
                 notes_part = None
                 for rel in rels_for_part(package, part).values():
@@ -1008,12 +1550,30 @@ def edit_powerpoint(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[
                 changes.append({"operation": op_type, "slideIndex": slide["index"], "before": before, "after": operation.get("text", "")})
                 modifications[notes_part] = ET.tostring(notes_root, encoding="utf-8", xml_declaration=True)
                 continue
-            for shape in root.findall(".//" + q("p", "sp")) + root.findall(".//" + q("p", "graphicFrame")):
+            candidates = (root.findall(".//" + q("p", "sp"))
+                          + root.findall(".//" + q("p", "pic"))
+                          + root.findall(".//" + q("p", "graphicFrame"))
+                          + root.findall(".//" + q("p", "grpSp")))
+            for shape in candidates:
                 nv = shape.find(".//" + q("p", "cNvPr"))
                 shape_id = nv.attrib.get("id") if nv is not None else None
                 if requested_shape is not None and shape_id != requested_shape:
                     continue
-                if op_type == "setShapeText":
+                if op_type == "deleteShape":
+                    parent = direct_parent(root, shape)
+                    if parent is None:
+                        raise OfficePackageError("Could not locate the selected PowerPoint shape parent.")
+                    before = ppt_shape_result(shape, slide["index"])
+                    parent.remove(shape)
+                    part_changes = [{"before": before, "after": None}]
+                elif op_type == "setTextStyle":
+                    before = {"runCount": len([node for node in shape.iter() if node.tag in {q("a", "r"), q("a", "fld")}])}
+                    part_changes = [{"before": before, "after": ppt_set_text_style(shape, operation)}]
+                elif op_type == "replaceImage":
+                    before_blip = shape.find(".//" + q("a", "blip"))
+                    before = {"relationshipId": before_blip.attrib.get(q("r", "embed")) if before_blip is not None else None}
+                    part_changes = [{"before": before, "after": ppt_replace_image(package, modifications, part, root, shape, operation)}]
+                elif op_type == "setShapeText":
                     before = set_text_nodes(list(shape.iter(q("a", "t"))), operation.get("text"))
                     part_changes = [{"before": before, "after": operation.get("text", "")}]
                 elif op_type == "setShapeGeometry":
@@ -1056,6 +1616,9 @@ def edit_powerpoint(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[
                     )
                 for change in part_changes:
                     changes.append({"operation": op_type, "slideIndex": slide["index"], "shapeId": shape_id, **change})
+                if part_changes and op_type in {"deleteShape", "setTextStyle", "replaceImage"}:
+                    operation_finished = True
+                    break
                 if part_changes and op_type == "replaceText" and not operation.get("all", True):
                     operation_finished = True
                     break

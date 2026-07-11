@@ -22,6 +22,7 @@ let officeWordBuffer = readFileSync(join(officeFixtureDir, "sample.docx"));
 let officeExcelBuffer = readFileSync(join(officeFixtureDir, "sample.xlsx"));
 let officeBusinessBuffer = Buffer.from(officeExcelBuffer);
 let officePowerPointBuffer = readFileSync(join(officeFixtureDir, "sample.pptx"));
+let officeWordPostMetadataFailuresRemaining = 0;
 const officeVersions = { "office-word": 1, "office-excel": 1, "office-business": 1, "office-powerpoint": 1 };
 
 const requests = [];
@@ -312,7 +313,12 @@ const graph = createServer(async (req, res) => {
     if (req.method === "PUT" && path.endsWith("/content")) {
       definition.buffer = await readBufferBody(req);
       officeVersions[id] += 1;
+      if (id === "office-word") officeWordPostMetadataFailuresRemaining = 20;
       return json(res, 200, officeItem(id, definition.name, definition.buffer, definition.mime, definition.driveId ? { parentReference: { driveId: definition.driveId, path: `/drives/${definition.driveId}/root:` } } : {}));
+    }
+    if (req.method === "GET" && id === "office-word" && officeWordPostMetadataFailuresRemaining > 0) {
+      officeWordPostMetadataFailuresRemaining -= 1;
+      return json(res, 503, { error: { code: "serviceUnavailable", message: "mock post-commit metadata failure" } }, { "Retry-After": "0" });
     }
     if (req.method === "GET") return json(res, 200, officeItem(id, definition.name, definition.buffer, definition.mime, definition.driveId ? { parentReference: { driveId: definition.driveId, path: `/drives/${definition.driveId}/root:` } } : {}));
   }
@@ -1286,7 +1292,9 @@ try {
     const wordPreview = await tool("onedrive_word_batch_update", { itemId: "office-word", operations: [{ type: "replaceText", find: "Hello Word", replace: "Updated Word" }] });
     assert(!wordPreview.isError && wordPreview.value.dryRun === true && wordPreview.value.previewToken, "Word edit preview failed", wordPreview);
     const wordLive = await tool("onedrive_word_batch_update", { itemId: "office-word", operations: [{ type: "replaceText", find: "Hello Word", replace: "Updated Word" }], dryRun: false, confirmed: true, expectedId: "office-word", previewToken: wordPreview.value.previewToken });
-    assert(!wordLive.isError && wordLive.value.changeCount === 1 && wordLive.value.verificationIncomplete === false, "Word live edit failed", wordLive);
+    officeWordPostMetadataFailuresRemaining = 0;
+    assert(!wordLive.isError && wordLive.value.changeCount === 1 && wordLive.value.verificationIncomplete === true, "Word live edit should remain successful when post-commit metadata verification fails", wordLive);
+    assert(wordLive.value.localWarnings?.some((entry) => entry.operation === "Office post-commit metadata verification"), "Word live edit should report the post-commit metadata warning", wordLive);
 
     const excelPreview = await tool("onedrive_excel_batch_update", { itemId: "office-excel", operations: [{ type: "setCell", sheet: "Data", address: "B2", value: "Updated" }] });
     assert(!excelPreview.isError && excelPreview.value.previewToken, "Excel edit preview failed", excelPreview);
@@ -1297,6 +1305,17 @@ try {
     assert(!pptPreview.isError && pptPreview.value.previewToken, "PowerPoint edit preview failed", pptPreview);
     const pptLive = await tool("onedrive_powerpoint_batch_update", { itemId: "office-powerpoint", operations: [{ type: "replaceText", slideIndex: 0, shapeId: "2", find: "Hello", replace: "Updated" }], dryRun: false, confirmed: true, expectedId: "office-powerpoint", previewToken: pptPreview.value.previewToken });
     assert(!pptLive.isError && pptLive.value.changeCount === 1, "PowerPoint live edit failed", pptLive);
+    const nativePptOperations = [
+      { type: "addTextBox", slideIndex: 0, shapeId: 4, name: "Added box", text: "Native text", x: 100, y: 200, width: 300, height: 400 },
+      { type: "setTextStyle", slideIndex: 0, shapeId: "4", fontFamily: "Aptos", fontSize: 18, bold: true, color: "12AB34" },
+      { type: "addTextBox", slideIndex: 0, shapeId: 5, text: "Delete me", x: 10, y: 20, width: 30, height: 40 },
+      { type: "deleteShape", slideIndex: 0, shapeId: "5" },
+      { type: "replaceImage", slideIndex: 0, shapeId: "3", base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", contentType: "image/png" }
+    ];
+    const nativePptPreview = await tool("onedrive_powerpoint_batch_update", { itemId: "office-powerpoint", operations: nativePptOperations });
+    assert(!nativePptPreview.isError && nativePptPreview.value.changeCount === 5 && nativePptPreview.value.previewToken, "PowerPoint native edit preview failed", nativePptPreview);
+    const nativePptLive = await tool("onedrive_powerpoint_batch_update", { itemId: "office-powerpoint", operations: nativePptOperations, dryRun: false, confirmed: true, expectedId: "office-powerpoint", previewToken: nativePptPreview.value.previewToken });
+    assert(!nativePptLive.isError && nativePptLive.value.changeCount === 5, "PowerPoint native live edit failed", nativePptLive);
 
     const updatedWord = await tool("onedrive_word_get_document", { itemId: "office-word" });
     const updatedExcel = await tool("onedrive_excel_get_workbook", { itemId: "office-excel" });
@@ -1304,10 +1323,13 @@ try {
     assert(updatedWord.value.paragraphs[0].text === "Updated Word", "Word edit did not persist", updatedWord);
     assert(updatedExcel.value.sheets[0].cells.some((cell) => cell.address === "B2" && cell.value === "Updated"), "Excel edit did not persist", updatedExcel);
     assert(updatedPowerpoint.value.slides[0].shapes[0].text === "Updated PowerPoint", "PowerPoint edit did not persist", updatedPowerpoint);
+    const pptShapes = new Map(updatedPowerpoint.value.slides[0].shapes.map((shape) => [shape.id, shape]));
+    assert(pptShapes.get("4")?.text === "Native text" && !pptShapes.has("5"), "PowerPoint text-box/style/delete edits did not persist", updatedPowerpoint);
+    assert(pptShapes.get("3")?.image?.target?.endsWith(".png"), "PowerPoint image relationship was not replaced", updatedPowerpoint);
     for (const id of ["office-word", "office-excel", "office-powerpoint"]) {
       assert(requests.some((entry) => entry.method === "PUT" && entry.path === `/v1.0/me/drive/items/${id}/content`), "Office commit did not target the stable item ID", { id });
     }
-    return { wordChanges: wordLive.value.changeCount, excelChanges: excelLive.value.changeCount, powerpointChanges: pptLive.value.changeCount };
+    return { wordChanges: wordLive.value.changeCount, excelChanges: excelLive.value.changeCount, powerpointChanges: pptLive.value.changeCount + nativePptLive.value.changeCount };
   });
 
   await check("business Excel uses a scoped Graph workbook session", async () => {

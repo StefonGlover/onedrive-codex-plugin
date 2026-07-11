@@ -28,9 +28,9 @@ def root_rels(target, rel_type):
 </Relationships>""" % (rel_type, target)
 
 
-def write_package(path, parts):
+def write_package(path, parts, content_types=CONTENT_TYPES):
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as package:
-        package.writestr("[Content_Types].xml", CONTENT_TYPES)
+        package.writestr("[Content_Types].xml", content_types)
         for name, value in parts.items():
             package.writestr(name, value)
 
@@ -62,16 +62,30 @@ def emit_fixtures(root):
     write_package(xlsx, {
         "_rels/.rels": root_rels("xl/workbook.xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"),
         "xl/workbook.xml": """<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets><definedNames><definedName name="Total">Data!$A$1</definedName></definedNames></workbook>""",
-        "xl/_rels/workbook.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>""",
-        "xl/worksheets/sheet1.xml": """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><f>SUM(1,2)</f><v>3</v></c><c r="B1" t="inlineStr"><is><t>Revenue</t></is></c></row></sheetData></worksheet>""",
+        "xl/_rels/workbook.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain" Target="calcChain.xml"/></Relationships>""",
+        "xl/worksheets/sheet1.xml": """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1"><f>SUM(1,2)</f><v>3</v></c><c r="B1" t="inlineStr"><is><t>Revenue</t></is></c></row></sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts></worksheet>""",
+        "xl/worksheets/_rels/sheet1.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/></Relationships>""",
+        "xl/tables/table1.xml": """<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="RevenueTable" displayName="RevenueTable" ref="A1:B2"><tableColumns count="2"><tableColumn id="1" name="Metric"/><tableColumn id="2" name="Revenue"/></tableColumns><tableStyleInfo name="TableStyleMedium2" showRowStripes="1"/></table>""",
+        "xl/styles.xml": """<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font/></fonts><fills count="1"><fill/></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>""",
+        "xl/calcChain.xml": """<calcChain xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><c r="A1" i="1"/></calcChain>""",
     })
     pptx = root / "sample.pptx"
+    ppt_content_types = """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="gif" ContentType="image/gif"/>
+  <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+  <Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+</Types>"""
     write_package(pptx, {
         "_rels/.rels": root_rels("ppt/presentation.xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"),
         "ppt/presentation.xml": """<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="12192000" cy="6858000" type="screen16x9"/></p:presentation>""",
         "ppt/_rels/presentation.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>""",
-        "ppt/slides/slide1.xml": """<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="2" name="Title 1"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr><a:xfrm><a:off x="1" y="2"/><a:ext cx="3" cy="4"/></a:xfrm></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Hello PowerPoint</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>""",
-    })
+        "ppt/slides/slide1.xml": """<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="2" name="Title 1"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr><a:xfrm><a:off x="1" y="2"/><a:ext cx="3" cy="4"/></a:xfrm></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Hello PowerPoint</a:t></a:r></a:p></p:txBody></p:sp><p:pic><p:nvPicPr><p:cNvPr id="3" name="Picture 1"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId2"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="10" y="20"/><a:ext cx="30" cy="40"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr></p:pic></p:spTree></p:cSld></p:sld>""",
+        "ppt/slides/_rels/slide1.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.gif"/></Relationships>""",
+        "ppt/media/image1.gif": b"GIF89a",
+    }, ppt_content_types)
     return {"word": docx, "excel": xlsx, "powerpoint": pptx}
 
 
@@ -85,8 +99,8 @@ def main():
             "_rels/.rels": root_rels("word/document.xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"),
             "word/document.xml": """<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Hello Word</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>A1</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:sdt><w:sdtPr><w:tag w:val="customer"/><w:alias w:val="Customer"/><w:id w:val="7"/></w:sdtPr><w:sdtContent><w:p><w:r><w:t>Acme</w:t></w:r></w:p></w:sdtContent></w:sdt></w:body></w:document>""",
         })
-        word = run_helper(docx, "word")
-        checks["word"] = word["paragraphs"][0]["text"] == "Hello Word" and word["tableCount"] == 1 and word["contentControlCount"] == 1
+        word = run_helper(docx, "word", searchText="Hello")
+        checks["word"] = word["paragraphs"][0]["text"] == "Hello Word" and word["tableCount"] == 1 and word["contentControlCount"] == 1 and word["search"]["matchCount"] == 1
         edited_docx = root / "edited.docx"
         word_edit = run_helper(docx, "word", action="edit", outputPath=str(edited_docx), operations=[{"type": "replaceText", "find": "Hello Word", "replace": "Edited Word"}])
         edited_word = run_helper(edited_docx, "word")
@@ -98,23 +112,51 @@ def main():
             {"type": "setTableCell", "tableIndex": 0, "rowIndex": 0, "columnIndex": 0, "text": "Table value"},
             {"type": "setContentControlText", "tag": "customer", "text": "Contoso"},
             {"type": "insertParagraph", "text": "Inserted paragraph", "style": "Normal"},
+            {"type": "addHyperlink", "paragraphIndex": 0, "text": " OpenAI", "url": "https://openai.com/docs"},
+            {"type": "addComment", "paragraphIndex": 0, "text": "Review this paragraph", "author": "Codex", "initials": "CX"},
+            {"type": "insertTable", "afterParagraphIndex": 0, "rows": [["Name", "Value"], ["Alpha", "1"]], "style": "TableGrid"},
         ])
         rich_word = run_helper(rich_docx, "word")
-        checks["wordStructuredEdits"] = rich_word_edit["changeCount"] == 5 and rich_word["paragraphs"][0]["text"] == "Native Word" and rich_word["paragraphs"][0]["style"] == "Title" and rich_word["tables"][0]["rows"][0][0] == "Table value" and rich_word["contentControls"][0]["text"] == "Contoso" and any(paragraph["text"] == "Inserted paragraph" for paragraph in rich_word["paragraphs"])
+        checks["wordStructuredEdits"] = rich_word_edit["changeCount"] == 8 and rich_word["paragraphs"][0]["text"] == "Native Word OpenAI" and rich_word["paragraphs"][0]["style"] == "Title" and rich_word["tables"][0]["rows"][0] == ["Name", "Value"] and rich_word["tables"][1]["rows"][0][0] == "Table value" and rich_word["contentControls"][0]["text"] == "Contoso" and rich_word["comments"][0]["text"] == "Review this paragraph" and any(paragraph["text"] == "Inserted paragraph" for paragraph in rich_word["paragraphs"])
+        with zipfile.ZipFile(rich_docx, "r") as package:
+            document_xml = package.read("word/document.xml").decode("utf-8")
+            relationships_xml = package.read("word/_rels/document.xml.rels").decode("utf-8")
+            content_types_xml = package.read("[Content_Types].xml").decode("utf-8")
+            checks["wordHyperlinkRelationship"] = "https://openai.com/docs" in relationships_xml and 'TargetMode="External"' in relationships_xml and "hyperlink" in document_xml
+            checks["wordCommentPackageParts"] = "word/comments.xml" in package.namelist() and "comments.xml" in relationships_xml and "/word/comments.xml" in content_types_xml and "commentRangeStart" in document_xml and "commentReference" in document_xml
         expanding_docx = root / "expanding.docx"
         expanding = run_helper(docx, "word", action="edit", outputPath=str(expanding_docx), operations=[{"type": "replaceText", "find": "o", "replace": "oo", "all": True}])
         checks["wordExpandingReplacementBounded"] = expanding["changeCount"] == 2
+        tracked_docx = root / "tracked.docx"
+        write_package(tracked_docx, {
+            "_rels/.rels": root_rels("word/document.xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"),
+            "word/document.xml": """<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:ins w:id="1"><w:r><w:t>Tracked text</w:t></w:r></w:ins></w:p></w:body></w:document>""",
+        })
+        tracked_result = subprocess.run(
+            [sys.executable, str(HELPER)],
+            input=json.dumps({"action": "edit", "inputPath": str(tracked_docx), "outputPath": str(root / "tracked-edited.docx"), "kind": "word", "operations": [{"type": "insertParagraph", "text": "Unsafe"}]}),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        checks["wordTrackedChangesRefused"] = tracked_result.returncode != 0 and "tracked changes are refused" in tracked_result.stdout
 
         xlsx = root / "sample.xlsx"
         write_package(xlsx, {
             "_rels/.rels": root_rels("xl/workbook.xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"),
             "xl/workbook.xml": """<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets><definedNames><definedName name="Total">Data!$A$1</definedName></definedNames></workbook>""",
-            "xl/_rels/workbook.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>""",
-            "xl/worksheets/sheet1.xml": """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><f>SUM(1,2)</f><v>3</v></c><c r="B1" t="inlineStr"><is><t>Revenue</t></is></c></row></sheetData></worksheet>""",
+            "xl/_rels/workbook.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain" Target="calcChain.xml"/></Relationships>""",
+            "xl/worksheets/sheet1.xml": """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1"><f>SUM(1,2)</f><v>3</v></c><c r="B1" t="inlineStr"><is><t>Revenue</t></is></c></row></sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts></worksheet>""",
+            "xl/worksheets/_rels/sheet1.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/></Relationships>""",
+            "xl/tables/table1.xml": """<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="RevenueTable" displayName="RevenueTable" ref="A1:B2"><tableColumns count="2"><tableColumn id="1" name="Metric"/><tableColumn id="2" name="Revenue"/></tableColumns><tableStyleInfo name="TableStyleMedium2" showRowStripes="1"/></table>""",
+            "xl/styles.xml": """<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font/></fonts><fills count="1"><fill/></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>""",
+            "xl/calcChain.xml": """<calcChain xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><c r="A1" i="1"/></calcChain>""",
         })
-        excel = run_helper(xlsx, "excel")
+        excel = run_helper(xlsx, "excel", searchText="Revenue")
         cells = excel["sheets"][0]["cells"]
-        checks["excel"] = excel["sheetCount"] == 1 and cells[0]["formula"] == "SUM(1,2)" and cells[1]["value"] == "Revenue"
+        checks["excel"] = excel["sheetCount"] == 1 and cells[0]["value"] == "Revenue" and excel["search"]["matchCount"] == 1 and excel["tableCount"] == 1 and excel["sheets"][0]["tables"][0]["displayName"] == "RevenueTable"
+        selected_excel = run_helper(xlsx, "excel", sheetNames=["Data"], address="A1:A1")
+        checks["excelSelectors"] = selected_excel["cellCount"] == 1 and selected_excel["sheets"][0]["cells"][0]["formula"] == "SUM(1,2)"
         edited_xlsx = root / "edited.xlsx"
         excel_edit = run_helper(xlsx, "excel", action="edit", outputPath=str(edited_xlsx), operations=[{"type": "setCell", "sheet": "Data", "address": "B2", "value": "Updated"}, {"type": "setFormula", "sheet": "Data", "address": "C2", "formula": "1+2"}])
         edited_excel = run_helper(edited_xlsx, "excel")
@@ -124,12 +166,19 @@ def main():
         rich_excel_edit = run_helper(xlsx, "excel", action="edit", outputPath=str(rich_xlsx), operations=[
             {"type": "setRange", "sheet": "Data", "address": "A3:B4", "values": [[1, 2], [3, 4]]},
             {"type": "setStyle", "sheet": "Data", "address": "A3:B3", "styleIndex": 2},
+            {"type": "setNumberFormat", "sheet": "Data", "address": "A1", "formatCode": "$#,##0.00"},
             {"type": "setDefinedName", "name": "InputBlock", "formula": "Data!$A$3:$B$4"},
             {"type": "renameSheet", "sheet": "Data", "newName": "Results"},
+            {"type": "recalculate"},
         ])
         rich_excel = run_helper(rich_xlsx, "excel")
         rich_cells = {cell["address"]: cell for cell in rich_excel["sheets"][0]["cells"]}
-        checks["excelRangeAndMetadataEdits"] = rich_excel_edit["changeCount"] == 8 and rich_excel["sheets"][0]["name"] == "Results" and rich_cells["B4"]["value"] == 4 and rich_cells["A3"]["styleIndex"] == 2 and any(entry["name"] == "InputBlock" for entry in rich_excel["definedNames"])
+        with zipfile.ZipFile(rich_xlsx, "r") as edited_package:
+            workbook_xml = edited_package.read("xl/workbook.xml").decode("utf-8")
+            styles_xml = edited_package.read("xl/styles.xml").decode("utf-8")
+            relations_xml = edited_package.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+            recalculation_safe = "fullCalcOnLoad=\"1\"" in workbook_xml and "forceFullCalc=\"1\"" in workbook_xml and "xl/calcChain.xml" not in edited_package.namelist() and "calcChain" not in relations_xml
+        checks["excelRangeAndMetadataEdits"] = rich_excel_edit["changeCount"] == 10 and rich_excel["sheets"][0]["name"] == "Results" and rich_cells["B4"]["value"] == 4 and rich_cells["A3"]["styleIndex"] == 2 and rich_cells["A1"]["styleIndex"] == 3 and "$#,##0.00" in styles_xml and recalculation_safe and any(entry["name"] == "InputBlock" for entry in rich_excel["definedNames"])
 
         pptx = root / "sample.pptx"
         write_package(pptx, {
@@ -138,8 +187,8 @@ def main():
             "ppt/_rels/presentation.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>""",
             "ppt/slides/slide1.xml": """<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="2" name="Title 1"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr><a:xfrm><a:off x="1" y="2"/><a:ext cx="3" cy="4"/></a:xfrm></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Hello PowerPoint</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>""",
         })
-        powerpoint = run_helper(pptx, "powerpoint")
-        checks["powerpoint"] = powerpoint["slideCount"] == 1 and powerpoint["slides"][0]["shapes"][0]["text"] == "Hello PowerPoint"
+        powerpoint = run_helper(pptx, "powerpoint", searchText="PowerPoint")
+        checks["powerpoint"] = powerpoint["slideCount"] == 1 and powerpoint["slides"][0]["shapes"][0]["text"] == "Hello PowerPoint" and powerpoint["search"]["matchCount"] == 1
         edited_pptx = root / "edited.pptx"
         ppt_edit = run_helper(pptx, "powerpoint", action="edit", outputPath=str(edited_pptx), operations=[{"type": "replaceText", "slideIndex": 0, "shapeId": "2", "find": "Hello", "replace": "Edited"}])
         edited_powerpoint = run_helper(edited_pptx, "powerpoint")
@@ -156,6 +205,43 @@ def main():
         slides_edit = run_helper(pptx, "powerpoint", action="edit", outputPath=str(slides_pptx), operations=[{"type": "duplicateSlide", "slideIndex": 0}, {"type": "moveSlide", "slideIndex": 1, "toIndex": 0}])
         slides_powerpoint = run_helper(slides_pptx, "powerpoint")
         checks["powerpointSlideLifecycle"] = slides_edit["changeCount"] == 2 and slides_powerpoint["slideCount"] == 2 and all(slide["shapes"][0]["text"] == "Hello PowerPoint" for slide in slides_powerpoint["slides"])
+
+        media_pptx = root / "media.pptx"
+        media_content_types = """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="gif" ContentType="image/gif"/>
+  <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+  <Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+</Types>"""
+        media_slide = """<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="2" name="Delete me"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="1" y="2"/><a:ext cx="3" cy="4"/></a:xfrm></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Old text</a:t></a:r></a:p></p:txBody></p:sp><p:pic><p:nvPicPr><p:cNvPr id="3" name="Picture 1" descr="replace target"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId2"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="100" y="200"/><a:ext cx="300" cy="400"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr></p:pic></p:spTree></p:cSld></p:sld>"""
+        write_package(media_pptx, {
+            "_rels/.rels": root_rels("ppt/presentation.xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"),
+            "ppt/presentation.xml": """<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="12192000" cy="6858000" type="screen16x9"/></p:presentation>""",
+            "ppt/_rels/presentation.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>""",
+            "ppt/slides/slide1.xml": media_slide,
+            "ppt/slides/_rels/slide1.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.gif"/></Relationships>""",
+            "ppt/media/image1.gif": b"GIF89a",
+        }, media_content_types)
+        native_pptx = root / "native-operations.pptx"
+        replacement_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        native_edit = run_helper(media_pptx, "powerpoint", action="edit", outputPath=str(native_pptx), operations=[
+            {"type": "addTextBox", "slideIndex": 0, "shapeId": 4, "name": "Added box", "text": "Styled text", "x": 1000, "y": 2000, "width": 3000, "height": 4000},
+            {"type": "setTextStyle", "slideIndex": 0, "shapeId": 4, "fontFamily": "Aptos", "fontSize": 18, "bold": True, "italic": True, "underline": True, "color": "12AB34"},
+            {"type": "deleteShape", "slideIndex": 0, "shapeId": 2},
+            {"type": "replaceImage", "slideIndex": 0, "shapeId": 3, "base64": replacement_png, "contentType": "image/png"},
+        ])
+        native_result = run_helper(native_pptx, "powerpoint")
+        native_shapes = {shape["id"]: shape for shape in native_result["slides"][0]["shapes"]}
+        styled = native_shapes["4"]["paragraphs"][0]["runs"][0]["properties"]
+        with zipfile.ZipFile(native_pptx, "r") as package:
+            slide_rels = package.read("ppt/slides/_rels/slide1.xml.rels").decode("utf-8")
+            slide_xml = package.read("ppt/slides/slide1.xml").decode("utf-8")
+            content_types = package.read("[Content_Types].xml").decode("utf-8")
+            new_media = [name for name in package.namelist() if name.startswith("ppt/media/image") and name.endswith(".png")]
+            preserved_source = package.read("ppt/media/image1.gif") == b"GIF89a"
+        checks["powerpointNativeShapeAndImageEdits"] = (native_edit["changeCount"] == 4 and "2" not in native_shapes and native_shapes["4"]["text"] == "Styled text" and styled.get("sz") == "1800" and styled.get("b") == "1" and styled.get("i") == "1" and styled.get("u") == "sng" and "Aptos" in slide_xml and "12AB34" in slide_xml and len(new_media) == 1 and "../media/" + Path(new_media[0]).name in slide_rels and "image/png" in content_types and preserved_source)
 
         bad = root / "bad.docx"
         write_package(bad, {

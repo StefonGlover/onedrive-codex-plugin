@@ -144,6 +144,11 @@ const officeTargetProperties = {
   preset: presetSchema,
   relativePath: relativePathSchema
 };
+const officeStructuredSearchProperties = {
+  searchText: { type: "string", minLength: 1, description: "Optional in-package text/value query; returns bounded structured matches alongside the normal read result." },
+  matchCase: { type: "boolean", default: false },
+  maxMatches: { type: "integer", minimum: 1, maximum: 5000, default: 200 }
+};
 const officeBatchCommonProperties = {
   ...officeTargetProperties,
   operations: {
@@ -174,7 +179,10 @@ const wordOperationsSchema = {
     operationObject(["type", "paragraphIndex", "style"], { type: { const: "setParagraphStyle" }, paragraphIndex: { type: "integer", minimum: 0 }, style: { type: "string", minLength: 1 }, part: { type: "string" } }),
     operationObject(["type", "text"], { type: { const: "insertParagraph" }, afterIndex: { type: "integer", minimum: 0 }, text: { type: "string" }, style: { type: "string" }, part: { type: "string" } }),
     operationObject(["type", "tableIndex", "rowIndex", "columnIndex", "text"], { type: { const: "setTableCell" }, tableIndex: { type: "integer", minimum: 0 }, rowIndex: { type: "integer", minimum: 0 }, columnIndex: { type: "integer", minimum: 0 }, text: { type: "string" }, part: { type: "string" } }),
-    operationObject(["type", "text"], { type: { const: "setContentControlText" }, contentControlIndex: { type: "integer", minimum: 0 }, id: { type: "string" }, tag: { type: "string" }, text: { type: "string" }, part: { type: "string" } })
+    operationObject(["type", "text"], { type: { const: "setContentControlText" }, contentControlIndex: { type: "integer", minimum: 0 }, id: { type: "string" }, tag: { type: "string" }, text: { type: "string" }, part: { type: "string" } }),
+    operationObject(["type", "paragraphIndex", "text", "url"], { type: { const: "addHyperlink" }, paragraphIndex: { type: "integer", minimum: 0 }, text: { type: "string", minLength: 1 }, url: { type: "string", minLength: 1 }, part: { type: "string" } }),
+    operationObject(["type", "paragraphIndex", "text"], { type: { const: "addComment" }, paragraphIndex: { type: "integer", minimum: 0 }, text: { type: "string", minLength: 1 }, author: { type: "string", maxLength: 255 }, initials: { type: "string", maxLength: 16 } }),
+    operationObject(["type", "rows"], { type: { const: "insertTable" }, afterParagraphIndex: { type: "integer", minimum: 0 }, rows: { type: "array", minItems: 1, maxItems: 100, items: { type: "array", minItems: 1, maxItems: 50, items: { type: "string" } } }, style: { type: "string", minLength: 1 } })
   ] }
 };
 const excelBaseOperation = { sheet: { type: "string", minLength: 1 }, address: { type: "string", pattern: "^[A-Za-z]{1,3}[1-9][0-9]*(?::[A-Za-z]{1,3}[1-9][0-9]*)?$" } };
@@ -185,8 +193,10 @@ const excelOperationsSchema = {
     operationObject(["type", "sheet", "address"], { type: { const: "setRange" }, ...excelBaseOperation, values: { type: "array", items: { type: "array" } }, formulas: { type: "array", items: { type: "array" } } }),
     operationObject(["type", "sheet", "address"], { type: { const: "clearRange" }, ...excelBaseOperation, contents: { type: "boolean" }, format: { type: "boolean" } }),
     operationObject(["type", "sheet", "address", "styleIndex"], { type: { const: "setStyle" }, ...excelBaseOperation, styleIndex: { type: "integer", minimum: 0 } }),
+    operationObject(["type", "sheet", "address", "formatCode"], { type: { const: "setNumberFormat" }, ...excelBaseOperation, formatCode: { type: "string", minLength: 1, maxLength: 255 } }),
     operationObject(["type", "sheet", "newName"], { type: { const: "renameSheet" }, sheet: { type: "string", minLength: 1 }, newName: { type: "string", minLength: 1, maxLength: 31 } }),
-    operationObject(["type", "name", "formula"], { type: { const: "setDefinedName" }, name: { type: "string", minLength: 1 }, formula: { type: "string" } })
+    operationObject(["type", "name", "formula"], { type: { const: "setDefinedName" }, name: { type: "string", minLength: 1 }, formula: { type: "string" } }),
+    operationObject(["type"], { type: { const: "recalculate" } })
   ] }
 };
 const powerpointSelector = { slideIndex: { type: "integer", minimum: 0 }, shapeId: { type: ["string", "integer"] } };
@@ -196,6 +206,10 @@ const powerpointOperationsSchema = {
     operationObject(["type", "slideIndex", "shapeId", "text"], { type: { const: "setShapeText" }, ...powerpointSelector, text: { type: "string" } }),
     operationObject(["type", "slideIndex", "shapeId"], { type: { const: "setShapeGeometry" }, ...powerpointSelector, x: { type: "integer" }, y: { type: "integer" }, width: { type: "integer", minimum: 0 }, height: { type: "integer", minimum: 0 } }),
     operationObject(["type", "slideIndex", "shapeId", "rowIndex", "columnIndex", "text"], { type: { const: "setTableCell" }, ...powerpointSelector, rowIndex: { type: "integer", minimum: 0 }, columnIndex: { type: "integer", minimum: 0 }, text: { type: "string" } }),
+    operationObject(["type", "slideIndex", "text", "x", "y", "width", "height"], { type: { const: "addTextBox" }, slideIndex: { type: "integer", minimum: 0 }, shapeId: { type: "integer", minimum: 1 }, name: { type: "string", minLength: 1 }, text: { type: "string" }, x: { type: "integer" }, y: { type: "integer" }, width: { type: "integer", minimum: 1 }, height: { type: "integer", minimum: 1 } }),
+    operationObject(["type", "slideIndex", "shapeId"], { type: { const: "deleteShape" }, ...powerpointSelector }),
+    operationObject(["type", "slideIndex", "shapeId"], { type: { const: "setTextStyle" }, ...powerpointSelector, fontFamily: { type: "string", minLength: 1 }, fontSize: { type: "number", minimum: 1, maximum: 400 }, bold: { type: "boolean" }, italic: { type: "boolean" }, underline: { type: "boolean" }, color: { type: "string", pattern: "^[0-9A-Fa-f]{6}$" } }),
+    operationObject(["type", "slideIndex", "shapeId", "base64", "contentType"], { type: { const: "replaceImage" }, ...powerpointSelector, base64: { type: "string", minLength: 1, maxLength: 36700160 }, contentType: { type: "string", enum: ["image/png", "image/jpeg", "image/gif", "image/bmp", "image/tiff"] } }),
     operationObject(["type", "slideIndex", "text"], { type: { const: "setNotes" }, slideIndex: { type: "integer", minimum: 0 }, text: { type: "string" } }),
     operationObject(["type", "slideIndex"], { type: { const: "duplicateSlide" }, slideIndex: { type: "integer", minimum: 0 }, toIndex: { type: "integer", minimum: 0 } }),
     operationObject(["type", "slideIndex"], { type: { const: "deleteSlide" }, slideIndex: { type: "integer", minimum: 0 } }),
@@ -701,6 +715,7 @@ const tools = [
       anyOf: itemTargetAnyOf,
       properties: {
         ...officeTargetProperties,
+        ...officeStructuredSearchProperties,
         maxParagraphs: { type: "integer", minimum: 1, maximum: 10000, default: 2000 },
         includeHeadersFooters: { type: "boolean", default: true },
         strictRelationships: { type: "boolean", default: true }
@@ -710,13 +725,17 @@ const tools = [
   },
   {
     name: "onedrive_excel_get_workbook",
-    description: "Read structured worksheets, cells, formulas, styles, and defined names from an .xlsx file using the local Open XML backend.",
+    description: "Read structured worksheets, bounded cell/range selections, searchable values/formulas, table metadata, styles, and defined names from an .xlsx file using the local Open XML backend.",
     inputSchema: {
       type: "object",
       anyOf: itemTargetAnyOf,
       properties: {
         ...officeTargetProperties,
+        ...officeStructuredSearchProperties,
         includeCells: { type: "boolean", default: true },
+        includeTables: { type: "boolean", default: true },
+        sheetNames: { type: "array", minItems: 1, maxItems: 100, uniqueItems: true, items: { type: "string", minLength: 1 }, description: "Optional worksheet-name selector." },
+        address: { type: "string", pattern: "^[A-Za-z]{1,3}[1-9][0-9]*(?::[A-Za-z]{1,3}[1-9][0-9]*)?$", description: "Optional bounded A1 cell or range selector applied to selected worksheets." },
         maxCells: { type: "integer", minimum: 1, maximum: 50000, default: 5000 },
         strictRelationships: { type: "boolean", default: true }
       },
@@ -731,6 +750,7 @@ const tools = [
       anyOf: itemTargetAnyOf,
       properties: {
         ...officeTargetProperties,
+        ...officeStructuredSearchProperties,
         maxSlides: { type: "integer", minimum: 1, maximum: 5000, default: 500 },
         strictRelationships: { type: "boolean", default: true }
       },
@@ -739,12 +759,12 @@ const tools = [
   },
   {
     name: "onedrive_word_batch_update",
-    description: "Preview or apply typed Word edits for text, paragraphs, styles, tables, and content controls; live commits require expected identity and the dry-run preview token.",
+    description: "Preview or apply typed Word edits for text, paragraphs, styles, tables, content controls, external hyperlinks, and anchored comments. Documents containing tracked changes are refused; live commits require expected identity and the dry-run preview token.",
     inputSchema: {
       type: "object",
       required: ["operations"],
       anyOf: itemTargetAnyOf,
-      properties: { ...officeBatchCommonProperties, operations: wordOperationsSchema },
+      properties: { ...officeBatchCommonProperties, operations: wordOperationsSchema, trackedChanges: { type: "string", enum: ["refuse"], default: "refuse", description: "Tracked-change markup is currently refused because native edits cannot safely preserve review semantics." } },
       additionalProperties: false
     }
   },
@@ -761,7 +781,7 @@ const tools = [
   },
   {
     name: "onedrive_powerpoint_batch_update",
-    description: "Preview or apply typed PowerPoint text, geometry, table, notes, duplicate, delete, and move-slide edits; live commits require a preview token.",
+    description: "Preview or apply typed PowerPoint text, text-box, text-style, shape deletion, geometry, image replacement, table, notes, duplicate, delete, and move-slide edits; live commits require a preview token.",
     inputSchema: {
       type: "object",
       required: ["operations"],
@@ -5827,10 +5847,15 @@ async function officeCapabilities() {
         formats: [".docx", ".docm", ".xlsx", ".xlsm", ".pptx", ".pptm", ".ppsx"],
         readOnlyToolsReady: true,
         mutationToolsReady: true,
+        operations: {
+          word: ["replaceText", "setParagraphText", "setParagraphStyle", "insertParagraph", "insertTable", "setTableCell", "setContentControlText", "addHyperlink", "addComment"],
+          excel: ["setCell", "setFormula", "setRange", "clearRange", "setStyle", "setNumberFormat", "renameSheet", "setDefinedName", "recalculate"],
+          powerpoint: ["replaceText", "setShapeText", "setShapeGeometry", "setTextStyle", "addTextBox", "deleteShape", "replaceImage", "setTableCell", "setNotes", "duplicateSlide", "deleteSlide", "moveSlide"]
+        },
         notes: [
           "Encrypted and legacy binary Office files are refused.",
           "Macro-enabled packages are inspectable but live mutation will require explicit macro-preservation safeguards.",
-          "Digitally signed packages are detected and live mutation will default to refusal."
+          "Digitally signed packages are detected and mutation is always refused."
         ]
       },
       graphExcel: {
@@ -6082,6 +6107,7 @@ async function officeBatchUpdate(args = {}, kind, toolName) {
       outputPath: editedPath,
       kind,
       operations: args.operations,
+      ...(kind === "word" ? { trackedChanges: args.trackedChanges || "refuse" } : {}),
       allowMacros: args.allowMacros === true,
       allowSignedPackage: args.allowSignedPackage === true
     }, { timeoutMs: 120_000 });

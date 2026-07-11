@@ -52,7 +52,9 @@ jobs:
           fi
 
       - name: Run mocked Microsoft Graph tests
-        run: node scripts/mock-graph-test.mjs
+        run: |
+          python3 scripts/office-openxml-test.py
+          node scripts/mock-graph-test.mjs
 
       - name: Run prepackage guard
         run: |

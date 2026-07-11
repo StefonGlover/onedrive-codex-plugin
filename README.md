@@ -162,12 +162,14 @@ Use absolute paths in `storageRoot` and `cacheRoot` if you override them. Enviro
 
 The plugin can inspect and edit modern Open XML files without requiring Word, Excel, or PowerPoint to be open. Reads expose structured document content and package-safety metadata. Mutations are typed, preview-first, bound to the file identity and eTag/cTag, backed up locally by default, uploaded with `If-Match`, validated after commit, and recorded in the mutation audit.
 
-- Word supports text replacement, paragraph text/style changes, paragraph insertion, table-cell updates, and content-control updates across document/header/footer parts.
-- Excel supports cell/formula/range writes, clearing, style-index assignment, sheet rename, and defined names. `backend: auto` uses Microsoft Graph workbook sessions for supported business `.xlsx` files and Open XML for personal drives, macros, or unsupported operations.
-- PowerPoint supports shape text and geometry, table cells, notes, text replacement, and slide duplicate/delete/reorder.
+- Word supports text replacement, paragraph text/style changes, paragraph/table insertion, table-cell and content-control updates, safe external hyperlinks, and anchored comments. Documents containing tracked changes are refused instead of silently changing review semantics.
+- Excel reads support worksheet/range selectors, bounded value/formula text search, and worksheet table metadata. Edits support cell/formula/range writes, clearing, style-index or safe number-format assignment, sheet rename, defined names, and full recalculation on next open. `backend: auto` uses Microsoft Graph workbook sessions for supported business `.xlsx` files and Open XML for personal drives, macros, or unsupported operations.
+- PowerPoint supports shape text, run styling and geometry, text-box creation, shape deletion, validated raster-image replacement, table cells, notes, text replacement, and slide duplicate/delete/reorder.
 - Encrypted and legacy binary files are refused. Macro-enabled edits require `allowMacros: true`; signed-package edits are always refused because any edit invalidates the signature.
 
 Run the corresponding structured read tool first, then call the batch-update tool as a dry run. A live commit requires `dryRun: false`, `confirmed: true`, `expectedName` or `expectedId`, and the exact returned `previewToken`.
+
+For faster research inside a known Office file, pass `searchText` to any structured read. Excel can additionally restrict reads to `sheetNames` and a bounded A1 `address`, avoiding a full-workbook response.
 
 ## Safety
 
