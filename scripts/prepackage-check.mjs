@@ -39,6 +39,9 @@ const requiredFiles = [
   "scripts/benchmark.mjs",
   "scripts/beta-test.mjs",
   "scripts/mock-graph-test.mjs",
+  "scripts/office-openxml.py",
+  "scripts/office-openxml-test.py",
+  "scripts/office-real-fixture-test.py",
   "scripts/prepackage-check.mjs",
   "skills/onedrive/SKILL.md",
   "README.md"

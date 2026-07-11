@@ -113,6 +113,14 @@ Use absolute paths in `storageRoot` and `cacheRoot` if you override them. Enviro
 - `onedrive_content_index_refresh`
 - `onedrive_content_search`
 - `onedrive_content_index_clear`
+- `onedrive_office_capabilities`
+- `onedrive_office_validate`
+- `onedrive_word_get_document`
+- `onedrive_excel_get_workbook`
+- `onedrive_powerpoint_get_presentation`
+- `onedrive_word_batch_update`
+- `onedrive_excel_batch_update`
+- `onedrive_powerpoint_batch_update`
 - `onedrive_get_info`
 - `onedrive_read_text`
 - `onedrive_preview`
@@ -149,6 +157,17 @@ Use absolute paths in `storageRoot` and `cacheRoot` if you override them. Enviro
 - `onedrive_audit_export`
 - `onedrive_audit_clear`
 - `onedrive_delete`
+
+## Native Office editing
+
+The plugin can inspect and edit modern Open XML files without requiring Word, Excel, or PowerPoint to be open. Reads expose structured document content and package-safety metadata. Mutations are typed, preview-first, bound to the file identity and eTag/cTag, backed up locally by default, uploaded with `If-Match`, validated after commit, and recorded in the mutation audit.
+
+- Word supports text replacement, paragraph text/style changes, paragraph insertion, table-cell updates, and content-control updates across document/header/footer parts.
+- Excel supports cell/formula/range writes, clearing, style-index assignment, sheet rename, and defined names. `backend: auto` uses Microsoft Graph workbook sessions for supported business `.xlsx` files and Open XML for personal drives, macros, or unsupported operations.
+- PowerPoint supports shape text and geometry, table cells, notes, text replacement, and slide duplicate/delete/reorder.
+- Encrypted and legacy binary files are refused. Macro-enabled edits require `allowMacros: true`; signed-package edits are always refused because any edit invalidates the signature.
+
+Run the corresponding structured read tool first, then call the batch-update tool as a dry run. A live commit requires `dryRun: false`, `confirmed: true`, `expectedName` or `expectedId`, and the exact returned `previewToken`.
 
 ## Safety
 

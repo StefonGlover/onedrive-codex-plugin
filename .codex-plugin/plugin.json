@@ -1,7 +1,7 @@
 {
   "name": "onedrive",
-  "version": "0.1.0+codex.20260711152309",
-  "description": "Manage OneDrive files from Codex through Microsoft Graph with device-code login and Keychain token storage.",
+  "version": "0.2.0+codex.20260711203448",
+  "description": "Manage OneDrive files and natively inspect or edit Word, Excel, and PowerPoint content from Codex.",
   "author": {
     "name": "Stefon Glover"
   },
@@ -15,8 +15,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "OneDrive",
-    "shortDescription": "Search, read, upload, share, and safely manage OneDrive files.",
-    "longDescription": "Connect Codex to your Microsoft OneDrive through Microsoft Graph without relying on the laptop's local OneDrive sync folder. The plugin supports device-code authentication, Keychain-backed refresh token storage, health checks, file listing, search, broad locate, delta sync, permission audits and diffs, path presets, document downloads and exports, uploads, text writes, folder creation, rename, move, copy, dry-run sharing links with optional password and expiration, dry-run named-recipient permission grants, dry-run restore, dry-run delete defaults, and local sync-folder guards. It works with personal OneDrive and Microsoft 365 OneDrive accounts when your Microsoft app registration has delegated Graph file permissions.",
+    "shortDescription": "Search, manage, and natively edit OneDrive Office files.",
+    "longDescription": "Connect Codex to Microsoft OneDrive through Microsoft Graph without relying on the laptop's local sync folder. Alongside safe file, search, sharing, permission, and cleanup workflows, the plugin can structurally inspect and preview-first edit Word, Excel, and PowerPoint Open XML content. Excel automatically uses scoped Graph workbook sessions for supported business .xlsx files and a local Open XML engine for personal drives and other supported packages.",
     "developerName": "Stefon Glover",
     "category": "Productivity",
     "capabilities": [
@@ -27,12 +27,13 @@
       "Sharing",
       "Permission management",
       "Keychain auth",
-      "Microsoft Graph"
+      "Microsoft Graph",
+      "Native Office editing"
     ],
     "defaultPrompt": [
       "Run a OneDrive plugin health check.",
       "Find recent documents in OneDrive.",
-      "Dry-run sharing a OneDrive file with a named recipient."
+      "Inspect and safely edit a Word, Excel, or PowerPoint file in OneDrive."
     ],
     "brandColor": "#2563EB",
     "composerIcon": "./assets/icon.png",

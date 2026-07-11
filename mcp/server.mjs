@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createReadStream, createWriteStream, readFileSync } from "node:fs";
 import { appendFile, chmod, copyFile, mkdir, open, readFile, realpath, rename as renameFile, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, parse, relative, resolve } from "node:path";
@@ -29,6 +29,10 @@ const backupRoot = join(storageRoot, "backups");
 const auditRoot = join(storageRoot, "audit");
 const auditPath = join(auditRoot, "mutations.jsonl");
 const auditLockPath = join(auditRoot, "mutations.lock");
+const officeEditingRoot = join(storageRoot, "office-editing");
+const officeHelperPath = join(pluginRoot, "scripts", "office-openxml.py");
+const officePythonPath = process.env.ONEDRIVE_OFFICE_PYTHON || localConfig.officeEditing?.pythonPath || "/usr/bin/python3";
+const maxOfficePackageBytes = 250 * 1024 * 1024;
 const localOneDriveSyncRoots = [
   { path: join(homedir(), "Library", "CloudStorage", "OneDrive"), prefix: false },
   { path: join(homedir(), "Library", "CloudStorage", "OneDrive-"), prefix: true },
@@ -133,6 +137,70 @@ const relativePathSchema = {
 const previewTokenSchema = {
   type: "string",
   description: "Token returned by the immediately preceding dry-run preview for this exact high-risk operation."
+};
+const officeTargetProperties = {
+  path: { type: "string", description: "Office file path relative to OneDrive root." },
+  itemId: { type: "string", description: "Office file drive item ID." },
+  preset: presetSchema,
+  relativePath: relativePathSchema
+};
+const officeBatchCommonProperties = {
+  ...officeTargetProperties,
+  operations: {
+    type: "array",
+    minItems: 1,
+    maxItems: 100,
+    items: { type: "object", additionalProperties: true },
+    description: "Typed Office edit operations executed in order. Use the corresponding read tool first to ground indexes, sheet names, slide indexes, and shape IDs."
+  },
+  dryRun: { type: "boolean", default: true },
+  confirmed: { type: "boolean", default: false },
+  expectedName: { type: "string", description: "Safety check for the resolved remote file name." },
+  expectedId: { type: "string", description: "Safety check for the resolved remote drive item ID." },
+  previewToken: previewTokenSchema,
+  createBackup: { type: "boolean", default: true },
+  verify: { type: "boolean", default: true },
+  allowMacros: { type: "boolean", default: false, description: "Allow editing a macro-enabled package while preserving VBA parts. Never executes macros." },
+  allowSignedPackage: { type: "boolean", default: false, description: "Reserved compatibility flag. Digitally signed packages are always refused because native edits invalidate signatures." }
+};
+const operationObject = (required, properties) => ({ type: "object", required, properties, additionalProperties: false });
+const replaceTextOperation = operationObject(["type", "find", "replace"], {
+  type: { const: "replaceText" }, find: { type: "string", minLength: 1 }, replace: { type: "string" }, matchCase: { type: "boolean" }, all: { type: "boolean" }
+});
+const wordOperationsSchema = {
+  type: "array", minItems: 1, maxItems: 100, items: { anyOf: [
+    { ...replaceTextOperation, properties: { ...replaceTextOperation.properties, scope: { type: "string", enum: ["document", "headers", "footers", "all"] } } },
+    operationObject(["type", "paragraphIndex", "text"], { type: { const: "setParagraphText" }, paragraphIndex: { type: "integer", minimum: 0 }, text: { type: "string" }, part: { type: "string" } }),
+    operationObject(["type", "paragraphIndex", "style"], { type: { const: "setParagraphStyle" }, paragraphIndex: { type: "integer", minimum: 0 }, style: { type: "string", minLength: 1 }, part: { type: "string" } }),
+    operationObject(["type", "text"], { type: { const: "insertParagraph" }, afterIndex: { type: "integer", minimum: 0 }, text: { type: "string" }, style: { type: "string" }, part: { type: "string" } }),
+    operationObject(["type", "tableIndex", "rowIndex", "columnIndex", "text"], { type: { const: "setTableCell" }, tableIndex: { type: "integer", minimum: 0 }, rowIndex: { type: "integer", minimum: 0 }, columnIndex: { type: "integer", minimum: 0 }, text: { type: "string" }, part: { type: "string" } }),
+    operationObject(["type", "text"], { type: { const: "setContentControlText" }, contentControlIndex: { type: "integer", minimum: 0 }, id: { type: "string" }, tag: { type: "string" }, text: { type: "string" }, part: { type: "string" } })
+  ] }
+};
+const excelBaseOperation = { sheet: { type: "string", minLength: 1 }, address: { type: "string", pattern: "^[A-Za-z]{1,3}[1-9][0-9]*(?::[A-Za-z]{1,3}[1-9][0-9]*)?$" } };
+const excelOperationsSchema = {
+  type: "array", minItems: 1, maxItems: 100, items: { anyOf: [
+    operationObject(["type", "sheet", "address"], { type: { const: "setCell" }, ...excelBaseOperation, value: {} }),
+    operationObject(["type", "sheet", "address", "formula"], { type: { const: "setFormula" }, ...excelBaseOperation, formula: { type: "string" }, value: {} }),
+    operationObject(["type", "sheet", "address"], { type: { const: "setRange" }, ...excelBaseOperation, values: { type: "array", items: { type: "array" } }, formulas: { type: "array", items: { type: "array" } } }),
+    operationObject(["type", "sheet", "address"], { type: { const: "clearRange" }, ...excelBaseOperation, contents: { type: "boolean" }, format: { type: "boolean" } }),
+    operationObject(["type", "sheet", "address", "styleIndex"], { type: { const: "setStyle" }, ...excelBaseOperation, styleIndex: { type: "integer", minimum: 0 } }),
+    operationObject(["type", "sheet", "newName"], { type: { const: "renameSheet" }, sheet: { type: "string", minLength: 1 }, newName: { type: "string", minLength: 1, maxLength: 31 } }),
+    operationObject(["type", "name", "formula"], { type: { const: "setDefinedName" }, name: { type: "string", minLength: 1 }, formula: { type: "string" } })
+  ] }
+};
+const powerpointSelector = { slideIndex: { type: "integer", minimum: 0 }, shapeId: { type: ["string", "integer"] } };
+const powerpointOperationsSchema = {
+  type: "array", minItems: 1, maxItems: 100, items: { anyOf: [
+    { ...replaceTextOperation, properties: { ...replaceTextOperation.properties, ...powerpointSelector } },
+    operationObject(["type", "slideIndex", "shapeId", "text"], { type: { const: "setShapeText" }, ...powerpointSelector, text: { type: "string" } }),
+    operationObject(["type", "slideIndex", "shapeId"], { type: { const: "setShapeGeometry" }, ...powerpointSelector, x: { type: "integer" }, y: { type: "integer" }, width: { type: "integer", minimum: 0 }, height: { type: "integer", minimum: 0 } }),
+    operationObject(["type", "slideIndex", "shapeId", "rowIndex", "columnIndex", "text"], { type: { const: "setTableCell" }, ...powerpointSelector, rowIndex: { type: "integer", minimum: 0 }, columnIndex: { type: "integer", minimum: 0 }, text: { type: "string" } }),
+    operationObject(["type", "slideIndex", "text"], { type: { const: "setNotes" }, slideIndex: { type: "integer", minimum: 0 }, text: { type: "string" } }),
+    operationObject(["type", "slideIndex"], { type: { const: "duplicateSlide" }, slideIndex: { type: "integer", minimum: 0 }, toIndex: { type: "integer", minimum: 0 } }),
+    operationObject(["type", "slideIndex"], { type: { const: "deleteSlide" }, slideIndex: { type: "integer", minimum: 0 } }),
+    operationObject(["type", "slideIndex", "toIndex"], { type: { const: "moveSlide" }, slideIndex: { type: "integer", minimum: 0 }, toIndex: { type: "integer", minimum: 0 } })
+  ] }
 };
 const pathTargetProperties = {
   path: { type: "string", description: "Item path relative to OneDrive root." },
@@ -605,6 +673,102 @@ const tools = [
     name: "onedrive_content_index_clear",
     description: "Clear the optional local OneDrive content index.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false }
+  },
+  {
+    name: "onedrive_office_capabilities",
+    description: "Report available native Office editing backends, runtime health, account limitations, and supported Open XML formats.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false }
+  },
+  {
+    name: "onedrive_office_validate",
+    description: "Download and safely validate a Word, Excel, or PowerPoint Open XML package without changing the remote file.",
+    inputSchema: {
+      type: "object",
+      anyOf: itemTargetAnyOf,
+      properties: {
+        ...officeTargetProperties,
+        expectedKind: { type: "string", enum: ["word", "excel", "powerpoint"] },
+        strictRelationships: { type: "boolean", default: true }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_word_get_document",
+    description: "Read structured paragraphs, tables, content controls, headers, footers, comments, and package safety metadata from a .docx file.",
+    inputSchema: {
+      type: "object",
+      anyOf: itemTargetAnyOf,
+      properties: {
+        ...officeTargetProperties,
+        maxParagraphs: { type: "integer", minimum: 1, maximum: 10000, default: 2000 },
+        includeHeadersFooters: { type: "boolean", default: true },
+        strictRelationships: { type: "boolean", default: true }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_excel_get_workbook",
+    description: "Read structured worksheets, cells, formulas, styles, and defined names from an .xlsx file using the local Open XML backend.",
+    inputSchema: {
+      type: "object",
+      anyOf: itemTargetAnyOf,
+      properties: {
+        ...officeTargetProperties,
+        includeCells: { type: "boolean", default: true },
+        maxCells: { type: "integer", minimum: 1, maximum: 50000, default: 5000 },
+        strictRelationships: { type: "boolean", default: true }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_powerpoint_get_presentation",
+    description: "Read structured slides, shapes, text, placeholders, geometry, tables, images, notes, and package safety metadata from a .pptx file.",
+    inputSchema: {
+      type: "object",
+      anyOf: itemTargetAnyOf,
+      properties: {
+        ...officeTargetProperties,
+        maxSlides: { type: "integer", minimum: 1, maximum: 5000, default: 500 },
+        strictRelationships: { type: "boolean", default: true }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_word_batch_update",
+    description: "Preview or apply typed Word edits for text, paragraphs, styles, tables, and content controls; live commits require expected identity and the dry-run preview token.",
+    inputSchema: {
+      type: "object",
+      required: ["operations"],
+      anyOf: itemTargetAnyOf,
+      properties: { ...officeBatchCommonProperties, operations: wordOperationsSchema },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_excel_batch_update",
+    description: "Preview or apply typed Excel cell, formula, range, style, sheet-name, and defined-name edits. Auto uses Graph sessions for supported business .xlsx files and Open XML otherwise.",
+    inputSchema: {
+      type: "object",
+      required: ["operations"],
+      anyOf: itemTargetAnyOf,
+      properties: { ...officeBatchCommonProperties, operations: excelOperationsSchema, backend: { type: "string", enum: ["auto", "openxml", "graph"], default: "auto" } },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_powerpoint_batch_update",
+    description: "Preview or apply typed PowerPoint text, geometry, table, notes, duplicate, delete, and move-slide edits; live commits require a preview token.",
+    inputSchema: {
+      type: "object",
+      required: ["operations"],
+      anyOf: itemTargetAnyOf,
+      properties: { ...officeBatchCommonProperties, operations: powerpointOperationsSchema },
+      additionalProperties: false
+    }
   },
   {
     name: "onedrive_get_info",
@@ -5608,6 +5772,427 @@ async function downloadResolvedItem(info, args = {}) {
   }
 }
 
+function officePackageKindFromName(name = "") {
+  const extension = extname(name).toLowerCase();
+  if ([".docx", ".docm"].includes(extension)) return "word";
+  if ([".xlsx", ".xlsm"].includes(extension)) return "excel";
+  if ([".pptx", ".pptm", ".ppsx"].includes(extension)) return "powerpoint";
+  return null;
+}
+
+function officeRuntimeStatus() {
+  let pythonAvailable = false;
+  let pythonVersion = null;
+  let helperAvailable = false;
+  let error = null;
+  try {
+    pythonVersion = execFileSync(officePythonPath, ["--version"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 5000
+    }).trim();
+    pythonAvailable = true;
+  } catch (runtimeError) {
+    error = safeToolErrorMessage(runtimeError);
+  }
+  try {
+    helperAvailable = readFileSync(officeHelperPath).length > 0;
+  } catch (helperError) {
+    error ||= safeToolErrorMessage(helperError);
+  }
+  return { pythonAvailable, pythonVersion, pythonPath: officePythonPath, helperAvailable, helperPath: officeHelperPath, error };
+}
+
+async function officeCapabilities() {
+  const runtime = officeRuntimeStatus();
+  let drive = null;
+  let driveError = null;
+  try {
+    drive = await graph("/me/drive");
+  } catch (error) {
+    driveError = safeToolErrorMessage(error);
+  }
+  const driveType = drive?.driveType || null;
+  return {
+    runtime,
+    account: {
+      driveType,
+      driveName: drive?.name || null,
+      checked: Boolean(drive),
+      error: driveError
+    },
+    backends: {
+      openXml: {
+        available: runtime.pythonAvailable && runtime.helperAvailable,
+        formats: [".docx", ".docm", ".xlsx", ".xlsm", ".pptx", ".pptm", ".ppsx"],
+        readOnlyToolsReady: true,
+        mutationToolsReady: true,
+        notes: [
+          "Encrypted and legacy binary Office files are refused.",
+          "Macro-enabled packages are inspectable but live mutation will require explicit macro-preservation safeguards.",
+          "Digitally signed packages are detected and live mutation will default to refusal."
+        ]
+      },
+      graphExcel: {
+        availableForAccount: Boolean(drive && driveType !== "personal"),
+        driveType,
+        formats: [".xlsx"],
+        limitation: driveType === "personal"
+          ? "Microsoft Graph workbook APIs do not support OneDrive Consumer workbooks; use the Open XML backend."
+          : "Graph workbook sessions will be used for supported business, SharePoint, or group-drive .xlsx files."
+      },
+      officeJs: {
+        available: false,
+        requiresCompanionAddIn: true,
+        note: "Office.js editing requires an active Word, Excel, or PowerPoint client and a separately deployed companion add-in."
+      }
+    }
+  };
+}
+
+async function runOfficeHelper(request, options = {}) {
+  const runtime = officeRuntimeStatus();
+  if (!runtime.pythonAvailable || !runtime.helperAvailable) {
+    throw new Error(`Office Open XML runtime is unavailable: ${runtime.error || "Python/helper not found"}`);
+  }
+  const timeoutMs = clampInteger(options.timeoutMs, 60_000, 1000, 5 * 60_000);
+  const maxOutputBytes = clampInteger(options.maxOutputBytes, 20 * 1024 * 1024, 1024, 50 * 1024 * 1024);
+  return await new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(officePythonPath, [officeHelperPath], {
+      cwd: pluginRoot,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, PYTHONPYCACHEPREFIX: join(storageRoot, "pycache") }
+    });
+    let stdout = Buffer.alloc(0);
+    let stderr = Buffer.alloc(0);
+    let settled = false;
+    let timer = null;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) rejectPromise(error);
+      else resolvePromise(value);
+    };
+    const appendBounded = (current, chunk, label) => {
+      const next = Buffer.concat([current, chunk]);
+      if (next.length > maxOutputBytes) {
+        child.kill("SIGKILL");
+        finish(new Error(`Office helper ${label} exceeded ${maxOutputBytes} bytes.`));
+      }
+      return next;
+    };
+    child.stdout.on("data", (chunk) => { stdout = appendBounded(stdout, chunk, "stdout"); });
+    child.stderr.on("data", (chunk) => { stderr = appendBounded(stderr, chunk, "stderr"); });
+    child.on("error", (error) => finish(new Error(`Could not start Office helper: ${error.message}`)));
+    child.on("close", (code) => {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(stdout.toString("utf8") || "{}");
+      } catch (error) {
+        finish(new Error(`Office helper returned invalid JSON: ${error.message}. ${stderr.toString("utf8").trim()}`));
+        return;
+      }
+      if (code !== 0 || parsed.ok !== true) {
+        finish(new Error(parsed.error || stderr.toString("utf8").trim() || `Office helper exited with code ${code}.`));
+        return;
+      }
+      finish(null, parsed.value);
+    });
+    timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(new Error(`Office helper timed out after ${timeoutMs}ms.`));
+    }, timeoutMs);
+    child.stdin.on("error", (error) => finish(new Error(`Could not send request to Office helper: ${error.message}`)));
+    child.stdin.end(JSON.stringify(request));
+  });
+}
+
+async function inspectRemoteOfficePackage(args = {}, expectedKind = null, action = "inspect") {
+  const info = await getInfo(args);
+  if (info.folder) throw new Error(`Item is a folder, not an Office document: ${info.name}`);
+  const detectedKind = officePackageKindFromName(info.name);
+  if (!detectedKind) {
+    throw new Error(`Office content tools require an Open XML package (.docx, .xlsx, or .pptx family). Got ${info.name || "unnamed item"}.`);
+  }
+  if (expectedKind && detectedKind !== expectedKind) {
+    throw new Error(`Expected a ${expectedKind} Open XML package. Got ${info.name}.`);
+  }
+  if (Number(info.size || 0) > maxOfficePackageBytes) {
+    throw new Error(`Office package is ${info.size} bytes, above the ${maxOfficePackageBytes}-byte inspection limit.`);
+  }
+  const transactionRoot = join(officeEditingRoot, `inspect-${randomUUID()}`);
+  await ensurePrivateDirectory(transactionRoot);
+  const localPath = join(transactionRoot, basename(info.name));
+  try {
+    await downloadResolvedItem(info, { localPath, overwrite: false });
+    const value = await runOfficeHelper({
+      ...args,
+      action,
+      inputPath: localPath,
+      kind: expectedKind || args.expectedKind || detectedKind
+    });
+    return {
+      item: info,
+      backend: "openxml",
+      ...value,
+      package: value.package ? { ...value.package, path: undefined } : undefined
+    };
+  } finally {
+    await rm(transactionRoot, { recursive: true, force: true });
+  }
+}
+
+function officeEditPreviewProof(rawItem, kind, operations, editResult, args = {}, backend = "openxml") {
+  return {
+    item: { id: rawItem.id, name: rawItem.name, eTag: rawItem.eTag, cTag: rawItem.cTag },
+    kind,
+    backend,
+    operations,
+    changeCount: editResult.changeCount,
+    outputFingerprint: editResult.validation?.package?.fingerprint,
+    allowMacros: args.allowMacros === true,
+    allowSignedPackage: args.allowSignedPackage === true
+  };
+}
+
+const excelGraphOperationTypes = new Set(["setCell", "setFormula", "setRange", "clearRange", "renameSheet"]);
+
+async function resolveExcelOfficeBackend(rawItem, args = {}) {
+  if (args.backend === "openxml") return { backend: "openxml", driveType: null, reason: "explicit" };
+  if (extname(rawItem.name || "").toLowerCase() !== ".xlsx") {
+    if (args.backend === "graph") throw new Error("The Graph Excel backend supports .xlsx only; use openxml for this workbook.");
+    return { backend: "openxml", driveType: null, reason: "format" };
+  }
+  const unsupported = (args.operations || []).map((entry) => entry?.type).filter((type) => !excelGraphOperationTypes.has(type));
+  if (unsupported.length) {
+    if (args.backend === "graph") throw new Error(`The Graph Excel backend does not support these operations: ${[...new Set(unsupported)].join(", ")}.`);
+    return { backend: "openxml", driveType: null, reason: "operation" };
+  }
+  const driveId = rawItem.parentReference?.driveId || rawItem.remoteItem?.parentReference?.driveId || null;
+  let drive;
+  try {
+    drive = driveId ? await graph(`/drives/${encodeURIComponent(driveId)}?$select=id,driveType,name`) : await graph("/me/drive?$select=id,driveType,name");
+  } catch (error) {
+    if (args.backend === "graph") throw new Error(`Could not verify the workbook drive for Graph Excel: ${safeToolErrorMessage(error)}`);
+    return { backend: "openxml", driveType: null, reason: "drive-check-failed" };
+  }
+  if (drive.driveType === "personal") {
+    if (args.backend === "graph") throw new Error("Microsoft Graph workbook APIs do not support OneDrive Consumer workbooks; use backend: openxml.");
+    return { backend: "openxml", driveType: drive.driveType, driveId: drive.id, reason: "consumer" };
+  }
+  return { backend: "graph", driveType: drive.driveType, driveId: drive.id || driveId, reason: args.backend === "graph" ? "explicit" : "supported-drive" };
+}
+
+function excelWorkbookBase(rawItem, resolvedBackend) {
+  const driveId = resolvedBackend.driveId || rawItem.parentReference?.driveId || rawItem.remoteItem?.parentReference?.driveId;
+  return driveId
+    ? `/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(rawItem.id)}/workbook`
+    : `/me/drive/items/${encodeURIComponent(rawItem.id)}/workbook`;
+}
+
+function excelGraphRangePath(base, operation) {
+  const sheet = String(operation.sheet || "");
+  const address = String(operation.address || "").toUpperCase();
+  if (!sheet || !/^[A-Z]{1,3}[1-9][0-9]*(?::[A-Z]{1,3}[1-9][0-9]*)?$/.test(address)) {
+    throw new Error("Graph Excel range operations require a worksheet name and a bounded A1 address.");
+  }
+  const escapedAddress = address.replaceAll("'", "''");
+  return `${base}/worksheets/${encodeURIComponent(sheet)}/range(address='${escapedAddress}')`;
+}
+
+async function applyExcelGraphOperations(rawItem, resolvedBackend, operations) {
+  const base = excelWorkbookBase(rawItem, resolvedBackend);
+  const created = await graph(`${base}/createSession`, {
+    method: "POST",
+    body: JSON.stringify({ persistChanges: true }),
+    maxRetries: 1
+  });
+  const sessionId = created?.id;
+  if (!sessionId) throw new Error("Microsoft Graph did not return an Excel workbook session ID.");
+  const headers = { "workbook-session-id": sessionId };
+  let writeStarted = false;
+  try {
+    for (const operation of operations) {
+      if (operation.type === "renameSheet") {
+        writeStarted = true;
+        await graph(`${base}/worksheets/${encodeURIComponent(String(operation.sheet || ""))}`, {
+          method: "PATCH", headers, body: JSON.stringify({ name: operation.newName }), maxRetries: 0
+        });
+        continue;
+      }
+      const rangePath = excelGraphRangePath(base, operation);
+      if (operation.type === "clearRange") {
+        writeStarted = true;
+        await graph(`${rangePath}/clear`, {
+          method: "POST", headers, body: JSON.stringify({ applyTo: operation.format ? "All" : "Contents" }), maxRetries: 0
+        });
+        continue;
+      }
+      const body = operation.type === "setCell"
+        ? { values: [[operation.value]] }
+        : operation.type === "setFormula"
+          ? { formulas: [[operation.formula]], ...(operation.value !== undefined ? { values: [[operation.value]] } : {}) }
+          : { ...(operation.values !== undefined ? { values: operation.values } : {}), ...(operation.formulas !== undefined ? { formulas: operation.formulas } : {}) };
+      writeStarted = true;
+      await graph(rangePath, { method: "PATCH", headers, body: JSON.stringify(body), maxRetries: 0 });
+    }
+  } catch (error) {
+    const suffix = writeStarted ? " A persistent workbook session had begun; the request was not replayed." : "";
+    throw new Error(`Graph Excel update failed: ${safeToolErrorMessage(error)}${suffix}`);
+  } finally {
+    try {
+      await graph(`${base}/closeSession`, { method: "POST", headers, maxRetries: 0 });
+    } catch (error) {
+      toolCallContext.getStore()?.localWarnings?.push({ operation: "Graph Excel session close", error: safeToolErrorMessage(error) });
+    }
+  }
+  return { sessionClosed: true, operationCount: operations.length };
+}
+
+async function officeBatchUpdate(args = {}, kind, toolName) {
+  const rawItem = await getRawInfo(args);
+  if (rawItem.folder) throw new Error(`Item is a folder, not an Office document: ${rawItem.name}`);
+  assertExpectedItem(rawItem, args, `${kind} batch update`);
+  const detectedKind = officePackageKindFromName(rawItem.name);
+  if (detectedKind !== kind) throw new Error(`Expected a ${kind} Open XML package. Got ${rawItem.name}.`);
+  if (Number(rawItem.size || 0) > maxOfficePackageBytes) {
+    throw new Error(`Office package is ${rawItem.size} bytes, above the ${maxOfficePackageBytes}-byte editing limit.`);
+  }
+  const backendResolution = kind === "excel" ? await resolveExcelOfficeBackend(rawItem, args) : { backend: "openxml" };
+  const selectedBackend = backendResolution.backend;
+  if (args.dryRun === false && args.confirmed !== true) {
+    return { dryRun: false, confirmed: false, requiredToUpdate: "Set dryRun: false and confirmed: true after reviewing the Office edit preview." };
+  }
+  if (args.dryRun === false && !hasExpectedIdentity(args)) {
+    return { dryRun: false, confirmed: true, requiredToUpdate: "Provide expectedName or expectedId for live Office edits." };
+  }
+
+  const transactionRoot = join(officeEditingRoot, `edit-${randomUUID()}`);
+  await ensurePrivateDirectory(transactionRoot);
+  const sourcePath = join(transactionRoot, `source-${basename(rawItem.name)}`);
+  const editedPath = join(transactionRoot, `edited-${basename(rawItem.name)}`);
+  let editResult;
+  let backup = null;
+  try {
+    await downloadResolvedItem(simplifyItem(rawItem), { localPath: sourcePath, overwrite: false });
+    editResult = await runOfficeHelper({
+      action: "edit",
+      inputPath: sourcePath,
+      outputPath: editedPath,
+      kind,
+      operations: args.operations,
+      allowMacros: args.allowMacros === true,
+      allowSignedPackage: args.allowSignedPackage === true
+    }, { timeoutMs: 120_000 });
+    if (!editResult.changeCount) {
+      return {
+        dryRun: args.dryRun !== false,
+        confirmed: args.confirmed === true,
+        item: simplifyItem(rawItem),
+        backend: "openxml",
+        changes: [],
+        changeCount: 0,
+        noChanges: true,
+        requiredToUpdate: "No requested edit matched the document. Re-read the document and correct the operation anchors."
+      };
+    }
+    const proof = officeEditPreviewProof(rawItem, kind, args.operations, editResult, args, selectedBackend);
+    const preview = {
+      dryRun: args.dryRun !== false,
+      confirmed: args.confirmed === true,
+      item: simplifyItem(rawItem),
+      backend: selectedBackend,
+      previewBackend: selectedBackend === "graph" ? "openxml" : undefined,
+      changes: editResult.changes,
+      changeCount: editResult.changeCount,
+      validation: editResult.validation
+    };
+    if (args.dryRun !== false) return previewWithToken(preview, toolName, proof);
+    const tokenRequired = previewTokenRequiredResult(preview, toolName, proof, args.previewToken, "requiredToUpdate");
+    if (tokenRequired) return tokenRequired;
+
+    if (args.createBackup !== false) {
+      await ensurePrivateDirectory(backupRoot);
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const backupPath = join(backupRoot, `office-${stamp}-${randomUUID()}-${basename(rawItem.name)}`);
+      await copyFile(sourcePath, backupPath);
+      await chmod(backupPath, 0o600);
+      backup = { localPath: backupPath, bytes: (await stat(backupPath)).size };
+    }
+
+    const uploaded = selectedBackend === "graph"
+      ? { item: simplifyItem(rawItem), ...(await applyExcelGraphOperations(rawItem, backendResolution, args.operations)), uploadMode: "graph-workbook-session" }
+      : await upload({
+        localPath: editedPath,
+        itemId: rawItem.id,
+        remotePath: itemRemotePath(rawItem),
+        conflictBehavior: "replace",
+        ifMatch: rawItem.eTag,
+        auditTool: toolName,
+        skipAudit: true
+      });
+    let afterRaw = uploaded.item ? { ...rawItem, ...uploaded.item } : rawItem;
+    let remoteValidation = null;
+    let verificationIncomplete = false;
+    try {
+      afterRaw = await getRawInfo({ itemId: rawItem.id });
+    } catch (error) {
+      verificationIncomplete = true;
+      toolCallContext.getStore()?.localWarnings?.push({ operation: "Office post-commit metadata verification", error: safeToolErrorMessage(error) });
+    }
+    if (args.verify !== false) {
+      try {
+        const verifyPath = join(transactionRoot, `verify-${basename(rawItem.name)}`);
+        await downloadResolvedItem(simplifyItem(afterRaw), { localPath: verifyPath, overwrite: false });
+        remoteValidation = await runOfficeHelper({ action: "validate", inputPath: verifyPath, kind });
+        if (selectedBackend === "openxml" && remoteValidation.package?.fingerprint !== editResult.validation?.package?.fingerprint) {
+          verificationIncomplete = true;
+          toolCallContext.getStore()?.localWarnings?.push({ operation: "Office post-commit fingerprint verification", error: "Uploaded package fingerprint differs from the locally validated edit." });
+        }
+      } catch (error) {
+        verificationIncomplete = true;
+        toolCallContext.getStore()?.localWarnings?.push({ operation: "Office post-commit validation", error: safeToolErrorMessage(error) });
+      }
+    }
+    await writeMutationAudit(toolName, {
+      status: "success",
+      target: itemAuditSummary(rawItem),
+      before: itemAuditSummary(rawItem),
+      after: itemAuditSummary(afterRaw),
+      officeEdit: { kind, backend: selectedBackend, changeCount: editResult.changeCount, operationTypes: args.operations.map((entry) => entry.type) },
+      backupCreated: Boolean(backup),
+      verificationIncomplete
+    });
+    return {
+      dryRun: false,
+      confirmed: true,
+      item: simplifyItem(afterRaw),
+      backend: selectedBackend,
+      changes: editResult.changes,
+      changeCount: editResult.changeCount,
+      validation: editResult.validation,
+      remoteValidation,
+      verificationIncomplete,
+      backup,
+      uploaded
+    };
+  } catch (error) {
+    if (args.dryRun === false && args.confirmed === true) {
+      await writeMutationAudit(toolName, {
+        status: "failed",
+        target: itemAuditSummary(rawItem),
+        officeEdit: { kind, backend: selectedBackend, operationTypes: (args.operations || []).map((entry) => entry.type) },
+        backupCreated: Boolean(backup),
+        error: safeErrorInfo(error)
+      });
+    }
+    throw error;
+  } finally {
+    await rm(transactionRoot, { recursive: true, force: true });
+  }
+}
+
 function assertOfficeKind(info, kindName) {
   const kind = officeKinds[kindName];
   if (!kind) throw new Error(`Unknown Office helper kind: ${kindName}`);
@@ -5985,7 +6570,7 @@ async function sharingAudit(args = {}, publicOnly = false) {
 async function upload(args = {}) {
   const localPath = resolve(args.localPath);
   await assertNotLocalOneDriveSyncPathForRead(localPath, "Upload", args);
-  const destinationPath = remotePath(args);
+  const destinationPath = args.itemId ? (args.remotePath || `item:${args.itemId}`) : remotePath(args);
   const fileStat = await stat(localPath);
   if (!fileStat.isFile()) throw new Error(`Not a file: ${localPath}`);
   const uploadMode = args.uploadMode || "auto";
@@ -5993,13 +6578,19 @@ async function upload(args = {}) {
   try {
     let response;
     if (fileStat.size > 0 && (uploadMode === "session" || (uploadMode === "auto" && fileStat.size > simpleUploadLimit))) {
-      response = await uploadLarge({ ...args, localPath, remotePath: destinationPath }, fileStat);
+      const sessionTarget = args.itemId
+        ? { endpoints: [`/me/drive/items/${encodeURIComponent(args.itemId)}/createUploadSession`], name: basename(destinationPath) }
+        : undefined;
+      response = await uploadLarge({ ...args, localPath, remotePath: destinationPath, sessionTarget }, fileStat);
     } else {
       if (uploadMode === "simple" && fileStat.size > simpleUploadLimit) {
         throw new Error(`Simple upload only supports files up to ${simpleUploadLimit} bytes. Use uploadMode: "session" or "auto".`);
       }
       const stream = createReadStream(localPath);
-      const result = await graph(uploadPath(destinationPath, args.conflictBehavior || "fail"), {
+      const targetPath = args.itemId
+        ? `/me/drive/items/${encodeURIComponent(args.itemId)}/content`
+        : uploadPath(destinationPath, args.conflictBehavior || "fail");
+      const result = await graph(targetPath, {
         method: "PUT",
         body: stream,
         duplex: "half",
@@ -6011,22 +6602,26 @@ async function upload(args = {}) {
       await bestEffortLocalWrite("metadata cache update", async () => await cacheItems([result]));
       response = { item: simplifyItem(result), localPath, bytesUploaded: fileStat.size, uploadMode: "simple" };
     }
-    await writeMutationAudit(auditTool, {
-      status: "success",
-      target: { remotePath: destinationPath },
-      after: itemAuditSummary(response.item),
-      localPath,
-      bytes: fileStat.size
-    });
+    if (args.skipAudit !== true) {
+      await writeMutationAudit(auditTool, {
+        status: "success",
+        target: { remotePath: destinationPath },
+        after: itemAuditSummary(response.item),
+        localPath,
+        bytes: fileStat.size
+      });
+    }
     return response;
   } catch (error) {
-    await writeMutationAudit(auditTool, {
-      status: "failed",
-      target: { remotePath: destinationPath },
-      localPath,
-      bytes: fileStat.size,
-      error: safeErrorInfo(error)
-    });
+    if (args.skipAudit !== true) {
+      await writeMutationAudit(auditTool, {
+        status: "failed",
+        target: { remotePath: destinationPath },
+        localPath,
+        bytes: fileStat.size,
+        error: safeErrorInfo(error)
+      });
+    }
     throw error;
   }
 }
@@ -6044,7 +6639,7 @@ function normalizeChunkSize(value = defaultUploadChunkSize) {
 
 async function uploadLarge(args = {}, fileStat) {
   const chunkSize = normalizeChunkSize(args.chunkSize ?? defaultUploadChunkSize);
-  const sessionTarget = await uploadSessionTarget(args.remotePath);
+  const sessionTarget = args.sessionTarget || await uploadSessionTarget(args.remotePath);
   const session = await createUploadSession(sessionTarget, args.conflictBehavior || "fail", args.ifMatch);
   if (!session.uploadUrl) throw new Error("Microsoft Graph did not return an uploadUrl.");
 
@@ -7303,6 +7898,22 @@ async function callTool(name, args = {}) {
       return textResult(await contentSearch(args));
     case "onedrive_content_index_clear":
       return textResult(await clearContentIndex());
+    case "onedrive_office_capabilities":
+      return textResult(await officeCapabilities());
+    case "onedrive_office_validate":
+      return textResult(await inspectRemoteOfficePackage(args, args.expectedKind || null, "validate"));
+    case "onedrive_word_get_document":
+      return textResult(await inspectRemoteOfficePackage(args, "word"));
+    case "onedrive_excel_get_workbook":
+      return textResult(await inspectRemoteOfficePackage(args, "excel"));
+    case "onedrive_powerpoint_get_presentation":
+      return textResult(await inspectRemoteOfficePackage(args, "powerpoint"));
+    case "onedrive_word_batch_update":
+      return textResult(await officeBatchUpdate(args, "word", "onedrive_word_batch_update"));
+    case "onedrive_excel_batch_update":
+      return textResult(await officeBatchUpdate(args, "excel", "onedrive_excel_batch_update"));
+    case "onedrive_powerpoint_batch_update":
+      return textResult(await officeBatchUpdate(args, "powerpoint", "onedrive_powerpoint_batch_update"));
     case "onedrive_get_info":
       return textResult(await getInfo(args));
     case "onedrive_read_text":

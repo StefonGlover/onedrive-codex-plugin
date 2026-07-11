@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -214,6 +214,7 @@ const exportPdfDownload = join(outDir, "exported-doc.pdf");
 const exportTextDownload = join(outDir, "exported-doc.txt");
 const updateCheckout = join(outDir, "update-checkout.txt");
 const updateManifest = join(outDir, "update-checkout.json");
+const officeFixtureDir = join(outDir, "office-fixtures");
 const blockedSyncDownload = join(homedir(), "Library", "CloudStorage", "OneDrive-Personal", `${unique}-blocked-download.txt`);
 const blockedSyncUpload = join(homedir(), "Library", "CloudStorage", "OneDrive-Personal", `${unique}-blocked-upload.txt`);
 const folderName = `Codex OneDrive Plugin Beta Test ${unique}`;
@@ -228,6 +229,9 @@ const content = [
 ].join("\n");
 
 await mkdir(outDir, { recursive: true });
+execFileSync("/usr/bin/python3", [join(pluginRoot, "scripts", "office-openxml-test.py"), `--emit-fixtures=${officeFixtureDir}`], {
+  env: { ...process.env, PYTHONPYCACHEPREFIX: join(outDir, "pycache") }, stdio: "ignore"
+});
 await writeFile(localUpload, `Uploaded through onedrive_upload: ${unique}\n`, "utf8");
 await writeFile(localSessionUpload, Buffer.alloc(400 * 1024, `session-${unique}\n`));
 await writeFile(localBinary, Buffer.from([0, 1, 2, 3, 4, 0, 255, 128]));
@@ -607,6 +611,14 @@ try {
     "onedrive_content_index_refresh",
     "onedrive_content_search",
     "onedrive_content_index_clear",
+    "onedrive_office_capabilities",
+    "onedrive_office_validate",
+    "onedrive_word_get_document",
+    "onedrive_excel_get_workbook",
+    "onedrive_powerpoint_get_presentation",
+    "onedrive_word_batch_update",
+    "onedrive_excel_batch_update",
+    "onedrive_powerpoint_batch_update",
     "onedrive_get_info",
     "onedrive_read_text",
     "onedrive_preview",
@@ -645,7 +657,7 @@ try {
     "onedrive_delete"
   ];
   const uniqueToolNames = new Set(toolNames);
-  record("tools/list includes all 58 tools", requiredTools.length === 58 && requiredTools.every((name) => toolNames.includes(name)) && uniqueToolNames.size === toolNames.length ? "pass" : "fail", {
+  record("tools/list includes all 66 tools", requiredTools.length === 66 && requiredTools.every((name) => toolNames.includes(name)) && uniqueToolNames.size === toolNames.length ? "pass" : "fail", {
     requiredToolCount: requiredTools.length,
     toolCount: toolNames.length,
     uniqueToolCount: uniqueToolNames.size,
@@ -745,14 +757,19 @@ try {
     content: `name,value\n${unique},42\n`,
     conflictBehavior: "fail"
   }));
-  await assertOk("write docx-like", await tool("onedrive_write_text", {
+  await assertOk("upload valid docx", await tool("onedrive_upload", {
     remotePath: `${folderName}/doc.docx`,
-    content: `Document helper test ${unique}\n`,
+    localPath: join(officeFixtureDir, "sample.docx"),
     conflictBehavior: "fail"
   }));
-  await assertOk("write pptx-like", await tool("onedrive_write_text", {
+  await assertOk("upload valid xlsx", await tool("onedrive_upload", {
+    remotePath: `${folderName}/book.xlsx`,
+    localPath: join(officeFixtureDir, "sample.xlsx"),
+    conflictBehavior: "fail"
+  }));
+  await assertOk("upload valid pptx", await tool("onedrive_upload", {
     remotePath: `${folderName}/deck.pptx`,
-    content: `PowerPoint helper test ${unique}\n`,
+    localPath: join(officeFixtureDir, "sample.pptx"),
     conflictBehavior: "fail"
   }));
   await assertOk("write duplicate A", await tool("onedrive_write_text", {
@@ -797,6 +814,29 @@ try {
     excel: excel.localPath,
     word: word.localPath,
     powerpoint: powerpoint.localPath
+  });
+
+  const officeCapabilities = assertOk("office capabilities", await tool("onedrive_office_capabilities"));
+  const wordStructured = assertOk("word structured read", await tool("onedrive_word_get_document", { path: `${folderName}/doc.docx` }));
+  const excelStructured = assertOk("excel structured read", await tool("onedrive_excel_get_workbook", { path: `${folderName}/book.xlsx` }));
+  const powerpointStructured = assertOk("powerpoint structured read", await tool("onedrive_powerpoint_get_presentation", { path: `${folderName}/deck.pptx` }));
+  const officeValidation = assertOk("office package validation", await tool("onedrive_office_validate", { path: `${folderName}/deck.pptx`, expectedKind: "powerpoint" }));
+  record("native Office structured reads", officeCapabilities.backends?.openXml?.available && wordStructured.paragraphCount > 0 && excelStructured.sheetCount > 0 && powerpointStructured.slideCount > 0 && officeValidation.valid ? "pass" : "fail", {
+    wordParagraphs: wordStructured.paragraphCount,
+    excelSheets: excelStructured.sheetCount,
+    powerpointSlides: powerpointStructured.slideCount
+  });
+
+  const wordOfficePreview = assertOk("word native edit preview", await tool("onedrive_word_batch_update", { path: `${folderName}/doc.docx`, operations: [{ type: "setParagraphText", paragraphIndex: 0, text: `Beta Word ${unique}` }] }));
+  const wordOfficeLive = assertOk("word native edit live", await tool("onedrive_word_batch_update", { path: `${folderName}/doc.docx`, operations: [{ type: "setParagraphText", paragraphIndex: 0, text: `Beta Word ${unique}` }], dryRun: false, confirmed: true, expectedName: "doc.docx", previewToken: wordOfficePreview.previewToken }));
+  const excelOfficePreview = assertOk("excel native edit preview", await tool("onedrive_excel_batch_update", { path: `${folderName}/book.xlsx`, backend: "auto", operations: [{ type: "setRange", sheet: "Data", address: "A3:B3", values: [[unique, 42]] }] }));
+  const excelOfficeLive = assertOk("excel native edit live", await tool("onedrive_excel_batch_update", { path: `${folderName}/book.xlsx`, backend: "auto", operations: [{ type: "setRange", sheet: "Data", address: "A3:B3", values: [[unique, 42]] }], dryRun: false, confirmed: true, expectedName: "book.xlsx", previewToken: excelOfficePreview.previewToken }));
+  const powerpointOfficePreview = assertOk("powerpoint native edit preview", await tool("onedrive_powerpoint_batch_update", { path: `${folderName}/deck.pptx`, operations: [{ type: "setShapeText", slideIndex: 0, shapeId: "2", text: `Beta PowerPoint ${unique}` }] }));
+  const powerpointOfficeLive = assertOk("powerpoint native edit live", await tool("onedrive_powerpoint_batch_update", { path: `${folderName}/deck.pptx`, operations: [{ type: "setShapeText", slideIndex: 0, shapeId: "2", text: `Beta PowerPoint ${unique}` }], dryRun: false, confirmed: true, expectedName: "deck.pptx", previewToken: powerpointOfficePreview.previewToken }));
+  record("native Office preview and live commits", wordOfficeLive.changeCount === 1 && excelOfficeLive.changeCount === 2 && powerpointOfficeLive.changeCount === 1 ? "pass" : "fail", {
+    wordChanges: wordOfficeLive.changeCount,
+    excelChanges: excelOfficeLive.changeCount,
+    powerpointChanges: powerpointOfficeLive.changeCount
   });
 
   const preview = assertOk("preview text file", await tool("onedrive_preview", {
