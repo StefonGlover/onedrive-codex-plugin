@@ -7,12 +7,14 @@ import subprocess
 import sys
 import tempfile
 import base64
+import shutil
 from io import BytesIO
 from contextlib import nullcontext
 from pathlib import Path
 
 from docx import Document
 from openpyxl import Workbook, load_workbook
+from openpyxl.worksheet.table import Table, TableStyleInfo
 from pptx import Presentation
 from pptx.util import Inches
 from PIL import Image
@@ -20,12 +22,12 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "scripts" / "office-openxml.py"
-SOFFICE = Path(os.environ.get("SOFFICE", "/Users/stefonglover/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/override/soffice"))
+SOFFICE = Path(os.environ.get("SOFFICE") or shutil.which("soffice") or "soffice")
 
 
 def edit(source, destination, kind, operations):
     result = subprocess.run(
-        ["/usr/bin/python3", str(HELPER)],
+        [sys.executable, str(HELPER)],
         input=json.dumps({"action": "edit", "inputPath": str(source), "outputPath": str(destination), "kind": kind, "operations": operations}),
         text=True,
         capture_output=True,
@@ -59,12 +61,21 @@ def main():
         workbook = Workbook()
         sheet = workbook.active
         sheet.title = "Data"
-        sheet["A1"] = "Revenue"
-        sheet["B1"] = 10
+        sheet.append(["Region", "Revenue"])
+        sheet.append(["North", 20])
+        sheet.append(["South", 30])
+        table = Table(displayName="RevenueTable", ref="A1:B3")
+        table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
+        sheet.add_table(table)
         source_xlsx = root / "real.xlsx"
         workbook.save(source_xlsx)
         edited_xlsx = root / "edited-excel.xlsx"
-        excel = edit(source_xlsx, edited_xlsx, "excel", [{"type": "setRange", "sheet": "Data", "address": "A2:B3", "values": [["North", 20], ["South", 30]]}])
+        excel = edit(source_xlsx, edited_xlsx, "excel", [
+            {"type": "addTableRow", "table": "RevenueTable", "values": [["West", 40]]},
+            {"type": "setTableTotals", "table": "RevenueTable", "enabled": True, "columns": [{"column": "Region", "label": "Total"}, {"column": "Revenue", "function": "sum"}]},
+            {"type": "createChart", "sheet": "Data", "sourceData": "A1:B4", "chartType": "ColumnClustered", "name": "Revenue chart", "titleText": "Revenue by region", "left": 20, "top": 30, "width": 420, "height": 240},
+            {"type": "updateChart", "sheet": "Data", "chart": "Revenue chart", "chartType": "Line", "sourceData": "A1:B4", "name": "Revenue trend", "titleText": "Revenue trend", "left": 40, "top": 50, "width": 400, "height": 220},
+        ])
 
         presentation = Presentation()
         slide = presentation.slides.add_slide(presentation.slide_layouts[6])
@@ -89,18 +100,27 @@ def main():
         ])
 
         Document(edited_docx)
-        load_workbook(edited_xlsx)
+        reopened_excel = load_workbook(edited_xlsx, data_only=False)
         Presentation(edited_pptx)
         rendered = {}
         for path in (edited_docx, edited_xlsx, edited_pptx):
             profile = root / ("profile-" + path.stem)
             conversion = subprocess.run([str(SOFFICE), "--headless", f"-env:UserInstallation={profile.as_uri()}", "--convert-to", "pdf", "--outdir", str(output), str(path)], cwd=root, capture_output=True, text=True, check=False)
             pdf = output / (path.stem + ".pdf")
-            rendered[path.suffix] = {"exitCode": conversion.returncode, "bytes": pdf.stat().st_size if pdf.exists() else 0, "stderr": conversion.stderr[-500:]}
+            diagnostic = (conversion.stdout + "\n" + conversion.stderr).lower()
+            rendered[path.suffix] = {"exitCode": conversion.returncode, "bytes": pdf.stat().st_size if pdf.exists() else 0, "cleanOpen": conversion.returncode == 0 and not any(term in diagnostic for term in ("repair", "corrupt", "fatal error")), "stderr": conversion.stderr[-500:]}
 
-        checks["wordRealPackage"] = word["changeCount"] == 2 and rendered[".docx"]["bytes"] > 0
-        checks["excelRealPackage"] = excel["changeCount"] == 4 and rendered[".xlsx"]["bytes"] > 0
-        checks["powerpointRealPackage"] = powerpoint["changeCount"] == 6 and rendered[".pptx"]["bytes"] > 0
+        checks["wordRealPackage"] = word["changeCount"] == 2 and rendered[".docx"]["bytes"] > 0 and rendered[".docx"]["cleanOpen"]
+        reopened_sheet = reopened_excel["Data"]
+        checks["excelRealPackage"] = (
+            excel["changeCount"] == 4
+            and reopened_sheet.tables["RevenueTable"].ref == "A1:B5"
+            and len(reopened_sheet._charts) == 1
+            and reopened_sheet["B5"].value == "=SUBTOTAL(109,[Revenue])"
+            and rendered[".xlsx"]["bytes"] > 0
+            and rendered[".xlsx"]["cleanOpen"]
+        )
+        checks["powerpointRealPackage"] = powerpoint["changeCount"] == 6 and rendered[".pptx"]["bytes"] > 0 and rendered[".pptx"]["cleanOpen"]
         print(json.dumps({"ok": all(checks.values()), "checks": checks, "rendered": rendered}, indent=2))
         raise SystemExit(0 if all(checks.values()) else 1)
 

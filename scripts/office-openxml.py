@@ -30,6 +30,7 @@ MAX_TEXT_CHARS = 2_000_000
 
 NS = {
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
     "ct": "http://schemas.openxmlformats.org/package/2006/content-types",
     "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
     "pr": "http://schemas.openxmlformats.org/package/2006/relationships",
@@ -37,6 +38,7 @@ NS = {
     "s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
     "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
     "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+    "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
 }
 
 for _prefix, _uri in NS.items():
@@ -74,6 +76,9 @@ def package_inventory(package: zipfile.ZipFile) -> Dict[str, Any]:
     infos = package.infolist()
     if len(infos) > MAX_PACKAGE_ENTRIES:
         raise OfficePackageError("Office package contains too many ZIP entries.")
+    names_in_order = [info.filename for info in infos]
+    if len(names_in_order) != len(set(names_in_order)):
+        raise OfficePackageError("Office package contains duplicate ZIP member names.")
     total_uncompressed = sum(info.file_size for info in infos)
     if total_uncompressed > MAX_UNCOMPRESSED_BYTES:
         raise OfficePackageError("Office package expands beyond the configured safety limit.")
@@ -169,6 +174,23 @@ def validate_relationships(package: zipfile.ZipFile, names: Iterable[str]) -> Li
             resolved = resolved_relationship_target(source_part, target)
             if resolved not in name_set:
                 errors.append({"part": rel_name, "target": resolved, "error": "relationship target is missing"})
+    return errors
+
+
+def validate_content_types(package: zipfile.ZipFile, names: Iterable[str]) -> List[Dict[str, str]]:
+    name_set = set(names)
+    if "[Content_Types].xml" not in name_set:
+        return [{"part": "[Content_Types].xml", "error": "content types manifest is missing"}]
+    root = xml_root(package, "[Content_Types].xml")
+    defaults = {entry.attrib.get("Extension", "").lower() for entry in root.findall(q("ct", "Default"))}
+    overrides = {entry.attrib.get("PartName", "").lstrip("/") for entry in root.findall(q("ct", "Override"))}
+    errors = []
+    for name in sorted(name_set):
+        if name == "[Content_Types].xml" or name.endswith("/"):
+            continue
+        extension = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        if name not in overrides and extension not in defaults:
+            errors.append({"part": name, "error": "part has no Default or Override content type"})
     return errors
 
 
@@ -347,6 +369,85 @@ def excel_tables_for_sheet(package: zipfile.ZipFile, sheet_part: str) -> List[Di
     return tables
 
 
+def excel_charts_for_sheet(package: zipfile.ZipFile, sheet_part: str) -> List[Dict[str, Any]]:
+    charts = []
+    for relationship in rels_for_part(package, sheet_part).values():
+        if not relationship.get("Type", "").endswith("/drawing"):
+            continue
+        drawing_part = resolved_relationship_target(sheet_part, relationship.get("Target", ""))
+        if drawing_part not in package.namelist():
+            continue
+        drawing = xml_root(package, drawing_part)
+        drawing_relationships = rels_for_part(package, drawing_part)
+        for chart_node in drawing.iter(q("c", "chart")):
+            rel_id = chart_node.attrib.get(q("r", "id"))
+            chart_rel = drawing_relationships.get(rel_id or "", {})
+            chart_part = resolved_relationship_target(drawing_part, chart_rel.get("Target", "")) if chart_rel else None
+            if not chart_part or chart_part not in package.namelist():
+                continue
+            root = xml_root(package, chart_part)
+            plot = root.find(".//" + q("c", "plotArea"))
+            chart_type = next((node.tag.split("}")[-1] for node in list(plot or []) if node.tag.endswith("Chart")), None)
+            title = text_of(root.find(".//" + q("c", "title")) or ET.Element("empty"), (q("a", "t"), q("c", "v")))
+            series = []
+            for entry in root.findall(".//" + q("c", "ser")):
+                formulas = [node.text for node in entry.iter(q("c", "f")) if node.text]
+                series.append({"index": len(series), "formulas": formulas})
+            frame = next((node for node in drawing.iter(q("xdr", "graphicFrame")) if chart_node in list(node.iter())), None)
+            anchor = direct_parent(drawing, frame) if frame is not None else None
+            non_visual = frame.find(".//" + q("xdr", "cNvPr")) if frame is not None else None
+            offset = anchor.find(q("xdr", "from")) if anchor is not None else None
+            extent = anchor.find(q("xdr", "ext")) if anchor is not None else None
+            geometry = {
+                "left": int(offset.find(q("xdr", "colOff")).text or "0") / 12700 if offset is not None and offset.find(q("xdr", "colOff")) is not None else 0,
+                "top": int(offset.find(q("xdr", "rowOff")).text or "0") / 12700 if offset is not None and offset.find(q("xdr", "rowOff")) is not None else 0,
+                "width": int(extent.attrib.get("cx", "0")) / 12700 if extent is not None else None,
+                "height": int(extent.attrib.get("cy", "0")) / 12700 if extent is not None else None,
+            }
+            charts.append({"relationshipId": rel_id, "part": chart_part, "id": non_visual.attrib.get("id") if non_visual is not None else None, "name": non_visual.attrib.get("name") if non_visual is not None else None, "type": chart_type, "title": title or None, "geometry": geometry, "series": series, "seriesCount": len(series)})
+    return charts
+
+
+def excel_pivots_for_sheet(package: zipfile.ZipFile, sheet_part: str) -> List[Dict[str, Any]]:
+    pivots = []
+    for relationship_id, relationship in rels_for_part(package, sheet_part).items():
+        if not relationship.get("Type", "").endswith("/pivotTable"):
+            continue
+        part = resolved_relationship_target(sheet_part, relationship.get("Target", ""))
+        if part not in package.namelist():
+            continue
+        root = xml_root(package, part)
+        location = root.find(q("s", "location"))
+        pivots.append({
+            "name": root.attrib.get("name"),
+            "cacheId": root.attrib.get("cacheId"),
+            "relationshipId": relationship_id,
+            "part": part,
+            "location": dict(location.attrib) if location is not None else None,
+            "rowFieldCount": len(list(root.find(q("s", "rowFields")) or [])),
+            "columnFieldCount": len(list(root.find(q("s", "colFields")) or [])),
+            "pageFieldCount": len(list(root.find(q("s", "pageFields")) or [])),
+            "dataFieldCount": len(list(root.find(q("s", "dataFields")) or [])),
+        })
+    return pivots
+
+
+def excel_formula_dependencies(formula: Optional[str], current_sheet: str) -> List[Dict[str, str]]:
+    if not formula:
+        return []
+    pattern = re.compile(r"(?:(?:'((?:[^']|'')+)'|([A-Za-z_][A-Za-z0-9_.]*))!)?(\$?[A-Za-z]{1,3}\$?[1-9][0-9]*(?::\$?[A-Za-z]{1,3}\$?[1-9][0-9]*)?)")
+    dependencies = []
+    seen = set()
+    for match in pattern.finditer(formula):
+        sheet = (match.group(1) or match.group(2) or current_sheet).replace("''", "'")
+        address = match.group(3).replace("$", "").upper()
+        key = (sheet, address)
+        if key not in seen:
+            seen.add(key)
+            dependencies.append({"sheet": sheet, "address": address})
+    return dependencies
+
+
 def inspect_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str, Any]:
     workbook = xml_root(package, "xl/workbook.xml")
     relationships = rels_for_part(package, "xl/workbook.xml")
@@ -355,6 +456,9 @@ def inspect_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str
     max_matches = max(1, min(int(request.get("maxMatches", 100)), 10_000))
     include_cells = request.get("includeCells", True)
     include_tables = request.get("includeTables", True)
+    include_charts = request.get("includeCharts", True)
+    include_pivots = request.get("includePivots", True)
+    include_dependencies = request.get("includeFormulaDependencies", False)
     requested_sheets = {str(name) for name in request.get("sheetNames", []) if str(name)}
     requested_range = str(request.get("address", "")).upper()
     selected_addresses = {
@@ -369,6 +473,9 @@ def inspect_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str
     matches = []
     total_cells = 0
     total_tables = 0
+    total_charts = 0
+    total_pivots = 0
+    dependency_edges = []
     found_sheet_names = set()
     sheet_nodes = workbook.find(q("s", "sheets"))
     for sheet in list(sheet_nodes or []):
@@ -389,7 +496,11 @@ def inspect_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str
         }
         cells = []
         tables = excel_tables_for_sheet(package, part) if include_tables and part and part in package.namelist() else []
+        charts = excel_charts_for_sheet(package, part) if include_charts and part and part in package.namelist() else []
+        pivots = excel_pivots_for_sheet(package, part) if include_pivots and part and part in package.namelist() else []
         total_tables += len(tables)
+        total_charts += len(charts)
+        total_pivots += len(pivots)
         if (include_cells or search_text) and part and part in package.namelist():
             root = xml_root(package, part)
             for cell in root.iter(q("s", "c")):
@@ -413,6 +524,9 @@ def inspect_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str
                     "styleIndex": int(cell.attrib.get("s", "0")),
                     "type": cell.attrib.get("t"),
                 }
+                if include_dependencies and formula_text:
+                    result["dependencies"] = excel_formula_dependencies(formula_text, sheet_name)
+                    dependency_edges.extend({"from": {"sheet": sheet_name, "address": address}, "to": dependency} for dependency in result["dependencies"])
                 if include_cells:
                     cells.append(result)
                 if search_text and len(matches) < max_matches:
@@ -424,6 +538,10 @@ def inspect_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str
         sheet_result["cellCount"] = len(cells)
         sheet_result["tables"] = tables
         sheet_result["tableCount"] = len(tables)
+        sheet_result["charts"] = charts
+        sheet_result["chartCount"] = len(charts)
+        sheet_result["pivots"] = pivots
+        sheet_result["pivotCount"] = len(pivots)
         sheets.append(sheet_result)
         if search_text and len(matches) >= max_matches:
             break
@@ -440,6 +558,10 @@ def inspect_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str
         "sheetCount": len(sheets),
         "cellCount": total_cells,
         "tableCount": total_tables,
+        "chartCount": total_charts,
+        "pivotCount": total_pivots,
+        "formulaDependencies": dependency_edges,
+        "formulaDependencyCount": len(dependency_edges),
         "definedNames": defined_names,
         "selectors": {
             "sheetNames": sorted(requested_sheets),
@@ -567,6 +689,9 @@ def inspect_package(path: Path, request: Dict[str, Any]) -> Dict[str, Any]:
             relationship_errors = validate_relationships(package, inventory["names"])
             if relationship_errors and request.get("strictRelationships", True):
                 raise OfficePackageError("Office package has broken internal relationships.")
+            content_type_errors = validate_content_types(package, inventory["names"])
+            if content_type_errors and request.get("strictContentTypes", True):
+                raise OfficePackageError("Office package has missing or incomplete content types.")
             if kind == "word":
                 content = inspect_word(package, request)
             elif kind == "excel":
@@ -612,6 +737,7 @@ def inspect_package(path: Path, request: Dict[str, Any]) -> Dict[str, Any]:
                     "hasMacros": inventory["hasMacros"],
                     "hasDigitalSignatures": inventory["hasDigitalSignatures"],
                     "relationshipErrors": relationship_errors,
+                    "contentTypeErrors": content_type_errors,
                     "fingerprint": package_fingerprint(package),
                 }
             })
@@ -1065,6 +1191,237 @@ def find_or_create_excel_cell(root: ET.Element, address: str) -> ET.Element:
     return cell
 
 
+def excel_table_target(
+    package: zipfile.ZipFile,
+    modifications: Dict[str, Optional[bytes]],
+    sheet_parts: Dict[str, str],
+    table_name: str,
+) -> Tuple[str, str, ET.Element, ET.Element]:
+    matches = []
+    for sheet_name, sheet_part in sheet_parts.items():
+        for relationship in rels_for_part(package, sheet_part).values():
+            if not relationship.get("Type", "").endswith("/table"):
+                continue
+            table_part = resolved_relationship_target(sheet_part, relationship.get("Target", ""))
+            if table_part not in package.namelist():
+                continue
+            table = ET.fromstring(modifications.get(table_part) or package.read(table_part))
+            if table_name in {table.attrib.get("name"), table.attrib.get("displayName")}:
+                sheet = ET.fromstring(modifications.get(sheet_part) or package.read(sheet_part))
+                matches.append((sheet_name, sheet_part, sheet, table_part, table))
+    if not matches:
+        raise OfficePackageError("Excel table was not found: %s" % table_name)
+    if len(matches) > 1:
+        raise OfficePackageError("Excel table name is ambiguous: %s" % table_name)
+    _sheet_name, sheet_part, sheet, table_part, table = matches[0]
+    return sheet_part, table_part, sheet, table
+
+
+def excel_table_bounds(table: ET.Element) -> Tuple[int, int, int, int]:
+    reference = str(table.attrib.get("ref", ""))
+    endpoints = reference.split(":")
+    if len(endpoints) != 2:
+        raise OfficePackageError("Excel table has an invalid range: %s" % reference)
+    start_column, start_row = excel_address_parts(endpoints[0])
+    end_column, end_row = excel_address_parts(endpoints[1])
+    if start_column > end_column or start_row > end_row:
+        raise OfficePackageError("Excel table has an invalid range: %s" % reference)
+    return start_column, start_row, end_column, end_row
+
+
+def excel_cells_in_columns(root: ET.Element, row_number: int, start_column: int, end_column: int) -> List[ET.Element]:
+    sheet_data = root.find(q("s", "sheetData"))
+    row = next((entry for entry in list(sheet_data or []) if int(entry.attrib.get("r", "0")) == row_number), None)
+    if row is None:
+        return []
+    result = []
+    for cell in row.findall(q("s", "c")):
+        address = cell.attrib.get("r", "")
+        try:
+            column, _row = excel_address_parts(address)
+        except OfficePackageError:
+            continue
+        if start_column <= column <= end_column:
+            result.append(cell)
+    return result
+
+
+def excel_remove_cell(root: ET.Element, address: str) -> None:
+    sheet_data = root.find(q("s", "sheetData"))
+    if sheet_data is None:
+        return
+    row_number = excel_row_number(address)
+    row = next((entry for entry in sheet_data.findall(q("s", "row")) if int(entry.attrib.get("r", "0")) == row_number), None)
+    if row is None:
+        return
+    cell = next((entry for entry in row.findall(q("s", "c")) if entry.attrib.get("r") == address.upper()), None)
+    if cell is not None:
+        row.remove(cell)
+    if not row.findall(q("s", "c")):
+        sheet_data.remove(row)
+
+
+def excel_shift_table_cells_down(root: ET.Element, start_row: int, end_row: int, start_column: int, end_column: int, count: int) -> None:
+    if end_row + count > 1_048_576:
+        raise OfficePackageError("Excel table expansion exceeds the worksheet row limit.")
+    for row_number in range(end_row + 1, end_row + count + 1):
+        if excel_cells_in_columns(root, row_number, start_column, end_column):
+            raise OfficePackageError("Excel table cannot expand because cells immediately below it are not empty.")
+    for row_number in range(end_row, start_row - 1, -1):
+        for column in range(start_column, end_column + 1):
+            source_address = "%s%d" % (excel_column_name(column), row_number)
+            source_cells = excel_cells_in_columns(root, row_number, column, column)
+            if not source_cells:
+                continue
+            source = source_cells[0]
+            destination_address = "%s%d" % (excel_column_name(column), row_number + count)
+            destination = find_or_create_excel_cell(root, destination_address)
+            destination.attrib.clear()
+            destination.attrib.update(source.attrib)
+            destination.attrib["r"] = destination_address
+            destination[:] = [ET.fromstring(ET.tostring(child)) for child in list(source)]
+            excel_remove_cell(root, source_address)
+
+
+def excel_update_table_ref(table: ET.Element, start_column: int, start_row: int, end_column: int, end_row: int) -> None:
+    reference = "%s%d:%s%d" % (excel_column_name(start_column), start_row, excel_column_name(end_column), end_row)
+    table.attrib["ref"] = reference
+    auto_filter = table.find(q("s", "autoFilter"))
+    if auto_filter is not None:
+        totals_count = int(table.attrib.get("totalsRowCount", "0"))
+        filter_end = end_row - totals_count
+        auto_filter.attrib["ref"] = "%s%d:%s%d" % (excel_column_name(start_column), start_row, excel_column_name(end_column), filter_end)
+
+
+def excel_add_table_rows(
+    package: zipfile.ZipFile,
+    modifications: Dict[str, Optional[bytes]],
+    sheet_parts: Dict[str, str],
+    operation: Dict[str, Any],
+) -> Dict[str, Any]:
+    table_name = str(operation.get("table", ""))
+    sheet_part, table_part, sheet, table = excel_table_target(package, modifications, sheet_parts, table_name)
+    start_column, start_row, end_column, end_row = excel_table_bounds(table)
+    column_count = end_column - start_column + 1
+    values = operation.get("values")
+    if not isinstance(values, list) or not values or any(not isinstance(row, list) or len(row) != column_count for row in values):
+        raise OfficePackageError("Excel addTableRow values must contain exactly %d columns per row." % column_count)
+    header_count = int(table.attrib.get("headerRowCount", "1"))
+    totals_count = int(table.attrib.get("totalsRowCount", "0"))
+    if header_count not in {0, 1} or totals_count not in {0, 1}:
+        raise OfficePackageError("Excel table uses unsupported header or totals row counts.")
+    data_count = end_row - start_row + 1 - header_count - totals_count
+    requested_index = operation.get("index")
+    index = data_count if requested_index is None else int(requested_index)
+    if index < 0 or index > data_count:
+        raise OfficePackageError("Excel addTableRow index is outside the table data rows.")
+    insertion_row = start_row + header_count + index
+    excel_shift_table_cells_down(sheet, insertion_row, end_row, start_column, end_column, len(values))
+    for row_offset, row_values in enumerate(values):
+        for column_offset, value in enumerate(row_values):
+            address = "%s%d" % (excel_column_name(start_column + column_offset), insertion_row + row_offset)
+            set_excel_cell(find_or_create_excel_cell(sheet, address), value)
+    excel_update_table_ref(table, start_column, start_row, end_column, end_row + len(values))
+    modifications[sheet_part] = ET.tostring(sheet, encoding="utf-8", xml_declaration=True)
+    modifications[table_part] = ET.tostring(table, encoding="utf-8", xml_declaration=True)
+    return {"table": table_name, "sheetPart": sheet_part, "index": index, "rowCount": len(values), "beforeRef": "%s%d:%s%d" % (excel_column_name(start_column), start_row, excel_column_name(end_column), end_row), "afterRef": table.attrib["ref"], "preservedTotalsRow": totals_count == 1}
+
+
+EXCEL_TOTAL_FUNCTIONS = {
+    "average": 101,
+    "countNums": 102,
+    "count": 103,
+    "max": 104,
+    "min": 105,
+    "stdDev": 107,
+    "sum": 109,
+    "var": 110,
+}
+
+
+def excel_set_table_totals(
+    package: zipfile.ZipFile,
+    modifications: Dict[str, Optional[bytes]],
+    sheet_parts: Dict[str, str],
+    operation: Dict[str, Any],
+) -> Dict[str, Any]:
+    table_name = str(operation.get("table", ""))
+    sheet_part, table_part, sheet, table = excel_table_target(package, modifications, sheet_parts, table_name)
+    start_column, start_row, end_column, end_row = excel_table_bounds(table)
+    before_enabled = int(table.attrib.get("totalsRowCount", "0")) == 1
+    enabled = bool(operation.get("enabled"))
+    if enabled and not before_enabled:
+        excel_shift_table_cells_down(sheet, end_row + 1, end_row, start_column, end_column, 1)
+        end_row += 1
+    elif not enabled and before_enabled:
+        for column in range(start_column, end_column + 1):
+            excel_remove_cell(sheet, "%s%d" % (excel_column_name(column), end_row))
+        end_row -= 1
+    table.attrib["totalsRowCount"] = "1" if enabled else "0"
+    table.attrib["totalsRowShown"] = "1" if enabled else "0"
+    columns_node = table.find(q("s", "tableColumns"))
+    columns = list(columns_node or [])
+    if len(columns) != end_column - start_column + 1:
+        raise OfficePackageError("Excel table column metadata does not match its range.")
+    configured = []
+    seen_columns = set()
+    for setting in operation.get("columns", []):
+        selector = setting.get("column")
+        if isinstance(selector, bool):
+            raise OfficePackageError("Excel totals column must be a name or zero-based index.")
+        if isinstance(selector, int):
+            column_index = selector
+        else:
+            column_index = next((index for index, column in enumerate(columns) if column.attrib.get("name") == str(selector)), -1)
+        if column_index < 0 or column_index >= len(columns):
+            raise OfficePackageError("Excel totals column was not found: %s" % selector)
+        if column_index in seen_columns:
+            raise OfficePackageError("Excel totals column is configured more than once: %s" % selector)
+        seen_columns.add(column_index)
+        column = columns[column_index]
+        for attribute in ("totalsRowFunction", "totalsRowLabel"):
+            column.attrib.pop(attribute, None)
+        function = setting.get("function")
+        label = setting.get("label")
+        formula = setting.get("formula")
+        if label is not None and (function is not None or formula is not None):
+            raise OfficePackageError("Excel totals column cannot combine label with function or formula.")
+        if formula is not None and function != "custom":
+            raise OfficePackageError("Excel totals formula requires function custom.")
+        if function == "custom" and not formula:
+            raise OfficePackageError("Excel custom totals require formula.")
+        if label is not None:
+            column.attrib["totalsRowLabel"] = str(label)
+        elif function is not None:
+            column.attrib["totalsRowFunction"] = str(function)
+        if enabled:
+            cell = find_or_create_excel_cell(sheet, "%s%d" % (excel_column_name(start_column + column_index), end_row))
+            if label is not None:
+                set_excel_cell(cell, label)
+            elif function == "custom":
+                set_excel_cell(cell, formula=str(formula).lstrip("="))
+            elif function in EXCEL_TOTAL_FUNCTIONS:
+                escaped_name = str(column.attrib.get("name", "")).replace("]", "]]" )
+                set_excel_cell(cell, formula="SUBTOTAL(%d,[%s])" % (EXCEL_TOTAL_FUNCTIONS[function], escaped_name))
+            else:
+                set_excel_cell(cell, None)
+        configured.append({"column": selector, "function": function, "label": label})
+    if enabled:
+        configured_indexes = {
+            setting.get("column") if isinstance(setting.get("column"), int) else next((index for index, column in enumerate(columns) if column.attrib.get("name") == str(setting.get("column"))), -1)
+            for setting in operation.get("columns", [])
+        }
+        for index, column in enumerate(columns):
+            if index not in configured_indexes and not before_enabled:
+                column.attrib.pop("totalsRowFunction", None)
+                column.attrib.pop("totalsRowLabel", None)
+                set_excel_cell(find_or_create_excel_cell(sheet, "%s%d" % (excel_column_name(start_column + index), end_row)), None)
+    excel_update_table_ref(table, start_column, start_row, end_column, end_row)
+    modifications[sheet_part] = ET.tostring(sheet, encoding="utf-8", xml_declaration=True)
+    modifications[table_part] = ET.tostring(table, encoding="utf-8", xml_declaration=True)
+    return {"table": table_name, "beforeEnabled": before_enabled, "afterEnabled": enabled, "afterRef": table.attrib["ref"], "columns": configured}
+
+
 def set_excel_cell(cell: ET.Element, value: Any = None, formula: Optional[str] = None) -> None:
     for child in list(cell):
         if child.tag in {q("s", "v"), q("s", "f"), q("s", "is")}:
@@ -1167,12 +1524,255 @@ def apply_excel_recalculate(package: zipfile.ZipFile, modifications: Dict[str, O
     return {"before": before, "after": dict(calculation.attrib), "removedCalcChain": removed_chain}
 
 
+def excel_add_fill_dxf(package: zipfile.ZipFile, modifications: Dict[str, Optional[bytes]], color: str) -> int:
+    if not re.fullmatch(r"[0-9A-Fa-f]{6}", color):
+        raise OfficePackageError("Excel conditional-format color must be six hexadecimal characters.")
+    styles_part = "xl/styles.xml"
+    if styles_part not in package.namelist():
+        raise OfficePackageError("Excel conditional formatting requires an existing styles.xml part.")
+    root = ET.fromstring(modifications.get(styles_part) or package.read(styles_part))
+    differential = root.find(q("s", "dxfs"))
+    if differential is None:
+        differential = ET.SubElement(root, q("s", "dxfs"), {"count": "0"})
+    dxf = ET.SubElement(differential, q("s", "dxf"))
+    fill = ET.SubElement(dxf, q("s", "fill"))
+    pattern = ET.SubElement(fill, q("s", "patternFill"), {"patternType": "solid"})
+    ET.SubElement(pattern, q("s", "fgColor"), {"rgb": "FF" + color.upper()})
+    ET.SubElement(pattern, q("s", "bgColor"), {"indexed": "64"})
+    differential.attrib["count"] = str(len(list(differential)))
+    modifications[styles_part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    return len(list(differential)) - 1
+
+
+def excel_set_column_width(root: ET.Element, address: str, width: float) -> Dict[str, Any]:
+    if width <= 0 or width > 255:
+        raise OfficePackageError("Excel column width must be greater than 0 and at most 255.")
+    endpoints = str(address).upper().split(":")
+    start_column = excel_address_parts(endpoints[0])[0]
+    end_column = excel_address_parts(endpoints[-1])[0]
+    columns = root.find(q("s", "cols"))
+    if columns is None:
+        columns = ET.Element(q("s", "cols"))
+        sheet_data = root.find(q("s", "sheetData"))
+        root.insert(list(root).index(sheet_data) if sheet_data is not None else 0, columns)
+    for column_number in range(start_column, end_column + 1):
+        for existing in list(columns):
+            minimum = int(existing.attrib.get("min", "0"))
+            maximum = int(existing.attrib.get("max", "0"))
+            if minimum <= column_number <= maximum:
+                columns.remove(existing)
+                if minimum < column_number:
+                    columns.append(ET.Element(q("s", "col"), {**existing.attrib, "max": str(column_number - 1)}))
+                if column_number < maximum:
+                    columns.append(ET.Element(q("s", "col"), {**existing.attrib, "min": str(column_number + 1)}))
+        columns.append(ET.Element(q("s", "col"), {"min": str(column_number), "max": str(column_number), "width": str(width), "customWidth": "1"}))
+    return {"startColumn": start_column, "endColumn": end_column, "width": width}
+
+
+def office_relationship_part(part: str) -> str:
+    return posixpath.join(posixpath.dirname(part), "_rels", posixpath.basename(part) + ".rels")
+
+
+def excel_relationship_root(package: zipfile.ZipFile, modifications: Dict[str, Optional[bytes]], part: str) -> Tuple[str, ET.Element]:
+    relationship_part = office_relationship_part(part)
+    if modifications.get(relationship_part) is not None:
+        return relationship_part, ET.fromstring(modifications[relationship_part])
+    if relationship_part in package.namelist():
+        return relationship_part, ET.fromstring(package.read(relationship_part))
+    return relationship_part, ET.Element(q("pr", "Relationships"))
+
+
+def excel_add_relationship(package: zipfile.ZipFile, modifications: Dict[str, Optional[bytes]], part: str, rel_type: str, target: str) -> str:
+    relationship_part, root = excel_relationship_root(package, modifications, part)
+    used = {entry.attrib.get("Id") for entry in root.findall(q("pr", "Relationship"))}
+    number = 1
+    while "rId%d" % number in used:
+        number += 1
+    rel_id = "rId%d" % number
+    ET.SubElement(root, q("pr", "Relationship"), {"Id": rel_id, "Type": rel_type, "Target": target})
+    modifications[relationship_part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    return rel_id
+
+
+def excel_next_part_number(package: zipfile.ZipFile, modifications: Dict[str, Optional[bytes]], pattern: str) -> int:
+    numbers = [int(match.group(1)) for name in set(package.namelist()) | set(modifications) if (match := re.fullmatch(pattern, name)) and modifications.get(name, b"present") is not None]
+    return max(numbers or [0]) + 1
+
+
+def excel_source_range(sheet_name: str, source_data: str) -> Tuple[str, List[List[str]]]:
+    source = str(source_data or "")
+    if "!" in source:
+        supplied_sheet, address = source.rsplit("!", 1)
+        supplied_sheet = supplied_sheet.strip("'").replace("''", "'")
+        if supplied_sheet != sheet_name:
+            raise OfficePackageError("OpenXML chart sourceData must reference the selected worksheet.")
+    else:
+        address = source
+    addresses = excel_range_addresses(address.replace("$", ""))
+    if len(addresses) < 2 or len(addresses[0]) < 2:
+        raise OfficePackageError("Excel chart sourceData must include a header row, category column, and at least one data row.")
+    escaped_sheet = "'%s'" % sheet_name.replace("'", "''")
+    return escaped_sheet, addresses
+
+
+def excel_chart_xml(sheet_name: str, source_data: str, chart_type: str, title: Optional[str]) -> bytes:
+    sheet_formula, addresses = excel_source_range(sheet_name, source_data)
+    normalized = re.sub(r"[^a-z]", "", str(chart_type or "").lower())
+    if normalized in {"bar", "barclustered"}:
+        element_name, bar_direction = "barChart", "bar"
+    elif normalized in {"column", "columnclustered", "clusteredcolumn"}:
+        element_name, bar_direction = "barChart", "col"
+    elif normalized in {"line", "linechart"}:
+        element_name, bar_direction = "lineChart", None
+    elif normalized in {"pie", "piechart"}:
+        element_name, bar_direction = "pieChart", None
+    else:
+        raise OfficePackageError("OpenXML chartType must be BarClustered, ColumnClustered, Line, or Pie.")
+    root = ET.Element(q("c", "chartSpace"))
+    chart = ET.SubElement(root, q("c", "chart"))
+    if title is not None:
+        title_node = ET.SubElement(chart, q("c", "title"))
+        tx = ET.SubElement(title_node, q("c", "tx"))
+        rich = ET.SubElement(tx, q("c", "rich"))
+        ET.SubElement(rich, q("a", "bodyPr")); ET.SubElement(rich, q("a", "lstStyle"))
+        paragraph = ET.SubElement(rich, q("a", "p")); run = ET.SubElement(paragraph, q("a", "r")); ET.SubElement(run, q("a", "t")).text = str(title)
+    plot = ET.SubElement(chart, q("c", "plotArea")); ET.SubElement(plot, q("c", "layout"))
+    chart_element = ET.SubElement(plot, q("c", element_name))
+    if bar_direction:
+        ET.SubElement(chart_element, q("c", "barDir"), {"val": bar_direction})
+        ET.SubElement(chart_element, q("c", "grouping"), {"val": "clustered"})
+    start = excel_address_parts(addresses[0][0]); end = excel_address_parts(addresses[-1][-1])
+    category_start = "%s%d" % (excel_column_name(start[0]), start[1] + 1)
+    category_end = "%s%d" % (excel_column_name(start[0]), end[1])
+    category_formula = "%s!$%s$%d:$%s$%d" % (sheet_formula, excel_column_name(start[0]), start[1] + 1, excel_column_name(start[0]), end[1])
+    for series_index, column in enumerate(range(start[0] + 1, end[0] + 1)):
+        series = ET.SubElement(chart_element, q("c", "ser"))
+        ET.SubElement(series, q("c", "idx"), {"val": str(series_index)}); ET.SubElement(series, q("c", "order"), {"val": str(series_index)})
+        tx = ET.SubElement(series, q("c", "tx")); ref = ET.SubElement(tx, q("c", "strRef")); ET.SubElement(ref, q("c", "f")).text = "%s!$%s$%d" % (sheet_formula, excel_column_name(column), start[1])
+        cat = ET.SubElement(series, q("c", "cat")); cat_ref = ET.SubElement(cat, q("c", "strRef")); ET.SubElement(cat_ref, q("c", "f")).text = category_formula
+        values = ET.SubElement(series, q("c", "val")); number_ref = ET.SubElement(values, q("c", "numRef")); ET.SubElement(number_ref, q("c", "f")).text = "%s!$%s$%d:$%s$%d" % (sheet_formula, excel_column_name(column), start[1] + 1, excel_column_name(column), end[1])
+    if element_name != "pieChart":
+        category_axis_id, value_axis_id = "123456", "123457"
+        ET.SubElement(chart_element, q("c", "axId"), {"val": category_axis_id}); ET.SubElement(chart_element, q("c", "axId"), {"val": value_axis_id})
+        category_axis = ET.SubElement(plot, q("c", "catAx")); ET.SubElement(category_axis, q("c", "axId"), {"val": category_axis_id}); ET.SubElement(category_axis, q("c", "axPos"), {"val": "b"}); ET.SubElement(category_axis, q("c", "crossAx"), {"val": value_axis_id}); ET.SubElement(category_axis, q("c", "crosses"), {"val": "autoZero"})
+        value_axis = ET.SubElement(plot, q("c", "valAx")); ET.SubElement(value_axis, q("c", "axId"), {"val": value_axis_id}); ET.SubElement(value_axis, q("c", "axPos"), {"val": "l"}); ET.SubElement(value_axis, q("c", "crossAx"), {"val": category_axis_id}); ET.SubElement(value_axis, q("c", "crosses"), {"val": "autoZero"})
+    ET.SubElement(chart, q("c", "plotVisOnly"), {"val": "1"})
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def excel_set_chart_title(root: ET.Element, title: str) -> None:
+    chart = root.find(q("c", "chart"))
+    if chart is None:
+        raise OfficePackageError("Excel chart part has no chart element.")
+    existing = chart.find(q("c", "title"))
+    if existing is not None:
+        chart.remove(existing)
+    title_node = ET.Element(q("c", "title")); tx = ET.SubElement(title_node, q("c", "tx")); rich = ET.SubElement(tx, q("c", "rich"))
+    ET.SubElement(rich, q("a", "bodyPr")); ET.SubElement(rich, q("a", "lstStyle")); paragraph = ET.SubElement(rich, q("a", "p")); run = ET.SubElement(paragraph, q("a", "r")); ET.SubElement(run, q("a", "t")).text = str(title)
+    chart.insert(0, title_node)
+
+
+def excel_sheet_drawing(package: zipfile.ZipFile, modifications: Dict[str, Optional[bytes]], sheet_part: str, sheet_root: ET.Element) -> Tuple[str, ET.Element]:
+    relationship_part, relationships = excel_relationship_root(package, modifications, sheet_part)
+    drawing_relationship = next((entry for entry in relationships.findall(q("pr", "Relationship")) if entry.attrib.get("Type", "").endswith("/drawing")), None)
+    if drawing_relationship is not None:
+        drawing_part = resolved_relationship_target(sheet_part, drawing_relationship.attrib.get("Target", ""))
+        payload = modifications.get(drawing_part) if drawing_part in modifications else package.read(drawing_part)
+        return drawing_part, ET.fromstring(payload)
+    number = excel_next_part_number(package, modifications, r"xl/drawings/drawing(\d+)\.xml")
+    drawing_part = "xl/drawings/drawing%d.xml" % number
+    target = posixpath.relpath(drawing_part, posixpath.dirname(sheet_part))
+    rel_id = excel_add_relationship(package, modifications, sheet_part, "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing", target)
+    ET.SubElement(sheet_root, q("s", "drawing"), {q("r", "id"): rel_id})
+    add_content_type_override(package, modifications, "/" + drawing_part, "application/vnd.openxmlformats-officedocument.drawing+xml")
+    return drawing_part, ET.Element(q("xdr", "wsDr"))
+
+
+def excel_create_chart(package: zipfile.ZipFile, modifications: Dict[str, Optional[bytes]], sheet_part: str, sheet_root: ET.Element, operation: Dict[str, Any]) -> Dict[str, Any]:
+    drawing_part, drawing = excel_sheet_drawing(package, modifications, sheet_part, sheet_root)
+    chart_number = excel_next_part_number(package, modifications, r"xl/charts/chart(\d+)\.xml")
+    chart_part = "xl/charts/chart%d.xml" % chart_number
+    chart_target = posixpath.relpath(chart_part, posixpath.dirname(drawing_part))
+    rel_id = excel_add_relationship(package, modifications, drawing_part, "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart", chart_target)
+    used_ids = [int(node.attrib.get("id", "0")) for node in drawing.iter(q("xdr", "cNvPr")) if node.attrib.get("id", "").isdigit()]
+    frame_id = max(used_ids or [0]) + 1
+    name = str(operation.get("name") or "Chart %d" % chart_number)
+    anchor = ET.SubElement(drawing, q("xdr", "oneCellAnchor"))
+    start = ET.SubElement(anchor, q("xdr", "from"))
+    ET.SubElement(start, q("xdr", "col")).text = "0"; ET.SubElement(start, q("xdr", "colOff")).text = str(round(float(operation.get("left", 0)) * 12700))
+    ET.SubElement(start, q("xdr", "row")).text = "0"; ET.SubElement(start, q("xdr", "rowOff")).text = str(round(float(operation.get("top", 0)) * 12700))
+    ET.SubElement(anchor, q("xdr", "ext"), {"cx": str(round(float(operation.get("width", 480)) * 12700)), "cy": str(round(float(operation.get("height", 288)) * 12700))})
+    frame = ET.SubElement(anchor, q("xdr", "graphicFrame"), {"macro": ""})
+    nv = ET.SubElement(frame, q("xdr", "nvGraphicFramePr")); ET.SubElement(nv, q("xdr", "cNvPr"), {"id": str(frame_id), "name": name}); ET.SubElement(nv, q("xdr", "cNvGraphicFramePr"))
+    transform = ET.SubElement(frame, q("xdr", "xfrm")); ET.SubElement(transform, q("a", "off"), {"x": "0", "y": "0"}); ET.SubElement(transform, q("a", "ext"), {"cx": "0", "cy": "0"})
+    graphic = ET.SubElement(frame, q("a", "graphic")); data = ET.SubElement(graphic, q("a", "graphicData"), {"uri": NS["c"]}); ET.SubElement(data, q("c", "chart"), {q("r", "id"): rel_id})
+    ET.SubElement(anchor, q("xdr", "clientData"))
+    modifications[drawing_part] = ET.tostring(drawing, encoding="utf-8", xml_declaration=True)
+    modifications[chart_part] = excel_chart_xml(str(operation.get("sheet", "")), str(operation.get("sourceData", "")), str(operation.get("chartType", "")), operation.get("titleText"))
+    add_content_type_override(package, modifications, "/" + chart_part, "application/vnd.openxmlformats-officedocument.drawingml.chart+xml")
+    return {"name": name, "part": chart_part, "type": operation.get("chartType"), "sourceData": operation.get("sourceData"), "relationshipId": rel_id}
+
+
+def excel_update_chart(package: zipfile.ZipFile, modifications: Dict[str, Optional[bytes]], sheet_part: str, operation: Dict[str, Any]) -> Dict[str, Any]:
+    requested = str(operation.get("chart", ""))
+    _, sheet_relationships = excel_relationship_root(package, modifications, sheet_part)
+    for relationship_node in sheet_relationships.findall(q("pr", "Relationship")):
+        relationship = relationship_node.attrib
+        if not relationship.get("Type", "").endswith("/drawing"):
+            continue
+        drawing_part = resolved_relationship_target(sheet_part, relationship.get("Target", ""))
+        drawing = ET.fromstring(modifications.get(drawing_part) or package.read(drawing_part))
+        drawing_relationship_part, drawing_relationships = excel_relationship_root(package, modifications, drawing_part)
+        relationship_map = {entry.attrib.get("Id"): entry for entry in drawing_relationships.findall(q("pr", "Relationship"))}
+        for frame in drawing.iter(q("xdr", "graphicFrame")):
+            name_node = frame.find(".//" + q("xdr", "cNvPr")); chart_node = frame.find(".//" + q("c", "chart"))
+            if chart_node is None or name_node is None or requested not in {name_node.attrib.get("name"), name_node.attrib.get("id")}:
+                continue
+            chart_relationship = relationship_map.get(chart_node.attrib.get(q("r", "id")))
+            if chart_relationship is None:
+                raise OfficePackageError("Excel chart relationship is missing.")
+            chart_part = resolved_relationship_target(drawing_part, chart_relationship.attrib.get("Target", ""))
+            existing_root = ET.fromstring(modifications.get(chart_part) or package.read(chart_part))
+            existing_type = next((node.tag.split("}")[-1] for node in existing_root.findall(".//" + q("c", "plotArea") + "/*") if node.tag.endswith("Chart")), "barChart")
+            inferred_type = operation.get("chartType") or {"barChart": "ColumnClustered", "lineChart": "Line", "pieChart": "Pie"}.get(existing_type, "ColumnClustered")
+            source_data = operation.get("sourceData")
+            title = operation.get("titleText")
+            if title is None:
+                title_node = existing_root.find(".//" + q("c", "title")); title = text_of(title_node, (q("a", "t"), q("c", "v"))) if title_node is not None else None
+            if source_data is not None:
+                modifications[chart_part] = excel_chart_xml(str(operation.get("sheet", "")), str(source_data), str(inferred_type), title)
+            elif operation.get("chartType") is not None:
+                raise OfficePackageError("OpenXML chartType updates require sourceData so series can be rebuilt safely.")
+            elif operation.get("titleText") is not None:
+                excel_set_chart_title(existing_root, str(operation.get("titleText")))
+                modifications[chart_part] = ET.tostring(existing_root, encoding="utf-8", xml_declaration=True)
+            if operation.get("name") is not None:
+                name_node.attrib["name"] = str(operation["name"])
+            anchor = direct_parent(drawing, frame)
+            start = anchor.find(q("xdr", "from")) if anchor is not None else None; extent = anchor.find(q("xdr", "ext")) if anchor is not None else None
+            if start is not None:
+                if operation.get("left") is not None: start.find(q("xdr", "colOff")).text = str(round(float(operation["left"]) * 12700))
+                if operation.get("top") is not None: start.find(q("xdr", "rowOff")).text = str(round(float(operation["top"]) * 12700))
+            if extent is not None:
+                if operation.get("width") is not None: extent.attrib["cx"] = str(round(float(operation["width"]) * 12700))
+                if operation.get("height") is not None: extent.attrib["cy"] = str(round(float(operation["height"]) * 12700))
+            modifications[drawing_part] = ET.tostring(drawing, encoding="utf-8", xml_declaration=True)
+            return {"name": name_node.attrib.get("name"), "part": chart_part, "type": inferred_type, "sourceData": source_data, "title": title}
+    raise OfficePackageError("Excel chart was not found: %s" % requested)
+
+
 def edit_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[str, Optional[bytes]], List[Dict[str, Any]]]:
     sheet_parts = excel_sheet_parts(package)
     modifications: Dict[str, Optional[bytes]] = {}
     changes = []
     for operation in request.get("operations", []):
         op_type = operation.get("type")
+        if op_type == "addTableRow":
+            changes.append({"operation": op_type, **excel_add_table_rows(package, modifications, sheet_parts, operation)})
+            continue
+        if op_type == "setTableTotals":
+            changes.append({"operation": op_type, **excel_set_table_totals(package, modifications, sheet_parts, operation)})
+            continue
         if op_type == "recalculate":
             changes.append({"operation": op_type, **apply_excel_recalculate(package, modifications)})
             continue
@@ -1209,7 +1809,7 @@ def edit_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[
             modifications["xl/workbook.xml"] = ET.tostring(workbook, encoding="utf-8", xml_declaration=True)
             changes.append({"operation": op_type, "name": name, "before": before, "after": target.text})
             continue
-        if op_type not in {"setCell", "setFormula", "setRange", "clearRange", "setStyle", "setNumberFormat"}:
+        if op_type not in {"setCell", "setFormula", "setRange", "clearRange", "setStyle", "setNumberFormat", "addConditionalFormat", "setDataValidation", "freezePanes", "setColumnWidth", "createChart", "updateChart"}:
             raise OfficePackageError("Unsupported Excel operation: %s" % op_type)
         sheet_name = str(operation.get("sheet", ""))
         part = sheet_parts.get(sheet_name)
@@ -1218,7 +1818,87 @@ def edit_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[
         address = str(operation.get("address", "")).upper()
         root = ET.fromstring(modifications.get(part, package.read(part)))
         shared = excel_shared_strings(package)
-        addresses = excel_range_addresses(address)
+        if op_type == "createChart":
+            after_chart = excel_create_chart(package, modifications, part, root, operation)
+            modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            changes.append({"operation": op_type, "sheet": sheet_name, "after": after_chart})
+            continue
+        if op_type == "updateChart":
+            after_chart = excel_update_chart(package, modifications, part, operation)
+            changes.append({"operation": op_type, "sheet": sheet_name, "chart": operation.get("chart"), "after": after_chart})
+            continue
+        addresses = [] if op_type == "freezePanes" else excel_range_addresses(address)
+        if op_type == "addConditionalFormat":
+            rule_type = str(operation.get("ruleType", "expression"))
+            if rule_type not in {"expression", "cellIs"}:
+                raise OfficePackageError("Excel conditional-format ruleType must be expression or cellIs.")
+            formula = str(operation.get("formula", ""))
+            if not formula:
+                raise OfficePackageError("Excel conditional formatting requires formula.")
+            dxf_id = excel_add_fill_dxf(package, modifications, str(operation.get("fillColor", "")))
+            priority = 1 + max([int(rule.attrib.get("priority", "0")) for rule in root.iter(q("s", "cfRule"))] or [0])
+            container = ET.SubElement(root, q("s", "conditionalFormatting"), {"sqref": address})
+            attributes = {"type": rule_type, "dxfId": str(dxf_id), "priority": str(priority)}
+            if rule_type == "cellIs":
+                operator = str(operation.get("operator", "equal"))
+                if operator not in {"between", "notBetween", "equal", "notEqual", "greaterThan", "lessThan", "greaterThanOrEqual", "lessThanOrEqual"}:
+                    raise OfficePackageError("Excel conditional-format operator is invalid.")
+                attributes["operator"] = operator
+            rule = ET.SubElement(container, q("s", "cfRule"), attributes)
+            ET.SubElement(rule, q("s", "formula")).text = formula.lstrip("=")
+            modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            changes.append({"operation": op_type, "sheet": sheet_name, "address": address, "after": {"ruleType": rule_type, "formula": formula, "fillColor": operation.get("fillColor"), "priority": priority}})
+            continue
+        if op_type == "setDataValidation":
+            validation_type = str(operation.get("validationType", "custom"))
+            if validation_type not in {"whole", "decimal", "list", "date", "time", "textLength", "custom"}:
+                raise OfficePackageError("Excel data-validation type is invalid.")
+            validations = root.find(q("s", "dataValidations"))
+            if validations is None:
+                validations = ET.SubElement(root, q("s", "dataValidations"), {"count": "0"})
+            for existing in list(validations):
+                if existing.attrib.get("sqref") == address:
+                    validations.remove(existing)
+            attributes = {"type": validation_type, "sqref": address, "allowBlank": "1" if operation.get("allowBlank", True) else "0"}
+            if operation.get("operator"):
+                attributes["operator"] = str(operation["operator"])
+            validation = ET.SubElement(validations, q("s", "dataValidation"), attributes)
+            for field in ("formula1", "formula2"):
+                if operation.get(field) is not None:
+                    ET.SubElement(validation, q("s", field)).text = str(operation[field])
+            validations.attrib["count"] = str(len(list(validations)))
+            modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            changes.append({"operation": op_type, "sheet": sheet_name, "address": address, "after": {"validationType": validation_type, "formula1": operation.get("formula1"), "formula2": operation.get("formula2")}})
+            continue
+        if op_type == "freezePanes":
+            rows = int(operation.get("rows", 0))
+            columns_count = int(operation.get("columns", 0))
+            if rows < 0 or columns_count < 0 or rows > 1_048_575 or columns_count > 16_383:
+                raise OfficePackageError("Excel freeze pane counts are outside worksheet limits.")
+            views = root.find(q("s", "sheetViews"))
+            if views is None:
+                views = ET.Element(q("s", "sheetViews"))
+                root.insert(0, views)
+            view = views.find(q("s", "sheetView"))
+            if view is None:
+                view = ET.SubElement(views, q("s", "sheetView"), {"workbookViewId": "0"})
+            existing = view.find(q("s", "pane"))
+            if existing is not None:
+                view.remove(existing)
+            if rows or columns_count:
+                top_left = "%s%d" % (excel_column_name(columns_count + 1), rows + 1)
+                pane = {"state": "frozen", "topLeftCell": top_left, "activePane": "bottomRight" if rows and columns_count else "bottomLeft" if rows else "topRight"}
+                if rows: pane["ySplit"] = str(rows)
+                if columns_count: pane["xSplit"] = str(columns_count)
+                view.insert(0, ET.Element(q("s", "pane"), pane))
+            modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            changes.append({"operation": op_type, "sheet": sheet_name, "after": {"rows": rows, "columns": columns_count}})
+            continue
+        if op_type == "setColumnWidth":
+            after_width = excel_set_column_width(root, address, float(operation.get("width", 0)))
+            modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            changes.append({"operation": op_type, "sheet": sheet_name, "address": address, "after": after_width})
+            continue
         values = operation.get("values")
         formulas = operation.get("formulas")
         if op_type == "setRange":

@@ -2,7 +2,7 @@
 
 import { execFileSync, spawn } from "node:child_process";
 import { createReadStream, createWriteStream, readFileSync } from "node:fs";
-import { appendFile, chmod, copyFile, mkdir, open, readFile, realpath, rename as renameFile, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, chmod, copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename as renameFile, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, parse, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -194,6 +194,14 @@ const excelOperationsSchema = {
     operationObject(["type", "sheet", "address"], { type: { const: "clearRange" }, ...excelBaseOperation, contents: { type: "boolean" }, format: { type: "boolean" } }),
     operationObject(["type", "sheet", "address", "styleIndex"], { type: { const: "setStyle" }, ...excelBaseOperation, styleIndex: { type: "integer", minimum: 0 } }),
     operationObject(["type", "sheet", "address", "formatCode"], { type: { const: "setNumberFormat" }, ...excelBaseOperation, formatCode: { type: "string", minLength: 1, maxLength: 255 } }),
+    operationObject(["type", "sheet", "address", "formula", "fillColor"], { type: { const: "addConditionalFormat" }, ...excelBaseOperation, ruleType: { type: "string", enum: ["expression", "cellIs"] }, operator: { type: "string", enum: ["between", "notBetween", "equal", "notEqual", "greaterThan", "lessThan", "greaterThanOrEqual", "lessThanOrEqual"] }, formula: { type: "string", minLength: 1 }, fillColor: { type: "string", pattern: "^[0-9A-Fa-f]{6}$" } }),
+    operationObject(["type", "sheet", "address", "validationType"], { type: { const: "setDataValidation" }, ...excelBaseOperation, validationType: { type: "string", enum: ["whole", "decimal", "list", "date", "time", "textLength", "custom"] }, operator: { type: "string" }, formula1: { type: "string" }, formula2: { type: "string" }, allowBlank: { type: "boolean" } }),
+    operationObject(["type", "sheet"], { type: { const: "freezePanes" }, sheet: { type: "string", minLength: 1 }, rows: { type: "integer", minimum: 0, maximum: 1048575 }, columns: { type: "integer", minimum: 0, maximum: 16383 } }),
+    operationObject(["type", "sheet", "address", "width"], { type: { const: "setColumnWidth" }, ...excelBaseOperation, width: { type: "number", exclusiveMinimum: 0, maximum: 255 } }),
+    operationObject(["type", "table", "values"], { type: { const: "addTableRow" }, table: { type: "string", minLength: 1 }, index: { type: ["integer", "null"], minimum: 0 }, values: { type: "array", minItems: 1, maxItems: 1000, items: { type: "array", minItems: 1, maxItems: 16384 } } }),
+    operationObject(["type", "table", "enabled"], { type: { const: "setTableTotals" }, table: { type: "string", minLength: 1 }, enabled: { type: "boolean" }, columns: { type: "array", maxItems: 16384, items: operationObject(["column"], { column: { anyOf: [{ type: "string", minLength: 1 }, { type: "integer", minimum: 0 }] }, function: { type: "string", enum: ["average", "count", "countNums", "custom", "max", "min", "none", "stdDev", "sum", "var"] }, label: { type: "string" }, formula: { type: "string", minLength: 1 } }) } }),
+    operationObject(["type", "sheet", "chartType", "sourceData"], { type: { const: "createChart" }, sheet: { type: "string", minLength: 1 }, chartType: { type: "string", enum: ["BarClustered", "ColumnClustered", "Line", "Pie"] }, sourceData: { type: "string", minLength: 1 }, seriesBy: { type: "string", enum: ["Auto", "Columns", "Rows"] }, name: { type: "string", minLength: 1 }, titleText: { type: "string" }, height: { type: "number", exclusiveMinimum: 0 }, width: { type: "number", exclusiveMinimum: 0 }, left: { type: "number", minimum: 0 }, top: { type: "number", minimum: 0 } }),
+    operationObject(["type", "sheet", "chart"], { type: { const: "updateChart" }, sheet: { type: "string", minLength: 1 }, chart: { type: "string", minLength: 1 }, chartType: { type: "string", enum: ["BarClustered", "ColumnClustered", "Line", "Pie"] }, name: { type: "string", minLength: 1 }, titleText: { type: "string" }, height: { type: "number", exclusiveMinimum: 0 }, width: { type: "number", exclusiveMinimum: 0 }, left: { type: "number", minimum: 0 }, top: { type: "number", minimum: 0 }, sourceData: { type: "string", minLength: 1 }, seriesBy: { type: "string", enum: ["Auto", "Columns", "Rows"] } }),
     operationObject(["type", "sheet", "newName"], { type: { const: "renameSheet" }, sheet: { type: "string", minLength: 1 }, newName: { type: "string", minLength: 1, maxLength: 31 } }),
     operationObject(["type", "name", "formula"], { type: { const: "setDefinedName" }, name: { type: "string", minLength: 1 }, formula: { type: "string" } }),
     operationObject(["type"], { type: { const: "recalculate" } })
@@ -644,6 +652,7 @@ const tools = [
           default: false,
           description: "When true, rebuild metadata with onedrive_cache_refresh before indexing cached files."
         },
+        metadataMode: { type: "string", enum: ["auto", "delta", "scan"], default: "auto", description: "Metadata refresh strategy. Auto prefers the stored delta cursor and falls back to a bounded scan." },
         maxFiles: { type: "integer", minimum: 1, maximum: 1000, default: 100 },
         maxBytesPerFile: { type: "integer", minimum: 1024, maximum: 5242880, default: defaultMaxIndexedFileSize },
         concurrencyLimit: { type: "integer", minimum: 1, maximum: 8, default: 2 },
@@ -657,6 +666,9 @@ const tools = [
           default: false,
           description: "When true, try Microsoft Graph text export for Office-like files. Unsupported file types fail per item, not the whole refresh."
         },
+        includeOfficeStructured: { type: "boolean", default: true, description: "Index structured Word, Excel, and PowerPoint Open XML content with semantic anchors." },
+        maxOfficeSegments: { type: "integer", minimum: 1, maximum: 100000, default: 50000 },
+        maxOfficePackageBytes: { type: "integer", minimum: 1024, maximum: 262144000, default: 52428800 },
         force: {
           type: "boolean",
           default: false,
@@ -672,6 +684,44 @@ const tools = [
   {
     name: "onedrive_content_search",
     description: "Search the optional local text content index and return lightweight metadata plus snippets. Does not call Microsoft Graph.",
+    inputSchema: {
+      type: "object",
+      required: ["query"],
+      properties: {
+        query: { type: "string", minLength: 1 },
+        maxResults: { type: "integer", minimum: 1, maximum: 100, default: 20 },
+        format: outputFormatSchema
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_office_index_refresh",
+    description: "Incrementally refresh the structured local Office index using item identity and eTag/cTag freshness, preferring OneDrive delta metadata updates.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...pathTargetProperties,
+        refreshMetadata: { type: "boolean", default: true },
+        metadataMode: { type: "string", enum: ["auto", "delta", "scan"], default: "auto" },
+        maxFiles: { type: "integer", minimum: 1, maximum: 1000, default: 100 },
+        concurrencyLimit: { type: "integer", minimum: 1, maximum: 8, default: 2 },
+        force: { type: "boolean", default: false },
+        maxOfficeSegments: { type: "integer", minimum: 1, maximum: 100000, default: 50000 },
+        maxOfficePackageBytes: { type: "integer", minimum: 1024, maximum: 262144000, default: 52428800 },
+        maxOfficeParagraphs: { type: "integer", minimum: 1, maximum: 10000, default: 10000 },
+        maxOfficeCells: { type: "integer", minimum: 1, maximum: 50000, default: 50000 },
+        maxOfficeSlides: { type: "integer", minimum: 1, maximum: 5000, default: 5000 },
+        scanMaxItems: { type: "integer", minimum: 1, maximum: 50000, default: 10000 },
+        scanMaxFolders: { type: "integer", minimum: 1, maximum: 10000, default: 2000 },
+        scanMaxDepth: { type: "integer", minimum: 0, maximum: 50, default: 25 }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_office_search",
+    description: "Search the structured local Office index and return semantic paragraph, cell, formula, table, shape, slide-note, content-control, and comment anchors without Graph calls.",
     inputSchema: {
       type: "object",
       required: ["query"],
@@ -734,6 +784,9 @@ const tools = [
         ...officeStructuredSearchProperties,
         includeCells: { type: "boolean", default: true },
         includeTables: { type: "boolean", default: true },
+        includeCharts: { type: "boolean", default: true },
+        includePivots: { type: "boolean", default: true },
+        includeFormulaDependencies: { type: "boolean", default: false },
         sheetNames: { type: "array", minItems: 1, maxItems: 100, uniqueItems: true, items: { type: "string", minLength: 1 }, description: "Optional worksheet-name selector." },
         address: { type: "string", pattern: "^[A-Za-z]{1,3}[1-9][0-9]*(?::[A-Za-z]{1,3}[1-9][0-9]*)?$", description: "Optional bounded A1 cell or range selector applied to selected worksheets." },
         maxCells: { type: "integer", minimum: 1, maximum: 50000, default: 5000 },
@@ -770,7 +823,7 @@ const tools = [
   },
   {
     name: "onedrive_excel_batch_update",
-    description: "Preview or apply typed Excel cell, formula, range, style, sheet-name, and defined-name edits. Auto uses Graph sessions for supported business .xlsx files and Open XML otherwise.",
+    description: "Preview or apply typed Excel cell/range, formatting, validation, pane, table-row, chart, sheet-name, defined-name, and recalculation edits. Auto uses Graph sessions only when every operation is supported for a business .xlsx file and Open XML otherwise.",
     inputSchema: {
       type: "object",
       required: ["operations"],
@@ -787,6 +840,83 @@ const tools = [
       required: ["operations"],
       anyOf: itemTargetAnyOf,
       properties: { ...officeBatchCommonProperties, operations: powerpointOperationsSchema },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_office_batch_transform",
+    description: "Preflight and apply one atomic-plan Office transformation across up to 25 files. Every file is fully previewed before the first mutation; live partial state includes recovery backups and remaining items.",
+    inputSchema: {
+      type: "object",
+      required: ["items"],
+      properties: {
+        items: {
+          type: "array",
+          minItems: 1,
+          maxItems: 25,
+          items: {
+            type: "object",
+            required: ["kind", "operations"],
+            anyOf: itemTargetAnyOf,
+            properties: {
+              ...officeTargetProperties,
+              kind: { type: "string", enum: ["word", "excel", "powerpoint"] },
+              operations: { type: "array", minItems: 1, maxItems: 100, items: { type: "object" } },
+              expectedName: { type: "string" },
+              expectedId: { type: "string" },
+              backend: { type: "string", enum: ["auto", "openxml", "graph"], default: "auto" },
+              allowMacros: { type: "boolean", default: false }
+            },
+            additionalProperties: false
+          }
+        },
+        dryRun: { type: "boolean", default: true },
+        confirmed: { type: "boolean", default: false },
+        previewToken: previewTokenSchema,
+        createBackup: { type: "boolean", default: true },
+        verify: { type: "boolean", default: true }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_office_backups",
+    description: "List plugin-managed Office backups with stable backup IDs and original remote item metadata.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        itemId: { type: "string", minLength: 1 },
+        kind: { type: "string", enum: ["word", "excel", "powerpoint"] },
+        limit: { type: "integer", minimum: 1, maximum: 500, default: 100 }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_office_compare_backup",
+    description: "Compare one plugin-managed Office backup with the current content of its original stable remote item ID.",
+    inputSchema: {
+      type: "object",
+      required: ["backupId"],
+      properties: { backupId: { type: "string", pattern: "^[0-9a-fA-F-]{36}$" }, maxChanges: { type: "integer", minimum: 1, maximum: 500, default: 100 } },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_office_restore_backup",
+    description: "Preview or restore an Office backup to its original stable item ID. Live restore requires expected ID/eTag and the dry-run preview token.",
+    inputSchema: {
+      type: "object",
+      required: ["backupId"],
+      properties: {
+        backupId: { type: "string", pattern: "^[0-9a-fA-F-]{36}$" },
+        dryRun: { type: "boolean", default: true },
+        confirmed: { type: "boolean", default: false },
+        expectedId: { type: "string" },
+        expectedETag: { type: "string" },
+        previewToken: previewTokenSchema,
+        verify: { type: "boolean", default: true }
+      },
       additionalProperties: false
     }
   },
@@ -1585,6 +1715,7 @@ const tools = [
 const toolByName = new Map(tools.map((tool) => [tool.name, tool]));
 
 function schemaTypeMatches(value, type) {
+  if (Array.isArray(type)) return type.some((candidate) => candidate === "null" ? value === null : schemaTypeMatches(value, candidate));
   if (type === "array") return Array.isArray(value);
   if (type === "integer") return Number.isInteger(value);
   if (type === "number") return typeof value === "number" && Number.isFinite(value);
@@ -1611,9 +1742,25 @@ function validateSchemaValue(value, schema = {}, path = "$") {
 
   if (normalized === undefined) return { ok: true, value: normalized, details };
 
+  if (schema.anyOf?.length && !schema.type) {
+    const branches = schema.anyOf.map((branch) => validateSchemaValue(normalized, branch, path));
+    const matched = branches.filter((branch) => branch.ok);
+    if (!matched.length) {
+      details.push(validationDetail(path, "Value does not match any allowed schema."));
+      const mostSpecific = branches.sort((left, right) => left.details.length - right.details.length)[0];
+      if (mostSpecific) details.push(...mostSpecific.details);
+      return { ok: false, value: normalized, details };
+    }
+    return { ok: true, value: matched[0].value, details };
+  }
+
   if (schema.type && !schemaTypeMatches(normalized, schema.type)) {
-    details.push(validationDetail(path, `Expected ${schema.type}.`));
+    details.push(validationDetail(path, `Expected ${Array.isArray(schema.type) ? schema.type.join(" or ") : schema.type}.`));
     return { ok: false, value: normalized, details };
+  }
+
+  if (schema.const !== undefined && normalized !== schema.const) {
+    details.push(validationDetail(path, `Expected constant value ${JSON.stringify(schema.const)}.`));
   }
 
   if (schema.enum && !schema.enum.includes(normalized)) {
@@ -1627,6 +1774,12 @@ function validateSchemaValue(value, schema = {}, path = "$") {
     if (schema.maximum !== undefined && normalized > schema.maximum) {
       details.push(validationDetail(path, `Must be <= ${schema.maximum}.`));
     }
+    if (schema.exclusiveMinimum !== undefined && normalized <= schema.exclusiveMinimum) {
+      details.push(validationDetail(path, `Must be > ${schema.exclusiveMinimum}.`));
+    }
+    if (schema.exclusiveMaximum !== undefined && normalized >= schema.exclusiveMaximum) {
+      details.push(validationDetail(path, `Must be < ${schema.exclusiveMaximum}.`));
+    }
   }
 
   if (schema.type === "string" && typeof normalized === "string") {
@@ -1635,6 +1788,9 @@ function validateSchemaValue(value, schema = {}, path = "$") {
     }
     if (schema.maxLength !== undefined && normalized.length > schema.maxLength) {
       details.push(validationDetail(path, `Must be at most ${schema.maxLength} characters.`));
+    }
+    if (schema.pattern !== undefined && !(new RegExp(schema.pattern).test(normalized))) {
+      details.push(validationDetail(path, `Must match pattern ${schema.pattern}.`));
     }
   }
 
@@ -2303,7 +2459,7 @@ async function clearMetadataCache() {
 
 function emptyContentIndex() {
   return {
-    version: 1,
+    version: 2,
     createdAt: new Date().toISOString(),
     updatedAt: null,
     itemCount: 0,
@@ -2464,6 +2620,13 @@ function contentIndexableReason(item = {}, args = {}) {
   if (!item?.file || item.folder) return { ok: false, reason: "not-file" };
   const settings = pluginSettings();
   const maxBytes = clampInteger(args.maxBytesPerFile, settings.maxIndexedFileSize, 1024, textFileLimit);
+  const isOffice = officeExportIndexable(item);
+  if (args.officeOnly === true && !isOffice) return { ok: false, reason: "not-office" };
+  if (isOffice && args.includeOfficeStructured !== false) {
+    const officeIndexLimit = clampInteger(args.maxOfficePackageBytes, 50 * 1024 * 1024, 1024, maxOfficePackageBytes);
+    if (item.size && item.size > officeIndexLimit) return { ok: false, reason: "office-package-too-large" };
+    return { ok: true, source: "office-openxml", kind: officePackageKindFromName(item.name) };
+  }
   if (item.size && item.size > maxBytes) return { ok: false, reason: "too-large" };
   const allowedExtensions = normalizeExtensions(args.extensions?.length ? args.extensions : settings.supportedIndexedFileTypes);
   const extension = extname(item.name || "").toLowerCase();
@@ -2474,11 +2637,72 @@ function contentIndexableReason(item = {}, args = {}) {
   return { ok: false, reason: "unsupported-type" };
 }
 
+function officeIndexSegments(document, maxSegments = 50_000) {
+  const segments = [];
+  const add = (text, anchor) => {
+    const value = String(text ?? "").trim();
+    if (!value || segments.length >= maxSegments) return;
+    segments.push({ text: value, anchor });
+  };
+  if (document.kind === "word") {
+    for (const paragraph of document.paragraphs || []) add(paragraph.text, { type: "paragraph", part: paragraph.part, index: paragraph.index, style: paragraph.style || null });
+    for (const table of document.tables || []) {
+      for (const [rowIndex, row] of (table.rows || []).entries()) {
+        for (const [columnIndex, value] of row.entries()) add(value, { type: "tableCell", part: table.part, tableIndex: table.index, rowIndex, columnIndex });
+      }
+    }
+    for (const control of document.contentControls || []) add(control.text, { type: "contentControl", part: control.part, index: control.index, id: control.id, tag: control.tag });
+    for (const comment of document.comments || []) add(comment.text, { type: "comment", id: comment.id, author: comment.author });
+  } else if (document.kind === "excel") {
+    for (const sheet of document.sheets || []) {
+      for (const cell of sheet.cells || []) {
+        add(cell.value, { type: "cell", sheet: sheet.name, address: cell.address, formula: cell.formula || null });
+        if (cell.formula) add(cell.formula, { type: "formula", sheet: sheet.name, address: cell.address });
+      }
+      for (const table of sheet.tables || []) add(`${table.name || table.displayName || "table"} ${table.ref || ""}`, { type: "table", sheet: sheet.name, name: table.name, ref: table.ref });
+    }
+    for (const name of document.definedNames || []) add(`${name.name || ""} ${name.value || ""}`, { type: "definedName", name: name.name });
+  } else if (document.kind === "powerpoint") {
+    const addShape = (shape, slideIndex, parentShapeId = null) => {
+      add(shape.text, { type: "shape", slideIndex, shapeId: shape.id, name: shape.name, parentShapeId });
+      for (const [rowIndex, row] of (shape.table?.rows || []).entries()) {
+        for (const [columnIndex, value] of row.entries()) add(value, { type: "tableCell", slideIndex, shapeId: shape.id, rowIndex, columnIndex });
+      }
+      for (const child of shape.children || []) addShape(child, slideIndex, shape.id);
+    };
+    for (const slide of document.slides || []) {
+      for (const shape of slide.shapes || []) addShape(shape, slide.index);
+      add(slide.notes, { type: "notes", slideIndex: slide.index });
+    }
+  }
+  return { segments, truncated: segments.length >= maxSegments };
+}
+
 async function extractIndexText(item, args = {}) {
   const settings = pluginSettings();
   const maxBytes = clampInteger(args.maxBytesPerFile, settings.maxIndexedFileSize, 1024, textFileLimit);
   const indexable = contentIndexableReason(item, args);
   if (!indexable.ok) throw new Error(indexable.reason);
+  if (indexable.source === "office-openxml") {
+    const document = await inspectRemoteOfficePackage({
+      itemId: item.id,
+      maxParagraphs: clampInteger(args.maxOfficeParagraphs, 10_000, 1, 10_000),
+      maxCells: clampInteger(args.maxOfficeCells, 50_000, 1, 50_000),
+      maxSlides: clampInteger(args.maxOfficeSlides, 5_000, 1, 5_000),
+      includeCells: true,
+      strictRelationships: true
+    }, indexable.kind, "inspect");
+    const structured = officeIndexSegments(document, clampInteger(args.maxOfficeSegments, 50_000, 1, 100_000));
+    const text = structured.segments.map((entry) => entry.text).join("\n");
+    return {
+      text,
+      segments: structured.segments,
+      structuredKind: document.kind,
+      bytesRead: Number(item.size || 0),
+      truncated: structured.truncated || Boolean(document.truncated),
+      source: "office-openxml"
+    };
+  }
   const target = { itemId: item.id };
   const sourcePath = indexable.source === "graph-text-export"
     ? `${contentPath(target)}?${new URLSearchParams({ format: "text" }).toString()}`
@@ -2543,10 +2767,27 @@ function contentMatchForQuery(entry, queryOrContext) {
   const end = rawIndex >= 0 ? Math.min(text.length, rawIndex + rawNeedle.length + 120) : Math.min(text.length, 200);
   const snippet = text.slice(start, end).replace(/\s+/g, " ").trim();
   const coverage = tokens.length ? tokenMatches.length / tokens.length : 0;
+  const segmentMatches = [];
+  for (const segment of entry.segments || []) {
+    const segmentText = String(segment.text || "");
+    const normalizedSegment = normalizeFindText(segmentText);
+    const segmentTokens = new Set(findTokens(segmentText));
+    const phrase = normalizedQuery && normalizedSegment.includes(normalizedQuery);
+    const matched = tokens.filter((token) => segmentTokens.has(token));
+    if (!phrase && !matched.length) continue;
+    segmentMatches.push({
+      anchor: segment.anchor,
+      snippet: segmentText.slice(0, 500),
+      score: (phrase ? 70 : 35) + Math.round((tokens.length ? matched.length / tokens.length : 0) * 35)
+    });
+  }
+  segmentMatches.sort((a, b) => b.score - a.score);
   return {
     score: (exactIndex >= 0 ? 70 : 35) + Math.round(coverage * 35),
     matchedTokens: tokenMatches.length,
-    snippet,
+    snippet: segmentMatches[0]?.snippet || snippet,
+    anchor: segmentMatches[0]?.anchor || null,
+    segmentMatches: segmentMatches.slice(0, 10),
     reasons: [
       exactIndex >= 0 ? "indexed content phrase" : "indexed content tokens",
       ...(tokenMatches.length ? [`content token matches: ${tokenMatches.slice(0, 5).join(", ")}`] : [])
@@ -2564,6 +2805,7 @@ async function contentSearch(args = {}) {
   const matches = [];
   let matched = 0;
   for (const entry of Object.values(index.entriesById || {})) {
+    if (args.officeOnly === true && entry.source !== "office-openxml") continue;
     const match = contentMatchForQuery(entry, context);
     if (!match) continue;
     matched += 1;
@@ -2572,6 +2814,8 @@ async function contentSearch(args = {}) {
       score: match.score,
       matchedTokens: match.matchedTokens,
       snippet: match.snippet,
+      anchor: match.anchor,
+      segmentMatches: match.segmentMatches,
       reasons: match.reasons,
       source: entry.source,
       indexedAt: entry.indexedAt,
@@ -2591,11 +2835,27 @@ async function contentSearch(args = {}) {
       matchedTokens: match.matchedTokens,
       reasons: match.reasons,
       snippet: match.snippet,
+      anchor: match.anchor,
+      segmentMatches: match.segmentMatches,
       source: match.source,
       indexedAt: match.indexedAt,
       truncated: match.truncated
     }))
   };
+}
+
+async function officeIndexRefresh(args = {}) {
+  return await contentIndexRefresh({
+    ...args,
+    refreshMetadata: args.refreshMetadata !== false,
+    metadataMode: args.metadataMode || "auto",
+    includeOfficeStructured: true,
+    officeOnly: true
+  });
+}
+
+async function officeContentSearch(args = {}) {
+  return await contentSearch({ ...args, officeOnly: true });
 }
 
 async function contentIndexRefresh(args = {}) {
@@ -2605,7 +2865,7 @@ async function contentIndexRefresh(args = {}) {
   if (args.refreshMetadata === true) {
     await cacheRefresh({
       ...args,
-      mode: "scan",
+      mode: args.metadataMode || "auto",
       maxItems: clampInteger(args.scanMaxItems, 10000, 1, 50000),
       maxFolders: clampInteger(args.scanMaxFolders, 2000, 1, 10000),
       maxDepth: clampInteger(args.scanMaxDepth, settings.maxScanDepth, 0, 50)
@@ -2666,6 +2926,8 @@ async function contentIndexRefresh(args = {}) {
         bytesRead: extracted.bytesRead,
         textBytes: Buffer.byteLength(extracted.text, "utf8"),
         truncated: extracted.truncated,
+        segments: extracted.segments || [],
+        structuredKind: extracted.structuredKind || null,
         eTag: item.eTag,
         cTag: item.cTag,
         lastModifiedDateTime: item.lastModifiedDateTime,
@@ -2694,6 +2956,7 @@ async function contentIndexRefresh(args = {}) {
       maxBytesPerFile: clampInteger(args.maxBytesPerFile, settings.maxIndexedFileSize, 1024, textFileLimit),
       supportedIndexedFileTypes: args.extensions?.length ? [...normalizeExtensions(args.extensions)] : settings.supportedIndexedFileTypes,
       includeOfficeExport: args.includeOfficeExport === true || settings.includeOfficeTextExport,
+      includeOfficeStructured: args.includeOfficeStructured !== false,
       concurrencyLimit: clampInteger(args.concurrencyLimit, settings.concurrencyLimit, 1, 8)
     },
     note: "Content indexing reads file bodies only during this explicit refresh. Normal find/search calls reuse the local index and do not fetch content."
@@ -2737,6 +3000,8 @@ async function syncStatus(args = {}) {
       : undefined,
     contentIndex: {
       itemCount: contentEntries.length,
+      structuredOfficeCount: contentEntries.filter((entry) => entry.source === "office-openxml").length,
+      segmentCount: contentEntries.reduce((sum, entry) => sum + (entry.segments?.length || 0), 0),
       updatedAt: contentIndex.updatedAt,
       enabled: settings.contentIndexEnabled
     },
@@ -5849,7 +6114,7 @@ async function officeCapabilities() {
         mutationToolsReady: true,
         operations: {
           word: ["replaceText", "setParagraphText", "setParagraphStyle", "insertParagraph", "insertTable", "setTableCell", "setContentControlText", "addHyperlink", "addComment"],
-          excel: ["setCell", "setFormula", "setRange", "clearRange", "setStyle", "setNumberFormat", "renameSheet", "setDefinedName", "recalculate"],
+          excel: ["setCell", "setFormula", "setRange", "clearRange", "setStyle", "setNumberFormat", "addConditionalFormat", "setDataValidation", "freezePanes", "setColumnWidth", "renameSheet", "setDefinedName", "recalculate", "addTableRow", "setTableTotals", "createChart", "updateChart"],
           powerpoint: ["replaceText", "setShapeText", "setShapeGeometry", "setTextStyle", "addTextBox", "deleteShape", "replaceImage", "setTableCell", "setNotes", "duplicateSlide", "deleteSlide", "moveSlide"]
         },
         notes: [
@@ -5862,6 +6127,7 @@ async function officeCapabilities() {
         availableForAccount: Boolean(drive && driveType !== "personal"),
         driveType,
         formats: [".xlsx"],
+        operations: ["setCell", "setFormula", "setRange", "clearRange", "renameSheet", "addTableRow", "createChart", "updateChart"],
         limitation: driveType === "personal"
           ? "Microsoft Graph workbook APIs do not support OneDrive Consumer workbooks; use the Open XML backend."
           : "Graph workbook sessions will be used for supported business, SharePoint, or group-drive .xlsx files."
@@ -5869,7 +6135,16 @@ async function officeCapabilities() {
       officeJs: {
         available: false,
         requiresCompanionAddIn: true,
-        note: "Office.js editing requires an active Word, Excel, or PowerPoint client and a separately deployed companion add-in."
+        protocolVersion: "codex-office-companion/1",
+        companionVersion: "1.1.0",
+        requirementSets: { word: "WordApi 1.3", excel: "ExcelApi 1.7", powerpoint: "PowerPointApi 1.5" },
+        operations: {
+          word: ["replaceText", "setSelectedText", "insertParagraph"],
+          excel: ["setRange", "clearRange", "formatRange"],
+          powerpoint: ["setSelectedText", "setSelectedTextStyle", "deleteSelectedShapes"]
+        },
+        transport: { manualPaste: true, remoteCommands: false, telemetry: false },
+        note: "Office.js commands require an active Word, Excel, or PowerPoint client and the separately deployed companion add-in; available remains false because the MCP server cannot attest to an active task pane."
       }
     }
   };
@@ -5882,11 +6157,14 @@ async function runOfficeHelper(request, options = {}) {
   }
   const timeoutMs = clampInteger(options.timeoutMs, 60_000, 1000, 5 * 60_000);
   const maxOutputBytes = clampInteger(options.maxOutputBytes, 20 * 1024 * 1024, 1024, 50 * 1024 * 1024);
+  await ensurePrivateDirectory(storageRoot);
+  const pythonCacheRoot = join(storageRoot, "pycache");
+  await ensurePrivateDirectory(pythonCacheRoot);
   return await new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(officePythonPath, [officeHelperPath], {
       cwd: pluginRoot,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, PYTHONPYCACHEPREFIX: join(storageRoot, "pycache") }
+      env: { ...process.env, PYTHONPYCACHEPREFIX: pythonCacheRoot }
     });
     let stdout = Buffer.alloc(0);
     let stderr = Buffer.alloc(0);
@@ -5981,7 +6259,8 @@ function officeEditPreviewProof(rawItem, kind, operations, editResult, args = {}
   };
 }
 
-const excelGraphOperationTypes = new Set(["setCell", "setFormula", "setRange", "clearRange", "renameSheet"]);
+const excelGraphOperationTypes = new Set(["setCell", "setFormula", "setRange", "clearRange", "renameSheet", "addTableRow", "createChart", "updateChart"]);
+const excelGraphOnlyOperationTypes = new Set(["createChart", "updateChart"]);
 
 async function resolveExcelOfficeBackend(rawItem, args = {}) {
   if (args.backend === "openxml") return { backend: "openxml", driveType: null, reason: "explicit" };
@@ -5994,7 +6273,8 @@ async function resolveExcelOfficeBackend(rawItem, args = {}) {
     if (args.backend === "graph") throw new Error(`The Graph Excel backend does not support these operations: ${[...new Set(unsupported)].join(", ")}.`);
     return { backend: "openxml", driveType: null, reason: "operation" };
   }
-  const driveId = rawItem.parentReference?.driveId || rawItem.remoteItem?.parentReference?.driveId || null;
+  const target = excelWorkbookTarget(rawItem);
+  const driveId = target.driveId;
   let drive;
   try {
     drive = driveId ? await graph(`/drives/${encodeURIComponent(driveId)}?$select=id,driveType,name`) : await graph("/me/drive?$select=id,driveType,name");
@@ -6009,11 +6289,23 @@ async function resolveExcelOfficeBackend(rawItem, args = {}) {
   return { backend: "graph", driveType: drive.driveType, driveId: drive.id || driveId, reason: args.backend === "graph" ? "explicit" : "supported-drive" };
 }
 
+function excelWorkbookTarget(rawItem) {
+  const remoteItem = rawItem.remoteItem;
+  if (remoteItem?.id && remoteItem.parentReference?.driveId) {
+    return { driveId: remoteItem.parentReference.driveId, itemId: remoteItem.id };
+  }
+  return {
+    driveId: rawItem.parentReference?.driveId || remoteItem?.parentReference?.driveId || null,
+    itemId: rawItem.id
+  };
+}
+
 function excelWorkbookBase(rawItem, resolvedBackend) {
-  const driveId = resolvedBackend.driveId || rawItem.parentReference?.driveId || rawItem.remoteItem?.parentReference?.driveId;
+  const target = excelWorkbookTarget(rawItem);
+  const driveId = resolvedBackend.driveId || target.driveId;
   return driveId
-    ? `/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(rawItem.id)}/workbook`
-    : `/me/drive/items/${encodeURIComponent(rawItem.id)}/workbook`;
+    ? `/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(target.itemId)}/workbook`
+    : `/me/drive/items/${encodeURIComponent(target.itemId)}/workbook`;
 }
 
 function excelGraphRangePath(base, operation) {
@@ -6028,17 +6320,45 @@ function excelGraphRangePath(base, operation) {
 
 async function applyExcelGraphOperations(rawItem, resolvedBackend, operations) {
   const base = excelWorkbookBase(rawItem, resolvedBackend);
-  const created = await graph(`${base}/createSession`, {
-    method: "POST",
-    body: JSON.stringify({ persistChanges: true }),
-    maxRetries: 1
-  });
+  const created = await createExcelWorkbookSession(base);
   const sessionId = created?.id;
   if (!sessionId) throw new Error("Microsoft Graph did not return an Excel workbook session ID.");
   const headers = { "workbook-session-id": sessionId };
   let writeStarted = false;
+  let sessionClosed = false;
   try {
     for (const operation of operations) {
+      if (operation.type === "addTableRow") {
+        writeStarted = true;
+        await graph(`${base}/tables/${encodeURIComponent(String(operation.table || ""))}/rows/add`, {
+          method: "POST", headers, body: JSON.stringify({ values: operation.values, index: operation.index ?? null }), maxRetries: 0
+        });
+        continue;
+      }
+      if (operation.type === "createChart") {
+        writeStarted = true;
+        await graph(`${base}/worksheets/${encodeURIComponent(String(operation.sheet || ""))}/charts/add`, {
+          method: "POST", headers, body: JSON.stringify({ type: operation.chartType, sourceData: operation.sourceData, seriesBy: operation.seriesBy || "Auto" }), maxRetries: 0
+        });
+        continue;
+      }
+      if (operation.type === "updateChart") {
+        const chartBase = `${base}/worksheets/${encodeURIComponent(String(operation.sheet || ""))}/charts/${encodeURIComponent(String(operation.chart || ""))}`;
+        const chartPatch = Object.fromEntries(["name", "height", "width", "left", "top"].filter((key) => operation[key] !== undefined).map((key) => [key, operation[key]]));
+        if (Object.keys(chartPatch).length) {
+          writeStarted = true;
+          await graph(chartBase, { method: "PATCH", headers, body: JSON.stringify(chartPatch), maxRetries: 0 });
+        }
+        if (operation.titleText !== undefined) {
+          writeStarted = true;
+          await graph(`${chartBase}/title`, { method: "PATCH", headers, body: JSON.stringify({ text: operation.titleText }), maxRetries: 0 });
+        }
+        if (operation.sourceData !== undefined) {
+          writeStarted = true;
+          await graph(`${chartBase}/setData`, { method: "POST", headers, body: JSON.stringify({ sourceData: operation.sourceData, seriesBy: operation.seriesBy || "Auto" }), maxRetries: 0 });
+        }
+        continue;
+      }
       if (operation.type === "renameSheet") {
         writeStarted = true;
         await graph(`${base}/worksheets/${encodeURIComponent(String(operation.sheet || ""))}`, {
@@ -6068,11 +6388,235 @@ async function applyExcelGraphOperations(rawItem, resolvedBackend, operations) {
   } finally {
     try {
       await graph(`${base}/closeSession`, { method: "POST", headers, maxRetries: 0 });
+      sessionClosed = true;
     } catch (error) {
       toolCallContext.getStore()?.localWarnings?.push({ operation: "Graph Excel session close", error: safeToolErrorMessage(error) });
     }
   }
-  return { sessionClosed: true, operationCount: operations.length };
+  return { sessionClosed, operationCount: operations.length };
+}
+
+function officeSemanticDiff(kind, changes = []) {
+  const operationCounts = {};
+  const affectedParts = new Set();
+  const affectedObjects = [];
+  for (const change of changes) {
+    const operation = change.operation || "unknown";
+    operationCounts[operation] = (operationCounts[operation] || 0) + 1;
+    if (change.part) affectedParts.add(change.part);
+    const selector = Object.fromEntries(["part", "paragraphIndex", "tableIndex", "rowIndex", "columnIndex", "contentControlIndex", "sheet", "address", "name", "slideIndex", "shapeId", "commentId"]
+      .filter((key) => change[key] !== undefined).map((key) => [key, change[key]]));
+    if (Object.keys(selector).length) affectedObjects.push({ operation, ...selector });
+  }
+  return { kind, changeCount: changes.length, operationCounts, affectedParts: [...affectedParts].sort(), affectedObjects: affectedObjects.slice(0, 200), affectedObjectsTruncated: affectedObjects.length > 200 };
+}
+
+function officeInspectionSummary(kind, value = {}) {
+  if (kind === "word") return { paragraphCount: value.paragraphCount || 0, tableCount: value.tableCount || 0, contentControlCount: value.contentControlCount || 0, commentCount: value.commentCount || 0 };
+  if (kind === "excel") return { sheetCount: value.sheetCount || 0, sheets: (value.sheets || []).map((sheet) => ({ name: sheet.name, cellCount: sheet.cellCount ?? sheet.cells?.length ?? 0 })) };
+  return { slideCount: value.slideCount || 0, slides: (value.slides || []).map((slide) => ({ index: slide.index, shapeCount: slide.shapeCount ?? slide.shapes?.length ?? 0 })) };
+}
+
+function compareOfficeInspections(kind, before = {}, after = {}, maxChanges = 100) {
+  const changes = [];
+  let totalChanges = 0;
+  const add = (change) => { totalChanges += 1; if (changes.length < maxChanges) changes.push(change); };
+  if (kind === "word") {
+    const paragraphs = (value) => new Map((value.paragraphs || []).map((entry) => [`${entry.part}:${entry.index}`, entry]));
+    const leftMap = paragraphs(before), rightMap = paragraphs(after);
+    for (const key of new Set([...leftMap.keys(), ...rightMap.keys()])) {
+      const left = leftMap.get(key), right = rightMap.get(key);
+      if (left?.text !== right?.text || left?.style !== right?.style) add({ objectType: "paragraph", key, before: left ? { text: left.text, style: left.style } : null, after: right ? { text: right.text, style: right.style } : null });
+    }
+  } else if (kind === "excel") {
+    const cells = (value) => new Map((value.sheets || []).flatMap((sheet) => (sheet.cells || []).map((cell) => [`${sheet.name}!${cell.address}`, cell])));
+    const leftMap = cells(before), rightMap = cells(after);
+    for (const key of new Set([...leftMap.keys(), ...rightMap.keys()])) {
+      const left = leftMap.get(key), right = rightMap.get(key);
+      if (JSON.stringify([left?.value, left?.formula, left?.styleIndex]) !== JSON.stringify([right?.value, right?.formula, right?.styleIndex])) add({ objectType: "cell", key, before: left ? { value: left.value, formula: left.formula, styleIndex: left.styleIndex } : null, after: right ? { value: right.value, formula: right.formula, styleIndex: right.styleIndex } : null });
+    }
+  } else {
+    const shapes = (value) => new Map((value.slides || []).flatMap((slide) => (slide.shapes || []).map((shape) => [`${slide.index}:${shape.id}`, shape])));
+    const leftMap = shapes(before), rightMap = shapes(after);
+    for (const key of new Set([...leftMap.keys(), ...rightMap.keys()])) {
+      const left = leftMap.get(key), right = rightMap.get(key);
+      if (JSON.stringify([left?.text, left?.geometry]) !== JSON.stringify([right?.text, right?.geometry])) add({ objectType: "shape", key, before: left ? { text: left.text, geometry: left.geometry } : null, after: right ? { text: right.text, geometry: right.geometry } : null });
+    }
+  }
+  const beforeSummary = officeInspectionSummary(kind, before), afterSummary = officeInspectionSummary(kind, after);
+  return { kind, sameSemantics: totalChanges === 0 && JSON.stringify(beforeSummary) === JSON.stringify(afterSummary), before: beforeSummary, after: afterSummary, changeCount: totalChanges, changes, truncated: totalChanges > changes.length };
+}
+
+function assertOfficeBackupId(backupId) {
+  const value = String(backupId || "");
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) throw new Error("backupId is invalid.");
+  return value.toLowerCase();
+}
+
+function officeBackupManifestPath(backupId) {
+  return join(backupRoot, `office-${assertOfficeBackupId(backupId)}.json`);
+}
+
+async function persistOfficeBackup(localPath, rawItem, kind, fingerprint, reason = "edit") {
+  await ensurePrivateDirectory(backupRoot);
+  const backupId = randomUUID();
+  const fileName = `office-${backupId}-${basename(rawItem.name || `${kind}.bin`)}`;
+  const backupPath = join(backupRoot, fileName);
+  await copyFile(localPath, backupPath);
+  await chmod(backupPath, 0o600);
+  const manifest = { version: 1, backupId, createdAt: new Date().toISOString(), reason, kind, fileName, bytes: (await stat(backupPath)).size, fingerprint: fingerprint || null, item: { id: rawItem.id, name: rawItem.name, remotePath: itemRemotePath(rawItem) || null, eTag: rawItem.eTag || null, cTag: rawItem.cTag || null, size: rawItem.size ?? null, lastModifiedDateTime: rawItem.lastModifiedDateTime || null } };
+  await writePrivateFileAtomic(officeBackupManifestPath(backupId), JSON.stringify(manifest));
+  return { backupId, createdAt: manifest.createdAt, kind, item: manifest.item, bytes: manifest.bytes, localPath: backupPath, reason };
+}
+
+async function loadOfficeBackup(backupId) {
+  const id = assertOfficeBackupId(backupId);
+  const manifestPath = officeBackupManifestPath(id);
+  let manifest;
+  try {
+    const manifestInfo = await lstat(manifestPath);
+    if (!manifestInfo.isFile() || manifestInfo.isSymbolicLink()) throw new Error("unsafe manifest");
+    manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  }
+  catch { throw new Error(`Office backup ${id} was not found or its manifest is invalid.`); }
+  if (manifest.version !== 1 || manifest.backupId !== id || !manifest.item?.id || !["word", "excel", "powerpoint"].includes(manifest.kind)) throw new Error(`Office backup ${id} has an invalid manifest.`);
+  if (!manifest.fileName || basename(manifest.fileName) !== manifest.fileName || !manifest.fileName.startsWith(`office-${id}-`)) throw new Error(`Office backup ${id} has an unsafe file reference.`);
+  const localPath = join(backupRoot, manifest.fileName);
+  const info = await lstat(localPath);
+  if (!info.isFile() || info.isSymbolicLink() || info.size > maxOfficePackageBytes) throw new Error(`Office backup ${id} is missing, unsafe, or exceeds the Office size limit.`);
+  const [resolvedRoot, resolvedFile] = await Promise.all([realpath(backupRoot), realpath(localPath)]);
+  if (dirname(resolvedFile) !== resolvedRoot) throw new Error(`Office backup ${id} resolves outside managed backup storage.`);
+  return { manifest, localPath };
+}
+
+async function officeBackups(args = {}) {
+  await ensurePrivateDirectory(backupRoot);
+  const entries = await readdir(backupRoot, { withFileTypes: true });
+  const items = [];
+  for (const entry of entries) {
+    const match = entry.isFile() && entry.name.match(/^office-([0-9a-f-]{36})\.json$/i);
+    if (!match) continue;
+    try {
+      const { manifest } = await loadOfficeBackup(match[1]);
+      if (args.itemId && manifest.item.id !== args.itemId) continue;
+      if (args.kind && manifest.kind !== args.kind) continue;
+      items.push({ backupId: manifest.backupId, createdAt: manifest.createdAt, reason: manifest.reason, kind: manifest.kind, bytes: manifest.bytes, fingerprint: manifest.fingerprint, item: manifest.item });
+    } catch { /* Ignore malformed legacy/unmanaged entries. */ }
+  }
+  items.sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)));
+  const limit = clampInteger(args.limit, 100, 1, 500);
+  return { count: Math.min(items.length, limit), total: items.length, items: items.slice(0, limit), truncated: items.length > limit };
+}
+
+async function inspectLocalOffice(localPath, kind) {
+  return await runOfficeHelper({ action: "inspect", inputPath: localPath, kind, maxParagraphs: 10000, maxCells: 50000, maxSlides: 5000 });
+}
+
+async function officeCompareBackup(args = {}) {
+  const { manifest, localPath } = await loadOfficeBackup(args.backupId);
+  const current = await getRawInfo({ itemId: manifest.item.id });
+  if (officePackageKindFromName(current.name) !== manifest.kind) throw new Error("Current remote item no longer has the backup's Office document kind.");
+  const transactionRoot = join(officeEditingRoot, `compare-${randomUUID()}`);
+  await ensurePrivateDirectory(transactionRoot);
+  const currentPath = join(transactionRoot, basename(current.name));
+  try {
+    await downloadResolvedItem(simplifyItem(current), { localPath: currentPath, overwrite: false });
+    const [backupInspection, currentInspection] = await Promise.all([inspectLocalOffice(localPath, manifest.kind), inspectLocalOffice(currentPath, manifest.kind)]);
+    return { backup: { backupId: manifest.backupId, createdAt: manifest.createdAt, kind: manifest.kind, bytes: manifest.bytes, fingerprint: backupInspection.package?.fingerprint, item: manifest.item }, current: { item: simplifyItem(current), fingerprint: currentInspection.package?.fingerprint }, sameContent: backupInspection.package?.fingerprint === currentInspection.package?.fingerprint, semanticDiff: compareOfficeInspections(manifest.kind, backupInspection, currentInspection, clampInteger(args.maxChanges, 100, 1, 500)) };
+  } finally { await rm(transactionRoot, { recursive: true, force: true }); }
+}
+
+async function officeRestoreBackup(args = {}) {
+  const { manifest, localPath } = await loadOfficeBackup(args.backupId);
+  const current = await getRawInfo({ itemId: manifest.item.id });
+  const backupValidation = await runOfficeHelper({ action: "validate", inputPath: localPath, kind: manifest.kind });
+  const comparison = await officeCompareBackup({ backupId: manifest.backupId, maxChanges: 100 });
+  const preview = { dryRun: args.dryRun !== false, confirmed: args.confirmed === true, wouldRestore: { backupId: manifest.backupId, createdAt: manifest.createdAt, kind: manifest.kind, originalItem: manifest.item, currentItem: simplifyItem(current), backupFingerprint: backupValidation.package?.fingerprint }, sameContent: comparison.sameContent, semanticDiff: comparison.semanticDiff };
+  const proof = { backupId: manifest.backupId, itemId: current.id, currentETag: current.eTag, backupFingerprint: backupValidation.package?.fingerprint };
+  if (args.dryRun !== false) return previewWithToken(preview, "onedrive_office_restore_backup", proof);
+  if (args.confirmed !== true) return { ...preview, requiredToRestore: "Set dryRun: false and confirmed: true after reviewing the Office backup preview." };
+  if (!args.expectedId || args.expectedId !== current.id || args.expectedId !== manifest.item.id) return { ...preview, dryRun: false, requiredToRestore: "Provide expectedId matching the backup's original stable item ID." };
+  if (!args.expectedETag || args.expectedETag !== current.eTag) return { ...preview, dryRun: false, requiredToRestore: "Provide expectedETag matching the current remote item eTag." };
+  const tokenRequired = previewTokenRequiredResult(preview, "onedrive_office_restore_backup", proof, args.previewToken, "requiredToRestore");
+  if (tokenRequired) return tokenRequired;
+  const transactionRoot = join(officeEditingRoot, `restore-${randomUUID()}`);
+  await ensurePrivateDirectory(transactionRoot);
+  let rollbackBackup = null, verificationIncomplete = false, afterRaw = current;
+  try {
+    const currentPath = join(transactionRoot, `current-${basename(current.name)}`);
+    await downloadResolvedItem(simplifyItem(current), { localPath: currentPath, overwrite: false });
+    const currentValidation = await runOfficeHelper({ action: "validate", inputPath: currentPath, kind: manifest.kind });
+    rollbackBackup = await persistOfficeBackup(currentPath, current, manifest.kind, currentValidation.package?.fingerprint, "pre-restore");
+    const uploaded = await upload({ localPath, itemId: current.id, remotePath: itemRemotePath(current), conflictBehavior: "replace", ifMatch: current.eTag, auditTool: "onedrive_office_restore_backup", skipAudit: true });
+    afterRaw = uploaded.item ? { ...current, ...uploaded.item } : current;
+    try { afterRaw = await getRawInfo({ itemId: current.id }); } catch (error) { verificationIncomplete = true; recordLocalWarning("Office backup restore metadata verification", error); }
+    let remoteValidation = null;
+    if (args.verify !== false) {
+      try {
+        const verifyPath = join(transactionRoot, `verify-${basename(current.name)}`);
+        await downloadResolvedItem(simplifyItem(afterRaw), { localPath: verifyPath, overwrite: false });
+        remoteValidation = await runOfficeHelper({ action: "validate", inputPath: verifyPath, kind: manifest.kind });
+        if (remoteValidation.package?.fingerprint !== backupValidation.package?.fingerprint) { verificationIncomplete = true; recordLocalWarning("Office backup restore fingerprint verification", new Error("Restored package fingerprint differs from the selected backup.")); }
+      } catch (error) { verificationIncomplete = true; recordLocalWarning("Office backup restore validation", error); }
+    }
+    await writeMutationAudit("onedrive_office_restore_backup", { status: "success", target: itemAuditSummary(current), before: itemAuditSummary(current), after: itemAuditSummary(afterRaw), backupId: manifest.backupId, rollbackBackupId: rollbackBackup.backupId, verificationIncomplete });
+    return { dryRun: false, confirmed: true, restoredBackupId: manifest.backupId, item: simplifyItem(afterRaw), rollbackBackup, backupValidation, remoteValidation, verificationIncomplete, uploaded };
+  } catch (error) {
+    await writeMutationAudit("onedrive_office_restore_backup", { status: "failed", target: itemAuditSummary(current), backupId: manifest.backupId, rollbackBackupId: rollbackBackup?.backupId, error: safeErrorInfo(error) });
+    throw error;
+  } finally { await rm(transactionRoot, { recursive: true, force: true }); }
+}
+
+function trustedExcelSessionOperationUrl(value, label) {
+  if (!value) throw new Error(`Microsoft Graph returned an asynchronous Excel session response without ${label}.`);
+  try {
+    return graphUrl(value);
+  } catch (error) {
+    throw new Error(`Microsoft Graph returned an untrusted Excel session ${label}: ${safeToolErrorMessage(error)}`);
+  }
+}
+
+async function createExcelWorkbookSession(base) {
+  // Microsoft documents 504 as safe to retry specifically for createSession.
+  const requestOptions = {
+    method: "POST",
+    body: JSON.stringify({ persistChanges: true }),
+    headers: { Prefer: "respond-async" },
+    maxRetries: 0,
+    returnResponse: true
+  };
+  let response = await graph(`${base}/createSession`, requestOptions);
+  if (response.status === 504) response = await graph(`${base}/createSession`, requestOptions);
+  if (!response.ok) {
+    throw microsoftGraphError(response.body, { headers: response.headers, status: response.status, statusText: "Excel session creation failed" });
+  }
+  if (response.status !== 202) return response.body;
+
+  const operationUrl = trustedExcelSessionOperationUrl(response.headers.get("location"), "Location URL");
+  const timeoutMs = clampInteger(process.env.ONEDRIVE_EXCEL_SESSION_TIMEOUT_MS, 60_000, 1000, 5 * 60_000);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const operation = await graph(operationUrl, { returnResponse: true, maxRetries: 3 });
+    if (!operation.ok) {
+      throw microsoftGraphError(operation.body, { headers: operation.headers, status: operation.status, statusText: "Excel session operation failed" });
+    }
+    const status = String(operation.body?.status || "");
+    if (status === "succeeded") {
+      const resourceLocation = operation.body?.resourceLocation || operation.headers.get("resource-location");
+      const resourceUrl = trustedExcelSessionOperationUrl(resourceLocation, "resourceLocation URL");
+      return await graph(resourceUrl, { maxRetries: 3 });
+    }
+    if (status === "failed") {
+      const detail = operation.body?.error?.message || operation.body?.error?.code || "the operation reported failure";
+      throw new Error(`Microsoft Graph Excel session creation failed: ${detail}`);
+    }
+    if (status && !["notStarted", "running", "inProgress"].includes(status)) {
+      throw new Error(`Microsoft Graph returned an unknown Excel session operation status: ${status}`);
+    }
+    const configuredDelay = clampInteger(process.env.ONEDRIVE_EXCEL_SESSION_POLL_MS, 2000, 0, 10_000);
+    await sleep(operation.headers.get("retry-after") ? retryDelayMs(operation, 0) : configuredDelay);
+  }
+  throw new Error(`Microsoft Graph Excel session creation did not complete within ${timeoutMs}ms.`);
 }
 
 async function officeBatchUpdate(args = {}, kind, toolName) {
@@ -6101,16 +6645,36 @@ async function officeBatchUpdate(args = {}, kind, toolName) {
   let backup = null;
   try {
     await downloadResolvedItem(simplifyItem(rawItem), { localPath: sourcePath, overwrite: false });
-    editResult = await runOfficeHelper({
-      action: "edit",
-      inputPath: sourcePath,
-      outputPath: editedPath,
-      kind,
-      operations: args.operations,
-      ...(kind === "word" ? { trackedChanges: args.trackedChanges || "refuse" } : {}),
-      allowMacros: args.allowMacros === true,
-      allowSignedPackage: args.allowSignedPackage === true
-    }, { timeoutMs: 120_000 });
+    const helperOperations = kind === "excel" && selectedBackend === "graph"
+      ? args.operations.filter((operation) => !excelGraphOnlyOperationTypes.has(operation.type))
+      : args.operations;
+    const graphOnlyChanges = kind === "excel" && selectedBackend === "graph"
+      ? args.operations.filter((operation) => excelGraphOnlyOperationTypes.has(operation.type)).map((operation) => ({
+          operation: operation.type,
+          sheet: operation.sheet,
+          table: operation.table,
+          chart: operation.chart,
+          after: Object.fromEntries(Object.entries(operation).filter(([key]) => key !== "type"))
+        }))
+      : [];
+    if (helperOperations.length) {
+      editResult = await runOfficeHelper({
+        action: "edit",
+        inputPath: sourcePath,
+        outputPath: editedPath,
+        kind,
+        operations: helperOperations,
+        ...(kind === "word" ? { trackedChanges: args.trackedChanges || "refuse" } : {}),
+        allowMacros: args.allowMacros === true,
+        allowSignedPackage: args.allowSignedPackage === true
+      }, { timeoutMs: 120_000 });
+    } else {
+      editResult = { kind, changes: [], changeCount: 0, validation: await runOfficeHelper({ action: "validate", inputPath: sourcePath, kind }) };
+    }
+    if (graphOnlyChanges.length) {
+      editResult.changes = [...(editResult.changes || []), ...graphOnlyChanges];
+      editResult.changeCount = (editResult.changeCount || 0) + graphOnlyChanges.length;
+    }
     if (!editResult.changeCount) {
       return {
         dryRun: args.dryRun !== false,
@@ -6119,6 +6683,7 @@ async function officeBatchUpdate(args = {}, kind, toolName) {
         backend: "openxml",
         changes: [],
         changeCount: 0,
+        semanticDiff: officeSemanticDiff(kind, []),
         noChanges: true,
         requiredToUpdate: "No requested edit matched the document. Re-read the document and correct the operation anchors."
       };
@@ -6132,6 +6697,7 @@ async function officeBatchUpdate(args = {}, kind, toolName) {
       previewBackend: selectedBackend === "graph" ? "openxml" : undefined,
       changes: editResult.changes,
       changeCount: editResult.changeCount,
+      semanticDiff: officeSemanticDiff(kind, editResult.changes),
       validation: editResult.validation
     };
     if (args.dryRun !== false) return previewWithToken(preview, toolName, proof);
@@ -6139,12 +6705,8 @@ async function officeBatchUpdate(args = {}, kind, toolName) {
     if (tokenRequired) return tokenRequired;
 
     if (args.createBackup !== false) {
-      await ensurePrivateDirectory(backupRoot);
-      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-      const backupPath = join(backupRoot, `office-${stamp}-${randomUUID()}-${basename(rawItem.name)}`);
-      await copyFile(sourcePath, backupPath);
-      await chmod(backupPath, 0o600);
-      backup = { localPath: backupPath, bytes: (await stat(backupPath)).size };
+      const sourceValidation = await runOfficeHelper({ action: "validate", inputPath: sourcePath, kind });
+      backup = await persistOfficeBackup(sourcePath, rawItem, kind, sourceValidation.package?.fingerprint, "edit");
     }
 
     const uploaded = selectedBackend === "graph"
@@ -6197,6 +6759,7 @@ async function officeBatchUpdate(args = {}, kind, toolName) {
       backend: selectedBackend,
       changes: editResult.changes,
       changeCount: editResult.changeCount,
+      semanticDiff: officeSemanticDiff(kind, editResult.changes),
       validation: editResult.validation,
       remoteValidation,
       verificationIncomplete,
@@ -6217,6 +6780,121 @@ async function officeBatchUpdate(args = {}, kind, toolName) {
   } finally {
     await rm(transactionRoot, { recursive: true, force: true });
   }
+}
+
+function officeToolForKind(kind) {
+  return `onedrive_${kind === "powerpoint" ? "powerpoint" : kind}_batch_update`;
+}
+
+async function officeBatchTransform(args = {}) {
+  const toolName = "onedrive_office_batch_transform";
+  const requested = args.items || [];
+  if (args.dryRun === false && args.confirmed !== true) {
+    return { dryRun: false, confirmed: false, requiredToUpdate: "Set dryRun: false and confirmed: true after reviewing the complete cross-file Office preview." };
+  }
+  if (args.dryRun === false) {
+    const missingIdentity = requested.findIndex((item) => !hasExpectedIdentity(item));
+    if (missingIdentity >= 0) return { dryRun: false, confirmed: true, requiredToUpdate: `Item ${missingIdentity} requires expectedName or expectedId.` };
+  }
+
+  const preflight = [];
+  for (const [index, item] of requested.entries()) {
+    const individualTool = officeToolForKind(item.kind);
+    try {
+      const preview = await officeBatchUpdate({
+        ...item,
+        dryRun: true,
+        confirmed: false,
+        createBackup: args.createBackup !== false,
+        verify: args.verify !== false
+      }, item.kind, individualTool);
+      if (preview.noChanges) throw new Error(preview.requiredToUpdate || "No requested edits matched.");
+      preflight.push({ index, request: item, individualTool, preview });
+    } catch (error) {
+      return {
+        dryRun: args.dryRun !== false,
+        confirmed: args.confirmed === true,
+        preflightComplete: false,
+        mutationStarted: false,
+        failedIndex: index,
+        error: safeToolErrorMessage(error),
+        items: preflight.map((entry) => entry.preview)
+      };
+    }
+  }
+
+  const proof = {
+    items: preflight.map((entry) => ({
+      id: entry.preview.item?.id,
+      name: entry.preview.item?.name,
+      eTag: entry.preview.item?.eTag,
+      cTag: entry.preview.item?.cTag,
+      kind: entry.request.kind,
+      backend: entry.preview.backend,
+      operations: entry.request.operations,
+      changeCount: entry.preview.changeCount,
+      outputFingerprint: entry.preview.validation?.package?.fingerprint
+    }))
+  };
+  const preview = {
+    dryRun: args.dryRun !== false,
+    confirmed: args.confirmed === true,
+    preflightComplete: true,
+    mutationStarted: false,
+    itemCount: preflight.length,
+    totalChangeCount: preflight.reduce((sum, entry) => sum + Number(entry.preview.changeCount || 0), 0),
+    items: preflight.map((entry) => ({ index: entry.index, kind: entry.request.kind, ...entry.preview }))
+  };
+  if (args.dryRun !== false) return previewWithToken(preview, toolName, proof);
+  const tokenRequired = previewTokenRequiredResult(preview, toolName, proof, args.previewToken, "requiredToUpdate");
+  if (tokenRequired) return tokenRequired;
+
+  const completed = [];
+  for (const entry of preflight) {
+    try {
+      const result = await officeBatchUpdate({
+        ...entry.request,
+        dryRun: false,
+        confirmed: true,
+        previewToken: entry.preview.previewToken,
+        createBackup: args.createBackup !== false,
+        verify: args.verify !== false
+      }, entry.request.kind, entry.individualTool);
+      completed.push({ index: entry.index, kind: entry.request.kind, result });
+    } catch (error) {
+      const remaining = preflight.slice(entry.index + 1).map((candidate) => ({ index: candidate.index, item: candidate.preview.item, kind: candidate.request.kind }));
+      await writeMutationAudit(toolName, {
+        status: "failed",
+        officeBatch: { itemCount: preflight.length, completedCount: completed.length, failedIndex: entry.index },
+        error: safeErrorInfo(error)
+      });
+      return {
+        dryRun: false,
+        confirmed: true,
+        preflightComplete: true,
+        mutationStarted: true,
+        partialState: completed.length > 0,
+        completed,
+        failed: { index: entry.index, item: entry.preview.item, kind: entry.request.kind, error: safeToolErrorMessage(error) },
+        remaining,
+        recovery: completed.map((candidate) => ({ index: candidate.index, item: candidate.result.item, backup: candidate.result.backup }))
+      };
+    }
+  }
+  await writeMutationAudit(toolName, {
+    status: "success",
+    officeBatch: { itemCount: preflight.length, completedCount: completed.length, totalChangeCount: preview.totalChangeCount }
+  });
+  return {
+    dryRun: false,
+    confirmed: true,
+    preflightComplete: true,
+    mutationStarted: true,
+    partialState: false,
+    itemCount: completed.length,
+    totalChangeCount: preview.totalChangeCount,
+    completed
+  };
 }
 
 function assertOfficeKind(info, kindName) {
@@ -7922,6 +8600,10 @@ async function callTool(name, args = {}) {
       return textResult(await contentIndexRefresh(args));
     case "onedrive_content_search":
       return textResult(await contentSearch(args));
+    case "onedrive_office_index_refresh":
+      return textResult(await officeIndexRefresh(args));
+    case "onedrive_office_search":
+      return textResult(await officeContentSearch(args));
     case "onedrive_content_index_clear":
       return textResult(await clearContentIndex());
     case "onedrive_office_capabilities":
@@ -7940,6 +8622,14 @@ async function callTool(name, args = {}) {
       return textResult(await officeBatchUpdate(args, "excel", "onedrive_excel_batch_update"));
     case "onedrive_powerpoint_batch_update":
       return textResult(await officeBatchUpdate(args, "powerpoint", "onedrive_powerpoint_batch_update"));
+    case "onedrive_office_backups":
+      return textResult(await officeBackups(args));
+    case "onedrive_office_compare_backup":
+      return textResult(await officeCompareBackup(args));
+    case "onedrive_office_restore_backup":
+      return textResult(await officeRestoreBackup(args));
+    case "onedrive_office_batch_transform":
+      return textResult(await officeBatchTransform(args));
     case "onedrive_get_info":
       return textResult(await getInfo(args));
     case "onedrive_read_text":

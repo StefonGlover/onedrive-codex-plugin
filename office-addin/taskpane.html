@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' https://appsforoffice.microsoft.com; script-src 'self' https://appsforoffice.microsoft.com; style-src 'self' 'unsafe-inline'; connect-src 'none'; img-src 'self' data:">
+  <title>Codex OneDrive Office Companion</title>
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <script defer src="taskpane.js"></script>
+  <style>
+    body{font:14px system-ui,sans-serif;margin:16px;color:#172033}textarea{box-sizing:border-box;width:100%;min-height:180px;font:12px ui-monospace,monospace}button{margin-top:8px;padding:8px 12px}pre{white-space:pre-wrap;background:#f4f7fb;padding:8px;border-radius:6px}.warn{color:#8a3b00}
+  </style>
+</head>
+<body>
+  <h1>Office Companion</h1>
+  <p id="host">Loading Office capabilities…</p>
+  <p class="warn">Commands stay inside this task pane and the active document. Review JSON before applying it.</p>
+  <textarea id="command" aria-label="Typed Office command">{"type":"replaceText","find":"old text","replace":"new text"}</textarea>
+  <button id="apply" disabled>Apply to active document</button>
+  <pre id="result" aria-live="polite"></pre>
+</body>
+</html>

@@ -613,12 +613,18 @@ try {
     "onedrive_content_index_clear",
     "onedrive_office_capabilities",
     "onedrive_office_validate",
+    "onedrive_office_index_refresh",
+    "onedrive_office_search",
     "onedrive_word_get_document",
     "onedrive_excel_get_workbook",
     "onedrive_powerpoint_get_presentation",
     "onedrive_word_batch_update",
     "onedrive_excel_batch_update",
     "onedrive_powerpoint_batch_update",
+    "onedrive_office_batch_transform",
+    "onedrive_office_backups",
+    "onedrive_office_compare_backup",
+    "onedrive_office_restore_backup",
     "onedrive_get_info",
     "onedrive_read_text",
     "onedrive_preview",
@@ -657,7 +663,7 @@ try {
     "onedrive_delete"
   ];
   const uniqueToolNames = new Set(toolNames);
-  record("tools/list includes all 66 tools", requiredTools.length === 66 && requiredTools.every((name) => toolNames.includes(name)) && uniqueToolNames.size === toolNames.length ? "pass" : "fail", {
+  record("tools/list includes all 72 tools", requiredTools.length === 72 && requiredTools.every((name) => toolNames.includes(name)) && uniqueToolNames.size === toolNames.length ? "pass" : "fail", {
     requiredToolCount: requiredTools.length,
     toolCount: toolNames.length,
     uniqueToolCount: uniqueToolNames.size,
@@ -836,8 +842,11 @@ try {
   const wordOfficePreview = assertOk("word native edit preview", await tool("onedrive_word_batch_update", { path: `${folderName}/doc.docx`, operations: wordOfficeOperations }));
   const wordOfficeLive = assertOk("word native edit live", await tool("onedrive_word_batch_update", { path: `${folderName}/doc.docx`, operations: wordOfficeOperations, dryRun: false, confirmed: true, expectedName: "doc.docx", previewToken: wordOfficePreview.previewToken }));
   const excelOfficeOperations = [
-    { type: "setRange", sheet: "Data", address: "A3:B3", values: [[unique, 42]] },
+    { type: "addTableRow", table: "RevenueTable", values: [[unique, 42]] },
     { type: "setNumberFormat", sheet: "Data", address: "B3", formatCode: "0.00" },
+    { type: "setTableTotals", table: "RevenueTable", enabled: true, columns: [{ column: "Metric", label: "Total" }, { column: "Revenue", function: "sum" }] },
+    { type: "createChart", sheet: "Data", sourceData: "A1:B4", chartType: "ColumnClustered", name: "Beta revenue", titleText: "Beta revenue", left: 20, top: 30, width: 420, height: 240 },
+    { type: "updateChart", sheet: "Data", chart: "Beta revenue", chartType: "Line", sourceData: "A1:B4", name: "Beta trend", titleText: "Beta trend", left: 40, top: 50, width: 400, height: 220 },
     { type: "recalculate" }
   ];
   const excelOfficePreview = assertOk("excel native edit preview", await tool("onedrive_excel_batch_update", { path: `${folderName}/book.xlsx`, backend: "auto", operations: excelOfficeOperations }));
@@ -852,10 +861,49 @@ try {
   ];
   const powerpointOfficePreview = assertOk("powerpoint native edit preview", await tool("onedrive_powerpoint_batch_update", { path: `${folderName}/deck.pptx`, operations: powerpointOfficeOperations }));
   const powerpointOfficeLive = assertOk("powerpoint native edit live", await tool("onedrive_powerpoint_batch_update", { path: `${folderName}/deck.pptx`, operations: powerpointOfficeOperations, dryRun: false, confirmed: true, expectedName: "deck.pptx", previewToken: powerpointOfficePreview.previewToken }));
-  record("native Office preview and live commits", wordOfficeLive.changeCount === 4 && excelOfficeLive.changeCount === 4 && powerpointOfficeLive.changeCount === 6 ? "pass" : "fail", {
+  record("native Office preview and live commits", wordOfficeLive.changeCount === 4 && excelOfficeLive.changeCount === 6 && powerpointOfficeLive.changeCount === 6 ? "pass" : "fail", {
     wordChanges: wordOfficeLive.changeCount,
     excelChanges: excelOfficeLive.changeCount,
     powerpointChanges: powerpointOfficeLive.changeCount
+  });
+
+  const officeIndex = assertOk("structured Office index refresh", await tool("onedrive_office_index_refresh", { path: `${folderName}/doc.docx`, refreshMetadata: false, force: true }));
+  const officeSearch = assertOk("structured Office search", await tool("onedrive_office_search", { query: `Beta Word ${unique}` }));
+  record("incremental Office research index", officeIndex.indexed === 1 && officeSearch.items?.[0]?.anchor?.type === "paragraph" ? "pass" : "fail", {
+    indexed: officeIndex.indexed,
+    anchor: officeSearch.items?.[0]?.anchor
+  });
+
+  const officeBatchItems = [
+    { path: `${folderName}/doc.docx`, expectedName: "doc.docx", kind: "word", operations: [{ type: "setParagraphText", paragraphIndex: 0, text: `Batch Word ${unique}` }] },
+    { path: `${folderName}/book.xlsx`, expectedName: "book.xlsx", kind: "excel", operations: [{ type: "setCell", sheet: "Data", address: "D4", value: `Batch Excel ${unique}` }] },
+    { path: `${folderName}/deck.pptx`, expectedName: "deck.pptx", kind: "powerpoint", operations: [{ type: "setShapeText", slideIndex: 0, shapeId: "2", text: `Batch PowerPoint ${unique}` }] }
+  ];
+  const officeBatchPreview = assertOk("cross-file Office batch preview", await tool("onedrive_office_batch_transform", { items: officeBatchItems }));
+  const officeBatchLive = assertOk("cross-file Office batch live", await tool("onedrive_office_batch_transform", { items: officeBatchItems, dryRun: false, confirmed: true, previewToken: officeBatchPreview.previewToken }));
+  record("cross-file Office batch transformation", officeBatchPreview.preflightComplete && officeBatchLive.partialState === false && officeBatchLive.completed?.length === 3 ? "pass" : "fail", {
+    preflightComplete: officeBatchPreview.preflightComplete,
+    completed: officeBatchLive.completed?.length,
+    totalChangeCount: officeBatchLive.totalChangeCount
+  });
+
+  const officeBackups = assertOk("managed Office backup list", await tool("onedrive_office_backups", { itemId: wordOfficeLive.item.id }));
+  const wordBackupId = wordOfficeLive.backup?.backupId || officeBackups.items?.[0]?.backupId;
+  if (!wordBackupId) throw new Error("The live Word edit did not produce a managed backup ID.");
+  const officeBackupComparison = assertOk("managed Office backup comparison", await tool("onedrive_office_compare_backup", { backupId: wordBackupId }));
+  const officeRestorePreview = assertOk("managed Office backup restore preview", await tool("onedrive_office_restore_backup", { backupId: wordBackupId }));
+  const officeRestoreLive = assertOk("managed Office backup restore live", await tool("onedrive_office_restore_backup", {
+    backupId: wordBackupId,
+    dryRun: false,
+    confirmed: true,
+    expectedId: wordOfficeLive.item.id,
+    expectedETag: officeRestorePreview.wouldRestore.currentItem.eTag,
+    previewToken: officeRestorePreview.previewToken
+  }));
+  record("managed Office compare and one-click undo", officeBackups.items?.some((entry) => entry.backupId === wordBackupId) && officeBackupComparison.sameContent === false && officeRestoreLive.restoredBackupId === wordBackupId && officeRestoreLive.rollbackBackup?.backupId ? "pass" : "fail", {
+    backupId: wordBackupId,
+    comparedChangeCount: officeBackupComparison.semanticDiff?.changeCount,
+    rollbackBackupId: officeRestoreLive.rollbackBackup?.backupId
   });
 
   const preview = assertOk("preview text file", await tool("onedrive_preview", {

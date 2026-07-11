@@ -63,9 +63,13 @@ def emit_fixtures(root):
         "_rels/.rels": root_rels("xl/workbook.xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"),
         "xl/workbook.xml": """<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets><definedNames><definedName name="Total">Data!$A$1</definedName></definedNames></workbook>""",
         "xl/_rels/workbook.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain" Target="calcChain.xml"/></Relationships>""",
-        "xl/worksheets/sheet1.xml": """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1"><f>SUM(1,2)</f><v>3</v></c><c r="B1" t="inlineStr"><is><t>Revenue</t></is></c></row></sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts></worksheet>""",
-        "xl/worksheets/_rels/sheet1.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/></Relationships>""",
+        "xl/worksheets/sheet1.xml": """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1"><f>SUM(1,2)</f><v>3</v></c><c r="B1" t="inlineStr"><is><t>Revenue</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>Q1</t></is></c><c r="B2"><v>10</v></c></row></sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts><pivotTableParts count="1"><pivotTablePart r:id="rId3"/></pivotTableParts><drawing r:id="rId2"/></worksheet>""",
+        "xl/worksheets/_rels/sheet1.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable1.xml"/></Relationships>""",
         "xl/tables/table1.xml": """<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="RevenueTable" displayName="RevenueTable" ref="A1:B2"><tableColumns count="2"><tableColumn id="1" name="Metric"/><tableColumn id="2" name="Revenue"/></tableColumns><tableStyleInfo name="TableStyleMedium2" showRowStripes="1"/></table>""",
+        "xl/drawings/drawing1.xml": """<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor><xdr:graphicFrame><c:chart r:id="rId1"/></xdr:graphicFrame></xdr:twoCellAnchor></xdr:wsDr>""",
+        "xl/drawings/_rels/drawing1.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>""",
+        "xl/charts/chart1.xml": """<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>Revenue Chart</a:t></a:r></a:p></c:rich></c:tx></c:title><c:plotArea><c:barChart><c:ser><c:val><c:numRef><c:f>Data!$B$1:$B$2</c:f></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>""",
+        "xl/pivotTables/pivotTable1.xml": """<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="RevenuePivot" cacheId="1"><location ref="D1:F5"/><rowFields count="1"><field x="0"/></rowFields><dataFields count="1"><dataField fld="1"/></dataFields></pivotTableDefinition>""",
         "xl/styles.xml": """<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font/></fonts><fills count="1"><fill/></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>""",
         "xl/calcChain.xml": """<calcChain xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><c r="A1" i="1"/></calcChain>""",
     })
@@ -146,27 +150,35 @@ def main():
             "_rels/.rels": root_rels("xl/workbook.xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"),
             "xl/workbook.xml": """<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets><definedNames><definedName name="Total">Data!$A$1</definedName></definedNames></workbook>""",
             "xl/_rels/workbook.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain" Target="calcChain.xml"/></Relationships>""",
-            "xl/worksheets/sheet1.xml": """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1"><f>SUM(1,2)</f><v>3</v></c><c r="B1" t="inlineStr"><is><t>Revenue</t></is></c></row></sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts></worksheet>""",
-            "xl/worksheets/_rels/sheet1.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/></Relationships>""",
+            "xl/worksheets/sheet1.xml": """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1"><f>SUM(1,2)</f><v>3</v></c><c r="B1" t="inlineStr"><is><t>Revenue</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>Q1</t></is></c><c r="B2"><v>10</v></c></row></sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts><pivotTableParts count="1"><pivotTablePart r:id="rId3"/></pivotTableParts><drawing r:id="rId2"/></worksheet>""",
+            "xl/worksheets/_rels/sheet1.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable1.xml"/></Relationships>""",
             "xl/tables/table1.xml": """<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="RevenueTable" displayName="RevenueTable" ref="A1:B2"><tableColumns count="2"><tableColumn id="1" name="Metric"/><tableColumn id="2" name="Revenue"/></tableColumns><tableStyleInfo name="TableStyleMedium2" showRowStripes="1"/></table>""",
+            "xl/drawings/drawing1.xml": """<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor><xdr:graphicFrame><c:chart r:id="rId1"/></xdr:graphicFrame></xdr:twoCellAnchor></xdr:wsDr>""",
+            "xl/drawings/_rels/drawing1.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>""",
+            "xl/charts/chart1.xml": """<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>Revenue Chart</a:t></a:r></a:p></c:rich></c:tx></c:title><c:plotArea><c:barChart><c:ser><c:val><c:numRef><c:f>Data!$B$1:$B$2</c:f></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>""",
+            "xl/pivotTables/pivotTable1.xml": """<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="RevenuePivot" cacheId="1"><location ref="D1:F5"/><rowFields count="1"><field x="0"/></rowFields><dataFields count="1"><dataField fld="1"/></dataFields></pivotTableDefinition>""",
             "xl/styles.xml": """<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font/></fonts><fills count="1"><fill/></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>""",
             "xl/calcChain.xml": """<calcChain xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><c r="A1" i="1"/></calcChain>""",
         })
         excel = run_helper(xlsx, "excel", searchText="Revenue")
         cells = excel["sheets"][0]["cells"]
-        checks["excel"] = excel["sheetCount"] == 1 and cells[0]["value"] == "Revenue" and excel["search"]["matchCount"] == 1 and excel["tableCount"] == 1 and excel["sheets"][0]["tables"][0]["displayName"] == "RevenueTable"
+        checks["excel"] = excel["sheetCount"] == 1 and cells[0]["value"] == "Revenue" and excel["search"]["matchCount"] == 1 and excel["tableCount"] == 1 and excel["sheets"][0]["tables"][0]["displayName"] == "RevenueTable" and excel["chartCount"] == 1 and excel["sheets"][0]["charts"][0]["title"] == "Revenue Chart" and excel["pivotCount"] == 1 and excel["sheets"][0]["pivots"][0]["name"] == "RevenuePivot"
         selected_excel = run_helper(xlsx, "excel", sheetNames=["Data"], address="A1:A1")
         checks["excelSelectors"] = selected_excel["cellCount"] == 1 and selected_excel["sheets"][0]["cells"][0]["formula"] == "SUM(1,2)"
         edited_xlsx = root / "edited.xlsx"
-        excel_edit = run_helper(xlsx, "excel", action="edit", outputPath=str(edited_xlsx), operations=[{"type": "setCell", "sheet": "Data", "address": "B2", "value": "Updated"}, {"type": "setFormula", "sheet": "Data", "address": "C2", "formula": "1+2"}])
-        edited_excel = run_helper(edited_xlsx, "excel")
+        excel_edit = run_helper(xlsx, "excel", action="edit", outputPath=str(edited_xlsx), operations=[{"type": "setCell", "sheet": "Data", "address": "B2", "value": "Updated"}, {"type": "setFormula", "sheet": "Data", "address": "C2", "formula": "B2+1"}])
+        edited_excel = run_helper(edited_xlsx, "excel", includeFormulaDependencies=True)
         edited_cells = {cell["address"]: cell for cell in edited_excel["sheets"][0]["cells"]}
-        checks["excelEdit"] = excel_edit["changeCount"] == 2 and edited_cells["B2"]["value"] == "Updated" and edited_cells["C2"]["formula"] == "1+2"
+        checks["excelEdit"] = excel_edit["changeCount"] == 2 and edited_cells["B2"]["value"] == "Updated" and edited_cells["C2"]["formula"] == "B2+1" and edited_excel["formulaDependencyCount"] == 1 and edited_excel["formulaDependencies"][0]["to"]["address"] == "B2"
         rich_xlsx = root / "rich.xlsx"
         rich_excel_edit = run_helper(xlsx, "excel", action="edit", outputPath=str(rich_xlsx), operations=[
             {"type": "setRange", "sheet": "Data", "address": "A3:B4", "values": [[1, 2], [3, 4]]},
             {"type": "setStyle", "sheet": "Data", "address": "A3:B3", "styleIndex": 2},
             {"type": "setNumberFormat", "sheet": "Data", "address": "A1", "formatCode": "$#,##0.00"},
+            {"type": "addConditionalFormat", "sheet": "Data", "address": "A3:B4", "ruleType": "cellIs", "operator": "greaterThan", "formula": "2", "fillColor": "FFF2CC"},
+            {"type": "setDataValidation", "sheet": "Data", "address": "A3:A4", "validationType": "whole", "operator": "between", "formula1": "1", "formula2": "10"},
+            {"type": "freezePanes", "sheet": "Data", "rows": 1, "columns": 1},
+            {"type": "setColumnWidth", "sheet": "Data", "address": "A1:B1", "width": 18},
             {"type": "setDefinedName", "name": "InputBlock", "formula": "Data!$A$3:$B$4"},
             {"type": "renameSheet", "sheet": "Data", "newName": "Results"},
             {"type": "recalculate"},
@@ -177,8 +189,51 @@ def main():
             workbook_xml = edited_package.read("xl/workbook.xml").decode("utf-8")
             styles_xml = edited_package.read("xl/styles.xml").decode("utf-8")
             relations_xml = edited_package.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+            sheet_xml = edited_package.read("xl/worksheets/sheet1.xml").decode("utf-8")
             recalculation_safe = "fullCalcOnLoad=\"1\"" in workbook_xml and "forceFullCalc=\"1\"" in workbook_xml and "xl/calcChain.xml" not in edited_package.namelist() and "calcChain" not in relations_xml
-        checks["excelRangeAndMetadataEdits"] = rich_excel_edit["changeCount"] == 10 and rich_excel["sheets"][0]["name"] == "Results" and rich_cells["B4"]["value"] == 4 and rich_cells["A3"]["styleIndex"] == 2 and rich_cells["A1"]["styleIndex"] == 3 and "$#,##0.00" in styles_xml and recalculation_safe and any(entry["name"] == "InputBlock" for entry in rich_excel["definedNames"])
+        checks["excelRangeAndMetadataEdits"] = rich_excel_edit["changeCount"] == 14 and rich_excel["sheets"][0]["name"] == "Results" and rich_cells["B4"]["value"] == 4 and rich_cells["A3"]["styleIndex"] == 2 and rich_cells["A1"]["styleIndex"] == 3 and "$#,##0.00" in styles_xml and "conditionalFormatting" in sheet_xml and "dataValidation" in sheet_xml and "state=\"frozen\"" in sheet_xml and "width=\"18.0\"" in sheet_xml and recalculation_safe and any(entry["name"] == "InputBlock" for entry in rich_excel["definedNames"])
+
+        charts_xlsx = root / "chart-operations.xlsx"
+        chart_edit = run_helper(xlsx, "excel", action="edit", outputPath=str(charts_xlsx), operations=[
+            {"type": "createChart", "sheet": "Data", "chartType": "ColumnClustered", "sourceData": "A1:B2", "name": "Consumer Chart", "titleText": "Consumer Revenue", "left": 12, "top": 18, "width": 360, "height": 220},
+            {"type": "updateChart", "sheet": "Data", "chart": "Consumer Chart", "chartType": "Line", "sourceData": "A1:B2", "name": "Consumer Trend", "titleText": "Revenue Trend", "left": 20, "top": 24, "width": 400, "height": 240},
+        ])
+        chart_result = run_helper(charts_xlsx, "excel")
+        created_chart = next(chart for chart in chart_result["sheets"][0]["charts"] if chart.get("name") == "Consumer Trend")
+        checks["excelChartLifecycle"] = chart_edit["changeCount"] == 2 and created_chart["type"] == "lineChart" and created_chart["title"] == "Revenue Trend" and created_chart["seriesCount"] == 1 and round(created_chart["geometry"]["width"]) == 400 and round(created_chart["geometry"]["height"]) == 240
+
+        table_xlsx = root / "table-operations.xlsx"
+        table_edit = run_helper(xlsx, "excel", action="edit", outputPath=str(table_xlsx), operations=[
+            {"type": "setTableTotals", "table": "RevenueTable", "enabled": True, "columns": [
+                {"column": "Metric", "label": "Total"},
+                {"column": "Revenue", "function": "sum"},
+            ]},
+            {"type": "addTableRow", "table": "RevenueTable", "index": 0, "values": [["Q2", 20], ["Q3", 30]]},
+        ])
+        table_result = run_helper(table_xlsx, "excel")
+        table_cells = {cell["address"]: cell for cell in table_result["sheets"][0]["cells"]}
+        table_metadata = table_result["sheets"][0]["tables"][0]
+        checks["excelTableRowsAndTotals"] = (
+            table_edit["changeCount"] == 2
+            and table_metadata["ref"] == "A1:B5"
+            and table_metadata["totalsRowCount"] == 1
+            and table_metadata["columns"][0]["totalsRowLabel"] == "Total"
+            and table_metadata["columns"][1]["totalsRowFunction"] == "sum"
+            and table_cells["A2"]["value"] == "Q2"
+            and table_cells["B3"]["value"] == 30
+            and table_cells["A4"]["value"] == "Q1"
+            and table_cells["A5"]["value"] == "Total"
+            and table_cells["B5"]["formula"] == "SUBTOTAL(109,[Revenue])"
+            and table_edit["changes"][1]["preservedTotalsRow"] is True
+        )
+        no_totals_xlsx = root / "table-no-totals.xlsx"
+        no_totals_edit = run_helper(table_xlsx, "excel", action="edit", outputPath=str(no_totals_xlsx), operations=[
+            {"type": "setTableTotals", "table": "RevenueTable", "enabled": False},
+        ])
+        no_totals_result = run_helper(no_totals_xlsx, "excel")
+        no_totals_cells = {cell["address"]: cell for cell in no_totals_result["sheets"][0]["cells"]}
+        no_totals_table = no_totals_result["sheets"][0]["tables"][0]
+        checks["excelDisableTotals"] = no_totals_edit["changeCount"] == 1 and no_totals_table["ref"] == "A1:B4" and no_totals_table["totalsRowCount"] == 0 and "A5" not in no_totals_cells and "B5" not in no_totals_cells
 
         pptx = root / "sample.pptx"
         write_package(pptx, {

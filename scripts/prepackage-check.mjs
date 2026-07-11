@@ -42,6 +42,12 @@ const requiredFiles = [
   "scripts/office-openxml.py",
   "scripts/office-openxml-test.py",
   "scripts/office-real-fixture-test.py",
+  "scripts/office-security-test.py",
+  "office-addin/manifest.xml",
+  "office-addin/taskpane.html",
+  "office-addin/taskpane.js",
+  "office-addin/taskpane-test.mjs",
+  "office-addin/README.md",
   "scripts/prepackage-check.mjs",
   "skills/onedrive/SKILL.md",
   "README.md"

@@ -22,7 +22,8 @@ jobs:
       - name: Install shell dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y zsh
+          sudo apt-get install -y zsh libreoffice-writer libreoffice-calc libreoffice-impress
+          python3 -m pip install python-docx openpyxl python-pptx pillow
 
       - name: Validate JSON manifests
         run: |
@@ -54,6 +55,9 @@ jobs:
       - name: Run mocked Microsoft Graph tests
         run: |
           python3 scripts/office-openxml-test.py
+          python3 scripts/office-security-test.py
+          SOFFICE="$(command -v soffice)" python3 scripts/office-real-fixture-test.py
+          node office-addin/taskpane-test.mjs
           node scripts/mock-graph-test.mjs
 
       - name: Run prepackage guard

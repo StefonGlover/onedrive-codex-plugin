@@ -23,6 +23,7 @@ let officeExcelBuffer = readFileSync(join(officeFixtureDir, "sample.xlsx"));
 let officeBusinessBuffer = Buffer.from(officeExcelBuffer);
 let officePowerPointBuffer = readFileSync(join(officeFixtureDir, "sample.pptx"));
 let officeWordPostMetadataFailuresRemaining = 0;
+let failNextOfficeExcelPut = false;
 const officeVersions = { "office-word": 1, "office-excel": 1, "office-business": 1, "office-powerpoint": 1 };
 
 const requests = [];
@@ -311,9 +312,14 @@ const graph = createServer(async (req, res) => {
     const definition = officeDefinitions[id];
     if (req.method === "GET" && path.endsWith("/content")) return binary(res, 200, definition.buffer, { "Content-Type": "application/octet-stream" });
     if (req.method === "PUT" && path.endsWith("/content")) {
+      if (id === "office-excel" && failNextOfficeExcelPut) {
+        failNextOfficeExcelPut = false;
+        await readBufferBody(req);
+        return json(res, 500, { error: { code: "internalError", message: "mock cross-file partial failure" } });
+      }
       definition.buffer = await readBufferBody(req);
       officeVersions[id] += 1;
-      if (id === "office-word") officeWordPostMetadataFailuresRemaining = 20;
+      if (id === "office-word") officeWordPostMetadataFailuresRemaining = 5;
       return json(res, 200, officeItem(id, definition.name, definition.buffer, definition.mime, definition.driveId ? { parentReference: { driveId: definition.driveId, path: `/drives/${definition.driveId}/root:` } } : {}));
     }
     if (req.method === "GET" && id === "office-word" && officeWordPostMetadataFailuresRemaining > 0) {
@@ -323,14 +329,46 @@ const graph = createServer(async (req, res) => {
     if (req.method === "GET") return json(res, 200, officeItem(id, definition.name, definition.buffer, definition.mime, definition.driveId ? { parentReference: { driveId: definition.driveId, path: `/drives/${definition.driveId}/root:` } } : {}));
   }
   if (req.method === "POST" && path === "/v1.0/drives/business-drive/items/office-business/workbook/createSession") {
-    return json(res, 201, { id: "business-session" });
+    const attempt = count("excel-create-session");
+    if (attempt === 1) {
+      return json(res, 504, { error: { code: "gatewayTimeout", message: "mock documented createSession timeout" } }, { "Retry-After": "0" });
+    }
+    if (attempt === 3) {
+      return json(res, 202, {}, {
+        Location: `http://${req.headers.host}/v1.0/drives/business-drive/items/office-business/workbook/operations/untrusted-resource`
+      });
+    }
+    if (attempt === 4) return json(res, 202, {}, { Location: "https://attacker.invalid/workbook/operations/session" });
+    return json(res, 202, {}, {
+      Location: `http://${req.headers.host}/v1.0/drives/business-drive/items/office-business/workbook/operations/create-session`
+    });
+  }
+  if (req.method === "GET" && path === "/v1.0/drives/business-drive/items/office-business/workbook/operations/untrusted-resource") {
+    return json(res, 200, { id: "untrusted-resource", status: "succeeded", resourceLocation: "https://attacker.invalid/sessionInfoResource" });
+  }
+  if (req.method === "GET" && path === "/v1.0/drives/business-drive/items/office-business/workbook/operations/create-session") {
+    if (count("excel-create-session-poll") === 1) {
+      return json(res, 200, { id: "create-session", status: "running" }, { "Retry-After": "0" });
+    }
+    return json(res, 200, {
+      id: "create-session",
+      status: "succeeded",
+      resourceLocation: `http://${req.headers.host}/v1.0/drives/business-drive/items/office-business/workbook/sessionInfoResource(key='create-session')`
+    });
+  }
+  if (req.method === "GET" && path === "/v1.0/drives/business-drive/items/office-business/workbook/sessionInfoResource(key='create-session')") {
+    return json(res, 200, { id: "business-session", persistChanges: true });
   }
   if (["PATCH", "POST"].includes(req.method) && path.startsWith("/v1.0/drives/business-drive/items/office-business/workbook/worksheets/")) {
     await readBufferBody(req);
     return json(res, 200, { address: "Data!A1", values: [["Graph updated"]] });
   }
+  if (req.method === "POST" && path.startsWith("/v1.0/drives/business-drive/items/office-business/workbook/tables/")) {
+    await readBufferBody(req);
+    return json(res, 201, { index: 1, values: [["Q4", 42]] });
+  }
   if (req.method === "POST" && path === "/v1.0/drives/business-drive/items/office-business/workbook/closeSession") {
-    return json(res, 204, null);
+    return json(res, 503, { error: { code: "serviceUnavailable", message: "mock close warning" } });
   }
   const officeUploadMatch = path.match(/^\/v1\.0\/me\/drive\/root:\/(sample\.(docx|xlsx|pptx)):\/content$/);
   if (req.method === "PUT" && officeUploadMatch) {
@@ -1266,9 +1304,14 @@ try {
     const expected = [
       "onedrive_office_capabilities",
       "onedrive_office_validate",
+      "onedrive_office_index_refresh",
+      "onedrive_office_search",
       "onedrive_word_get_document",
       "onedrive_excel_get_workbook",
-      "onedrive_powerpoint_get_presentation"
+      "onedrive_powerpoint_get_presentation",
+      "onedrive_office_backups",
+      "onedrive_office_compare_backup",
+      "onedrive_office_restore_backup"
     ];
     const missing = expected.filter((name) => !names.has(name));
     assert(missing.length === 0, "missing Office inspection tools", { missing });
@@ -1277,6 +1320,7 @@ try {
     assert(capabilities.value.runtime.pythonAvailable === true, "Office Python runtime should be available", capabilities.value);
     assert(capabilities.value.runtime.helperAvailable === true, "Office Open XML helper should be available", capabilities.value);
     assert(capabilities.value.backends.openXml.readOnlyToolsReady === true, "Open XML read tools should report ready", capabilities.value);
+    assert(capabilities.value.backends.openXml.operations.excel.includes("addTableRow") && capabilities.value.backends.openXml.operations.excel.includes("setTableTotals"), "Open XML table operations should be advertised", capabilities.value);
     assert(capabilities.value.backends.graphExcel.availableForAccount === false, "mock personal drive should report Graph Excel unavailable", capabilities.value);
     return { checked: expected, runtime: capabilities.value.runtime.pythonVersion };
   });
@@ -1285,12 +1329,13 @@ try {
     const word = await tool("onedrive_word_get_document", { itemId: "office-word" });
     const excel = await tool("onedrive_excel_get_workbook", { itemId: "office-excel" });
     const powerpoint = await tool("onedrive_powerpoint_get_presentation", { itemId: "office-powerpoint" });
-    assert(!word.isError && word.value.paragraphs[0].text === "Hello Word", "Word structured read failed", word);
-    assert(!excel.isError && excel.value.sheets[0].cells.some((cell) => cell.address === "B1" && cell.value === "Revenue"), "Excel structured read failed", excel);
-    assert(!powerpoint.isError && powerpoint.value.slides[0].shapes[0].text === "Hello PowerPoint", "PowerPoint structured read failed", powerpoint);
+    assert(!word.isError && word.value.paragraphs?.[0]?.text === "Hello Word", "Word structured read failed", word);
+    assert(!excel.isError && excel.value.sheets?.[0]?.cells?.some((cell) => cell.address === "B1" && cell.value === "Revenue"), "Excel structured read failed", excel);
+    assert(!powerpoint.isError && powerpoint.value.slides?.[0]?.shapes?.[0]?.text === "Hello PowerPoint", "PowerPoint structured read failed", powerpoint);
 
     const wordPreview = await tool("onedrive_word_batch_update", { itemId: "office-word", operations: [{ type: "replaceText", find: "Hello Word", replace: "Updated Word" }] });
     assert(!wordPreview.isError && wordPreview.value.dryRun === true && wordPreview.value.previewToken, "Word edit preview failed", wordPreview);
+    assert(wordPreview.value.semanticDiff?.operationCounts?.replaceText === 1, "Word preview should include a semantic operation summary", wordPreview);
     const wordLive = await tool("onedrive_word_batch_update", { itemId: "office-word", operations: [{ type: "replaceText", find: "Hello Word", replace: "Updated Word" }], dryRun: false, confirmed: true, expectedId: "office-word", previewToken: wordPreview.value.previewToken });
     officeWordPostMetadataFailuresRemaining = 0;
     assert(!wordLive.isError && wordLive.value.changeCount === 1 && wordLive.value.verificationIncomplete === true, "Word live edit should remain successful when post-commit metadata verification fails", wordLive);
@@ -1298,11 +1343,13 @@ try {
 
     const excelPreview = await tool("onedrive_excel_batch_update", { itemId: "office-excel", operations: [{ type: "setCell", sheet: "Data", address: "B2", value: "Updated" }] });
     assert(!excelPreview.isError && excelPreview.value.previewToken, "Excel edit preview failed", excelPreview);
+    assert(excelPreview.value.semanticDiff?.affectedObjects?.some((entry) => entry.sheet === "Data" && entry.address === "B2"), "Excel preview should identify the affected cell", excelPreview);
     const excelLive = await tool("onedrive_excel_batch_update", { itemId: "office-excel", operations: [{ type: "setCell", sheet: "Data", address: "B2", value: "Updated" }], dryRun: false, confirmed: true, expectedId: "office-excel", previewToken: excelPreview.value.previewToken });
     assert(!excelLive.isError && excelLive.value.changeCount === 1, "Excel live edit failed", excelLive);
 
     const pptPreview = await tool("onedrive_powerpoint_batch_update", { itemId: "office-powerpoint", operations: [{ type: "replaceText", slideIndex: 0, shapeId: "2", find: "Hello", replace: "Updated" }] });
     assert(!pptPreview.isError && pptPreview.value.previewToken, "PowerPoint edit preview failed", pptPreview);
+    assert(pptPreview.value.semanticDiff?.affectedObjects?.some((entry) => entry.slideIndex === 0 && entry.shapeId === "2"), "PowerPoint preview should identify the affected shape", pptPreview);
     const pptLive = await tool("onedrive_powerpoint_batch_update", { itemId: "office-powerpoint", operations: [{ type: "replaceText", slideIndex: 0, shapeId: "2", find: "Hello", replace: "Updated" }], dryRun: false, confirmed: true, expectedId: "office-powerpoint", previewToken: pptPreview.value.previewToken });
     assert(!pptLive.isError && pptLive.value.changeCount === 1, "PowerPoint live edit failed", pptLive);
     const nativePptOperations = [
@@ -1329,7 +1376,23 @@ try {
     for (const id of ["office-word", "office-excel", "office-powerpoint"]) {
       assert(requests.some((entry) => entry.method === "PUT" && entry.path === `/v1.0/me/drive/items/${id}/content`), "Office commit did not target the stable item ID", { id });
     }
-    return { wordChanges: wordLive.value.changeCount, excelChanges: excelLive.value.changeCount, powerpointChanges: pptLive.value.changeCount + nativePptLive.value.changeCount };
+    assert(wordLive.value.backup?.backupId, "Word live edit should create a managed backup manifest", wordLive);
+    const backups = await tool("onedrive_office_backups", { itemId: "office-word" });
+    assert(!backups.isError && backups.value.items.some((entry) => entry.backupId === wordLive.value.backup.backupId), "Managed Word backup should be listed", backups);
+    const comparison = await tool("onedrive_office_compare_backup", { backupId: wordLive.value.backup.backupId });
+    assert(!comparison.isError && comparison.value.sameContent === false && comparison.value.semanticDiff.changeCount > 0, "Backup comparison should report the Word semantic change", comparison);
+    const restorePreview = await tool("onedrive_office_restore_backup", { backupId: wordLive.value.backup.backupId });
+    assert(!restorePreview.isError && restorePreview.value.previewToken && restorePreview.value.wouldRestore.currentItem.id === "office-word" && restorePreview.value.semanticDiff?.changeCount > 0, "Office backup restore preview failed", restorePreview);
+    const restorePutCount = requests.filter((entry) => entry.method === "PUT" && entry.path === "/v1.0/me/drive/items/office-word/content").length;
+    const staleRestore = await tool("onedrive_office_restore_backup", { backupId: wordLive.value.backup.backupId, dryRun: false, confirmed: true, expectedId: "office-word", expectedETag: "stale-etag", previewToken: restorePreview.value.previewToken });
+    assert(!staleRestore.isError && staleRestore.value.requiredToRestore?.includes("expectedETag"), "Office backup restore should refuse a stale expected eTag", staleRestore);
+    assert(requests.filter((entry) => entry.method === "PUT" && entry.path === "/v1.0/me/drive/items/office-word/content").length === restorePutCount, "Stale Office restore must not upload", { restorePutCount });
+    const restored = await tool("onedrive_office_restore_backup", { backupId: wordLive.value.backup.backupId, dryRun: false, confirmed: true, expectedId: "office-word", expectedETag: restorePreview.value.wouldRestore.currentItem.eTag, previewToken: restorePreview.value.previewToken });
+    assert(!restored.isError && restored.value.restoredBackupId === wordLive.value.backup.backupId && restored.value.rollbackBackup?.backupId && restored.value.remoteValidation?.package?.fingerprint === restored.value.backupValidation?.package?.fingerprint, "Office backup restore failed", restored);
+    officeWordPostMetadataFailuresRemaining = 0;
+    const restoredWord = await tool("onedrive_word_get_document", { itemId: "office-word" });
+    assert(!restoredWord.isError && restoredWord.value.paragraphs?.[0]?.text === "Hello Word", "Office backup restore did not restore original Word content", restoredWord);
+    return { wordChanges: wordLive.value.changeCount, excelChanges: excelLive.value.changeCount, powerpointChanges: pptLive.value.changeCount + nativePptLive.value.changeCount, restoredBackupId: restored.value.restoredBackupId };
   });
 
   await check("business Excel uses a scoped Graph workbook session", async () => {
@@ -1341,9 +1404,89 @@ try {
     const sessionRequests = requests.filter((entry) => entry.path.includes("/office-business/workbook/"));
     const rangeRequest = sessionRequests.find((entry) => entry.method === "PATCH" && entry.path.includes("/range"));
     assert(sessionRequests.some((entry) => entry.path.endsWith("/createSession")), "Graph createSession was not called", { sessionRequests });
+    assert(counters.get("excel-create-session") === 2, "Graph createSession should retry the documented safe 504 once", { sessionRequests });
+    assert(counters.get("excel-create-session-poll") === 2, "Graph createSession LRO should poll until succeeded", { sessionRequests });
+    assert(sessionRequests.some((entry) => entry.path.includes("/sessionInfoResource")), "Graph createSession LRO resourceLocation was not fetched", { sessionRequests });
+    const createRequest = sessionRequests.find((entry) => entry.path.endsWith("/createSession"));
+    assert(createRequest?.headers?.prefer === "respond-async", "Graph createSession should request asynchronous completion", { createRequest });
     assert(rangeRequest?.headers?.["workbook-session-id"] === "business-session", "Graph range write omitted workbook-session-id", { rangeRequest });
     assert(sessionRequests.some((entry) => entry.path.endsWith("/closeSession")), "Graph closeSession was not called", { sessionRequests });
-    return { calls: sessionRequests.length, backend: live.value.backend };
+    assert(live.value.uploaded?.sessionClosed === false, "failed Graph closeSession should not be reported as closed", live.value);
+    assert(live.value.localWarnings?.some((entry) => entry.operation === "Graph Excel session close"), "failed Graph closeSession should be a non-fatal warning", live.value);
+    return { calls: sessionRequests.length, backend: live.value.backend, sessionClosed: live.value.uploaded.sessionClosed };
+  });
+
+  await check("structured Office index refresh is incremental and returns semantic anchors", async () => {
+    const first = await tool("onedrive_office_index_refresh", { itemId: "office-word", refreshMetadata: false, force: true });
+    assert(!first.isError && first.value.indexed === 1, "Office structured index refresh failed", first);
+    const search = await tool("onedrive_office_search", { query: "Updated Word" });
+    assert(!search.isError && search.value.items[0]?.anchor?.type === "paragraph", "Office structured search did not return a paragraph anchor", search);
+    const second = await tool("onedrive_office_index_refresh", { itemId: "office-word", refreshMetadata: false });
+    assert(!second.isError && second.value.reused === 1 && second.value.graphContentReadsAttempted === 0, "unchanged Office item should reuse the structured index", second);
+    return { indexed: first.value.indexed, reused: second.value.reused, anchor: search.value.items[0].anchor };
+  });
+
+  await check("cross-file Office batch transformation preflights every file before mutation", async () => {
+    const items = [
+      { itemId: "office-word", expectedId: "office-word", kind: "word", operations: [{ type: "setParagraphText", paragraphIndex: 0, text: "Batch Word" }] },
+      { itemId: "office-excel", expectedId: "office-excel", kind: "excel", operations: [{ type: "setCell", sheet: "Data", address: "D4", value: "Batch Excel" }] },
+      { itemId: "office-powerpoint", expectedId: "office-powerpoint", kind: "powerpoint", operations: [{ type: "setShapeText", slideIndex: 0, shapeId: "2", text: "Batch PowerPoint" }] }
+    ];
+    const preview = await tool("onedrive_office_batch_transform", { items });
+    assert(!preview.isError && preview.value.preflightComplete === true && preview.value.itemCount === 3 && preview.value.previewToken, "cross-file preview failed", preview);
+    const beforePutCount = requests.filter((entry) => entry.method === "PUT" && entry.path.includes("/office-")).length;
+    const live = await tool("onedrive_office_batch_transform", { items, dryRun: false, confirmed: true, previewToken: preview.value.previewToken });
+    assert(!live.isError && live.value.partialState === false && live.value.completed.length === 3, "cross-file live transformation failed", live);
+    const afterPutCount = requests.filter((entry) => entry.method === "PUT" && entry.path.includes("/office-")).length;
+    assert(afterPutCount - beforePutCount === 3, "cross-file transformation should commit each preflighted file exactly once", { beforePutCount, afterPutCount });
+    return { itemCount: live.value.itemCount, totalChangeCount: live.value.totalChangeCount };
+  });
+
+  await check("cross-file Office batch reports recoverable partial state without replaying writes", async () => {
+    const items = [
+      { itemId: "office-word", expectedId: "office-word", kind: "word", operations: [{ type: "setParagraphText", paragraphIndex: 0, text: "Partial Word" }] },
+      { itemId: "office-excel", expectedId: "office-excel", kind: "excel", operations: [{ type: "setCell", sheet: "Data", address: "E5", value: "Partial Excel" }] }
+    ];
+    const preview = await tool("onedrive_office_batch_transform", { items });
+    assert(!preview.isError && preview.value.preflightComplete, "partial-state batch preview failed", preview);
+    failNextOfficeExcelPut = true;
+    const live = await tool("onedrive_office_batch_transform", { items, dryRun: false, confirmed: true, previewToken: preview.value.previewToken });
+    assert(!live.isError && live.value.partialState === true && live.value.completed.length === 1 && live.value.failed.index === 1, "batch should surface one completed and one failed item", live);
+    assert(live.value.recovery?.[0]?.backup?.backupId, "partial-state result should include a managed recovery backup", live.value);
+    return { completed: live.value.completed.length, failedIndex: live.value.failed.index, recoveryBackupId: live.value.recovery[0].backup.backupId };
+  });
+
+  await check("Graph Excel async session rejects untrusted operation URLs", async () => {
+    const operations = [{ type: "setCell", sheet: "Data", address: "B2", value: "Blocked" }];
+    const preview = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations });
+    const untrustedResource = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations, dryRun: false, confirmed: true, expectedId: "office-business", previewToken: preview.value.previewToken });
+    assert(untrustedResource.isError && String(untrustedResource.value).includes("untrusted Excel session resourceLocation"), "untrusted Excel resourceLocation should be rejected", untrustedResource);
+
+    const secondPreview = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations });
+    const untrustedLocation = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations, dryRun: false, confirmed: true, expectedId: "office-business", previewToken: secondPreview.value.previewToken });
+    assert(untrustedLocation.isError && String(untrustedLocation.value).includes("untrusted Excel session Location"), "untrusted Excel Location should be rejected", untrustedLocation);
+    assert(!requests.some((entry) => entry.path.startsWith("/workbook/operations/session") || entry.path.startsWith("/sessionInfoResource")), "untrusted Excel async URL should never be fetched", { requests });
+    return { rejected: ["Location", "resourceLocation"] };
+  });
+
+  await check("business Excel Graph supports typed table rows and chart lifecycle", async () => {
+    const operations = [
+      { type: "addTableRow", table: "RevenueTable", values: [["Q4", 42]] },
+      { type: "createChart", sheet: "Data", chartType: "ColumnClustered", sourceData: "A1:B4", seriesBy: "Columns" },
+      { type: "updateChart", sheet: "Data", chart: "Chart 1", titleText: "Revenue", width: 480, sourceData: "A1:B5", seriesBy: "Columns" }
+    ];
+    const preview = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations });
+    assert(!preview.isError && preview.value.backend === "graph" && preview.value.changeCount === 3, "typed Graph Excel preview failed", preview);
+    const before = requests.length;
+    const live = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations, dryRun: false, confirmed: true, expectedId: "office-business", previewToken: preview.value.previewToken });
+    assert(!live.isError && live.value.changeCount === 3, "typed Graph Excel live update failed", live);
+    const added = requests.slice(before);
+    assert(added.some((entry) => entry.method === "POST" && entry.path.includes("/tables/RevenueTable/rows/add")), "table row endpoint was not called", { added });
+    assert(added.some((entry) => entry.method === "POST" && entry.path.includes("/worksheets/Data/charts/add")), "chart add endpoint was not called", { added });
+    assert(added.some((entry) => entry.method === "PATCH" && entry.path.includes("/charts/Chart%201")), "chart update endpoint was not called", { added });
+    assert(added.some((entry) => entry.method === "PATCH" && entry.path.endsWith("/title")), "chart title endpoint was not called", { added });
+    assert(added.some((entry) => entry.method === "POST" && entry.path.endsWith("/setData")), "chart setData endpoint was not called", { added });
+    return { changeCount: live.value.changeCount, graphCalls: added.filter((entry) => entry.path.includes("/workbook/")).length };
   });
 
   await check("find schemas expose bounded adaptive search concurrency", async () => {

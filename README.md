@@ -115,12 +115,18 @@ Use absolute paths in `storageRoot` and `cacheRoot` if you override them. Enviro
 - `onedrive_content_index_clear`
 - `onedrive_office_capabilities`
 - `onedrive_office_validate`
+- `onedrive_office_index_refresh`
+- `onedrive_office_search`
 - `onedrive_word_get_document`
 - `onedrive_excel_get_workbook`
 - `onedrive_powerpoint_get_presentation`
 - `onedrive_word_batch_update`
 - `onedrive_excel_batch_update`
 - `onedrive_powerpoint_batch_update`
+- `onedrive_office_batch_transform`
+- `onedrive_office_backups`
+- `onedrive_office_compare_backup`
+- `onedrive_office_restore_backup`
 - `onedrive_get_info`
 - `onedrive_read_text`
 - `onedrive_preview`
@@ -160,16 +166,21 @@ Use absolute paths in `storageRoot` and `cacheRoot` if you override them. Enviro
 
 ## Native Office editing
 
-The plugin can inspect and edit modern Open XML files without requiring Word, Excel, or PowerPoint to be open. Reads expose structured document content and package-safety metadata. Mutations are typed, preview-first, bound to the file identity and eTag/cTag, backed up locally by default, uploaded with `If-Match`, validated after commit, and recorded in the mutation audit.
+The plugin can inspect and edit modern Open XML files without requiring Word, Excel, or PowerPoint to be open. Reads expose structured document content and package-safety metadata. Mutation previews include semantic operation counts and affected objects, are bound to file identity and eTag/cTag, backed up locally by default, uploaded with `If-Match`, validated after commit, and recorded in the mutation audit.
+
+Managed Office backups have opaque IDs and manifests containing the original stable item ID and version metadata. Use `onedrive_office_backups` to list them and `onedrive_office_compare_backup` for a bounded semantic comparison with the current remote content. `onedrive_office_restore_backup` defaults to dry-run and requires the preview token, original `expectedId`, and current `expectedETag`; it restores by item ID, creates a rollback backup, audits the mutation, and verifies the restored fingerprint.
 
 - Word supports text replacement, paragraph text/style changes, paragraph/table insertion, table-cell and content-control updates, safe external hyperlinks, and anchored comments. Documents containing tracked changes are refused instead of silently changing review semantics.
-- Excel reads support worksheet/range selectors, bounded value/formula text search, and worksheet table metadata. Edits support cell/formula/range writes, clearing, style-index or safe number-format assignment, sheet rename, defined names, and full recalculation on next open. `backend: auto` uses Microsoft Graph workbook sessions for supported business `.xlsx` files and Open XML for personal drives, macros, or unsupported operations.
+- Excel reads support worksheet/range selectors, bounded value/formula text search, table/chart/pivot metadata, and formula dependency tracing. Open XML edits support cells, ranges, styles/number formats, conditional formatting, data validation, frozen panes, column widths, sheet names, defined names, table-row insertion, totals-row configuration, basic clustered bar/column, line, and pie chart creation/update, and full recalculation on next open. `addTableRow` inserts at a zero-based data-row `index` or appends when it is omitted/null; existing totals rows are moved and preserved. `setTableTotals` enables or disables the totals row and can configure columns by name or zero-based index with a label, built-in function, or custom formula. Chart operations accept a same-sheet rectangular source range plus title, name, and point-based geometry; changing chart type requires `sourceData`. Business `.xlsx` Graph sessions additionally support table-row insertion and chart creation/update. `backend: auto` uses Graph only when every requested operation is supported there and otherwise uses Open XML.
 - PowerPoint supports shape text, run styling and geometry, text-box creation, shape deletion, validated raster-image replacement, table cells, notes, text replacement, and slide duplicate/delete/reorder.
+- The optional Office.js companion negotiates protocol `codex-office-companion/1` against the active Word, Excel, or PowerPoint requirement set and exposes a bounded typed command list. It remains local/manual-paste only: no remote command or telemetry transport is enabled. See `office-addin/README.md` for development and centralized production deployment.
 - Encrypted and legacy binary files are refused. Macro-enabled edits require `allowMacros: true`; signed-package edits are always refused because any edit invalidates the signature.
 
 Run the corresponding structured read tool first, then call the batch-update tool as a dry run. A live commit requires `dryRun: false`, `confirmed: true`, `expectedName` or `expectedId`, and the exact returned `previewToken`.
 
 For faster research inside a known Office file, pass `searchText` to any structured read. Excel can additionally restrict reads to `sheetNames` and a bounded A1 `address`, avoiding a full-workbook response.
+
+For cross-drive research, `onedrive_office_index_refresh` stores structured paragraph, cell, formula, table, content-control, comment, shape, and notes segments with semantic anchors. It reuses unchanged eTag/cTag entries and prefers the existing OneDrive delta cursor before scanning. `onedrive_office_search` searches that private local index without Graph calls. `onedrive_office_batch_transform` preflights every requested file before the first write and returns recovery backup IDs if a later item fails.
 
 ## Safety
 
@@ -194,7 +205,7 @@ For faster research inside a known Office file, pass `searchText` to any structu
 - `onedrive_sync_status` reports cache age, item count, delta cursor availability, resumable delta next-link availability, unresolved path count, and plugin storage locations.
 - Metadata cache, content index, and audit files are written with compact atomic JSON/JSONL updates, interprocess locks, and reload-on-write freshness checks. Version 3 cache migration clears unscoped legacy cursors so stale ordinary pagination state cannot masquerade as delta state.
 - `onedrive_cache_refresh` rebuilds the cache from a bounded recursive scan and uses delta refreshes when a previous cursor exists for the same root. Cache refresh batches metadata-cache writes during scans, persists only delta-origin `nextLink` cursors for continuation, reconciles pathless delta records through cached parent IDs, and returns progress milestones. Ordinary list/search pagination cannot seed delta state. `onedrive_cache_clear` clears the cache.
-- `onedrive_content_index_refresh` is the explicit content-reading step. It indexes supported cached text-like files into `content-index.json`, stores normalized text/tokens for faster local lookup, reuses entries when ETag/cTag/mtime/size are unchanged, and applies file-size, extension, concurrency, and per-item failure limits. Explicit metadata deletes and changed fingerprints evict stale entries; moves and renames update indexed metadata; unchanged explicit cTags preserve content entries across metadata-only renames, while changed or omitted content tags with changed ETags invalidate conservatively. Bounded partial scans do not globally prune unseen entries.
+- `onedrive_content_index_refresh` is the explicit content-reading step. It indexes supported cached text and structured Office content into `content-index.json`, stores normalized text/tokens plus semantic Office anchors, reuses entries when ETag/cTag/mtime/size are unchanged, and applies file-size, segment, concurrency, and per-item failure limits. Explicit metadata deletes and changed fingerprints evict stale entries; moves and renames update indexed metadata; unchanged explicit cTags preserve content entries across metadata-only renames, while changed or omitted content tags with changed ETags invalidate conservatively. Bounded partial scans do not globally prune unseen entries.
 - `onedrive_content_search` searches only the local content index and returns lightweight metadata plus snippets. It does not call Microsoft Graph or read file bodies.
 - `onedrive_find` and `onedrive_find_all` can merge local content-index hits into ranking, but they never fetch or parse full content themselves. Build or refresh the index first when content search is needed.
 - `onedrive_find` is the preferred file lookup helper. It uses the local metadata cache when available, confirms exact strong cache hits with live metadata, runs the canonical Graph query first, and expands additional terms in bounded concurrent waves only while confidence remains low. Canonical Graph results can represent filename, metadata, or file-content matches; unrelated expansion-only results remain gated. Results expose the planned, executed, and skipped search terms. `graphSearchCalls` reports actual Graph search pages fetched, not just term count. Tune expansion with `searchConcurrency` and fallback scans with `scanConcurrency`. Fallback scans prune duplicate and nested folder hints regardless of input order. Cache-only hits must still have query relevance and are not treated as authoritative when live evidence cannot confirm them. Pass `useCache: false` for a fully live lookup with no metadata-cache reads or writes.
@@ -298,6 +309,17 @@ Run the prepackage guard before refreshing the plugin cache:
 ```bash
 scripts/prepackage-check.mjs
 ```
+
+Office compatibility checks are split by purpose:
+
+```bash
+python3 scripts/office-openxml-test.py
+python3 scripts/office-security-test.py
+node office-addin/taskpane-test.mjs
+SOFFICE="$(command -v soffice)" python3 scripts/office-real-fixture-test.py
+```
+
+The security corpus includes malformed ZIP/XML/relationship cases, deterministic mutation fuzzing, every possible two-run PowerPoint split of a target phrase, and a 5,000-run deck. The real-fixture gate generates packages with `python-docx`, `openpyxl`, and `python-pptx`, edits them, reopens them with their native libraries, and requires LibreOffice PDF conversion without repair/corruption diagnostics. Microsoft Office itself is not available in headless CI; release candidates should additionally be opened and saved in desktop Word, Excel, and PowerPoint when exact Microsoft interoperability is required.
 
 After installing a refreshed build, compare source with the installed cache:
 
