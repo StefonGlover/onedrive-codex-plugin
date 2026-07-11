@@ -86,6 +86,14 @@ function uniqueBetaFolderCandidates(items = [], maxResults = 100) {
   return candidates;
 }
 
+function betaIsolationRoots(runDirectory) {
+  const storageRoot = resolve(runDirectory, "plugin-state");
+  return {
+    storageRoot,
+    cacheRoot: join(storageRoot, "cache")
+  };
+}
+
 function errorText(value) {
   if (value instanceof Error) return value.message;
   if (typeof value === "string") return value;
@@ -154,6 +162,7 @@ if (selfCheck) {
   const stale = { id: "stale", name: `${betaFolderPrefix}old`, folder: {}, lastModifiedDateTime: new Date(now - 2 * 86_400_000).toISOString() };
   const fresh = { id: "fresh", name: `${betaFolderPrefix}new`, folder: {}, lastModifiedDateTime: new Date(now).toISOString() };
   const candidates = uniqueBetaFolderCandidates([stale, stale, fresh, { id: "file", name: `${betaFolderPrefix}file` }], 10);
+  const isolationProbe = betaIsolationRoots(join(workspace, "work", "onedrive-beta", "self-check"));
   let transientAttempts = 0;
   const transientResult = await retryTransientReadCall("probe", async () => {
     transientAttempts += 1;
@@ -177,6 +186,8 @@ if (selfCheck) {
     staleClassification: betaFolderLooksStale(stale, now - 86_400_000) && !betaFolderLooksStale(fresh, now - 86_400_000),
     unknownTimestampNotStale: !betaFolderLooksStale({ id: "unknown-age", name: `${betaFolderPrefix}unknown`, folder: {} }, now),
     candidateDeduplication: candidates.length === 2 && candidates[0].id === "stale" && candidates[1].id === "fresh",
+    isolatedStorageRoot: isolationProbe.storageRoot === resolve(workspace, "work", "onedrive-beta", "self-check", "plugin-state"),
+    isolatedCacheRoot: isolationProbe.cacheRoot === resolve(workspace, "work", "onedrive-beta", "self-check", "plugin-state", "cache"),
     transientFetchFailure: clearlyTransientReadError("fetch failed"),
     classifiedTransportFailure: clearlyTransientReadError("Microsoft Graph transport error after 3 attempts: fetch failed"),
     deterministicErrorNotTransient: !clearlyTransientReadError("Microsoft Graph error: itemNotFound"),
@@ -190,6 +201,7 @@ if (selfCheck) {
 
 const unique = `codex-beta-${Date.now()}-${process.pid}`;
 const outDir = join(workspace, "work", "onedrive-beta", unique);
+const { storageRoot: betaStorageRoot, cacheRoot: betaCacheRoot } = betaIsolationRoots(outDir);
 const localUpload = join(outDir, "upload-source.txt");
 const localSessionUpload = join(outDir, "upload-session-source.txt");
 const localBinary = join(outDir, "binary-source.bin");
@@ -230,6 +242,11 @@ await rm(updateManifest, { force: true });
 
 const child = spawn(process.execPath, [serverPath], {
   cwd: workspace,
+  env: {
+    ...process.env,
+    ONEDRIVE_STORAGE_ROOT: betaStorageRoot,
+    ONEDRIVE_CACHE_ROOT: betaCacheRoot
+  },
   stdio: ["pipe", "pipe", "pipe"]
 });
 
@@ -499,6 +516,8 @@ async function runOneTenantMatrixEntry(tenant) {
     exitCode,
     summary: parsed?.summary,
     configuredTenant: parsed?.checks?.find((check) => check.name === "configured and token available")?.details?.tenant,
+    localWorkCleaned: parsed?.localWorkCleaned,
+    localWorkDir: parsed?.localWorkDir,
     error: parsed?.error,
     stdout: parsed ? undefined : stdout.trim(),
     stderr: stderrText.trim() || undefined
@@ -545,7 +564,11 @@ if (tenantMatrix) {
   ]);
   if (!childExited) child.kill("SIGKILL");
   const matrix = await runTenantMatrix();
-  await rm(outDir, { recursive: true, force: true });
+  if (keepWork) matrix.localWorkDir = outDir;
+  else {
+    await rm(outDir, { recursive: true, force: true });
+    matrix.localWorkCleaned = true;
+  }
   console.log(JSON.stringify(matrix, null, 2));
   process.exitCode = matrix.ok ? 0 : 1;
   process.exit();
@@ -581,6 +604,9 @@ try {
     "onedrive_sync_status",
     "onedrive_cache_refresh",
     "onedrive_cache_clear",
+    "onedrive_content_index_refresh",
+    "onedrive_content_search",
+    "onedrive_content_index_clear",
     "onedrive_get_info",
     "onedrive_read_text",
     "onedrive_preview",
@@ -619,7 +645,8 @@ try {
     "onedrive_delete"
   ];
   const uniqueToolNames = new Set(toolNames);
-  record("tools/list includes enhanced tools", requiredTools.every((name) => toolNames.includes(name)) && uniqueToolNames.size === toolNames.length ? "pass" : "fail", {
+  record("tools/list includes all 58 tools", requiredTools.length === 58 && requiredTools.every((name) => toolNames.includes(name)) && uniqueToolNames.size === toolNames.length ? "pass" : "fail", {
+    requiredToolCount: requiredTools.length,
     toolCount: toolNames.length,
     uniqueToolCount: uniqueToolNames.size,
     missing: requiredTools.filter((name) => !toolNames.includes(name))
@@ -631,6 +658,17 @@ try {
     scopes: config.scopes,
     keychainTokenConfigured: config.keychainTokenConfigured,
     accessTokenAvailable: config.accessTokenAvailable
+  });
+  const expectedConfigPath = join(homedir(), ".codex", "onedrive-plugin", "config.json");
+  record("beta child isolates mutable local state while retaining normal auth config", config.settings?.storageRoot === betaStorageRoot
+    && config.settings?.cacheRoot === betaCacheRoot
+    && config.configPath === expectedConfigPath ? "pass" : "fail", {
+    storageRoot: config.settings?.storageRoot,
+    cacheRoot: config.settings?.cacheRoot,
+    configPath: config.configPath,
+    expectedStorageRoot: betaStorageRoot,
+    expectedCacheRoot: betaCacheRoot,
+    expectedConfigPath
   });
 
   const doctor = assertOk("onedrive_doctor", await tool("onedrive_doctor", { checkRootList: true, rootListLimit: 3 }));
@@ -1063,6 +1101,54 @@ try {
     scanned: cacheRefreshAfterClear.scan?.summary?.itemsScanned
   });
 
+  const contentIndexClearedBefore = assertOk("content index initial clear", await tool("onedrive_content_index_clear"));
+  record("content_index_clear starts isolated lifecycle", contentIndexClearedBefore.itemCount === 0 ? "pass" : "fail", {
+    itemCount: contentIndexClearedBefore.itemCount,
+    updatedAt: contentIndexClearedBefore.updatedAt
+  });
+
+  const contentIndexRefresh = assertOk("content index refresh", await tool("onedrive_content_index_refresh", {
+    itemId: uploaded.item.id,
+    maxFiles: 1,
+    maxBytesPerFile: 10000,
+    concurrencyLimit: 1,
+    force: true
+  }));
+  record("content_index_refresh indexes one isolated beta file", contentIndexRefresh.indexed === 1
+    && contentIndexRefresh.failed === 0
+    && contentIndexRefresh.itemCount === 1 ? "pass" : "fail", {
+    considered: contentIndexRefresh.considered,
+    selected: contentIndexRefresh.selected,
+    indexed: contentIndexRefresh.indexed,
+    failed: contentIndexRefresh.failed,
+    itemCount: contentIndexRefresh.itemCount
+  });
+
+  const contentSearch = assertOk("content search", await tool("onedrive_content_search", {
+    query: "Edited through update_file commit",
+    maxResults: 5
+  }));
+  record("content_search returns the indexed beta file with a snippet", contentSearch.items?.[0]?.id === uploaded.item.id
+    && contentSearch.items[0].snippet?.includes("Edited through update_file commit") ? "pass" : "fail", {
+    itemCount: contentSearch.itemCount,
+    matched: contentSearch.matched,
+    returned: contentSearch.returned,
+    top: contentSearch.items?.[0]
+  });
+
+  const contentIndexClearedAfter = assertOk("content index final clear", await tool("onedrive_content_index_clear"));
+  const contentSearchAfterClear = assertOk("content search after clear", await tool("onedrive_content_search", {
+    query: "Edited through update_file commit",
+    maxResults: 5
+  }));
+  record("content_index_clear removes indexed beta content", contentIndexClearedAfter.itemCount === 0
+    && contentSearchAfterClear.itemCount === 0
+    && contentSearchAfterClear.returned === 0 ? "pass" : "fail", {
+    clearedItemCount: contentIndexClearedAfter.itemCount,
+    searchItemCount: contentSearchAfterClear.itemCount,
+    returned: contentSearchAfterClear.returned
+  });
+
   const recent = assertOk("recent files", await tool("onedrive_recent", { limit: 10 }));
   record("recent files call succeeds", Array.isArray(recent.items) && recent.count >= 0 ? "pass" : "fail", {
     count: recent.count,
@@ -1306,10 +1392,23 @@ try {
     dryRun: false,
     confirmed: true
   }));
-  const batchRevoked = assertOk("batch revoke permissions live", await toolWithPreview("onedrive_batch_revoke_permissions", {
+  const batchRevokeDryRun = assertOk("batch revoke permissions dry-run", await tool("onedrive_batch_revoke_permissions", {
+    items: [{ itemId: copiedInfo.id, permissionId: sharingLiveBatch.permission.id, expectedId: copiedInfo.id }]
+  }));
+  record("batch revoke permissions dry-run previews isolated permission", batchRevokeDryRun.dryRun === true
+    && batchRevokeDryRun.results?.length === 1
+    && batchRevokeDryRun.results[0].wouldRevoke?.permissionId === sharingLiveBatch.permission.id
+    && batchRevokeDryRun.previewToken ? "pass" : "fail", {
+    count: batchRevokeDryRun.count,
+    permissionId: batchRevokeDryRun.results?.[0]?.wouldRevoke?.permissionId,
+    previewTokenIssued: Boolean(batchRevokeDryRun.previewToken)
+  });
+
+  const batchRevoked = assertOk("batch revoke permissions live", await tool("onedrive_batch_revoke_permissions", {
     items: [{ itemId: copiedInfo.id, permissionId: sharingLiveBatch.permission.id, expectedId: copiedInfo.id }],
     dryRun: false,
-    confirmed: true
+    confirmed: true,
+    previewToken: batchRevokeDryRun.previewToken
   }));
   record("batch revoke permissions live succeeds", batchRevoked.confirmed === true && batchRevoked.results?.length === 1 ? "pass" : "fail", {
     count: batchRevoked.count,
@@ -1442,7 +1541,7 @@ const passCount = results.checks.filter((check) => check.status === "pass").leng
 const failCount = results.checks.filter((check) => check.status === "fail").length;
 results.summary = { passCount, failCount, total: results.checks.length };
 
-if (!results.error && failCount === 0 && !keepWork) {
+if (!keepWork) {
   await rm(outDir, { recursive: true, force: true });
   results.localWorkCleaned = true;
 } else {

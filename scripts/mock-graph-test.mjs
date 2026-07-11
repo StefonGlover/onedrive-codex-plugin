@@ -822,6 +822,10 @@ const graph = createServer(async (req, res) => {
     return json(res, 200, { value: [] });
   }
 
+  if (req.method === "GET" && path === "/v1.0/me/drive/root:/Folder%20A:") {
+    return json(res, 200, folder("folder-a", "Folder A", { parentReference: { id: "root", path: "/drive/root:" } }));
+  }
+
   if (req.method === "GET" && path === "/v1.0/me/drive/items/root/children") {
     return json(res, 200, {
       value: [
@@ -2154,6 +2158,19 @@ process.exit(2);
     return { bytesWritten: result.value.bytesWritten, localPath: result.value.localPath };
   });
 
+  await check("Office download helpers reuse resolved metadata", async () => {
+    const localPath = join(pluginRoot, "work", "mock-download-word.docx");
+    const before = requests.length;
+    const result = await tool("onedrive_download_word", { itemId: "quarterly-report", localPath, overwrite: true });
+    assert(!result.isError, "Word download helper should succeed", result);
+    const added = requests.slice(before);
+    const metadataRequests = added.filter((request) => request.method === "GET" && request.path === "/v1.0/me/drive/items/quarterly-report");
+    assert(metadataRequests.length === 1, "Word download helper fetched metadata more than once", { metadataRequests, added });
+    assert(readFileSync(localPath, "utf8").includes("Quarterly Report raw content"), "Word helper wrote unexpected content", result.value);
+    rmSync(localPath, { force: true });
+    return { metadataRequests: metadataRequests.length, bytesWritten: result.value.bytesWritten };
+  });
+
   await check("concurrent default downloads and exports reserve distinct destinations", async () => {
     const managedDownloads = join(mockHome, ".codex", "onedrive-plugin", "downloads");
     for (const name of ["same-name.txt", "same-name (2).txt"]) rmSync(join(managedDownloads, name), { force: true });
@@ -2878,6 +2895,35 @@ process.exit(2);
     assert(!result.isError, "no-match find should succeed", result);
     assert(result.value.items.length === 0, "no-match find should not return unrelated cached items", result.value);
     return { summary: result.value.summary };
+  });
+
+  await check("find root fallback does not rescan completed hinted subtrees", async () => {
+    const before = requests.length;
+    const result = await tool("onedrive_find", {
+      query: "qwertyuiopasdf",
+      folderHints: ["Folder A", ""],
+      maxSearchTerms: 1,
+      maxResults: 3,
+      scanConcurrency: 1,
+      scanMaxItems: 50,
+      scanMaxFolders: 20,
+      useCache: false,
+      useContentIndex: false
+    });
+    assert(!result.isError, "find subtree-pruning fallback should succeed", result);
+    const added = requests.slice(before);
+    const folderAChildrenRequests = added.filter((request) => request.url.includes("/items/folder-a/children"));
+    assert(folderAChildrenRequests.length === 1, "root fallback rescanned the completed Folder A subtree", {
+      folderAChildrenRequests,
+      scanRuns: result.value.scanRuns
+    });
+    const rootRun = result.value.scanRuns.find((run) => run.folder === "root" && run.summary);
+    assert(rootRun?.summary?.foldersSkipped >= 1, "root fallback did not report the completed subtree exclusion", result.value.scanRuns);
+    return {
+      folderAChildrenRequests: folderAChildrenRequests.length,
+      rootFoldersSkipped: rootRun.summary.foldersSkipped,
+      scanAttempts: result.value.summary.scanAttempts
+    };
   });
 
   await check("find drops stale cache-only hits when live scan cannot confirm", async () => {

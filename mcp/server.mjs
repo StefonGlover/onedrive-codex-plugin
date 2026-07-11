@@ -3846,6 +3846,7 @@ async function scan(args = {}) {
     const maxDepth = clampInteger(args.maxDepth, 25, 0, 50);
     const maxFolders = clampInteger(args.maxFolders, 1000, 1, 10000);
     const extensionFilter = normalizeExtensions(args.extensions || []);
+    const skipFolderIds = new Set((args._skipFolderIds || []).filter(Boolean));
     const root = args._resolvedRoot || await resolveScanRoot(args);
     const params = new URLSearchParams();
     params.set("$top", String(pageSize));
@@ -3859,6 +3860,7 @@ async function scan(args = {}) {
       filesScanned: 0,
       foldersScanned: 0,
       foldersVisited: 0,
+      foldersSkipped: 0,
       matched: 0
     };
     let truncatedReason = null;
@@ -3918,12 +3920,16 @@ async function scan(args = {}) {
           }
 
           if (item.folder && folder.depth < maxDepth) {
-            queue.push({
-              id: item.id,
-              name: item.name,
-              remotePath: itemRemotePath(item),
-              depth: folder.depth + 1
-            });
+            if (skipFolderIds.has(item.id)) {
+              counters.foldersSkipped += 1;
+            } else {
+              queue.push({
+                id: item.id,
+                name: item.name,
+                remotePath: itemRemotePath(item),
+                depth: folder.depth + 1
+              });
+            }
           }
         }
         if (args.cacheResults !== false) pendingCacheItems.push(...cacheableItems);
@@ -4611,15 +4617,23 @@ async function find(args = {}) {
       let remainingItems = Math.min(args.scanMaxItems ?? 1500, 10000);
       let remainingFolders = Math.min(args.scanMaxFolders ?? 250, 2000);
       const scannedFolderKeys = new Set();
+      const completedScanRootIds = new Set();
       let folderIndex = 0;
       while (folderIndex < folderHints.length && remainingItems > 0 && remainingFolders > 0) {
         const targetBatch = [];
         while (folderIndex < folderHints.length && targetBatch.length < scanConcurrency) {
           const folder = folderHints[folderIndex];
           folderIndex += 1;
+          // Keep the broad root fallback in its own wave so it can exclude every
+          // hinted subtree that earlier waves already traversed completely.
+          if (!folder && targetBatch.length > 0) {
+            folderIndex -= 1;
+            break;
+          }
           try {
             const root = await resolveScanRoot({
               ...(folder ? { path: folder } : {}),
+              useCache: args.useCache !== false,
               cacheResults: args.useCache !== false
             });
             const key = scanRootKey(root, folder);
@@ -4652,7 +4666,8 @@ async function find(args = {}) {
               maxResults: Math.max(maxResults * 2, 20),
               stopAfterResults: true,
               format: "full",
-              cacheResults: args.useCache !== false
+              cacheResults: args.useCache !== false,
+              _skipFolderIds: [...completedScanRootIds].filter((id) => id !== target.root.id)
             });
             return { target, result };
           } catch (error) {
@@ -4668,6 +4683,9 @@ async function find(args = {}) {
           }
           const result = entry.result;
           scanRuns.push({ folder: folderLabel, reason: plan.reason, nameContains: plan.nameContains || null, extensions: plan.extensions, summary: result.summary });
+          if (!result.summary.traversalTruncated && entry.target.root.id) {
+            completedScanRootIds.add(entry.target.root.id);
+          }
           remainingItems -= result.summary.itemsScanned || 0;
           remainingFolders -= result.summary.foldersVisited || 0;
           for (const item of result.items || []) {
@@ -5604,7 +5622,7 @@ function assertOfficeKind(info, kindName) {
 async function downloadOffice(args = {}, kindName) {
   const info = await getInfo(args);
   assertOfficeKind(info, kindName);
-  return await download({
+  return await downloadResolvedItem(info, {
     ...args,
     localPath: args.localPath || join(downloadRoot, kindName, info.name || `${kindName}-download`),
     overwrite: args.overwrite,
