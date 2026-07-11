@@ -288,12 +288,17 @@ const tools = [
   },
   {
     name: "onedrive_auth_device_start",
-    description: "Start Microsoft device-code login for OneDrive and return the user code and verification URL.",
+    description: "Verify existing Keychain authentication first, and start Microsoft device-code login only when reauthentication is required or explicitly forced.",
     inputSchema: {
       type: "object",
       properties: {
         tenant: { type: "string", description: "Optional tenant override. Defaults to configured tenant or common." },
-        scopes: { type: "string", description: "Optional space-separated scope override." }
+        scopes: { type: "string", description: "Optional space-separated scope override." },
+        forceReauth: {
+          type: "boolean",
+          default: false,
+          description: "Generate a new device code even when existing Keychain authentication is healthy. Use only for explicit account switching or consent repair."
+        }
       },
       additionalProperties: false
     }
@@ -1954,6 +1959,22 @@ function isMsaOnlyEndpointError(error) {
   return message.includes("AADSTS9002331") || message.includes("/consumers endpoint");
 }
 
+function isMissingStoredAuthenticationError(error) {
+  const message = String(error?.message || "");
+  return message.includes("OneDrive is not authenticated")
+    || message.includes("Stored token has no refresh token");
+}
+
+function isReauthenticationRequiredError(error) {
+  const code = String(error?.body?.error || "").toLowerCase();
+  return new Set([
+    "invalid_grant",
+    "interaction_required",
+    "login_required",
+    "consent_required"
+  ]).has(code);
+}
+
 async function postFormWithConsumerFallback(kind, cfg, params) {
   try {
     return { body: await postForm(kind === "device" ? deviceCodeUrl(cfg.tenant) : tokenUrl(cfg.tenant), params), tenant: cfg.tenant };
@@ -3137,10 +3158,34 @@ async function postForm(url, params) {
 }
 
 async function startDeviceLogin(args = {}) {
-  const generation = authGeneration;
-  const deviceGeneration = ++deviceLoginGeneration;
   const cfg = config(args);
   requireClientId(cfg);
+  let reauthenticationReason = args.forceReauth === true ? "explicitly-forced" : "no-stored-credential";
+  if (args.forceReauth !== true) {
+    try {
+      await getAccessToken();
+      return {
+        authenticated: true,
+        alreadyAuthenticated: true,
+        deviceCodeIssued: false,
+        keychainTokenConfigured: Boolean(getKeychainToken(config())?.refresh_token),
+        message: "Existing OneDrive authentication is healthy. No device code was issued."
+      };
+    } catch (error) {
+      if (isMissingStoredAuthenticationError(error)) {
+        reauthenticationReason = "no-stored-credential";
+      } else if (isReauthenticationRequiredError(error)) {
+        reauthenticationReason = "stored-credential-rejected";
+      } else {
+        throw new Error(
+          `Existing OneDrive authentication could not be verified, so device login was not started. ${safeToolErrorMessage(error)} `
+          + "Retry the token check after the temporary problem clears, or use forceReauth: true only when the user explicitly wants to sign in again."
+        );
+      }
+    }
+  }
+  const generation = authGeneration;
+  const deviceGeneration = ++deviceLoginGeneration;
   const { body: result, tenant } = await postFormWithConsumerFallback("device", cfg, {
     client_id: cfg.clientId,
     scope: cfg.scopes
@@ -3157,6 +3202,7 @@ async function startDeviceLogin(args = {}) {
     interval: result.interval,
     message: result.message,
     authTenant: tenant,
+    reauthenticationReason,
     deviceCodeStoredInMemory: true
   };
 }

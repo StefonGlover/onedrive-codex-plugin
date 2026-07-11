@@ -21,7 +21,9 @@ scripts/configure.zsh
 ```
 
 5. Start a fresh Codex thread after installing or refreshing the plugin.
-6. Ask Codex to call `onedrive_auth_device_start`, open the returned verification URL, enter the returned user code, then ask Codex to call `onedrive_auth_device_poll`.
+6. Ask Codex to call `onedrive_config` with `checkToken: true`. If no reusable credential exists, call `onedrive_auth_device_start`, open the returned verification URL, enter the returned user code, then call `onedrive_auth_device_poll`.
+
+After the first successful login, the refresh token is reused from macOS Keychain. `onedrive_auth_device_start` now checks that credential before contacting Microsoft's device-code endpoint and returns `alreadyAuthenticated: true` without generating a code when authentication is healthy. Use `forceReauth: true` only for an intentional account switch, consent repair, or explicit sign-in reset. Temporary token-check network failures do not trigger a new login flow.
 
 ## Configuration
 

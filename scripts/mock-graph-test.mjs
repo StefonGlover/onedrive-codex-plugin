@@ -31,6 +31,7 @@ const authRequests = [];
 const graphBodies = [];
 const counters = new Map();
 let refreshResponseDelayMs = 0;
+let refreshFailureMode = null;
 let deviceStartResponseDelayMs = 0;
 let devicePollResponseDelayMs = 0;
 let devicePollShouldSucceed = false;
@@ -1106,6 +1107,18 @@ const identity = createServer(async (req, res) => {
     if (grantType === "refresh_token") {
       const attempt = count("identity-refresh");
       if (refreshResponseDelayMs) await new Promise((resolve) => setTimeout(resolve, refreshResponseDelayMs));
+      if (refreshFailureMode === "transient") {
+        return json(res, 503, {
+          error: "temporarily_unavailable",
+          error_description: "Temporary identity service failure."
+        });
+      }
+      if (refreshFailureMode === "invalid_grant") {
+        return json(res, 400, {
+          error: "invalid_grant",
+          error_description: "The stored refresh token was revoked."
+        });
+      }
       return json(res, 200, {
         token_type: "Bearer",
         access_token: `refreshed-access-${attempt}`,
@@ -1267,6 +1280,8 @@ try {
     for (const entry of utilities) {
       assert(!entry.inputSchema?.anyOf, `${entry.name} should not require OneDrive item target fields`, entry.inputSchema);
     }
+    const authStart = utilities.find((entry) => entry.name === "onedrive_auth_device_start");
+    assert(authStart.inputSchema?.properties?.forceReauth?.default === false, "device login should expose an explicit false-by-default forceReauth guard", authStart.inputSchema);
     return { checked: utilities.map((entry) => entry.name).sort() };
   });
 
@@ -1500,11 +1515,24 @@ try {
     return { checked: [findTool.name, findAllTool.name] };
   });
 
-  await check("MSA-only common tenant auth retries device login on consumers endpoint", async () => {
+  await check("healthy authentication suppresses unnecessary device codes", async () => {
+    const before = counters.get("identity-device-start") || 0;
     const result = await tool("onedrive_auth_device_start", { tenant: "common" });
+    assert(!result.isError, "healthy authentication check should succeed", result);
+    assert(result.value.alreadyAuthenticated === true && result.value.deviceCodeIssued === false, "healthy authentication should not issue a device code", result.value);
+    assert((counters.get("identity-device-start") || 0) === before, "healthy authentication must not contact the device-code endpoint", {
+      before,
+      after: counters.get("identity-device-start") || 0
+    });
+    return { alreadyAuthenticated: result.value.alreadyAuthenticated, deviceCodeIssued: result.value.deviceCodeIssued };
+  });
+
+  await check("explicit reauthentication still retries MSA-only common tenant login on consumers", async () => {
+    const result = await tool("onedrive_auth_device_start", { tenant: "common", forceReauth: true });
     assert(!result.isError, "device-code login should retry on consumers", result);
     assert(result.value.authTenant === "consumers", "device-code login should report consumers fallback", result.value);
     assert(result.value.userCode.startsWith("MOCK-CODE-"), "device-code login should return mocked consumers response", result.value);
+    assert(result.value.reauthenticationReason === "explicitly-forced", "forced login should report its reason", result.value);
     assert(authRequests.some((request) => request.path === "/common/oauth2/v2.0/devicecode"), "common endpoint was not attempted", authRequests);
     assert(authRequests.some((request) => request.path === "/consumers/oauth2/v2.0/devicecode"), "consumers endpoint was not attempted", authRequests);
     return { authTenant: result.value.authTenant, paths: authRequests.map((request) => request.path) };
@@ -1582,6 +1610,31 @@ process.exit(2);
         after: counters.get("identity-refresh") || 0
       });
 
+      const healthyDeviceStarts = counters.get("identity-device-start") || 0;
+      const healthyStart = await authClient.tool("onedrive_auth_device_start", { tenant: "consumers" });
+      assert(!healthyStart.isError && healthyStart.value.alreadyAuthenticated === true && healthyStart.value.deviceCodeIssued === false, "healthy Keychain authentication should suppress a new device code", healthyStart);
+      assert((counters.get("identity-device-start") || 0) === healthyDeviceStarts, "healthy Keychain guard should not contact the device-code endpoint", {
+        before: healthyDeviceStarts,
+        after: counters.get("identity-device-start") || 0
+      });
+
+      expiredToken();
+      await authClient.tool("onedrive_logout", { deleteKeychainToken: false });
+      refreshFailureMode = "transient";
+      const transientDeviceStarts = counters.get("identity-device-start") || 0;
+      const transientStart = await authClient.tool("onedrive_auth_device_start", { tenant: "consumers" });
+      assert(transientStart.isError && String(transientStart.value).includes("device login was not started"), "temporary refresh failure should not become a login prompt", transientStart);
+      assert((counters.get("identity-device-start") || 0) === transientDeviceStarts, "temporary refresh failure must not contact the device-code endpoint", {
+        before: transientDeviceStarts,
+        after: counters.get("identity-device-start") || 0
+      });
+
+      refreshFailureMode = "invalid_grant";
+      const rejectedStart = await authClient.tool("onedrive_auth_device_start", { tenant: "consumers" });
+      assert(!rejectedStart.isError && rejectedStart.value.userCode && rejectedStart.value.reauthenticationReason === "stored-credential-rejected", "revoked refresh token should permit a new device login", rejectedStart);
+      refreshFailureMode = null;
+      await authClient.tool("onedrive_logout", { deleteKeychainToken: true, confirmed: true });
+
       expiredToken();
       await authClient.tool("onedrive_logout", { deleteKeychainToken: false });
       refreshResponseDelayMs = 100;
@@ -1628,6 +1681,9 @@ process.exit(2);
       assert(!existsSync(keychainPath), "superseded poll must not persist a Keychain token");
       return {
         refreshRequests: (counters.get("identity-refresh") || 0) - refreshBefore,
+        healthyDeviceCodeSuppressed: true,
+        transientFailureSuppressed: true,
+        revokedTokenPrompted: true,
         lateRefreshDiscarded: true,
         lateDevicePollDiscarded: true,
         supersededDeviceStartDiscarded: true,
@@ -1635,6 +1691,7 @@ process.exit(2);
       };
     } finally {
       refreshResponseDelayMs = 0;
+      refreshFailureMode = null;
       deviceStartResponseDelayMs = 0;
       devicePollResponseDelayMs = 0;
       devicePollShouldSucceed = false;

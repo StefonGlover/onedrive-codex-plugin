@@ -1608,16 +1608,10 @@ try {
   });
 
   const deviceStart = assertOk("auth device start", await tool("onedrive_auth_device_start", { tenant: "consumers" }));
-  record("auth_device_start returns device login metadata", deviceStart.userCode && deviceStart.verificationUri && deviceStart.deviceCodeStoredInMemory === true ? "pass" : "fail", {
-    authTenant: deviceStart.authTenant,
-    expiresIn: deviceStart.expiresIn,
-    verificationUri: deviceStart.verificationUri
-  });
-
-  const devicePoll = assertOk("auth device poll pending", await tool("onedrive_auth_device_poll"));
-  record("auth_device_poll reports pending authorization safely", devicePoll.authorizationPending === true ? "pass" : "fail", {
-    message: devicePoll.message,
-    slowDown: devicePoll.slowDown
+  record("healthy auth suppresses a redundant device code", deviceStart.alreadyAuthenticated === true && deviceStart.deviceCodeIssued === false && !deviceStart.userCode ? "pass" : "fail", {
+    alreadyAuthenticated: deviceStart.alreadyAuthenticated,
+    deviceCodeIssued: deviceStart.deviceCodeIssued,
+    keychainTokenConfigured: deviceStart.keychainTokenConfigured
   });
 
   const logoutMemoryOnly = assertOk("logout memory only", await tool("onedrive_logout", { deleteKeychainToken: false }));

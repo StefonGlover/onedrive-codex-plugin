@@ -23,9 +23,9 @@ When the configured tenant is `common`, the plugin can retry Microsoft-account-o
 
 ## Tool Guidance
 
-- Start with `onedrive_config` to check whether a client ID and Keychain token are configured.
+- Start with `onedrive_config({ checkToken: true })` when authentication state is relevant. A healthy Keychain refresh token must be reused silently.
 - Use `onedrive_doctor` when setup, auth, or Graph access seems questionable, or before a larger workflow where a single health check would save time.
-- Use `onedrive_auth_device_start` when no refresh token is stored. Ask the user to open the returned verification URL and enter the returned user code.
+- Use `onedrive_auth_device_start` only after the token check reports no stored credential or a genuine Microsoft reauthentication error. The tool verifies existing authentication itself and returns `alreadyAuthenticated: true` without issuing a code when Keychain access is healthy. Never turn a timeout, network failure, throttling response, or other temporary verification problem into a device-login prompt. Pass `forceReauth: true` only when the user explicitly asks to switch accounts, repair consent, or sign in again.
 - Use `onedrive_auth_device_poll` after the user finishes browser sign-in.
 - Use `onedrive_logout` only when the user asks to disconnect or reset OneDrive auth. Do not delete the Keychain token unless the user explicitly asks.
 - Use `onedrive_me` to confirm the signed-in account.

@@ -46,4 +46,4 @@ NODE
 
 chmod 600 "$config_file"
 echo "Wrote $config_file"
-echo "Next: reinstall/refresh the plugin, start a fresh Codex thread, then run onedrive_auth_device_start."
+echo "Next: reinstall/refresh the plugin, start a fresh Codex thread, then run onedrive_config with checkToken=true. Start device login only if no reusable credential exists."
