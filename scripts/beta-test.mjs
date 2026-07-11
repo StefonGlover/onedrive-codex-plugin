@@ -827,13 +827,32 @@ try {
     powerpointSlides: powerpointStructured.slideCount
   });
 
-  const wordOfficePreview = assertOk("word native edit preview", await tool("onedrive_word_batch_update", { path: `${folderName}/doc.docx`, operations: [{ type: "setParagraphText", paragraphIndex: 0, text: `Beta Word ${unique}` }] }));
-  const wordOfficeLive = assertOk("word native edit live", await tool("onedrive_word_batch_update", { path: `${folderName}/doc.docx`, operations: [{ type: "setParagraphText", paragraphIndex: 0, text: `Beta Word ${unique}` }], dryRun: false, confirmed: true, expectedName: "doc.docx", previewToken: wordOfficePreview.previewToken }));
-  const excelOfficePreview = assertOk("excel native edit preview", await tool("onedrive_excel_batch_update", { path: `${folderName}/book.xlsx`, backend: "auto", operations: [{ type: "setRange", sheet: "Data", address: "A3:B3", values: [[unique, 42]] }] }));
-  const excelOfficeLive = assertOk("excel native edit live", await tool("onedrive_excel_batch_update", { path: `${folderName}/book.xlsx`, backend: "auto", operations: [{ type: "setRange", sheet: "Data", address: "A3:B3", values: [[unique, 42]] }], dryRun: false, confirmed: true, expectedName: "book.xlsx", previewToken: excelOfficePreview.previewToken }));
-  const powerpointOfficePreview = assertOk("powerpoint native edit preview", await tool("onedrive_powerpoint_batch_update", { path: `${folderName}/deck.pptx`, operations: [{ type: "setShapeText", slideIndex: 0, shapeId: "2", text: `Beta PowerPoint ${unique}` }] }));
-  const powerpointOfficeLive = assertOk("powerpoint native edit live", await tool("onedrive_powerpoint_batch_update", { path: `${folderName}/deck.pptx`, operations: [{ type: "setShapeText", slideIndex: 0, shapeId: "2", text: `Beta PowerPoint ${unique}` }], dryRun: false, confirmed: true, expectedName: "deck.pptx", previewToken: powerpointOfficePreview.previewToken }));
-  record("native Office preview and live commits", wordOfficeLive.changeCount === 1 && excelOfficeLive.changeCount === 2 && powerpointOfficeLive.changeCount === 1 ? "pass" : "fail", {
+  const wordOfficeOperations = [
+    { type: "setParagraphText", paragraphIndex: 0, text: `Beta Word ${unique}` },
+    { type: "addHyperlink", paragraphIndex: 0, text: "Microsoft", url: "https://www.microsoft.com" },
+    { type: "addComment", paragraphIndex: 0, text: `Beta comment ${unique}`, author: "Codex", initials: "CX" },
+    { type: "insertTable", afterParagraphIndex: 0, rows: [["Beta", unique]] }
+  ];
+  const wordOfficePreview = assertOk("word native edit preview", await tool("onedrive_word_batch_update", { path: `${folderName}/doc.docx`, operations: wordOfficeOperations }));
+  const wordOfficeLive = assertOk("word native edit live", await tool("onedrive_word_batch_update", { path: `${folderName}/doc.docx`, operations: wordOfficeOperations, dryRun: false, confirmed: true, expectedName: "doc.docx", previewToken: wordOfficePreview.previewToken }));
+  const excelOfficeOperations = [
+    { type: "setRange", sheet: "Data", address: "A3:B3", values: [[unique, 42]] },
+    { type: "setNumberFormat", sheet: "Data", address: "B3", formatCode: "0.00" },
+    { type: "recalculate" }
+  ];
+  const excelOfficePreview = assertOk("excel native edit preview", await tool("onedrive_excel_batch_update", { path: `${folderName}/book.xlsx`, backend: "auto", operations: excelOfficeOperations }));
+  const excelOfficeLive = assertOk("excel native edit live", await tool("onedrive_excel_batch_update", { path: `${folderName}/book.xlsx`, backend: "auto", operations: excelOfficeOperations, dryRun: false, confirmed: true, expectedName: "book.xlsx", previewToken: excelOfficePreview.previewToken }));
+  const powerpointOfficeOperations = [
+    { type: "setShapeText", slideIndex: 0, shapeId: "2", text: `Beta PowerPoint ${unique}` },
+    { type: "setTextStyle", slideIndex: 0, shapeId: "2", fontFamily: "Aptos", fontSize: 18, bold: true, color: "2563EB" },
+    { type: "addTextBox", slideIndex: 0, shapeId: 10, text: "Temporary beta text box", x: 100, y: 100, width: 1000000, height: 400000 },
+    { type: "deleteShape", slideIndex: 0, shapeId: 10 },
+    { type: "replaceImage", slideIndex: 0, shapeId: "3", base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", contentType: "image/png" },
+    { type: "duplicateSlide", slideIndex: 0 }
+  ];
+  const powerpointOfficePreview = assertOk("powerpoint native edit preview", await tool("onedrive_powerpoint_batch_update", { path: `${folderName}/deck.pptx`, operations: powerpointOfficeOperations }));
+  const powerpointOfficeLive = assertOk("powerpoint native edit live", await tool("onedrive_powerpoint_batch_update", { path: `${folderName}/deck.pptx`, operations: powerpointOfficeOperations, dryRun: false, confirmed: true, expectedName: "deck.pptx", previewToken: powerpointOfficePreview.previewToken }));
+  record("native Office preview and live commits", wordOfficeLive.changeCount === 4 && excelOfficeLive.changeCount === 4 && powerpointOfficeLive.changeCount === 6 ? "pass" : "fail", {
     wordChanges: wordOfficeLive.changeCount,
     excelChanges: excelOfficeLive.changeCount,
     powerpointChanges: powerpointOfficeLive.changeCount
