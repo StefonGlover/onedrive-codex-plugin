@@ -336,6 +336,7 @@ scripts/beta-test.mjs
 ```
 
 The test creates a clearly named temporary OneDrive folder, exercises CRUD and safety behavior, deletes only that test folder during cleanup, and removes local temporary work on success. Pass `--keep-work` to keep local artifacts for debugging.
+Unknown, duplicate, and positional CLI options are rejected before the beta harness starts, so a misspelled safety or mode flag cannot silently fall through to a different test mode.
 
 Find old beta-test folders without deleting them. Cleanup discovery uses bounded Graph search followed by item verification, so it does not recursively scan the entire drive. Candidates with missing or invalid timestamps are skipped, and invalid/overflowing cleanup limits are rejected before any delete:
 

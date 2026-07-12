@@ -14,10 +14,43 @@ const betaFolderPrefix = "Codex OneDrive Plugin Beta Test codex-beta-";
 const maxCleanupStaleDays = 1_000_000;
 
 function parseCliArgs(argv = []) {
-  return Object.fromEntries(argv.map((arg) => {
-    const [key, ...rest] = arg.replace(/^--/, "").split("=");
-    return [key, rest.length ? rest.join("=") : true];
-  }));
+  const parsed = {};
+  for (const arg of argv) {
+    if (!arg.startsWith("--")) {
+      throw new Error(`Unexpected positional argument: ${arg}. Options must use --name or --name=value.`);
+    }
+    const [key, ...rest] = arg.slice(2).split("=");
+    if (!key) throw new Error("Empty CLI option is not allowed.");
+    if (Object.hasOwn(parsed, key)) throw new Error(`--${key} may only be provided once.`);
+    parsed[key] = rest.length ? rest.join("=") : true;
+  }
+  return parsed;
+}
+
+const allowedCliArgs = new Set([
+  "keep-work",
+  "doctor-only",
+  "cleanup-stale",
+  "confirmed",
+  "delete",
+  "stale-days",
+  "cleanup-max-items",
+  "cleanup-max-results",
+  "cleanup-page-size",
+  "cleanup-verify-concurrency",
+  "cleanup-search-query",
+  "read-retry-attempts",
+  "read-retry-delay-ms",
+  "tenant-matrix",
+  "tenant-matrix-live",
+  "self-check"
+]);
+
+function validateCliArgs(args = {}) {
+  for (const key of Object.keys(args)) {
+    if (!allowedCliArgs.has(key)) throw new Error(`Unknown CLI option: --${key}.`);
+  }
+  return args;
 }
 
 function parseBooleanFlag(value, name, defaultValue = false) {
@@ -141,7 +174,7 @@ async function retryTransientReadCall(name, call, options = {}) {
   throw lastError || new Error(`${name} failed without a result.`);
 }
 
-const cliArgs = parseCliArgs(process.argv.slice(2));
+const cliArgs = validateCliArgs(parseCliArgs(process.argv.slice(2)));
 const keepWork = parseBooleanFlag(cliArgs["keep-work"], "keep-work");
 const doctorOnly = parseBooleanFlag(cliArgs["doctor-only"], "doctor-only");
 const cleanupStale = parseBooleanFlag(cliArgs["cleanup-stale"], "cleanup-stale");
@@ -178,6 +211,9 @@ if (selfCheck) {
   const checks = {
     explicitFalseFlag: parseBooleanFlag("false", "probe", true) === false,
     explicitTrueFlag: parseBooleanFlag("true", "probe") === true,
+    positionalArgumentRejected: throws(() => parseCliArgs(["unexpected"])),
+    duplicateOptionRejected: throws(() => parseCliArgs(["--keep-work", "--keep-work=false"])),
+    unknownOptionRejected: throws(() => validateCliArgs(parseCliArgs(["--keep-wrok"]))),
     negativeStaleDaysRejected: throws(() => parseNonNegativeNumberFlag("-1", "stale-days", 1)),
     nonFiniteStaleDaysRejected: throws(() => parseNonNegativeNumberFlag("NaN", "stale-days", 1)),
     overflowingStaleDaysRejected: throws(() => parseNonNegativeNumberFlag("1e308", "stale-days", 1, maxCleanupStaleDays)),

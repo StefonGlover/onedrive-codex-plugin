@@ -92,5 +92,6 @@ When the configured tenant is `common`, the plugin can retry Microsoft-account-o
 - Run `scripts/prepackage-check.mjs` before reinstalling the plugin cache.
 - Run `scripts/prepackage-check.mjs --installed <installed-cache-path>` after reinstalling to catch source/cache drift.
 - Run `scripts/beta-test.mjs` only when live OneDrive CRUD verification is intended.
+- The beta harness rejects unknown, duplicate, and positional CLI options before startup; correct a rejected flag instead of retrying with a guessed alternative.
 - Run `scripts/beta-test.mjs --cleanup-stale --stale-days=1` to dry-run cleanup of old `Codex OneDrive Plugin Beta Test ...` folders; add `--confirmed` only after reviewing candidates. Cleanup discovers candidates with bounded search and verifies each item; missing/invalid timestamps fail closed and are skipped.
 - Run `scripts/beta-test.mjs --tenant-matrix=common,consumers,organizations` for read-only tenant health checks, and add `--tenant-matrix-live` only when full live beta runs are intended for each tenant.
