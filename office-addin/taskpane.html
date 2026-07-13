@@ -15,7 +15,7 @@
   <h1>Office Companion</h1>
   <p id="host">Loading Office capabilities…</p>
   <p class="warn">Commands stay inside this task pane and the active document. Review JSON before applying it.</p>
-  <textarea id="command" aria-label="Typed Office command">{"type":"replaceText","find":"old text","replace":"new text"}</textarea>
+  <textarea id="command" aria-label="Typed Office command" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>
   <button id="apply" disabled>Apply to active document</button>
   <pre id="result" aria-live="polite"></pre>
 </body>

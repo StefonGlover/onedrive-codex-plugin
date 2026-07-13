@@ -1,0 +1,96 @@
+export const ONEDRIVE_TOOL_CONTRACT = Object.freeze([
+  "onedrive_config",
+  "onedrive_auth_device_start",
+  "onedrive_auth_device_poll",
+  "onedrive_logout",
+  "onedrive_doctor",
+  "onedrive_me",
+  "onedrive_drive",
+  "onedrive_presets",
+  "onedrive_list",
+  "onedrive_list_all",
+  "onedrive_scan",
+  "onedrive_search",
+  "onedrive_search_all",
+  "onedrive_find",
+  "onedrive_find_all",
+  "onedrive_delta",
+  "onedrive_sync_status",
+  "onedrive_cache_refresh",
+  "onedrive_cache_clear",
+  "onedrive_content_index_refresh",
+  "onedrive_content_search",
+  "onedrive_content_index_clear",
+  "onedrive_office_capabilities",
+  "onedrive_office_validate",
+  "onedrive_office_index_refresh",
+  "onedrive_office_search",
+  "onedrive_word_get_document",
+  "onedrive_excel_get_workbook",
+  "onedrive_powerpoint_get_presentation",
+  "onedrive_word_batch_update",
+  "onedrive_excel_batch_update",
+  "onedrive_powerpoint_batch_update",
+  "onedrive_office_batch_transform",
+  "onedrive_office_backups",
+  "onedrive_office_compare_backup",
+  "onedrive_office_restore_backup",
+  "onedrive_get_info",
+  "onedrive_read_text",
+  "onedrive_preview",
+  "onedrive_download",
+  "onedrive_download_excel",
+  "onedrive_download_word",
+  "onedrive_download_powerpoint",
+  "onedrive_export_pdf",
+  "onedrive_export_text",
+  "onedrive_upload",
+  "onedrive_write_text",
+  "onedrive_create_folder",
+  "onedrive_rename",
+  "onedrive_move",
+  "onedrive_copy",
+  "onedrive_create_sharing_link",
+  "onedrive_invite_permission",
+  "onedrive_revoke_permission",
+  "onedrive_batch_revoke_permissions",
+  "onedrive_permissions",
+  "onedrive_batch_get_info",
+  "onedrive_batch_permissions",
+  "onedrive_batch_download",
+  "onedrive_batch_delete",
+  "onedrive_batch_move",
+  "onedrive_update_file",
+  "onedrive_recent",
+  "onedrive_large_files",
+  "onedrive_duplicates",
+  "onedrive_shared_by_me",
+  "onedrive_public_links",
+  "onedrive_restore_deleted",
+  "onedrive_audit_recent",
+  "onedrive_audit_export",
+  "onedrive_audit_clear",
+  "onedrive_delete"
+]);
+
+if (ONEDRIVE_TOOL_CONTRACT.length !== 72 || new Set(ONEDRIVE_TOOL_CONTRACT).size !== 72) {
+  throw new Error("OneDrive tool contract must contain exactly 72 unique tool names.");
+}
+
+export function compareToolContract(actualNames = []) {
+  const expected = [...ONEDRIVE_TOOL_CONTRACT].sort();
+  const actual = [...actualNames].sort();
+  const expectedSet = new Set(expected);
+  const actualSet = new Set(actual);
+  return {
+    ok: expected.length === actual.length
+      && actualSet.size === actual.length
+      && expected.every((name, index) => name === actual[index]),
+    expectedCount: expected.length,
+    actualCount: actual.length,
+    uniqueActualCount: actualSet.size,
+    missing: expected.filter((name) => !actualSet.has(name)),
+    extra: actual.filter((name) => !expectedSet.has(name)),
+    duplicates: actual.filter((name, index) => actual.indexOf(name) !== index)
+  };
+}

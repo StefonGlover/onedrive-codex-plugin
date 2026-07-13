@@ -3,7 +3,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createReadStream, createWriteStream, readFileSync } from "node:fs";
 import { appendFile, chmod, copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename as renameFile, rm, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, extname, join, parse, relative, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, parse, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
@@ -37,7 +37,8 @@ const localOneDriveSyncRoots = [
   { path: join(homedir(), "Library", "CloudStorage", "OneDrive"), prefix: false },
   { path: join(homedir(), "Library", "CloudStorage", "OneDrive-"), prefix: true },
   { path: join(homedir(), "OneDrive"), prefix: false },
-  { path: join(homedir(), "OneDrive - "), prefix: true }
+  { path: join(homedir(), "OneDrive - "), prefix: true },
+  ...readAdditionalLocalSyncRoots()
 ];
 const textFileLimit = 5 * 1024 * 1024;
 const maxTextFileReadLimit = 10 * 1024 * 1024;
@@ -106,17 +107,33 @@ let pendingDevice = null;
 let tokenRefreshPromise = null;
 let authGeneration = 0;
 let deviceLoginGeneration = 0;
+let storageScopeGeneration = 0;
 let metadataCacheMemory = null;
 let contentIndexMemory = null;
+let metadataCacheMemoryGeneration = null;
+let contentIndexMemoryGeneration = null;
 let metadataCacheLoadPromise = null;
 let contentIndexLoadPromise = null;
+let metadataCacheLoadGeneration = null;
+let contentIndexLoadGeneration = null;
 let metadataCacheFileVersion = null;
 let contentIndexFileVersion = null;
 let metadataMutationQueue = Promise.resolve();
 let contentIndexMutationQueue = Promise.resolve();
+let activeStorageScopePromise = null;
+let activeStorageScopeKey = null;
+let activeStorageScopeGeneration = null;
+const testAuthContextId = process.env.ONEDRIVE_TEST_AUTH_CONTEXT_ID || randomUUID();
 
 const previewTokens = new Map();
 const previewTokenTtlMs = 15 * 60 * 1000;
+const previewScopedTools = new Set([
+  "onedrive_upload", "onedrive_write_text", "onedrive_batch_delete", "onedrive_delete",
+  "onedrive_create_sharing_link", "onedrive_invite_permission", "onedrive_revoke_permission",
+  "onedrive_batch_revoke_permissions", "onedrive_restore_deleted", "onedrive_word_batch_update",
+  "onedrive_excel_batch_update", "onedrive_powerpoint_batch_update", "onedrive_office_batch_transform",
+  "onedrive_office_restore_backup"
+]);
 const partialBatchMutationWarning = "Batch live mutations are preflighted but not atomic; if a later item fails, earlier remote changes may already have taken effect.";
 const toolCallContext = new AsyncLocalStorage();
 
@@ -606,6 +623,7 @@ const tools = [
         nextLink: { type: "string", description: "Previous @odata.nextLink returned by onedrive_delta." },
         pageSize: { type: "integer", minimum: 1, maximum: 200, default: 200 },
         maxItems: { type: "integer", minimum: 1, maximum: 5000, default: 1000 },
+        maxPages: { type: "integer", minimum: 1, maximum: 100, description: "Optional maximum number of Microsoft Graph delta pages to fetch in this call. Returns the advanced nextLink or terminal deltaLink when reached." },
         format: outputFormatSchema
       },
       additionalProperties: false
@@ -866,7 +884,7 @@ const tools = [
             properties: {
               ...officeTargetProperties,
               kind: { type: "string", enum: ["word", "excel", "powerpoint"] },
-              operations: { type: "array", minItems: 1, maxItems: 100, items: { type: "object" } },
+              operations: { anyOf: [wordOperationsSchema, excelOperationsSchema, powerpointOperationsSchema] },
               expectedName: { type: "string" },
               expectedId: { type: "string" },
               backend: { type: "string", enum: ["auto", "openxml", "graph"], default: "auto" },
@@ -1105,6 +1123,11 @@ const tools = [
         remotePath: { type: "string", description: "Destination path relative to OneDrive root, including filename." },
         ...remotePresetProperties,
         conflictBehavior: { type: "string", enum: ["fail", "replace", "rename"], default: "fail" },
+        dryRun: { type: "boolean", default: true, description: "When replacing an existing file, return a guarded preview unless explicitly set to false." },
+        confirmed: { type: "boolean", default: false },
+        expectedName: { type: "string", description: "Required identity check when replacing an existing file." },
+        expectedId: { type: "string", description: "Required identity check when replacing an existing file." },
+        previewToken: previewTokenSchema,
         uploadMode: { type: "string", enum: ["auto", "simple", "session"], default: "auto" },
         allowLocalOneDriveSyncPath: {
           type: "boolean",
@@ -1133,7 +1156,12 @@ const tools = [
         remotePath: { type: "string", description: "Destination path relative to OneDrive root, including filename." },
         ...remotePresetProperties,
         content: { type: "string" },
-        conflictBehavior: { type: "string", enum: ["fail", "replace", "rename"], default: "fail" }
+        conflictBehavior: { type: "string", enum: ["fail", "replace", "rename"], default: "fail" },
+        dryRun: { type: "boolean", default: true, description: "When replacing an existing file, return a guarded preview unless explicitly set to false." },
+        confirmed: { type: "boolean", default: false },
+        expectedName: { type: "string", description: "Required identity check when replacing an existing file." },
+        expectedId: { type: "string", description: "Required identity check when replacing an existing file." },
+        previewToken: previewTokenSchema
       },
       additionalProperties: false
     }
@@ -1468,7 +1496,7 @@ const tools = [
             properties: {
               ...pathTargetProperties,
               localPath: { type: "string" },
-              overwrite: { type: "boolean", default: false }
+              overwrite: { type: "boolean" }
             },
             additionalProperties: false
           }
@@ -1857,7 +1885,31 @@ function validateToolArguments(name, args = {}) {
   const tool = toolByName.get(name);
   if (!tool) return { ok: true, args };
   const result = validateSchemaValue(args || {}, tool.inputSchema || { type: "object" }, "$");
-  if (result.ok) return { ok: true, args: result.value };
+  if (result.ok) {
+    const pairedFields = [
+      ["destinationParentRelativePath", "destinationParentPreset"],
+      ["parentRelativePath", "parentPreset"],
+      ["remoteRelativePath", "remotePreset"]
+    ];
+    const pairDetails = pairedFields
+      .filter(([relativeField, presetField]) => result.value?.[relativeField] !== undefined && !result.value?.[presetField])
+      .map(([relativeField, presetField]) => validationDetail(`$.${relativeField}`, `${relativeField} requires ${presetField}.`));
+    const officeKindDetails = [];
+    if (name === "onedrive_office_batch_transform") {
+      const schemas = { word: wordOperationsSchema, excel: excelOperationsSchema, powerpoint: powerpointOperationsSchema };
+      for (const [index, item] of (result.value?.items || []).entries()) {
+        const operationResult = validateSchemaValue(item.operations, schemas[item.kind] || {}, `$.items[${index}].operations`);
+        if (!operationResult.ok) {
+          officeKindDetails.push(validationDetail(`$.items[${index}].operations`, `Operations do not match kind ${item.kind}.`), ...operationResult.details);
+        } else {
+          item.operations = operationResult.value;
+        }
+      }
+    }
+    const semanticDetails = [...pairDetails, ...officeKindDetails];
+    if (!semanticDetails.length) return { ok: true, args: result.value };
+    return { ok: false, error: { error: "invalid_arguments", tool: name, details: semanticDetails } };
+  }
   return {
     ok: false,
     error: {
@@ -1866,6 +1918,21 @@ function validateToolArguments(name, args = {}) {
       details: result.details
     }
   };
+}
+
+function readAdditionalLocalSyncRoots() {
+  const raw = process.env.ONEDRIVE_ADDITIONAL_LOCAL_SYNC_ROOTS;
+  if (!raw) return [];
+  let paths;
+  try {
+    paths = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`ONEDRIVE_ADDITIONAL_LOCAL_SYNC_ROOTS must be a JSON array of absolute paths: ${error.message}`);
+  }
+  if (!Array.isArray(paths) || paths.some((path) => typeof path !== "string" || !path.trim() || !isAbsolute(path))) {
+    throw new Error("ONEDRIVE_ADDITIONAL_LOCAL_SYNC_ROOTS must be a JSON array containing only non-empty absolute paths.");
+  }
+  return [...new Set(paths.map((path) => resolve(path)))].map((path) => ({ path, prefix: false }));
 }
 
 function readLocalConfig() {
@@ -1882,6 +1949,139 @@ function config(overrides = {}) {
   const scopes = overrides.scopes || process.env.ONEDRIVE_SCOPES || localConfig.scopes || "offline_access User.Read Files.ReadWrite";
   const keychainService = process.env.ONEDRIVE_KEYCHAIN_SERVICE || localConfig.keychainService || "Codex OneDrive";
   return { clientId, tenant, scopes, keychainService };
+}
+
+function normalizeAuthContextToken(token = {}) {
+  if (token.auth_context_id) return token;
+  return { ...token, auth_context_id: randomUUID() };
+}
+
+function invalidateActiveStorageScope() {
+  storageScopeGeneration += 1;
+  activeStorageScopePromise = null;
+  activeStorageScopeKey = null;
+  activeStorageScopeGeneration = null;
+  metadataCacheMemory = null;
+  contentIndexMemory = null;
+  metadataCacheMemoryGeneration = null;
+  contentIndexMemoryGeneration = null;
+  metadataCacheLoadPromise = null;
+  contentIndexLoadPromise = null;
+  metadataCacheLoadGeneration = null;
+  contentIndexLoadGeneration = null;
+  metadataCacheFileVersion = null;
+  contentIndexFileVersion = null;
+  previewTokens.clear();
+}
+
+function accountContextChangedError(operation = "OneDrive operation") {
+  const error = new Error(`${operation} was cancelled because the OneDrive authentication or storage scope changed while it was in flight.`);
+  error.code = "ONEDRIVE_ACCOUNT_CONTEXT_CHANGED";
+  return error;
+}
+
+function isAccountContextChangedError(error) {
+  return error?.code === "ONEDRIVE_ACCOUNT_CONTEXT_CHANGED";
+}
+
+function assertToolAccountGeneration(operation = "OneDrive operation") {
+  const store = toolCallContext.getStore();
+  if (!store) return;
+  if (store.authGeneration !== authGeneration || store.storageScopeGeneration !== storageScopeGeneration) {
+    throw accountContextChangedError(operation);
+  }
+}
+
+function adoptCurrentToolAccountGeneration() {
+  const store = toolCallContext.getStore();
+  if (!store) return;
+  store.authGeneration = authGeneration;
+  store.storageScopeGeneration = storageScopeGeneration;
+}
+
+function currentAuthContextId() {
+  if (process.env.ONEDRIVE_TEST_ACCESS_TOKEN) return testAuthContextId;
+  const cfg = config();
+  const current = tokenCache || getKeychainToken(cfg);
+  if (!current) return null;
+  if (current.auth_context_id) return current.auth_context_id;
+  const migrated = normalizeAuthContextToken(current);
+  tokenCache = migrated;
+  setKeychainToken(migrated, cfg);
+  return migrated.auth_context_id;
+}
+
+function storageScopesEqual(left, right) {
+  return Boolean(left?.authContextId && left?.driveId
+    && left.authContextId === right?.authContextId
+    && left.driveId === right?.driveId);
+}
+
+function storageScopeKey(scope) {
+  return scope?.authContextId && scope?.driveId ? `${scope.authContextId}:${scope.driveId}` : null;
+}
+
+function assertStorageScopeGuard(guard, operation = "OneDrive local-state operation") {
+  assertToolAccountGeneration(operation);
+  if (!guard?.scope || guard.generation !== storageScopeGeneration) throw accountContextChangedError(operation);
+  const authContextId = currentAuthContextId();
+  if (!authContextId || authContextId !== guard.scope.authContextId) throw accountContextChangedError(operation);
+  if (activeStorageScopeGeneration !== guard.generation || activeStorageScopeKey !== storageScopeKey(guard.scope)) {
+    throw accountContextChangedError(operation);
+  }
+  return guard;
+}
+
+async function captureStorageScopeGuard(operation = "OneDrive local-state operation") {
+  assertToolAccountGeneration(operation);
+  const generation = storageScopeGeneration;
+  const scope = await activeStorageScope();
+  return assertStorageScopeGuard({ generation, scope }, operation);
+}
+
+async function activeStorageScope() {
+  assertToolAccountGeneration("OneDrive storage-scope resolution");
+  const generation = storageScopeGeneration;
+  await getAccessToken();
+  if (generation !== storageScopeGeneration) throw accountContextChangedError("OneDrive storage-scope resolution");
+  assertToolAccountGeneration("OneDrive storage-scope resolution");
+  const authContextId = currentAuthContextId();
+  if (!authContextId) throw new Error("OneDrive authentication context is unavailable. Refusing to use account-scoped local state.");
+  if (activeStorageScopePromise
+    && activeStorageScopeGeneration === generation
+    && activeStorageScopeKey?.startsWith(`${authContextId}:`)) {
+    const scope = await activeStorageScopePromise;
+    return assertStorageScopeGuard({ generation, scope }, "OneDrive storage-scope resolution").scope;
+  }
+  const promise = (async () => {
+    const drive = await graph("/me/drive?$select=id");
+    if (generation !== storageScopeGeneration || currentAuthContextId() !== authContextId) {
+      throw accountContextChangedError("OneDrive storage-scope resolution");
+    }
+    if (!drive?.id) throw new Error("Microsoft Graph did not return the current OneDrive drive ID. Refusing to use account-scoped local state.");
+    return { authContextId, driveId: drive.id };
+  })();
+  activeStorageScopePromise = promise;
+  activeStorageScopeKey = `${authContextId}:pending`;
+  activeStorageScopeGeneration = generation;
+  try {
+    const scope = await promise;
+    if (activeStorageScopePromise !== promise
+      || activeStorageScopeGeneration !== generation
+      || generation !== storageScopeGeneration
+      || currentAuthContextId() !== authContextId) {
+      throw accountContextChangedError("OneDrive storage-scope resolution");
+    }
+    activeStorageScopeKey = storageScopeKey(scope);
+    return assertStorageScopeGuard({ generation, scope }, "OneDrive storage-scope resolution").scope;
+  } catch (error) {
+    if (activeStorageScopePromise === promise) {
+      activeStorageScopePromise = null;
+      activeStorageScopeKey = null;
+      activeStorageScopeGeneration = null;
+    }
+    throw error;
+  }
 }
 
 function boolSetting(value, defaultValue) {
@@ -2047,9 +2247,10 @@ function publicConfig() {
   };
 }
 
-function emptyMetadataCache() {
+function emptyMetadataCache(scope = null) {
   return {
-    version: 3,
+    version: 4,
+    scope,
     createdAt: new Date().toISOString(),
     updatedAt: null,
     deltaLink: null,
@@ -2082,15 +2283,17 @@ async function writePrivateFile(path, data, options = {}) {
 }
 
 async function writePrivateFileAtomic(path, data, options = {}) {
+  const { beforeCommit, ...writeOptions } = options;
   await ensurePrivateDirectory(dirname(path));
   const temporaryPath = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
   let handle;
   try {
     handle = await open(temporaryPath, "wx", 0o600);
-    await handle.writeFile(data, options);
+    await handle.writeFile(data, writeOptions);
     await handle.sync();
     await handle.close();
     handle = null;
+    if (beforeCommit) await beforeCommit();
     await renameFile(temporaryPath, path);
     await hardenPrivateFile(path);
   } finally {
@@ -2182,11 +2385,12 @@ async function runSerialized(queueName, fn) {
   }
 }
 
-function normalizeMetadataCache(parsed = {}) {
+function normalizeMetadataCache(parsed = {}, scope = null) {
   const cache = {
-    ...emptyMetadataCache(),
+    ...emptyMetadataCache(scope),
     ...parsed,
-    version: 3,
+    version: 4,
+    scope,
     itemsById: parsed.itemsById || {},
     pathsByLower: parsed.pathsByLower || {},
     pathRootsById: parsed.pathRootsById || {}
@@ -2199,50 +2403,106 @@ function normalizeMetadataCache(parsed = {}) {
   return cache;
 }
 
-async function readMetadataCacheFromDisk() {
+async function readMetadataCacheFromDisk(existingGuard = null) {
+  const guard = existingGuard || await captureStorageScopeGuard("metadata cache read");
+  assertStorageScopeGuard(guard, "metadata cache read");
   await ensurePrivateDirectory(cacheRoot);
   try {
     const parsed = JSON.parse(await readFile(cachePath, "utf8"));
     await hardenPrivateFile(cachePath);
-    return normalizeMetadataCache(parsed);
+    assertStorageScopeGuard(guard, "metadata cache read");
+    if (parsed.version !== 4 || !storageScopesEqual(parsed.scope, guard.scope)) return emptyMetadataCache(guard.scope);
+    return normalizeMetadataCache(parsed, guard.scope);
   } catch (error) {
-    if (error?.code === "ENOENT") return emptyMetadataCache();
+    if (error?.code === "ENOENT") {
+      assertStorageScopeGuard(guard, "metadata cache read");
+      return emptyMetadataCache(guard.scope);
+    }
     throw error;
   }
 }
 
 async function loadMetadataCache() {
+  const guard = await captureStorageScopeGuard("metadata cache load");
+  if (metadataCacheLoadPromise && metadataCacheLoadGeneration !== guard.generation) {
+    throw accountContextChangedError("metadata cache load");
+  }
   if (!metadataCacheLoadPromise) {
-    metadataCacheLoadPromise = (async () => {
+    let loadPromise;
+    loadPromise = (async () => {
       try {
+        assertStorageScopeGuard(guard, "metadata cache load");
         const diskVersion = await localFileVersion(cachePath);
-        if (metadataCacheMemory && diskVersion === metadataCacheFileVersion) return metadataCacheMemory;
+        assertStorageScopeGuard(guard, "metadata cache load");
+        if (metadataCacheMemory
+          && metadataCacheMemoryGeneration === guard.generation
+          && storageScopesEqual(metadataCacheMemory.scope, guard.scope)
+          && diskVersion === metadataCacheFileVersion) return metadataCacheMemory;
+        let loaded = null;
         await withFileLock(metadataCacheLockPath, async () => {
+          assertStorageScopeGuard(guard, "metadata cache load");
           const lockedVersion = await localFileVersion(cachePath);
-          if (metadataCacheMemory && lockedVersion === metadataCacheFileVersion) return;
-          metadataCacheMemory = await readMetadataCacheFromDisk();
+          assertStorageScopeGuard(guard, "metadata cache load");
+          if (metadataCacheMemory
+            && metadataCacheMemoryGeneration === guard.generation
+            && storageScopesEqual(metadataCacheMemory.scope, guard.scope)
+            && lockedVersion === metadataCacheFileVersion) {
+            loaded = metadataCacheMemory;
+            return;
+          }
+          loaded = await readMetadataCacheFromDisk(guard);
+          assertStorageScopeGuard(guard, "metadata cache publication");
+          metadataCacheMemory = loaded;
+          metadataCacheMemoryGeneration = guard.generation;
           metadataCacheFileVersion = await localFileVersion(cachePath);
         });
+        assertStorageScopeGuard(guard, "metadata cache return");
+        return loaded || metadataCacheMemory;
       } catch (error) {
+        if (isAccountContextChangedError(error)) throw error;
         recordLocalWarning("metadata cache read", error);
-        metadataCacheMemory = emptyMetadataCache();
+        assertStorageScopeGuard(guard, "metadata cache fallback publication");
+        metadataCacheMemory = emptyMetadataCache(guard.scope);
+        metadataCacheMemoryGeneration = guard.generation;
         metadataCacheFileVersion = null;
       } finally {
-        metadataCacheLoadPromise = null;
+        if (metadataCacheLoadPromise === loadPromise) {
+          metadataCacheLoadPromise = null;
+          metadataCacheLoadGeneration = null;
+        }
       }
+      assertStorageScopeGuard(guard, "metadata cache return");
       return metadataCacheMemory;
     })();
+    metadataCacheLoadPromise = loadPromise;
+    metadataCacheLoadGeneration = guard.generation;
   }
-  return await metadataCacheLoadPromise;
+  const result = await metadataCacheLoadPromise;
+  assertStorageScopeGuard(guard, "metadata cache return");
+  if (!storageScopesEqual(result?.scope, guard.scope)) throw accountContextChangedError("metadata cache return");
+  return result;
 }
 
-async function saveMetadataCache(cache) {
+async function saveMetadataCache(cache, existingGuard = null) {
+  const guard = existingGuard || await captureStorageScopeGuard("metadata cache write");
+  assertStorageScopeGuard(guard, "metadata cache write");
+  if (cache.scope && !storageScopesEqual(cache.scope, guard.scope)) {
+    throw new Error("Metadata cache scope changed during this operation. Refusing to persist cross-account state.");
+  }
+  cache.version = 4;
+  cache.scope = guard.scope;
   cache.updatedAt = new Date().toISOString();
   cache.itemCount = Object.keys(cache.itemsById || {}).length;
   await ensurePrivateDirectory(cacheRoot);
-  await writePrivateFileAtomic(cachePath, JSON.stringify(cache));
+  assertStorageScopeGuard(guard, "metadata cache write");
+  await writePrivateFileAtomic(cachePath, JSON.stringify(cache), {
+    beforeCommit: async () => assertStorageScopeGuard(guard, "metadata cache commit")
+  });
+  assertStorageScopeGuard(guard, "metadata cache publication");
   metadataCacheMemory = cache;
+  metadataCacheMemoryGeneration = guard.generation;
   metadataCacheFileVersion = await localFileVersion(cachePath);
+  assertStorageScopeGuard(guard, "metadata cache return");
   const store = toolCallContext.getStore();
   if (store) store.metadataCacheWrites = (store.metadataCacheWrites || 0) + 1;
   return cache;
@@ -2425,6 +2685,7 @@ function resolveUnresolvedCachedPaths(cache) {
 }
 
 async function cacheItems(items = [], metadata = {}) {
+  const guard = await captureStorageScopeGuard("metadata cache update");
   const hasMetadata = metadata.deltaLink !== undefined
     || metadata.deltaNextLink !== undefined
     || metadata.deltaTarget !== undefined
@@ -2432,12 +2693,18 @@ async function cacheItems(items = [], metadata = {}) {
     || metadata.pathRoot !== undefined;
   if (!items.length && !hasMetadata) return await loadMetadataCache();
   return await runSerialized("metadata", async () => await withFileLock(metadataCacheLockPath, async () => {
+    assertStorageScopeGuard(guard, "metadata cache update");
     let cache;
     try {
-      cache = await readMetadataCacheFromDisk();
+      cache = await readMetadataCacheFromDisk(guard);
     } catch (error) {
+      if (isAccountContextChangedError(error)) throw error;
       recordLocalWarning("metadata cache read", error);
-      cache = metadataCacheMemory || emptyMetadataCache();
+      cache = metadataCacheMemory
+        && metadataCacheMemoryGeneration === guard.generation
+        && storageScopesEqual(metadataCacheMemory.scope, guard.scope)
+        ? metadataCacheMemory
+        : emptyMetadataCache(guard.scope);
     }
     if (metadata.pathRoot?.id) {
       cache.pathRootsById ||= {};
@@ -2456,31 +2723,43 @@ async function cacheItems(items = [], metadata = {}) {
       changes.push(change, ...(change.descendants || []));
     }
     changes.push(...resolveUnresolvedCachedPaths(cache));
-    await reconcileContentIndexWithMetadata(changes);
+    assertStorageScopeGuard(guard, "metadata/content index reconciliation");
+    await reconcileContentIndexWithMetadata(changes, guard);
     if (metadata.deltaLink !== undefined) {
       cache.deltaLink = metadata.deltaLink || null;
       if (metadata.deltaLink) cache.deltaNextLink = null;
     }
     if (metadata.deltaNextLink !== undefined) cache.deltaNextLink = metadata.deltaNextLink || null;
     if (metadata.deltaTarget !== undefined) cache.deltaTarget = metadata.deltaTarget || null;
-    return await saveMetadataCache(cache);
+    assertStorageScopeGuard(guard, "metadata cache update");
+    return await saveMetadataCache(cache, guard);
   }));
 }
 
 async function clearMetadataCache() {
+  const guard = await captureStorageScopeGuard("metadata cache clear");
   return await runSerialized("metadata", async () => await withFileLock(metadataCacheLockPath, async () => {
-    metadataCacheMemory = emptyMetadataCache();
+    assertStorageScopeGuard(guard, "metadata cache clear");
+    const cleared = emptyMetadataCache(guard.scope);
     metadataCacheLoadPromise = null;
+    metadataCacheLoadGeneration = null;
     await ensurePrivateDirectory(cacheRoot);
-    await writePrivateFileAtomic(cachePath, JSON.stringify(metadataCacheMemory));
+    await writePrivateFileAtomic(cachePath, JSON.stringify(cleared), {
+      beforeCommit: async () => assertStorageScopeGuard(guard, "metadata cache clear commit")
+    });
+    assertStorageScopeGuard(guard, "metadata cache clear publication");
+    metadataCacheMemory = cleared;
+    metadataCacheMemoryGeneration = guard.generation;
     metadataCacheFileVersion = await localFileVersion(cachePath);
-    return metadataCacheMemory;
+    assertStorageScopeGuard(guard, "metadata cache clear return");
+    return cleared;
   }));
 }
 
-function emptyContentIndex() {
+function emptyContentIndex(scope = null) {
   return {
-    version: 2,
+    version: 3,
+    scope,
     createdAt: new Date().toISOString(),
     updatedAt: null,
     itemCount: 0,
@@ -2489,64 +2768,128 @@ function emptyContentIndex() {
 }
 
 async function loadContentIndex() {
+  const guard = await captureStorageScopeGuard("content index load");
+  if (contentIndexLoadPromise && contentIndexLoadGeneration !== guard.generation) {
+    throw accountContextChangedError("content index load");
+  }
   if (!contentIndexLoadPromise) {
-    contentIndexLoadPromise = (async () => {
+    let loadPromise;
+    loadPromise = (async () => {
       try {
+        assertStorageScopeGuard(guard, "content index load");
         const diskVersion = await localFileVersion(contentIndexPath);
-        if (contentIndexMemory && diskVersion === contentIndexFileVersion) return contentIndexMemory;
+        assertStorageScopeGuard(guard, "content index load");
+        if (contentIndexMemory
+          && contentIndexMemoryGeneration === guard.generation
+          && storageScopesEqual(contentIndexMemory.scope, guard.scope)
+          && diskVersion === contentIndexFileVersion) return contentIndexMemory;
+        let loaded = null;
         await withFileLock(contentIndexLockPath, async () => {
+          assertStorageScopeGuard(guard, "content index load");
           const lockedVersion = await localFileVersion(contentIndexPath);
-          if (contentIndexMemory && lockedVersion === contentIndexFileVersion) return;
-          contentIndexMemory = await readContentIndexFromDisk();
+          assertStorageScopeGuard(guard, "content index load");
+          if (contentIndexMemory
+            && contentIndexMemoryGeneration === guard.generation
+            && storageScopesEqual(contentIndexMemory.scope, guard.scope)
+            && lockedVersion === contentIndexFileVersion) {
+            loaded = contentIndexMemory;
+            return;
+          }
+          loaded = await readContentIndexFromDisk(guard);
+          assertStorageScopeGuard(guard, "content index publication");
+          contentIndexMemory = loaded;
+          contentIndexMemoryGeneration = guard.generation;
           contentIndexFileVersion = await localFileVersion(contentIndexPath);
         });
+        assertStorageScopeGuard(guard, "content index return");
+        return loaded || contentIndexMemory;
       } catch (error) {
+        if (isAccountContextChangedError(error)) throw error;
         recordLocalWarning("content index read", error);
-        contentIndexMemory = emptyContentIndex();
+        assertStorageScopeGuard(guard, "content index fallback publication");
+        contentIndexMemory = emptyContentIndex(guard.scope);
+        contentIndexMemoryGeneration = guard.generation;
         contentIndexFileVersion = null;
       } finally {
-        contentIndexLoadPromise = null;
+        if (contentIndexLoadPromise === loadPromise) {
+          contentIndexLoadPromise = null;
+          contentIndexLoadGeneration = null;
+        }
       }
+      assertStorageScopeGuard(guard, "content index return");
       return contentIndexMemory;
     })();
+    contentIndexLoadPromise = loadPromise;
+    contentIndexLoadGeneration = guard.generation;
   }
-  return await contentIndexLoadPromise;
+  const result = await contentIndexLoadPromise;
+  assertStorageScopeGuard(guard, "content index return");
+  if (!storageScopesEqual(result?.scope, guard.scope)) throw accountContextChangedError("content index return");
+  return result;
 }
 
-async function readContentIndexFromDisk() {
+async function readContentIndexFromDisk(existingGuard = null) {
+  const guard = existingGuard || await captureStorageScopeGuard("content index read");
+  assertStorageScopeGuard(guard, "content index read");
   await ensurePrivateDirectory(cacheRoot);
   try {
     const parsed = JSON.parse(await readFile(contentIndexPath, "utf8"));
     await hardenPrivateFile(contentIndexPath);
+    assertStorageScopeGuard(guard, "content index read");
+    if (parsed.version !== 3 || !storageScopesEqual(parsed.scope, guard.scope)) return emptyContentIndex(guard.scope);
     return {
-      ...emptyContentIndex(),
+      ...emptyContentIndex(guard.scope),
       ...parsed,
+      version: 3,
+      scope: guard.scope,
       entriesById: parsed.entriesById || {}
     };
   } catch (error) {
-    if (error?.code === "ENOENT") return emptyContentIndex();
+    if (error?.code === "ENOENT") {
+      assertStorageScopeGuard(guard, "content index read");
+      return emptyContentIndex(guard.scope);
+    }
     throw error;
   }
 }
 
-async function writeContentIndex(index) {
+async function writeContentIndex(index, existingGuard = null) {
+  const guard = existingGuard || await captureStorageScopeGuard("content index write");
+  assertStorageScopeGuard(guard, "content index write");
+  if (index.scope && !storageScopesEqual(index.scope, guard.scope)) {
+    throw new Error("Content index scope changed during this operation. Refusing to persist cross-account state.");
+  }
+  index.version = 3;
+  index.scope = guard.scope;
   index.updatedAt = new Date().toISOString();
   index.itemCount = Object.keys(index.entriesById || {}).length;
   await ensurePrivateDirectory(cacheRoot);
-  await writePrivateFileAtomic(contentIndexPath, JSON.stringify(index));
+  await writePrivateFileAtomic(contentIndexPath, JSON.stringify(index), {
+    beforeCommit: async () => assertStorageScopeGuard(guard, "content index commit")
+  });
+  assertStorageScopeGuard(guard, "content index publication");
   contentIndexMemory = index;
+  contentIndexMemoryGeneration = guard.generation;
   contentIndexFileVersion = await localFileVersion(contentIndexPath);
+  assertStorageScopeGuard(guard, "content index return");
   return index;
 }
 
-async function saveContentIndex(index) {
+async function saveContentIndex(index, existingGuard = null) {
+  const guard = existingGuard || await captureStorageScopeGuard("content index update");
   return await runSerialized("content", async () => await withFileLock(contentIndexLockPath, async () => {
+    assertStorageScopeGuard(guard, "content index update");
     let latest;
     try {
-      latest = await readContentIndexFromDisk();
+      latest = await readContentIndexFromDisk(guard);
     } catch (error) {
+      if (isAccountContextChangedError(error)) throw error;
       recordLocalWarning("content index read", error);
-      latest = contentIndexMemory || emptyContentIndex();
+      latest = contentIndexMemory
+        && contentIndexMemoryGeneration === guard.generation
+        && storageScopesEqual(contentIndexMemory.scope, guard.scope)
+        ? contentIndexMemory
+        : emptyContentIndex(guard.scope);
     }
     const merged = {
       ...latest,
@@ -2555,18 +2898,28 @@ async function saveContentIndex(index) {
         ...(index.entriesById || {})
       }
     };
-    return await writeContentIndex(merged);
+    assertStorageScopeGuard(guard, "content index update");
+    return await writeContentIndex(merged, guard);
   }));
 }
 
 async function clearContentIndex() {
+  const guard = await captureStorageScopeGuard("content index clear");
   return await runSerialized("content", async () => await withFileLock(contentIndexLockPath, async () => {
-    contentIndexMemory = emptyContentIndex();
+    assertStorageScopeGuard(guard, "content index clear");
+    const cleared = emptyContentIndex(guard.scope);
     contentIndexLoadPromise = null;
+    contentIndexLoadGeneration = null;
     await ensurePrivateDirectory(cacheRoot);
-    await writePrivateFileAtomic(contentIndexPath, JSON.stringify(contentIndexMemory));
+    await writePrivateFileAtomic(contentIndexPath, JSON.stringify(cleared), {
+      beforeCommit: async () => assertStorageScopeGuard(guard, "content index clear commit")
+    });
+    assertStorageScopeGuard(guard, "content index clear publication");
+    contentIndexMemory = cleared;
+    contentIndexMemoryGeneration = guard.generation;
     contentIndexFileVersion = await localFileVersion(contentIndexPath);
-    return contentIndexMemory;
+    assertStorageScopeGuard(guard, "content index clear return");
+    return cleared;
   }));
 }
 
@@ -2586,15 +2939,22 @@ function indexedItemMetadataChanged(left = {}, right = {}) {
     || Boolean(left.deleted) !== Boolean(right.deleted);
 }
 
-async function reconcileContentIndexWithMetadata(changes = []) {
+async function reconcileContentIndexWithMetadata(changes = [], existingGuard = null) {
   if (!changes.length) return;
+  const guard = existingGuard || await captureStorageScopeGuard("metadata/content index reconciliation");
   await runSerialized("content", async () => await withFileLock(contentIndexLockPath, async () => {
+    assertStorageScopeGuard(guard, "metadata/content index reconciliation");
     let index;
     try {
-      index = await readContentIndexFromDisk();
+      index = await readContentIndexFromDisk(guard);
     } catch (error) {
+      if (isAccountContextChangedError(error)) throw error;
       recordLocalWarning("content index read", error);
-      index = contentIndexMemory || emptyContentIndex();
+      index = contentIndexMemory
+        && contentIndexMemoryGeneration === guard.generation
+        && storageScopesEqual(contentIndexMemory.scope, guard.scope)
+        ? contentIndexMemory
+        : emptyContentIndex(guard.scope);
     }
     let changed = false;
     for (const change of changes) {
@@ -2618,8 +2978,13 @@ async function reconcileContentIndexWithMetadata(changes = []) {
         changed = true;
       }
     }
-    contentIndexMemory = index;
-    if (changed) await writeContentIndex(index);
+    assertStorageScopeGuard(guard, "content index reconciliation publication");
+    if (changed) {
+      await writeContentIndex(index, guard);
+    } else {
+      contentIndexMemory = index;
+      contentIndexMemoryGeneration = guard.generation;
+    }
   }));
 }
 
@@ -2876,7 +3241,33 @@ async function officeIndexRefresh(args = {}) {
 }
 
 async function officeContentSearch(args = {}) {
-  return await contentSearch({ ...args, officeOnly: true });
+  let result = await contentSearch({ ...args, officeOnly: true });
+  if (!result.items.length) return result;
+  const staleIds = [];
+  for (const item of result.items) {
+    try {
+      const index = await loadContentIndex();
+      const entry = index.entriesById?.[item.id];
+      const current = simplifyItem(await getRawInfo({ itemId: item.id }));
+      if (entry && !contentIndexEntryFresh(entry, current)) staleIds.push(item.id);
+      await bestEffortLocalWrite("Office search metadata freshness update", async () => await cacheItems([current]));
+    } catch (error) {
+      staleIds.push(item.id);
+      await bestEffortLocalWrite("Office search stale index removal", async () => {
+        const index = await loadContentIndex();
+        if (index.entriesById?.[item.id]) {
+          delete index.entriesById[item.id];
+          await saveContentIndex(index);
+        }
+      });
+      recordLocalWarning("Office search metadata freshness check", error);
+    }
+  }
+  if (staleIds.length) {
+    result = await contentSearch({ ...args, officeOnly: true });
+    result.staleEntriesRemoved = [...new Set(staleIds)];
+  }
+  return result;
 }
 
 async function contentIndexRefresh(args = {}) {
@@ -3239,9 +3630,13 @@ async function pollDeviceLogin(args = {}) {
     throw new Error("OneDrive authentication state changed while device login was pending. Start login again.");
   }
   if (result.authorizationPending) return result;
-  tokenCache = normalizeToken(result);
+  authGeneration += 1;
+  invalidateActiveStorageScope();
+  tokenRefreshPromise = null;
+  tokenCache = normalizeToken({ ...result, auth_context_id: randomUUID() });
   setKeychainToken(tokenCache, cfg);
   pendingDevice = null;
+  adoptCurrentToolAccountGeneration();
   return {
     authenticated: true,
     authTenant: tokenResponse.tenant || cfg.tenant,
@@ -3251,7 +3646,7 @@ async function pollDeviceLogin(args = {}) {
   };
 }
 
-async function refreshAccessToken(refreshToken, cfg = config(), generation = authGeneration) {
+async function refreshAccessToken(refreshToken, cfg = config(), generation = authGeneration, authContextId = null) {
   requireClientId(cfg);
   const { body: result, tenant } = await postFormWithConsumerFallback("token", cfg, {
     grant_type: "refresh_token",
@@ -3262,7 +3657,12 @@ async function refreshAccessToken(refreshToken, cfg = config(), generation = aut
   if (generation !== authGeneration) {
     throw new Error("OneDrive authentication state changed while the access token was refreshing. Try again if access is still intended.");
   }
-  tokenCache = normalizeToken({ ...result, auth_tenant: tenant, refresh_token: result.refresh_token || refreshToken });
+  tokenCache = normalizeToken({
+    ...result,
+    auth_tenant: tenant,
+    refresh_token: result.refresh_token || refreshToken,
+    auth_context_id: authContextId || randomUUID()
+  });
   setKeychainToken(tokenCache, cfg);
   return tokenCache;
 }
@@ -3271,9 +3671,14 @@ async function getAccessToken() {
   if (process.env.ONEDRIVE_TEST_ACCESS_TOKEN) return process.env.ONEDRIVE_TEST_ACCESS_TOKEN;
   const cfg = config();
   requireClientId(cfg);
-  const current = tokenCache || getKeychainToken(cfg);
+  let current = tokenCache || getKeychainToken(cfg);
   if (!current?.refresh_token && !current?.access_token) {
     throw new Error("OneDrive is not authenticated. Run onedrive_auth_device_start, complete browser login, then run onedrive_auth_device_poll.");
+  }
+  if (!current.auth_context_id) {
+    current = normalizeAuthContextToken(current);
+    tokenCache = current;
+    setKeychainToken(current, cfg);
   }
   const expiresAt = current.expires_at || 0;
   if (current.access_token && expiresAt - Date.now() > 60_000) {
@@ -3283,7 +3688,7 @@ async function getAccessToken() {
   if (!current.refresh_token) throw new Error("Stored token has no refresh token. Run device-code login again.");
   if (!tokenRefreshPromise) {
     const generation = authGeneration;
-    tokenRefreshPromise = refreshAccessToken(current.refresh_token, cfg, generation);
+    tokenRefreshPromise = refreshAccessToken(current.refresh_token, cfg, generation, current.auth_context_id);
   }
   const refresh = tokenRefreshPromise;
   try {
@@ -3475,11 +3880,33 @@ function assertTrustedUploadSessionUrl(uploadUrl) {
   return target.toString();
 }
 
+function captureGraphAccountContext(operation = "Microsoft Graph request") {
+  assertToolAccountGeneration(operation);
+  return {
+    authGeneration,
+    storageScopeGeneration,
+    authContextId: currentAuthContextId()
+  };
+}
+
+function assertGraphAccountContext(snapshot, operation = "Microsoft Graph request") {
+  assertToolAccountGeneration(operation);
+  if (snapshot.authGeneration !== authGeneration || snapshot.storageScopeGeneration !== storageScopeGeneration) {
+    throw accountContextChangedError(operation);
+  }
+  if (snapshot.authContextId && currentAuthContextId() !== snapshot.authContextId) {
+    throw accountContextChangedError(operation);
+  }
+}
+
 async function graph(path, options = {}) {
   const { returnResponse = false, maxRetries, skipAuth = false, isMutation, ...fetchOptions } = options;
   const method = String(fetchOptions.method || "GET").toUpperCase();
   const mutationRequest = isMutation ?? !["GET", "HEAD", "OPTIONS"].includes(method);
+  const accountContext = captureGraphAccountContext("Microsoft Graph request");
   const accessToken = skipAuth ? null : await getAccessToken();
+  if (!skipAuth && !accountContext.authContextId) accountContext.authContextId = currentAuthContextId();
+  assertGraphAccountContext(accountContext, "Microsoft Graph request");
   const url = graphUrl(path, { skipAuth });
   const headers = {
     ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
@@ -3491,6 +3918,7 @@ async function graph(path, options = {}) {
     headers
   }, { maxRetries: retryCountForRequest(fetchOptions, maxRetries) });
   const body = await parseResponseBody(retriedResponse);
+  assertGraphAccountContext(accountContext, "Microsoft Graph response");
   const requestId = graphRequestId(retriedResponse.headers, body);
   rememberGraphRequestId(requestId, { mutation: mutationRequest });
   if (returnResponse) {
@@ -3503,7 +3931,10 @@ async function graph(path, options = {}) {
 }
 
 async function graphDownloadToFile(path, target, options = {}) {
+  const accountContext = captureGraphAccountContext("Microsoft Graph download");
   const accessToken = await getAccessToken();
+  if (!accountContext.authContextId) accountContext.authContextId = currentAuthContextId();
+  assertGraphAccountContext(accountContext, "Microsoft Graph download");
   const url = graphUrl(path);
   const response = await fetchWithRetry(url, {
     method: "GET",
@@ -3512,6 +3943,7 @@ async function graphDownloadToFile(path, target, options = {}) {
       ...(options.headers || {})
     }
   }, { maxRetries: 3 });
+  assertGraphAccountContext(accountContext, "Microsoft Graph download response");
   if (!response.ok) {
     const body = await parseResponseBody(response);
     throw microsoftGraphError(body, response);
@@ -3519,6 +3951,7 @@ async function graphDownloadToFile(path, target, options = {}) {
   await mkdir(dirname(target), { recursive: true, mode: 0o700 });
   const temp = `${target}.part-${process.pid}-${randomUUID()}`;
   let bytesWritten = 0;
+  let published = false;
   try {
     if (response.body) {
       const counter = new TransformStream({
@@ -3533,18 +3966,25 @@ async function graphDownloadToFile(path, target, options = {}) {
       bytesWritten = buffer.length;
       await writePrivateFile(temp, buffer);
     }
+    assertGraphAccountContext(accountContext, "Microsoft Graph download publication");
     await renameFile(temp, target);
+    published = true;
+    assertGraphAccountContext(accountContext, "Microsoft Graph download publication");
     await hardenPrivateFile(target);
+    assertGraphAccountContext(accountContext, "Microsoft Graph download completion");
   } catch (error) {
     await rm(temp, { force: true });
-    if (options.reserved === true) await rm(target, { force: true });
+    if ((published && isAccountContextChangedError(error)) || options.reserved === true) await rm(target, { force: true });
     throw error;
   }
   return { bytesWritten: bytesWritten || contentLength(response) || 0 };
 }
 
 async function graphLimitedBuffer(path, maxBytes, options = {}) {
+  const accountContext = captureGraphAccountContext("Microsoft Graph bounded content read");
   const accessToken = await getAccessToken();
+  if (!accountContext.authContextId) accountContext.authContextId = currentAuthContextId();
+  assertGraphAccountContext(accountContext, "Microsoft Graph bounded content read");
   const url = graphUrl(path);
   const limit = Math.max(1, maxBytes);
   const response = await fetchWithRetry(url, {
@@ -3554,6 +3994,7 @@ async function graphLimitedBuffer(path, maxBytes, options = {}) {
       Range: `bytes=0-${limit}`
     }
   }, { maxRetries: 3 });
+  assertGraphAccountContext(accountContext, "Microsoft Graph bounded content response");
   if (!response.ok && response.status !== 206) {
     const body = await parseResponseBody(response);
     throw microsoftGraphError(body, response);
@@ -3561,6 +4002,7 @@ async function graphLimitedBuffer(path, maxBytes, options = {}) {
 
   if (!response.body?.getReader) {
     const buffer = Buffer.from(await response.arrayBuffer());
+    assertGraphAccountContext(accountContext, "Microsoft Graph bounded content return");
     return {
       buffer: buffer.subarray(0, limit),
       bytesRead: buffer.length,
@@ -3591,6 +4033,7 @@ async function graphLimitedBuffer(path, maxBytes, options = {}) {
   }
 
   const buffer = Buffer.concat(chunks);
+  assertGraphAccountContext(accountContext, "Microsoft Graph bounded content return");
   return {
     buffer: buffer.subarray(0, limit),
     bytesRead,
@@ -3677,6 +4120,9 @@ function itemArgsWithResolvedPath(args = {}) {
 }
 
 function remotePath(args = {}) {
+  if (args.remoteRelativePath !== undefined && !args.remotePreset) {
+    throw new Error("remoteRelativePath requires remotePreset.");
+  }
   if (args.remotePreset && !args.remoteRelativePath) {
     throw new Error("remoteRelativePath is required when remotePreset is used, and must include the destination filename.");
   }
@@ -3819,12 +4265,20 @@ function cleanupPreviewTokens(now = Date.now()) {
 }
 
 function issuePreviewToken(tool, proof = {}) {
+  assertToolAccountGeneration(`${tool} preview issuance`);
   cleanupPreviewTokens();
+  const scope = toolCallContext.getStore()?.storageScope;
+  if (!scope?.authContextId || !scope?.driveId) {
+    throw new Error("OneDrive storage scope is unavailable. Refusing to issue an unscoped preview token.");
+  }
   const token = randomUUID();
   const expiresAt = Date.now() + previewTokenTtlMs;
   previewTokens.set(token, {
     tool,
     proofHash: previewProofHash(tool, proof),
+    scopeKey: storageScopeKey(scope),
+    authGeneration,
+    storageScopeGeneration,
     expiresAt
   });
   return {
@@ -3842,10 +4296,18 @@ function previewWithToken(preview, tool, proof = {}) {
 }
 
 function consumePreviewToken(tool, proof = {}, token) {
+  assertToolAccountGeneration(`${tool} preview consumption`);
   cleanupPreviewTokens();
   if (!token) return { ok: false, reason: "missing" };
   const entry = previewTokens.get(token);
   if (!entry) return { ok: false, reason: "not_found_or_expired" };
+  const currentScopeKey = storageScopeKey(toolCallContext.getStore()?.storageScope);
+  if (!currentScopeKey
+    || entry.scopeKey !== currentScopeKey
+    || entry.authGeneration !== authGeneration
+    || entry.storageScopeGeneration !== storageScopeGeneration) {
+    return { ok: false, reason: "scope_mismatch" };
+  }
   if (entry.tool !== tool || entry.proofHash !== previewProofHash(tool, proof)) {
     return { ok: false, reason: "mismatch" };
   }
@@ -4210,10 +4672,12 @@ async function collectPages(firstPath, maxItems, format = "compact", formatter =
     let unsafePageTruncation = false;
     const pendingCacheItems = [];
     let pendingCursorMetadata = {};
-    const maxPages = Math.max(1, Math.ceil(maxItems / 1) + 100);
+    const safetyMaxPages = Math.max(1, Math.ceil(maxItems / 1) + 100);
+    const requestedMaxPages = options.maxPages === undefined ? null : clampInteger(options.maxPages, 1, 1, 100);
+    let maxPagesReached = false;
     while (nextPath && items.length < maxItems) {
       if (seenPages.has(nextPath)) throw new Error(`Microsoft Graph pagination cycle detected at ${safeDisplayPath(nextPath)}.`);
-      if (pagesFetched >= maxPages) throw new Error(`Microsoft Graph pagination exceeded ${maxPages} pages before reaching the item limit.`);
+      if (pagesFetched >= safetyMaxPages) throw new Error(`Microsoft Graph pagination exceeded ${safetyMaxPages} pages before reaching the item limit.`);
       seenPages.add(nextPath);
       pagesFetched += 1;
       let result;
@@ -4249,6 +4713,11 @@ async function collectPages(firstPath, maxItems, format = "compact", formatter =
       deltaLink = pageTruncated ? null : pageDeltaLink;
       nextPath = !pageTruncated && nextLink && items.length < maxItems ? nextLink : null;
       truncated = truncated || pageTruncated || (Boolean(nextLink) && items.length >= maxItems);
+      if (requestedMaxPages !== null && pagesFetched >= requestedMaxPages && nextPath) {
+        maxPagesReached = true;
+        truncated = true;
+        nextPath = null;
+      }
     }
     if (pendingCacheItems.length || Object.keys(pendingCursorMetadata).length) {
       const deduplicatedCacheItems = [...new Map(pendingCacheItems.filter((item) => item?.id).map((item) => [item.id, item])).values()];
@@ -4261,6 +4730,7 @@ async function collectPages(firstPath, maxItems, format = "compact", formatter =
       truncated,
       unsafePageTruncation,
       pagesFetched,
+      ...(requestedMaxPages !== null ? { maxPagesReached } : {}),
       count: items.length
     };
   });
@@ -5418,6 +5888,7 @@ async function delta(args = {}) {
     cacheResults: true,
     persistDeltaCursor: args._persistCursor === true,
     deltaTarget: target,
+    maxPages: args.maxPages,
     prepareCacheItems: async (items) => await hydrateDeltaParentItems(items, pathRoot)
   });
   const cache = await loadMetadataCache();
@@ -6032,6 +6503,12 @@ function assertNoBinaryNulls(buffer) {
 }
 
 async function resolveDestinationParent(args = {}) {
+  if (args.destinationParentRelativePath !== undefined && !args.destinationParentPreset) {
+    throw new Error("destinationParentRelativePath requires destinationParentPreset.");
+  }
+  if (args.parentRelativePath !== undefined && !args.parentPreset) {
+    throw new Error("parentRelativePath requires parentPreset.");
+  }
   assertAtMostOneSelector(args, "destination parent", [
     { label: "destinationParentItemId", keys: ["destinationParentItemId"] },
     { label: "destinationParentPath", keys: ["destinationParentPath"] },
@@ -6182,7 +6659,7 @@ async function officeCapabilities() {
         available: false,
         requiresCompanionAddIn: true,
         protocolVersion: "codex-office-companion/1",
-        companionVersion: "1.1.0",
+        companionVersion: "1.1.1",
         requirementSets: { word: "WordApi 1.3", excel: "ExcelApi 1.7", powerpoint: "PowerPointApi 1.5" },
         operations: {
           word: ["replaceText", "setSelectedText", "insertParagraph"],
@@ -6299,9 +6776,11 @@ function officeEditPreviewProof(rawItem, kind, operations, editResult, args = {}
     backend,
     operations,
     changeCount: editResult.changeCount,
-    outputFingerprint: editResult.validation?.package?.fingerprint,
+    semanticEvidence: officeSemanticDiff(kind, editResult.changes || []),
     allowMacros: args.allowMacros === true,
-    allowSignedPackage: args.allowSignedPackage === true
+    allowSignedPackage: args.allowSignedPackage === true,
+    createBackup: args.createBackup !== false,
+    verify: args.verify !== false
   };
 }
 
@@ -6310,6 +6789,17 @@ const excelGraphOnlyOperationTypes = new Set(["createChart", "updateChart"]);
 
 async function resolveExcelOfficeBackend(rawItem, args = {}) {
   if (args.backend === "openxml") return { backend: "openxml", driveType: null, reason: "explicit" };
+  for (const operation of args.operations || []) {
+    if (operation.type === "clearRange" && operation.contents === false && operation.format === false) {
+      throw new Error("clearRange must clear contents, formats, or both; contents:false and format:false is a no-op.");
+    }
+    if (operation.type === "updateChart" && operation.chartType !== undefined) {
+      if (args.backend === "graph") {
+        throw new Error("The Graph Excel backend cannot change an existing chart's chartType; use backend: openxml or backend: auto.");
+      }
+      return { backend: "openxml", driveType: null, reason: "chart-type-update" };
+    }
+  }
   if (extname(rawItem.name || "").toLowerCase() !== ".xlsx") {
     if (args.backend === "graph") throw new Error("The Graph Excel backend supports .xlsx only; use openxml for this workbook.");
     return { backend: "openxml", driveType: null, reason: "format" };
@@ -6364,6 +6854,85 @@ function excelGraphRangePath(base, operation) {
   return `${base}/worksheets/${encodeURIComponent(sheet)}/range(address='${escapedAddress}')`;
 }
 
+function excelGraphClearApplyTo(operation) {
+  const contents = operation.contents !== false;
+  const formats = operation.format === true;
+  if (!contents && !formats) throw new Error("clearRange must clear contents, formats, or both.");
+  if (contents && formats) return "All";
+  return contents ? "Contents" : "Formats";
+}
+
+function assertExcelGraphRangeVerification(operation, observed) {
+  if (!observed || typeof observed !== "object") throw new Error(`Graph Excel semantic verification returned no range for ${operation.sheet}!${operation.address}.`);
+  if (operation.type === "setCell" && JSON.stringify(observed.values) !== JSON.stringify([[operation.value]])) {
+    throw new Error(`Graph Excel semantic verification failed for setCell ${operation.sheet}!${operation.address}.`);
+  }
+  if (operation.type === "setFormula" && JSON.stringify(observed.formulas) !== JSON.stringify([[operation.formula]])) {
+    throw new Error(`Graph Excel semantic verification failed for setFormula ${operation.sheet}!${operation.address}.`);
+  }
+  if (operation.type === "setRange") {
+    if (operation.values !== undefined && JSON.stringify(observed.values) !== JSON.stringify(operation.values)) throw new Error(`Graph Excel semantic verification failed for setRange values at ${operation.sheet}!${operation.address}.`);
+    if (operation.formulas !== undefined && JSON.stringify(observed.formulas) !== JSON.stringify(operation.formulas)) throw new Error(`Graph Excel semantic verification failed for setRange formulas at ${operation.sheet}!${operation.address}.`);
+  }
+  if (operation.type === "clearRange" && excelGraphClearApplyTo(operation) !== "Formats") {
+    const values = Array.isArray(observed.values) ? observed.values.flat(Infinity) : [];
+    if (values.some((value) => value !== null && value !== "")) throw new Error(`Graph Excel semantic verification found uncleared contents at ${operation.sheet}!${operation.address}.`);
+  }
+}
+
+function assertExcelGraphObservedFields(observed, expected, label) {
+  if (!observed || typeof observed !== "object") throw new Error(`Graph Excel semantic verification returned no ${label}.`);
+  for (const [key, value] of Object.entries(expected)) {
+    if (!Object.hasOwn(observed, key)) {
+      throw new Error(`Graph Excel semantic verification could not observe expected ${label} field ${key}.`);
+    }
+    if (observed[key] !== value) {
+      throw new Error(`Graph Excel semantic verification failed for ${label} field ${key}.`);
+    }
+  }
+}
+
+function observableRangeFormat(format) {
+  if (!format || typeof format !== "object") return null;
+  const keys = ["columnWidth", "rowHeight", "horizontalAlignment", "verticalAlignment", "wrapText", "numberFormat"];
+  const observed = Object.fromEntries(keys.filter((key) => Object.hasOwn(format, key)).map((key) => [key, format[key]]));
+  return Object.keys(observed).length ? observed : null;
+}
+
+function excelGraphChartDataVerification(operation, observed = {}) {
+  const limitations = [];
+  const series = Array.isArray(observed?.value) ? observed.value : [];
+  const exposedSourceData = observed.sourceData ?? series.find((entry) => entry?.sourceData !== undefined)?.sourceData;
+  const exposedSeriesBy = observed.seriesBy ?? series.find((entry) => entry?.seriesBy !== undefined)?.seriesBy;
+  const expectedSeriesBy = operation.seriesBy || "Auto";
+  let sourceDataVerified = false;
+  let seriesByVerified = false;
+  if (exposedSourceData !== undefined) {
+    if (exposedSourceData !== operation.sourceData) throw new Error("Graph Excel semantic verification failed for updated chart sourceData.");
+    sourceDataVerified = true;
+  } else {
+    const formulas = series.flatMap((entry) => [entry?.formula, entry?.categoryFormula, entry?.xValuesFormula, entry?.bubbleSizeFormula]).filter((entry) => typeof entry === "string");
+    const sourceSheet = String(operation.sourceData || "").split("!")[0].replaceAll("'", "").replace(/^=/, "").toLowerCase();
+    if (formulas.length && sourceSheet && formulas.some((formula) => formula.replaceAll("'", "").toLowerCase().includes(`${sourceSheet}!`))) {
+      sourceDataVerified = true;
+    } else {
+      limitations.push("Graph did not expose enough chart-series source metadata to verify sourceData.");
+    }
+  }
+  if (exposedSeriesBy !== undefined) {
+    if (exposedSeriesBy !== expectedSeriesBy) throw new Error("Graph Excel semantic verification failed for chart seriesBy.");
+    seriesByVerified = true;
+  } else {
+    limitations.push("Graph did not expose seriesBy in observable chart-series metadata.");
+  }
+  return {
+    succeeded: sourceDataVerified && seriesByVerified,
+    sourceDataVerified,
+    seriesByVerified,
+    ...(limitations.length ? { verificationLimited: true, limitations } : {})
+  };
+}
+
 async function applyExcelGraphOperations(rawItem, resolvedBackend, operations) {
   const base = excelWorkbookBase(rawItem, resolvedBackend);
   const created = await createExcelWorkbookSession(base);
@@ -6372,23 +6941,69 @@ async function applyExcelGraphOperations(rawItem, resolvedBackend, operations) {
   const headers = { "workbook-session-id": sessionId };
   let writeStarted = false;
   let sessionClosed = false;
+  const semanticVerification = [];
   try {
     for (const operation of operations) {
       if (operation.type === "addTableRow") {
         writeStarted = true;
-        await graph(`${base}/tables/${encodeURIComponent(String(operation.table || ""))}/rows/add`, {
+        const addedRow = await graph(`${base}/tables/${encodeURIComponent(String(operation.table || ""))}/rows/add`, {
           method: "POST", headers, body: JSON.stringify({ values: operation.values, index: operation.index ?? null }), maxRetries: 0
         });
+        if (Array.isArray(addedRow?.values) && JSON.stringify(addedRow.values) !== JSON.stringify(operation.values)) {
+          throw new Error(`Graph Excel semantic verification failed for addTableRow ${operation.table}.`);
+        }
+        semanticVerification.push({ operation: operation.type, table: operation.table, succeeded: true });
         continue;
       }
       if (operation.type === "createChart") {
         writeStarted = true;
-        await graph(`${base}/worksheets/${encodeURIComponent(String(operation.sheet || ""))}/charts/add`, {
+        const createdChart = await graph(`${base}/worksheets/${encodeURIComponent(String(operation.sheet || ""))}/charts/add`, {
           method: "POST", headers, body: JSON.stringify({ type: operation.chartType, sourceData: operation.sourceData, seriesBy: operation.seriesBy || "Auto" }), maxRetries: 0
+        });
+        const chartId = createdChart?.id || createdChart?.name;
+        if (!chartId) throw new Error("Microsoft Graph created a chart but did not return its stable ID or name.");
+        const chartBase = `${base}/worksheets/${encodeURIComponent(String(operation.sheet || ""))}/charts/${encodeURIComponent(String(chartId))}`;
+        const chartPatch = Object.fromEntries(["name", "height", "width", "left", "top"].filter((key) => operation[key] !== undefined).map((key) => [key, operation[key]]));
+        if (Object.keys(chartPatch).length) await graph(chartBase, { method: "PATCH", headers, body: JSON.stringify(chartPatch), maxRetries: 0 });
+        if (operation.titleText !== undefined) await graph(`${chartBase}/title`, { method: "PATCH", headers, body: JSON.stringify({ text: operation.titleText }), maxRetries: 0 });
+        const observed = await graph(chartBase, { headers, maxRetries: 0 });
+        assertExcelGraphObservedFields(observed, chartPatch, "created chart");
+        if (operation.titleText !== undefined) {
+          const title = await graph(`${chartBase}/title`, { headers, maxRetries: 0 });
+          assertExcelGraphObservedFields(title, { text: operation.titleText }, "created chart title");
+        }
+        const limitations = [];
+        const observedChartType = observed?.chartType ?? observed?.type;
+        let chartTypeVerified = false;
+        if (observedChartType === undefined) {
+          limitations.push("Graph did not expose the created chart type for readback.");
+        } else if (observedChartType !== operation.chartType) {
+          throw new Error("Graph Excel semantic verification failed for created chart type.");
+        } else {
+          chartTypeVerified = true;
+        }
+        let dataVerification;
+        try {
+          dataVerification = excelGraphChartDataVerification(operation, await graph(`${chartBase}/series`, { headers, maxRetries: 0 }));
+        } catch (error) {
+          if (String(error?.message || "").includes("semantic verification failed")) throw error;
+          dataVerification = { succeeded: false, sourceDataVerified: false, seriesByVerified: false, verificationLimited: true, limitations: [`Graph chart-series readback was unavailable: ${safeToolErrorMessage(error)}`] };
+        }
+        limitations.push(...(dataVerification.limitations || []));
+        semanticVerification.push({
+          operation: operation.type,
+          sheet: operation.sheet,
+          chartId,
+          succeeded: chartTypeVerified && dataVerification.succeeded,
+          chartTypeVerified,
+          sourceDataVerified: dataVerification.sourceDataVerified,
+          seriesByVerified: dataVerification.seriesByVerified,
+          ...(limitations.length ? { verificationLimited: true, limitations } : {})
         });
         continue;
       }
       if (operation.type === "updateChart") {
+        if (operation.chartType !== undefined) throw new Error("Graph Excel cannot update chartType; use the Open XML backend.");
         const chartBase = `${base}/worksheets/${encodeURIComponent(String(operation.sheet || ""))}/charts/${encodeURIComponent(String(operation.chart || ""))}`;
         const chartPatch = Object.fromEntries(["name", "height", "width", "left", "top"].filter((key) => operation[key] !== undefined).map((key) => [key, operation[key]]));
         if (Object.keys(chartPatch).length) {
@@ -6403,6 +7018,22 @@ async function applyExcelGraphOperations(rawItem, resolvedBackend, operations) {
           writeStarted = true;
           await graph(`${chartBase}/setData`, { method: "POST", headers, body: JSON.stringify({ sourceData: operation.sourceData, seriesBy: operation.seriesBy || "Auto" }), maxRetries: 0 });
         }
+        const observed = await graph(chartBase, { headers, maxRetries: 0 });
+        assertExcelGraphObservedFields(observed, chartPatch, "updated chart");
+        if (operation.titleText !== undefined) {
+          const title = await graph(`${chartBase}/title`, { headers, maxRetries: 0 });
+          assertExcelGraphObservedFields(title, { text: operation.titleText }, "updated chart title");
+        }
+        let dataVerification = { succeeded: true };
+        if (operation.sourceData !== undefined) {
+          try {
+            dataVerification = excelGraphChartDataVerification(operation, await graph(`${chartBase}/series`, { headers, maxRetries: 0 }));
+          } catch (error) {
+            if (String(error?.message || "").includes("semantic verification failed")) throw error;
+            dataVerification = { succeeded: false, sourceDataVerified: false, seriesByVerified: false, verificationLimited: true, limitations: [`Graph chart-series readback was unavailable: ${safeToolErrorMessage(error)}`] };
+          }
+        }
+        semanticVerification.push({ operation: operation.type, sheet: operation.sheet, chart: operation.chart, ...dataVerification });
         continue;
       }
       if (operation.type === "renameSheet") {
@@ -6410,13 +7041,50 @@ async function applyExcelGraphOperations(rawItem, resolvedBackend, operations) {
         await graph(`${base}/worksheets/${encodeURIComponent(String(operation.sheet || ""))}`, {
           method: "PATCH", headers, body: JSON.stringify({ name: operation.newName }), maxRetries: 0
         });
+        const observed = await graph(`${base}/worksheets/${encodeURIComponent(String(operation.newName || ""))}`, { headers, maxRetries: 0 });
+        if (observed?.name !== operation.newName) throw new Error(`Graph Excel semantic verification failed for renamed worksheet ${operation.newName}.`);
+        semanticVerification.push({ operation: operation.type, sheet: operation.newName, succeeded: true });
         continue;
       }
       const rangePath = excelGraphRangePath(base, operation);
       if (operation.type === "clearRange") {
+        const applyTo = excelGraphClearApplyTo(operation);
+        let formatBefore = null;
+        let formatReadError = null;
+        if (applyTo !== "Contents") {
+          try {
+            formatBefore = observableRangeFormat(await graph(`${rangePath}/format`, { headers, maxRetries: 0 }));
+          } catch (error) {
+            formatReadError = safeToolErrorMessage(error);
+          }
+        }
         writeStarted = true;
         await graph(`${rangePath}/clear`, {
-          method: "POST", headers, body: JSON.stringify({ applyTo: operation.format ? "All" : "Contents" }), maxRetries: 0
+          method: "POST", headers, body: JSON.stringify({ applyTo }), maxRetries: 0
+        });
+        const observed = await graph(rangePath, { headers, maxRetries: 0 });
+        assertExcelGraphRangeVerification(operation, observed);
+        let formatVerified = applyTo === "Contents";
+        const limitations = [];
+        if (applyTo !== "Contents") {
+          try {
+            const formatAfter = observableRangeFormat(await graph(`${rangePath}/format`, { headers, maxRetries: 0 }));
+            formatVerified = Boolean(formatBefore && formatAfter && JSON.stringify(formatBefore) !== JSON.stringify(formatAfter));
+            if (!formatVerified) limitations.push("Graph did not expose a distinguishable post-clear format state.");
+          } catch (error) {
+            limitations.push(`Graph format readback was unavailable: ${safeToolErrorMessage(error)}`);
+          }
+          if (formatReadError) limitations.push(`Graph pre-clear format readback was unavailable: ${formatReadError}`);
+        }
+        semanticVerification.push({
+          operation: operation.type,
+          sheet: operation.sheet,
+          address: operation.address,
+          applyTo,
+          succeeded: formatVerified,
+          contentsVerified: applyTo !== "Formats",
+          formatVerified,
+          ...(limitations.length ? { verificationLimited: true, limitations } : {})
         });
         continue;
       }
@@ -6427,6 +7095,9 @@ async function applyExcelGraphOperations(rawItem, resolvedBackend, operations) {
           : { ...(operation.values !== undefined ? { values: operation.values } : {}), ...(operation.formulas !== undefined ? { formulas: operation.formulas } : {}) };
       writeStarted = true;
       await graph(rangePath, { method: "PATCH", headers, body: JSON.stringify(body), maxRetries: 0 });
+      const observed = await graph(rangePath, { headers, maxRetries: 0 });
+      assertExcelGraphRangeVerification(operation, observed);
+      semanticVerification.push({ operation: operation.type, sheet: operation.sheet, address: operation.address, succeeded: true });
     }
   } catch (error) {
     const suffix = writeStarted ? " A persistent workbook session had begun; the request was not replayed." : "";
@@ -6439,7 +7110,7 @@ async function applyExcelGraphOperations(rawItem, resolvedBackend, operations) {
       toolCallContext.getStore()?.localWarnings?.push({ operation: "Graph Excel session close", error: safeToolErrorMessage(error) });
     }
   }
-  return { sessionClosed, operationCount: operations.length };
+  return { sessionClosed, operationCount: operations.length, semanticVerification };
 }
 
 function officeSemanticDiff(kind, changes = []) {
@@ -6505,12 +7176,13 @@ function officeBackupManifestPath(backupId) {
 
 async function persistOfficeBackup(localPath, rawItem, kind, fingerprint, reason = "edit") {
   await ensurePrivateDirectory(backupRoot);
+  const scope = await activeStorageScope();
   const backupId = randomUUID();
   const fileName = `office-${backupId}-${basename(rawItem.name || `${kind}.bin`)}`;
   const backupPath = join(backupRoot, fileName);
   await copyFile(localPath, backupPath);
   await chmod(backupPath, 0o600);
-  const manifest = { version: 1, backupId, createdAt: new Date().toISOString(), reason, kind, fileName, bytes: (await stat(backupPath)).size, fingerprint: fingerprint || null, item: { id: rawItem.id, name: rawItem.name, remotePath: itemRemotePath(rawItem) || null, eTag: rawItem.eTag || null, cTag: rawItem.cTag || null, size: rawItem.size ?? null, lastModifiedDateTime: rawItem.lastModifiedDateTime || null } };
+  const manifest = { version: 2, scope, backupId, createdAt: new Date().toISOString(), reason, kind, fileName, bytes: (await stat(backupPath)).size, fingerprint: fingerprint || null, item: { id: rawItem.id, name: rawItem.name, remotePath: itemRemotePath(rawItem) || null, eTag: rawItem.eTag || null, cTag: rawItem.cTag || null, size: rawItem.size ?? null, lastModifiedDateTime: rawItem.lastModifiedDateTime || null } };
   await writePrivateFileAtomic(officeBackupManifestPath(backupId), JSON.stringify(manifest));
   return { backupId, createdAt: manifest.createdAt, kind, item: manifest.item, bytes: manifest.bytes, localPath: backupPath, reason };
 }
@@ -6525,7 +7197,12 @@ async function loadOfficeBackup(backupId) {
     manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   }
   catch { throw new Error(`Office backup ${id} was not found or its manifest is invalid.`); }
-  if (manifest.version !== 1 || manifest.backupId !== id || !manifest.item?.id || !["word", "excel", "powerpoint"].includes(manifest.kind)) throw new Error(`Office backup ${id} has an invalid manifest.`);
+  if (manifest.version !== 2 || !manifest.scope) {
+    throw new Error(`Office backup ${id} uses a legacy unscoped manifest and cannot be used. Create a new backup under the current account.`);
+  }
+  const scope = await activeStorageScope();
+  if (!storageScopesEqual(manifest.scope, scope)) throw new Error(`Office backup ${id} belongs to a different OneDrive authentication context or drive.`);
+  if (manifest.backupId !== id || !manifest.item?.id || !["word", "excel", "powerpoint"].includes(manifest.kind)) throw new Error(`Office backup ${id} has an invalid manifest.`);
   if (!manifest.fileName || basename(manifest.fileName) !== manifest.fileName || !manifest.fileName.startsWith(`office-${id}-`)) throw new Error(`Office backup ${id} has an unsafe file reference.`);
   const localPath = join(backupRoot, manifest.fileName);
   const info = await lstat(localPath);
@@ -6768,7 +7445,14 @@ async function officeBatchUpdate(args = {}, kind, toolName) {
       });
     let afterRaw = uploaded.item ? { ...rawItem, ...uploaded.item } : rawItem;
     let remoteValidation = null;
-    let verificationIncomplete = false;
+    let verificationIncomplete = selectedBackend === "graph"
+      && (uploaded.semanticVerification || []).some((entry) => entry.succeeded !== true);
+    if (verificationIncomplete) {
+      toolCallContext.getStore()?.localWarnings?.push({
+        operation: "Graph Excel semantic verification",
+        error: "At least one requested Graph Excel effect could not be fully observed after the write; inspect uploaded.semanticVerification limitations."
+      });
+    }
     try {
       afterRaw = await getRawInfo({ itemId: rawItem.id });
     } catch (error) {
@@ -6790,7 +7474,7 @@ async function officeBatchUpdate(args = {}, kind, toolName) {
       }
     }
     await writeMutationAudit(toolName, {
-      status: "success",
+      status: verificationIncomplete ? "success-verification-incomplete" : "success",
       target: itemAuditSummary(rawItem),
       before: itemAuditSummary(rawItem),
       after: itemAuditSummary(afterRaw),
@@ -6870,17 +7554,18 @@ async function officeBatchTransform(args = {}) {
   }
 
   const proof = {
-    items: preflight.map((entry) => ({
-      id: entry.preview.item?.id,
-      name: entry.preview.item?.name,
-      eTag: entry.preview.item?.eTag,
-      cTag: entry.preview.item?.cTag,
-      kind: entry.request.kind,
-      backend: entry.preview.backend,
-      operations: entry.request.operations,
-      changeCount: entry.preview.changeCount,
-      outputFingerprint: entry.preview.validation?.package?.fingerprint
-    }))
+    items: preflight.map((entry) => officeEditPreviewProof(
+      entry.preview.item,
+      entry.request.kind,
+      entry.request.operations,
+      entry.preview,
+      {
+        ...entry.request,
+        createBackup: args.createBackup !== false,
+        verify: args.verify !== false
+      },
+      entry.preview.backend
+    ))
   };
   const preview = {
     dryRun: args.dryRun !== false,
@@ -6906,6 +7591,54 @@ async function officeBatchTransform(args = {}) {
         createBackup: args.createBackup !== false,
         verify: args.verify !== false
       }, entry.request.kind, entry.individualTool);
+      const requiredField = Object.entries(result || {}).find(([key, value]) => key.startsWith("requiredTo") && Boolean(value));
+      const committed = Boolean(
+        result
+        && result.dryRun === false
+        && result.confirmed === true
+        && result.previewTokenRequired !== true
+        && result.noChanges !== true
+        && !requiredField
+        && Number(result.changeCount) > 0
+        && result.uploaded
+        && result.item?.id
+        && result.item.id === entry.preview.item?.id
+      );
+      if (!committed) {
+        const reason = result?.previewTokenRequired === true
+          ? "The item changed after the cross-file preflight, so its individual preview token was refused."
+          : requiredField
+            ? String(requiredField[1])
+            : result?.noChanges === true
+              ? String(result.requiredToUpdate || "The individual update reported no changes.")
+              : "The individual Office update did not return proof of a committed mutation.";
+        const remaining = preflight.slice(entry.index + 1).map((candidate) => ({ index: candidate.index, item: candidate.preview.item, kind: candidate.request.kind }));
+        const partialState = completed.length > 0;
+        await writeMutationAudit(toolName, {
+          status: "refused",
+          officeBatch: { itemCount: preflight.length, completedCount: completed.length, failedIndex: entry.index, mutationStarted: partialState },
+          error: { name: "OfficeBatchCommitRefused", message: reason },
+          refusal: sanitizeAuditValue(result)
+        });
+        return {
+          dryRun: false,
+          confirmed: true,
+          preflightComplete: true,
+          mutationStarted: partialState,
+          partialState,
+          completed,
+          failed: {
+            index: entry.index,
+            item: entry.preview.item,
+            kind: entry.request.kind,
+            refused: true,
+            reason,
+            result: sanitizeAuditValue(result)
+          },
+          remaining,
+          recovery: completed.map((candidate) => ({ index: candidate.index, item: candidate.result.item, backup: candidate.result.backup }))
+        };
+      }
       completed.push({ index: entry.index, kind: entry.request.kind, result });
     } catch (error) {
       const remaining = preflight.slice(entry.index + 1).map((candidate) => ({ index: candidate.index, item: candidate.preview.item, kind: candidate.request.kind }));
@@ -6927,9 +7660,11 @@ async function officeBatchTransform(args = {}) {
       };
     }
   }
+  const verificationIncomplete = completed.some((entry) => entry.result?.verificationIncomplete === true);
   await writeMutationAudit(toolName, {
-    status: "success",
-    officeBatch: { itemCount: preflight.length, completedCount: completed.length, totalChangeCount: preview.totalChangeCount }
+    status: verificationIncomplete ? "success-verification-incomplete" : "success",
+    officeBatch: { itemCount: preflight.length, completedCount: completed.length, totalChangeCount: preview.totalChangeCount },
+    verificationIncomplete
   });
   return {
     dryRun: false,
@@ -6937,6 +7672,7 @@ async function officeBatchTransform(args = {}) {
     preflightComplete: true,
     mutationStarted: true,
     partialState: false,
+    verificationIncomplete,
     itemCount: completed.length,
     totalChangeCount: preview.totalChangeCount,
     completed
@@ -7047,6 +7783,7 @@ function updateManifestPath(localPath, manifestPath) {
 async function updateFile(args = {}) {
   const remote = assertSafeRemotePath(args.remotePath, "remotePath");
   if (!remote) throw new Error("remotePath is required.");
+  const scope = await activeStorageScope();
 
   if (args.mode === "checkout") {
     if (args.localPath) await assertNotLocalOneDriveSyncPathForWrite(resolve(args.localPath), "Checkout", args);
@@ -7069,7 +7806,8 @@ async function updateFile(args = {}) {
         allowLocalOneDriveSyncPath: args.allowLocalOneDriveSyncPath
       });
       const manifest = {
-        version: 1,
+        version: 2,
+        scope,
         checkedOutAt: new Date().toISOString(),
         remotePath: remote,
         item: downloaded.item,
@@ -7093,9 +7831,15 @@ async function updateFile(args = {}) {
   } catch (error) {
     if (args.force !== true) throw new Error(`Could not read checkout manifest ${manifestPath}. Pass force: true only when intentionally overwriting without checkout metadata.`);
   }
+  if (manifest && (manifest.version !== 2 || !manifest.scope)) {
+    throw new Error(`Checkout manifest ${manifestPath} is legacy and unscoped. Re-checkout the file before committing.`);
+  }
+  if (manifest && !storageScopesEqual(manifest.scope, scope)) {
+    throw new Error(`Checkout manifest ${manifestPath} belongs to a different OneDrive authentication context or drive. Re-checkout the file.`);
+  }
   if (manifest && args.force !== true) {
     const manifestProblems = [];
-    if (manifest.version !== 1) manifestProblems.push("version");
+    if (manifest.version !== 2) manifestProblems.push("version");
     if (manifest.remotePath && cleanPath(manifest.remotePath) !== cleanPath(remote)) manifestProblems.push("remotePath");
     if (manifest.localPath && resolve(manifest.localPath) !== localPath) manifestProblems.push("localPath");
     if (manifestPath && updateManifestPath(localPath, manifestPath) !== manifestPath) manifestProblems.push("manifestPath");
@@ -7132,7 +7876,8 @@ async function updateFile(args = {}) {
     conflictBehavior: "replace",
     allowLocalOneDriveSyncPath: args.allowLocalOneDriveSyncPath,
     ifMatch: args.conflictCheck !== false && args.force !== true ? manifest?.item?.eTag : undefined,
-    auditTool: "onedrive_update_file"
+    auditTool: "onedrive_update_file",
+    guardedInternalReplace: true
   });
   const verified = args.verify !== false
     ? await bestEffortLocalWrite("post-commit remote verification", async () => await getInfo({ path: remote }))
@@ -7317,12 +8062,59 @@ async function sharingAudit(args = {}, publicOnly = false) {
   };
 }
 
+async function existingReplacementTarget(remotePathValue) {
+  try {
+    return await getRawInfo({ path: remotePathValue });
+  } catch (error) {
+    if (error?.graphStatus === 404) return null;
+    throw error;
+  }
+}
+
+async function guardPublicReplacement(args, destinationPath, replacement, toolName) {
+  if (args.conflictBehavior !== "replace" || args.itemId || args.guardedInternalReplace === true) return null;
+  const current = await existingReplacementTarget(destinationPath);
+  if (!current) return { allowed: true, createOnly: true };
+  if (current.folder) throw new Error(`Refusing to replace a folder with file content: ${current.name}`);
+  const proof = {
+    destinationPath,
+    existing: { id: current.id, name: current.name, eTag: current.eTag, cTag: current.cTag },
+    replacement
+  };
+  const preview = {
+    dryRun: args.dryRun !== false,
+    confirmed: args.confirmed === true,
+    wouldReplace: simplifyItem(current),
+    replacement
+  };
+  if (args.dryRun !== false) return previewWithToken(preview, toolName, proof);
+  if (args.confirmed !== true) {
+    return { ...preview, dryRun: false, requiredToReplace: "Set dryRun: false and confirmed: true after reviewing the existing-file replacement preview." };
+  }
+  if (!hasExpectedIdentity(args)) {
+    return { ...preview, dryRun: false, confirmed: true, requiredToReplace: "Provide expectedName or expectedId matching the existing remote file." };
+  }
+  assertExpectedItem(current, args, "Replace");
+  return previewTokenRequiredResult(preview, toolName, proof, args.previewToken, "requiredToReplace") || { allowed: true, current };
+}
+
 async function upload(args = {}) {
   const localPath = resolve(args.localPath);
   await assertNotLocalOneDriveSyncPathForRead(localPath, "Upload", args);
   const destinationPath = args.itemId ? (args.remotePath || `item:${args.itemId}`) : remotePath(args);
   const fileStat = await stat(localPath);
   if (!fileStat.isFile()) throw new Error(`Not a file: ${localPath}`);
+  const replacementGuard = await guardPublicReplacement(args, destinationPath, {
+    localPath,
+    bytes: fileStat.size,
+    modifiedAtMs: Math.trunc(fileStat.mtimeMs)
+  }, "onedrive_upload");
+  if (replacementGuard && replacementGuard.allowed !== true) return replacementGuard;
+  if (replacementGuard?.allowed === true && replacementGuard.current?.eTag && !args.ifMatch) {
+    args = { ...args, ifMatch: replacementGuard.current.eTag };
+  }
+  const effectiveConflictBehavior = replacementGuard?.createOnly === true ? "fail" : (args.conflictBehavior || "fail");
+  const ifNoneMatch = replacementGuard?.createOnly === true ? "*" : undefined;
   const uploadMode = args.uploadMode || "auto";
   const auditTool = args.auditTool || "onedrive_upload";
   try {
@@ -7331,7 +8123,7 @@ async function upload(args = {}) {
       const sessionTarget = args.itemId
         ? { endpoints: [`/me/drive/items/${encodeURIComponent(args.itemId)}/createUploadSession`], name: basename(destinationPath) }
         : undefined;
-      response = await uploadLarge({ ...args, localPath, remotePath: destinationPath, sessionTarget }, fileStat);
+      response = await uploadLarge({ ...args, localPath, remotePath: destinationPath, sessionTarget, effectiveConflictBehavior, ifNoneMatch }, fileStat);
     } else {
       if (uploadMode === "simple" && fileStat.size > simpleUploadLimit) {
         throw new Error(`Simple upload only supports files up to ${simpleUploadLimit} bytes. Use uploadMode: "session" or "auto".`);
@@ -7339,14 +8131,15 @@ async function upload(args = {}) {
       const stream = createReadStream(localPath);
       const targetPath = args.itemId
         ? `/me/drive/items/${encodeURIComponent(args.itemId)}/content`
-        : uploadPath(destinationPath, args.conflictBehavior || "fail");
+        : uploadPath(destinationPath, effectiveConflictBehavior);
       const result = await graph(targetPath, {
         method: "PUT",
         body: stream,
         duplex: "half",
         headers: {
           "Content-Type": "application/octet-stream",
-          ...(args.ifMatch ? { "If-Match": args.ifMatch } : {})
+          ...(args.ifMatch ? { "If-Match": args.ifMatch } : {}),
+          ...(ifNoneMatch ? { "If-None-Match": ifNoneMatch } : {})
         }
       });
       await bestEffortLocalWrite("metadata cache update", async () => await cacheItems([result]));
@@ -7390,7 +8183,11 @@ function normalizeChunkSize(value = defaultUploadChunkSize) {
 async function uploadLarge(args = {}, fileStat) {
   const chunkSize = normalizeChunkSize(args.chunkSize ?? defaultUploadChunkSize);
   const sessionTarget = args.sessionTarget || await uploadSessionTarget(args.remotePath);
-  const session = await createUploadSession(sessionTarget, args.conflictBehavior || "fail", args.ifMatch);
+  const session = await createUploadSession(
+    sessionTarget,
+    args.effectiveConflictBehavior || args.conflictBehavior || "fail",
+    { ifMatch: args.ifMatch, ifNoneMatch: args.ifNoneMatch }
+  );
   if (!session.uploadUrl) throw new Error("Microsoft Graph did not return an uploadUrl.");
 
   let position = 0;
@@ -7444,7 +8241,7 @@ async function uploadLarge(args = {}, fileStat) {
   };
 }
 
-async function createUploadSession(sessionTarget, conflictBehavior, ifMatch) {
+async function createUploadSession(sessionTarget, conflictBehavior, conditions = {}) {
   const bodies = [
     {
       item: {
@@ -7459,7 +8256,7 @@ async function createUploadSession(sessionTarget, conflictBehavior, ifMatch) {
         name: sessionTarget.name
       }
     },
-    null
+    ...(conditions.ifNoneMatch ? [] : [null])
   ];
   const errors = [];
   for (const endpoint of sessionTarget.endpoints) {
@@ -7467,7 +8264,10 @@ async function createUploadSession(sessionTarget, conflictBehavior, ifMatch) {
       try {
         return await graph(endpoint, {
           method: "POST",
-          ...(ifMatch ? { headers: { "If-Match": ifMatch } } : {}),
+          ...((conditions.ifMatch || conditions.ifNoneMatch) ? { headers: {
+            ...(conditions.ifMatch ? { "If-Match": conditions.ifMatch } : {}),
+            ...(conditions.ifNoneMatch ? { "If-None-Match": conditions.ifNoneMatch } : {})
+          } } : {}),
           ...(body ? { body: JSON.stringify(body) } : {})
         });
       } catch (error) {
@@ -7480,14 +8280,25 @@ async function createUploadSession(sessionTarget, conflictBehavior, ifMatch) {
 
 async function writeText(args = {}) {
   const destinationPath = remotePath(args);
+  const contentBuffer = Buffer.from(args.content, "utf8");
+  const replacementGuard = await guardPublicReplacement(args, destinationPath, {
+    bytes: contentBuffer.length,
+    sha256: createHash("sha256").update(contentBuffer).digest("hex")
+  }, "onedrive_write_text");
+  if (replacementGuard && replacementGuard.allowed !== true) return replacementGuard;
+  const effectiveConflictBehavior = replacementGuard?.createOnly === true ? "fail" : (args.conflictBehavior || "fail");
   try {
-    const result = await graph(uploadPath(destinationPath, args.conflictBehavior || "fail"), {
+    const result = await graph(uploadPath(destinationPath, effectiveConflictBehavior), {
       method: "PUT",
-      body: Buffer.from(args.content, "utf8"),
-      headers: { "Content-Type": "text/plain; charset=utf-8" }
+      body: contentBuffer,
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        ...(replacementGuard?.allowed === true && replacementGuard.current?.eTag ? { "If-Match": replacementGuard.current.eTag } : {}),
+        ...(replacementGuard?.createOnly === true ? { "If-None-Match": "*" } : {})
+      }
     });
     await bestEffortLocalWrite("metadata cache update", async () => await cacheItems([result]));
-    const response = { item: simplifyItem(result), bytesUploaded: Buffer.byteLength(args.content, "utf8") };
+    const response = { item: simplifyItem(result), bytesUploaded: contentBuffer.length };
     await writeMutationAudit("onedrive_write_text", {
       status: "success",
       target: { remotePath: destinationPath },
@@ -7672,20 +8483,45 @@ async function pollCopyMonitor(monitorUrl, timeoutSeconds = 60) {
   while (Date.now() < deadline) {
     const response = await graph(trustedMonitorUrl, { skipAuth: true, returnResponse: true, maxRetries: 3, redirect: "manual" });
     last = response.body && !(response.body instanceof ArrayBuffer) ? response.body : null;
+    if (!response.ok && response.status !== 303) {
+      return {
+        complete: true,
+        terminal: true,
+        succeeded: false,
+        terminalState: "failed",
+        status: response.status,
+        monitorUrl: safeMonitorUrl,
+        monitor: sanitizeAuditValue(last)
+      };
+    }
     if (response.status === 303) {
       return {
         complete: true,
+        terminal: true,
+        succeeded: true,
+        terminalState: "succeeded",
         status: response.status,
         resourceLocation: response.headers.get("location") ? safeDisplayPath(response.headers.get("location")) : null,
         monitorUrl: safeMonitorUrl
       };
     }
     if (response.ok && last?.status && !["notStarted", "running", "inProgress"].includes(String(last.status))) {
-      return { complete: true, status: response.status, monitorUrl: safeMonitorUrl, monitor: sanitizeAuditValue(last) };
+      const normalizedStatus = String(last.status).toLowerCase();
+      const succeeded = ["completed", "complete", "succeeded", "success"].includes(normalizedStatus);
+      const failed = ["failed", "error", "cancelled", "canceled"].includes(normalizedStatus);
+      return {
+        complete: true,
+        terminal: true,
+        succeeded,
+        terminalState: succeeded ? "succeeded" : failed ? "failed" : "unknown",
+        status: response.status,
+        monitorUrl: safeMonitorUrl,
+        monitor: sanitizeAuditValue(last)
+      };
     }
     await sleep(2000);
   }
-  return { complete: false, timeoutSeconds, monitorUrl: safeMonitorUrl, monitor: sanitizeAuditValue(last) };
+  return { complete: false, terminal: false, succeeded: false, terminalState: "timeout", timeoutSeconds, monitorUrl: safeMonitorUrl, monitor: sanitizeAuditValue(last) };
 }
 
 async function copyItem(args = {}) {
@@ -7738,15 +8574,38 @@ async function copyItem(args = {}) {
       source: item,
       monitorUrl: monitorUrl ? safeDisplayPath(monitorUrl) : null
     };
-    if (args.waitForCompletion && monitorUrl) {
-      try {
-        result.monitor = await pollCopyMonitor(monitorUrl, args.timeoutSeconds ?? 60);
-      } catch (error) {
-        result.monitorError = safeToolErrorMessage(error);
+    if (args.waitForCompletion) {
+      if (!monitorUrl) {
+        result.monitor = {
+          complete: false,
+          terminal: false,
+          succeeded: false,
+          terminalState: "missing_monitor_url"
+        };
+      } else {
+        try {
+          result.monitor = await pollCopyMonitor(monitorUrl, args.timeoutSeconds ?? 60);
+        } catch (error) {
+          result.monitorError = safeToolErrorMessage(error);
+          result.monitor = {
+            complete: false,
+            terminal: false,
+            succeeded: false,
+            terminalState: "monitor_error"
+          };
+        }
       }
     }
     await writeMutationAudit("onedrive_copy", {
-      status: result.monitorError ? "accepted-monitor-failed" : "success",
+      status: result.monitorError
+        ? "accepted-monitor-failed"
+        : result.monitor?.terminalState === "missing_monitor_url"
+          ? "accepted-monitor-unavailable"
+        : result.monitor?.terminal && !result.monitor?.succeeded
+          ? "accepted-copy-failed"
+          : result.monitor?.succeeded
+            ? "success"
+            : "accepted",
       target: itemAuditSummary(current),
       before: itemAuditSummary(current),
       destination: parentReference,
@@ -8578,6 +9437,10 @@ function sendError(id, code, message) {
 }
 
 async function callTool(name, args = {}) {
+  if (previewScopedTools.has(name)) {
+    const store = toolCallContext.getStore();
+    if (store) store.storageScope = await activeStorageScope();
+  }
   switch (name) {
     case "onedrive_config": {
       const status = publicConfig();
@@ -8599,9 +9462,11 @@ async function callTool(name, args = {}) {
     case "onedrive_logout": {
       authGeneration += 1;
       deviceLoginGeneration += 1;
+      invalidateActiveStorageScope();
       tokenCache = null;
       pendingDevice = null;
       tokenRefreshPromise = null;
+      adoptCurrentToolAccountGeneration();
       if (args.deleteKeychainToken === true && args.confirmed !== true) {
         return textResult({
           memoryCleared: true,
@@ -8778,10 +9643,14 @@ async function handleRequest(message) {
         localWarnings: [],
         lastGraphRequestId: null,
         lastMutationGraphRequestId: null,
-        metadataCacheWrites: 0
+        metadataCacheWrites: 0,
+        authGeneration,
+        storageScopeGeneration
       }, async () => {
         try {
-          return await callTool(params.name, validation.args || {});
+          const value = await callTool(params.name, validation.args || {});
+          assertToolAccountGeneration(`${params.name} completion`);
+          return value;
         } catch (error) {
           return textResult(safeToolErrorMessage(error), true);
         }

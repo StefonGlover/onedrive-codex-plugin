@@ -22,6 +22,7 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "scripts" / "office-openxml.py"
+FIXTURE_FACTORY = ROOT / "scripts" / "office-openxml-test.py"
 SOFFICE = Path(os.environ.get("SOFFICE") or shutil.which("soffice") or "soffice")
 
 
@@ -49,6 +50,39 @@ def main():
         root.mkdir(parents=True, exist_ok=True)
         output = root / "rendered"
         output.mkdir()
+
+        emitted_root = root / "consolidated-fixtures"
+        emitted = subprocess.run(
+            [sys.executable, str(FIXTURE_FACTORY), f"--emit-fixtures={emitted_root}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "PYTHONPYCACHEPREFIX": str(root / "pycache")},
+        )
+        if emitted.returncode != 0:
+            raise RuntimeError(emitted.stderr or emitted.stdout)
+        emitted_paths = {
+            "word": emitted_root / "sample.docx",
+            "excel": emitted_root / "sample.xlsx",
+            "powerpoint": emitted_root / "sample.pptx",
+        }
+        Document(emitted_paths["word"])
+        load_workbook(emitted_paths["excel"], data_only=False)
+        Presentation(emitted_paths["powerpoint"])
+        emitted_rendered = {}
+        for kind, path in emitted_paths.items():
+            destination = output / ("consolidated-" + kind)
+            destination.mkdir()
+            profile = root / ("profile-consolidated-" + kind)
+            conversion = subprocess.run([str(SOFFICE), "--headless", f"-env:UserInstallation={profile.as_uri()}", "--convert-to", "pdf", "--outdir", str(destination), str(path)], cwd=root, capture_output=True, text=True, check=False)
+            pdf = destination / "sample.pdf"
+            diagnostic = (conversion.stdout + "\n" + conversion.stderr).lower()
+            emitted_rendered[kind] = {
+                "exitCode": conversion.returncode,
+                "bytes": pdf.stat().st_size if pdf.exists() else 0,
+                "cleanOpen": conversion.returncode == 0 and not any(term in diagnostic for term in ("repair", "corrupt", "fatal error")),
+                "stderr": conversion.stderr[-500:],
+            }
 
         document = Document()
         document.add_heading("Real Word Fixture", level=1)
@@ -121,7 +155,8 @@ def main():
             and rendered[".xlsx"]["cleanOpen"]
         )
         checks["powerpointRealPackage"] = powerpoint["changeCount"] == 6 and rendered[".pptx"]["bytes"] > 0 and rendered[".pptx"]["cleanOpen"]
-        print(json.dumps({"ok": all(checks.values()), "checks": checks, "rendered": rendered}, indent=2))
+        checks["consolidatedFixturesAreGenuinePackages"] = all(entry["bytes"] > 0 and entry["cleanOpen"] for entry in emitted_rendered.values())
+        print(json.dumps({"ok": all(checks.values()), "checks": checks, "rendered": rendered, "consolidatedRendered": emitted_rendered}, indent=2))
         raise SystemExit(0 if all(checks.values()) else 1)
 
 

@@ -8,8 +8,12 @@ on:
 
 jobs:
   test:
-    name: Plugin regression checks
+    name: Plugin regression checks (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["20", "26"]
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -17,18 +21,21 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: ${{ matrix.node }}
 
       - name: Install shell dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y zsh libreoffice-writer libreoffice-calc libreoffice-impress
-          python3 -m pip install python-docx openpyxl python-pptx pillow
+          sudo apt-get install -y zsh libxml2-utils libreoffice-writer libreoffice-calc libreoffice-impress
+          python3 -m pip install -r scripts/requirements-office-test.txt
 
-      - name: Validate JSON manifests
+      - name: Validate manifests and whitespace
         run: |
           node -e "JSON.parse(require('node:fs').readFileSync('.codex-plugin/plugin.json', 'utf8'))"
           node -e "JSON.parse(require('node:fs').readFileSync('.mcp.json', 'utf8'))"
+          xmllint --noout office-addin/manifest.xml
+          git diff-tree --check --root -r HEAD
+          git diff --check
 
       - name: Syntax check scripts
         run: |
@@ -37,18 +44,34 @@ jobs:
           node --check scripts/prepackage-check.mjs
           node --check scripts/beta-test.mjs
           node --check scripts/benchmark.mjs
+          node --check scripts/tool-contract.mjs
+          node --check scripts/install-versioned-cache.mjs
+          node --check office-addin/manifest-contract.mjs
+          node --check office-addin/serve.mjs
+          node --check office-addin/prepare-test-manifest.mjs
           zsh -n scripts/configure.zsh
+          zsh -n office-addin/host-test-runner.zsh
 
       - name: Run utility self-checks
         run: |
           node scripts/beta-test.mjs --self-check
           node scripts/benchmark.mjs --self-check
+          node scripts/install-versioned-cache.mjs --self-check
+          node office-addin/prepare-test-manifest.mjs --self-check
           if node scripts/beta-test.mjs --self-check --stale-days=-1; then
             echo "beta-test should reject negative --stale-days" >&2
             exit 1
           fi
           if node scripts/beta-test.mjs --self-check --cleanup-page-size=invalid; then
             echo "beta-test should reject invalid numeric cleanup controls" >&2
+            exit 1
+          fi
+          if node scripts/beta-test.mjs --live --run-id=codex-beta-ci --invite-recipient=beta@example.test; then
+            echo "beta-test should reject --live without --confirmed" >&2
+            exit 1
+          fi
+          if node scripts/beta-test.mjs --live --confirmed --invite-recipient=beta@example.test; then
+            echo "beta-test should reject --live without an exact --run-id" >&2
             exit 1
           fi
 
@@ -62,6 +85,7 @@ jobs:
 
       - name: Run prepackage guard
         run: |
+          node scripts/prepackage-check.mjs --self-check
           node scripts/prepackage-check.mjs
           if node scripts/prepackage-check.mjs --installed; then
             echo "prepackage-check --installed without a path should fail" >&2

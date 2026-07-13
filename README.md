@@ -2,6 +2,8 @@
 
 Local Codex plugin for OneDrive file operations through Microsoft Graph.
 
+Release `0.4.0+codex.20260713202830` exposes an exact 72-tool contract. The optional Office companion is version `1.1.1`.
+
 This is an unofficial integration and is not affiliated with, endorsed by, or sponsored by Microsoft.
 
 The plugin is remote-first: it uses Microsoft Graph rather than the laptop's local OneDrive sync folder. Upload and download tools refuse local OneDrive sync-folder paths by default unless `allowLocalOneDriveSyncPath: true` is explicitly provided.
@@ -89,7 +91,7 @@ Optional performance settings can also be placed in the config file:
 }
 ```
 
-Use absolute paths in `storageRoot` and `cacheRoot` if you override them. Environment variables take precedence.
+Use absolute paths in `storageRoot` and `cacheRoot` if you override them. Configuration precedence is environment variables, then `~/.codex/onedrive-plugin/config.json`, then server defaults. The checked-in `.mcp.json` does not override tenant or scopes.
 
 ## Tools
 
@@ -189,12 +191,14 @@ For cross-drive research, `onedrive_office_index_refresh` stores structured para
 - Remote mutations that move, rename, copy, expose, invite, restore, delete, or revoke access use a preview-first pattern.
 - Rename, move, copy, sharing-link creation, named-recipient invitation, permission revoke, restore, and delete default to dry-run where the operation has a dry-run mode.
 - Live rename, move, copy, sharing-link creation, named-recipient invitation, permission revoke, restore, and delete require `dryRun: false`, `confirmed: true`, and stable expected identity (`expectedName` or `expectedId`; restore requires `expectedId`).
+- Replacing an existing file with `onedrive_upload` or `onedrive_write_text` is also preview-token gated: review the returned existing item, then repeat with `dryRun: false`, `confirmed: true`, matching expected identity, and the exact preview token.
 - Live sharing-link creation, named-recipient invitation, permission revoke, batch permission revoke, restore, delete, and batch delete also require the `previewToken` returned by the immediately preceding dry-run preview for the same resolved operation.
 - Batch delete, batch move, and batch permission revoke preflight every item before any mutation and refuse partial execution when a preflight check fails. Live batch responses include a warning that successful earlier items may already be changed if a later item fails.
 - Sharing-link creation supports Microsoft Graph link type/scope plus optional password and expiration, and can include a before/after permission diff so the caller can see what changed.
 - `onedrive_invite_permission` grants named users or groups access through Microsoft Graph `driveItem: invite`. It defaults to a silent direct grant (`sendInvitation: false`, `requireSignIn: true`); email invitations are opt-in with `sendInvitation: true` and optional `message`.
 - Permission revoke uses Microsoft Graph `DELETE /me/drive/items/{item-id}/permissions/{permission-id}` and includes before permissions by default; live revoke includes after permissions and a permission diff.
 - Rename, move, copy, share, and delete refuse to operate on the OneDrive root.
+- A relative target or destination field is refused unless its matching preset field is present; it never silently resolves relative to the OneDrive root.
 - Tool arguments are validated before handlers run, including required fields, unknown properties, enum values, numeric bounds, array bounds, and target `anyOf` rules.
 - Text reads are bounded to 5 MB by default.
 - Text reads use MIME/extension checks and refuse likely binary files unless `force: true` is set.
@@ -205,7 +209,7 @@ For cross-drive research, `onedrive_office_index_refresh` stores structured para
 - Normal list, search, scan, delta, and metadata calls opportunistically maintain a local metadata cache at `~/.codex/onedrive-plugin/cache/metadata-cache.json`.
 - Plugin-managed storage, cache, audit, download, export, and update-workflow directories are restricted to the current user (`0700`), and locally persisted metadata, extracted content, audit records, downloads, exports, and update manifests are restricted to the current user (`0600`). Existing managed cache/index/audit files are hardened when loaded or rewritten.
 - `onedrive_sync_status` reports cache age, item count, delta cursor availability, resumable delta next-link availability, unresolved path count, and plugin storage locations.
-- Metadata cache, content index, and audit files are written with compact atomic JSON/JSONL updates, interprocess locks, and reload-on-write freshness checks. Version 3 cache migration clears unscoped legacy cursors so stale ordinary pagination state cannot masquerade as delta state.
+- Metadata cache v4 and content/Office indexes v3 are bound to both an opaque authentication context and the active drive ID. Delta cursors, preview tokens, Office backups, and update manifests use the same scope; legacy unscoped local state is invalidated or retained but refused until safely recreated. Local-only search fails closed on a scope mismatch. Cache, index, and audit files use atomic/locked updates with reload-on-write freshness checks.
 - `onedrive_cache_refresh` rebuilds the cache from a bounded recursive scan and uses delta refreshes when a previous cursor exists for the same root. Cache refresh batches metadata-cache writes during scans, persists only delta-origin `nextLink` cursors for continuation, reconciles pathless delta records through cached parent IDs, and returns progress milestones. Ordinary list/search pagination cannot seed delta state. `onedrive_cache_clear` clears the cache.
 - `onedrive_content_index_refresh` is the explicit content-reading step. It indexes supported cached text and structured Office content into `content-index.json`, stores normalized text/tokens plus semantic Office anchors, reuses entries when ETag/cTag/mtime/size are unchanged, and applies file-size, segment, concurrency, and per-item failure limits. Explicit metadata deletes and changed fingerprints evict stale entries; moves and renames update indexed metadata; unchanged explicit cTags preserve content entries across metadata-only renames, while changed or omitted content tags with changed ETags invalidate conservatively. Bounded partial scans do not globally prune unseen entries.
 - `onedrive_content_search` searches only the local content index and returns lightweight metadata plus snippets. It does not call Microsoft Graph or read file bodies.
@@ -221,7 +225,7 @@ For cross-drive research, `onedrive_office_index_refresh` stores structured para
 - `onedrive_doctor` checks config, auth, profile, drive metadata, presets, and optional root listing in one call.
 - `onedrive_export_pdf` and `onedrive_export_text` ask Microsoft Graph to convert supported Office files before saving locally. Microsoft Graph may reject conversions for unsupported file types.
 - `onedrive_permissions` audits current sharing/permission grants before changing access.
-- `onedrive_delta` can return deleted item changes. Microsoft Graph does not expose a normal OneDrive recycle-bin listing endpoint through the driveItem file APIs.
+- `onedrive_delta` can return deleted item changes. Set `maxPages` from 1 to 100 to cap Graph pages in one call while retaining the advanced `nextLink` or terminal `deltaLink`. Microsoft Graph does not expose a normal OneDrive recycle-bin listing endpoint through the driveItem file APIs.
 - `onedrive_get_info` supports `includeDeletedItems: true` when targeting an item ID; Microsoft documents this as OneDrive Personal-only.
 - `onedrive_restore_deleted` defaults to dry-run and requires a deleted item ID. Live restore may require `Files.ReadWrite.All` for personal OneDrive.
 - Live remote mutations are recorded in a local JSONL audit log at `~/.codex/onedrive-plugin/audit/mutations.jsonl`. Audit entries include safe item summaries, before/after summaries when available, permission diffs when relevant, Graph request IDs when available, and safe error details for failed live mutations. They do not log tokens, authorization headers, file contents, raw request bodies, sharing-link web URLs, passwords, invite messages, or recipient identifiers.
@@ -312,6 +316,20 @@ Run the prepackage guard before refreshing the plugin cache:
 scripts/prepackage-check.mjs
 ```
 
+Preview the exact new versioned cache directory, then install only after reviewing that path. The installer runs the source prepackage gate, creates the version directory atomically, refuses any existing target, preserves older cache versions, and requires full byte/mode/type/symlink parity before succeeding:
+
+```bash
+node scripts/install-versioned-cache.mjs
+node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.4.0+codex.20260713202830"
+```
+
+After both live betas and the real Office matrix, regenerate the two QA reports, preview their exact sync into that new cache, then apply only those evidence files and re-run parity:
+
+```bash
+node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.4.0+codex.20260713202830"
+node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.4.0+codex.20260713202830"
+```
+
 Office compatibility checks are split by purpose:
 
 ```bash
@@ -321,7 +339,7 @@ node office-addin/taskpane-test.mjs
 SOFFICE="$(command -v soffice)" python3 scripts/office-real-fixture-test.py
 ```
 
-The security corpus includes malformed ZIP/XML/relationship cases, deterministic mutation fuzzing, every possible two-run PowerPoint split of a target phrase, and a 5,000-run deck. The real-fixture gate generates packages with `python-docx`, `openpyxl`, and `python-pptx`, edits them, reopens them with their native libraries, and requires LibreOffice PDF conversion without repair/corruption diagnostics. Microsoft Office itself is not available in headless CI; release candidates should additionally be opened and saved in desktop Word, Excel, and PowerPoint when exact Microsoft interoperability is required.
+Install the pinned fixture dependencies with `python3 -m pip install -r scripts/requirements-office-test.txt`. The security corpus includes malformed ZIP/XML/relationship cases, deterministic mutation fuzzing, every possible two-run PowerPoint split of a target phrase, and a 5,000-run deck. The real-fixture gate generates packages with `python-docx`, `openpyxl`, and `python-pptx`, edits them, reopens them with their native libraries, and requires LibreOffice PDF conversion without repair/corruption diagnostics. Microsoft Office itself is not available in headless CI; release candidates should additionally run the Word, Excel, and PowerPoint matrix documented in `office-addin/README.md`.
 
 After installing a refreshed build, compare source with the installed cache:
 
@@ -329,13 +347,13 @@ After installing a refreshed build, compare source with the installed cache:
 scripts/prepackage-check.mjs --installed /path/to/installed/onedrive/cache
 ```
 
-Run the live CRUD/regression test from the plugin directory or with an absolute path to the installed plugin:
+Running the harness without `--live` is read-only. It prints the exact proposed run ID and folder name. Review those values, then run the live CRUD/regression test from the plugin directory or with an absolute path to the installed plugin:
 
 ```bash
-scripts/beta-test.mjs
+scripts/beta-test.mjs --live --confirmed --run-id=codex-beta-20260713t150000z --invite-recipient=person@example.com
 ```
 
-The test creates a clearly named temporary OneDrive folder, exercises CRUD and safety behavior, deletes only that test folder during cleanup, and removes local temporary work on success. Pass `--keep-work` to keep local artifacts for debugging.
+All four live arguments are required. The test creates the exact named temporary OneDrive folder, exercises CRUD and safety behavior, silently grants then revokes read access for the explicit recipient, creates then revokes an anonymous test link, deletes only that test folder during cleanup, and removes isolated local work on success. Results are recorded as `pass`, `fail`, or `blocked`; a resource limitation is never reported as a pass. Pass `--keep-work` to keep local artifacts for debugging.
 Unknown, duplicate, and positional CLI options are rejected before the beta harness starts, so a misspelled safety or mode flag cannot silently fall through to a different test mode.
 
 Find old beta-test folders without deleting them. Cleanup discovery uses bounded Graph search followed by item verification, so it does not recursively scan the entire drive. Candidates with missing or invalid timestamps are skipped, and invalid/overflowing cleanup limits are rejected before any delete:
@@ -347,7 +365,7 @@ scripts/beta-test.mjs --cleanup-stale --stale-days=1
 Delete the stale candidates only after reviewing the dry-run output:
 
 ```bash
-scripts/beta-test.mjs --cleanup-stale --stale-days=1 --confirmed
+scripts/beta-test.mjs --cleanup-stale --stale-days=1 --live --confirmed --run-id=codex-beta-cleanup-20260713
 ```
 
 Run read-only tenant health checks across personal/work-school tenant endpoints:
@@ -356,7 +374,7 @@ Run read-only tenant health checks across personal/work-school tenant endpoints:
 scripts/beta-test.mjs --tenant-matrix=common,consumers,organizations
 ```
 
-Use `--tenant-matrix-live` only when you intentionally want to run the full live beta once per tenant entry.
+Use `--tenant-matrix-live --live --confirmed --run-id=<exact-id> --invite-recipient=<email>` only when you intentionally want to run the full live beta once per tenant entry.
 
 ## Plugin Gallery
 
@@ -366,7 +384,7 @@ The plugin manifest includes a file-manager flow screenshot at `assets/screensho
 
 ## CI
 
-The GitHub Actions workflow in `.github/workflows/ci.yml` runs syntax checks, the mocked Microsoft Graph regression suite, and the prepackage guard on every push and pull request.
+The GitHub Actions workflow in `.github/workflows/ci.yml` runs syntax checks, pinned Office fixture/security checks, the companion mocks, the Microsoft Graph regression suite, and the prepackage guard on Node.js 20 and 26 for every push and pull request.
 
 ## Microsoft References
 

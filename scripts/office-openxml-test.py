@@ -13,11 +13,39 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "scripts" / "office-openxml.py"
 
+OPENXML_TOOL_NAMES = {
+    "word": "onedrive_word_batch_update",
+    "excel": "onedrive_excel_batch_update",
+    "powerpoint": "onedrive_powerpoint_batch_update",
+}
+EXPECTED_OPENXML_OPERATION_COUNTS = {"word": 9, "excel": 17, "powerpoint": 12}
+COVERED_OPENXML_OPERATIONS = {kind: set() for kind in OPENXML_TOOL_NAMES}
+
 
 CONTENT_TYPES = """<?xml version="1.0" encoding="UTF-8"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
+</Types>"""
+
+WORD_CONTENT_TYPES = """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"""
+
+EXCEL_CONTENT_TYPES = """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+  <Override PartName="/xl/tables/table1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml"/>
+  <Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>
+  <Override PartName="/xl/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>
+  <Override PartName="/xl/calcChain.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml"/>
 </Types>"""
 
 
@@ -48,7 +76,38 @@ def run_helper(path, kind, action="inspect", **options):
     parsed = json.loads(result.stdout or "{}")
     if result.returncode != 0 or not parsed.get("ok"):
         raise AssertionError(parsed.get("error") or result.stderr)
+    if action == "edit":
+        COVERED_OPENXML_OPERATIONS[kind].update(operation.get("type") for operation in options.get("operations", []))
     return parsed["value"]
+
+
+def production_openxml_operations():
+    """Read the advertised operation contracts from the production MCP schemas."""
+    requests = "\n".join([
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "office-openxml-test", "version": "1"}}}),
+        json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+        "",
+    ])
+    result = subprocess.run(
+        ["node", str(ROOT / "mcp" / "server.mjs")],
+        cwd=ROOT,
+        input=requests,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+        env={**os.environ, "ONEDRIVE_TEST_ACCESS_TOKEN": "office-openxml-schema-check"},
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr or "MCP schema inspection failed")
+    messages = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    tools = next(message["result"]["tools"] for message in messages if message.get("id") == 2)
+    tools_by_name = {tool["name"]: tool for tool in tools}
+    contract = {}
+    for kind, tool_name in OPENXML_TOOL_NAMES.items():
+        operation_variants = tools_by_name[tool_name]["inputSchema"]["properties"]["operations"]["items"]["anyOf"]
+        contract[kind] = {variant["properties"]["type"]["const"] for variant in operation_variants}
+    return contract
 
 
 def emit_fixtures(root):
@@ -57,22 +116,21 @@ def emit_fixtures(root):
     write_package(docx, {
         "_rels/.rels": root_rels("word/document.xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"),
         "word/document.xml": """<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Hello Word</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>A1</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:sdt><w:sdtPr><w:tag w:val="customer"/><w:alias w:val="Customer"/><w:id w:val="7"/></w:sdtPr><w:sdtContent><w:p><w:r><w:t>Acme</w:t></w:r></w:p></w:sdtContent></w:sdt></w:body></w:document>""",
-    })
+    }, WORD_CONTENT_TYPES)
     xlsx = root / "sample.xlsx"
     write_package(xlsx, {
         "_rels/.rels": root_rels("xl/workbook.xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"),
         "xl/workbook.xml": """<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets><definedNames><definedName name="Total">Data!$A$1</definedName></definedNames></workbook>""",
         "xl/_rels/workbook.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain" Target="calcChain.xml"/></Relationships>""",
-        "xl/worksheets/sheet1.xml": """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1"><f>SUM(1,2)</f><v>3</v></c><c r="B1" t="inlineStr"><is><t>Revenue</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>Q1</t></is></c><c r="B2"><v>10</v></c></row></sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts><pivotTableParts count="1"><pivotTablePart r:id="rId3"/></pivotTableParts><drawing r:id="rId2"/></worksheet>""",
-        "xl/worksheets/_rels/sheet1.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable1.xml"/></Relationships>""",
+        "xl/worksheets/sheet1.xml": """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1"><f>SUM(1,2)</f><v>3</v></c><c r="B1" t="inlineStr"><is><t>Revenue</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>Q1</t></is></c><c r="B2"><v>10</v></c></row></sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts><drawing r:id="rId2"/></worksheet>""",
+        "xl/worksheets/_rels/sheet1.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>""",
         "xl/tables/table1.xml": """<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="RevenueTable" displayName="RevenueTable" ref="A1:B2"><tableColumns count="2"><tableColumn id="1" name="Metric"/><tableColumn id="2" name="Revenue"/></tableColumns><tableStyleInfo name="TableStyleMedium2" showRowStripes="1"/></table>""",
-        "xl/drawings/drawing1.xml": """<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor><xdr:graphicFrame><c:chart r:id="rId1"/></xdr:graphicFrame></xdr:twoCellAnchor></xdr:wsDr>""",
+        "xl/drawings/drawing1.xml": """<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor><xdr:graphicFrame><xdr:nvGraphicFramePr><xdr:cNvPr id="2" name="Chart 1"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><c:chart r:id="rId1"/></xdr:graphicFrame></xdr:twoCellAnchor></xdr:wsDr>""",
         "xl/drawings/_rels/drawing1.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>""",
         "xl/charts/chart1.xml": """<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>Revenue Chart</a:t></a:r></a:p></c:rich></c:tx></c:title><c:plotArea><c:barChart><c:ser><c:val><c:numRef><c:f>Data!$B$1:$B$2</c:f></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>""",
-        "xl/pivotTables/pivotTable1.xml": """<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="RevenuePivot" cacheId="1"><location ref="D1:F5"/><rowFields count="1"><field x="0"/></rowFields><dataFields count="1"><dataField fld="1"/></dataFields></pivotTableDefinition>""",
-        "xl/styles.xml": """<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font/></fonts><fills count="1"><fill/></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>""",
+        "xl/styles.xml": """<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="0"/><fonts count="1"><font><name val="Calibri"/><family val="2"/><color theme="1"/><sz val="11"/><scheme val="minor"/></font></fonts><fills count="2"><fill><patternFill/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" pivotButton="0" quotePrefix="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" pivotButton="0" quotePrefix="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" pivotButton="0" quotePrefix="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles><tableStyles count="0" defaultTableStyle="TableStyleMedium9" defaultPivotStyle="PivotStyleLight16"/></styleSheet>""",
         "xl/calcChain.xml": """<calcChain xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><c r="A1" i="1"/></calcChain>""",
-    })
+    }, EXCEL_CONTENT_TYPES)
     pptx = root / "sample.pptx"
     ppt_content_types = """<?xml version="1.0" encoding="UTF-8"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
@@ -81,13 +139,15 @@ def emit_fixtures(root):
   <Default Extension="gif" ContentType="image/gif"/>
   <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
   <Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+  <Override PartName="/ppt/notesSlides/notesSlide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml"/>
 </Types>"""
     write_package(pptx, {
         "_rels/.rels": root_rels("ppt/presentation.xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"),
         "ppt/presentation.xml": """<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="12192000" cy="6858000" type="screen16x9"/></p:presentation>""",
         "ppt/_rels/presentation.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>""",
-        "ppt/slides/slide1.xml": """<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="2" name="Title 1"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr><a:xfrm><a:off x="1" y="2"/><a:ext cx="3" cy="4"/></a:xfrm></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Hello PowerPoint</a:t></a:r></a:p></p:txBody></p:sp><p:pic><p:nvPicPr><p:cNvPr id="3" name="Picture 1"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId2"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="10" y="20"/><a:ext cx="30" cy="40"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr></p:pic></p:spTree></p:cSld></p:sld>""",
-        "ppt/slides/_rels/slide1.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.gif"/></Relationships>""",
+        "ppt/slides/slide1.xml": """<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="2" name="Title 1"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr><a:xfrm><a:off x="1" y="2"/><a:ext cx="3" cy="4"/></a:xfrm></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Hello PowerPoint</a:t></a:r></a:p></p:txBody></p:sp><p:pic><p:nvPicPr><p:cNvPr id="3" name="Picture 1"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId2"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="10" y="20"/><a:ext cx="30" cy="40"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr></p:pic><p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="4" name="Table 1"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="100" y="200"/><a:ext cx="300" cy="400"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table"><a:tbl><a:tblPr firstRow="1"/><a:tblGrid><a:gridCol w="300"/></a:tblGrid><a:tr h="200"><a:tc><a:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Old table value</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc></a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:cSld></p:sld>""",
+        "ppt/slides/_rels/slide1.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.gif"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/></Relationships>""",
+        "ppt/notesSlides/notesSlide1.xml": """<p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="2" name="Notes Placeholder"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Original notes</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>""",
         "ppt/media/image1.gif": b"GIF89a",
     }, ppt_content_types)
     return {"word": docx, "excel": xlsx, "powerpoint": pptx}
@@ -98,11 +158,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix="onedrive-office-test-") as directory:
         root = Path(directory)
 
-        docx = root / "sample.docx"
-        write_package(docx, {
-            "_rels/.rels": root_rels("word/document.xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"),
-            "word/document.xml": """<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Hello Word</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>A1</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:sdt><w:sdtPr><w:tag w:val="customer"/><w:alias w:val="Customer"/><w:id w:val="7"/></w:sdtPr><w:sdtContent><w:p><w:r><w:t>Acme</w:t></w:r></w:p></w:sdtContent></w:sdt></w:body></w:document>""",
-        })
+        fixtures = emit_fixtures(root)
+        docx = fixtures["word"]
         word = run_helper(docx, "word", searchText="Hello")
         checks["word"] = word["paragraphs"][0]["text"] == "Hello Word" and word["tableCount"] == 1 and word["contentControlCount"] == 1 and word["search"]["matchCount"] == 1
         edited_docx = root / "edited.docx"
@@ -145,24 +202,10 @@ def main():
         )
         checks["wordTrackedChangesRefused"] = tracked_result.returncode != 0 and "tracked changes are refused" in tracked_result.stdout
 
-        xlsx = root / "sample.xlsx"
-        write_package(xlsx, {
-            "_rels/.rels": root_rels("xl/workbook.xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"),
-            "xl/workbook.xml": """<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets><definedNames><definedName name="Total">Data!$A$1</definedName></definedNames></workbook>""",
-            "xl/_rels/workbook.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain" Target="calcChain.xml"/></Relationships>""",
-            "xl/worksheets/sheet1.xml": """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1"><f>SUM(1,2)</f><v>3</v></c><c r="B1" t="inlineStr"><is><t>Revenue</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>Q1</t></is></c><c r="B2"><v>10</v></c></row></sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts><pivotTableParts count="1"><pivotTablePart r:id="rId3"/></pivotTableParts><drawing r:id="rId2"/></worksheet>""",
-            "xl/worksheets/_rels/sheet1.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable1.xml"/></Relationships>""",
-            "xl/tables/table1.xml": """<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="RevenueTable" displayName="RevenueTable" ref="A1:B2"><tableColumns count="2"><tableColumn id="1" name="Metric"/><tableColumn id="2" name="Revenue"/></tableColumns><tableStyleInfo name="TableStyleMedium2" showRowStripes="1"/></table>""",
-            "xl/drawings/drawing1.xml": """<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor><xdr:graphicFrame><c:chart r:id="rId1"/></xdr:graphicFrame></xdr:twoCellAnchor></xdr:wsDr>""",
-            "xl/drawings/_rels/drawing1.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>""",
-            "xl/charts/chart1.xml": """<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>Revenue Chart</a:t></a:r></a:p></c:rich></c:tx></c:title><c:plotArea><c:barChart><c:ser><c:val><c:numRef><c:f>Data!$B$1:$B$2</c:f></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>""",
-            "xl/pivotTables/pivotTable1.xml": """<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="RevenuePivot" cacheId="1"><location ref="D1:F5"/><rowFields count="1"><field x="0"/></rowFields><dataFields count="1"><dataField fld="1"/></dataFields></pivotTableDefinition>""",
-            "xl/styles.xml": """<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font/></fonts><fills count="1"><fill/></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>""",
-            "xl/calcChain.xml": """<calcChain xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><c r="A1" i="1"/></calcChain>""",
-        })
+        xlsx = fixtures["excel"]
         excel = run_helper(xlsx, "excel", searchText="Revenue")
         cells = excel["sheets"][0]["cells"]
-        checks["excel"] = excel["sheetCount"] == 1 and cells[0]["value"] == "Revenue" and excel["search"]["matchCount"] == 1 and excel["tableCount"] == 1 and excel["sheets"][0]["tables"][0]["displayName"] == "RevenueTable" and excel["chartCount"] == 1 and excel["sheets"][0]["charts"][0]["title"] == "Revenue Chart" and excel["pivotCount"] == 1 and excel["sheets"][0]["pivots"][0]["name"] == "RevenuePivot"
+        checks["excel"] = excel["sheetCount"] == 1 and cells[0]["value"] == "Revenue" and excel["search"]["matchCount"] == 1 and excel["tableCount"] == 1 and excel["sheets"][0]["tables"][0]["displayName"] == "RevenueTable" and excel["chartCount"] == 1 and excel["sheets"][0]["charts"][0]["title"] == "Revenue Chart" and excel["pivotCount"] == 0
         selected_excel = run_helper(xlsx, "excel", sheetNames=["Data"], address="A1:A1")
         checks["excelSelectors"] = selected_excel["cellCount"] == 1 and selected_excel["sheets"][0]["cells"][0]["formula"] == "SUM(1,2)"
         edited_xlsx = root / "edited.xlsx"
@@ -193,14 +236,95 @@ def main():
             recalculation_safe = "fullCalcOnLoad=\"1\"" in workbook_xml and "forceFullCalc=\"1\"" in workbook_xml and "xl/calcChain.xml" not in edited_package.namelist() and "calcChain" not in relations_xml
         checks["excelRangeAndMetadataEdits"] = rich_excel_edit["changeCount"] == 14 and rich_excel["sheets"][0]["name"] == "Results" and rich_cells["B4"]["value"] == 4 and rich_cells["A3"]["styleIndex"] == 2 and rich_cells["A1"]["styleIndex"] == 3 and "$#,##0.00" in styles_xml and "conditionalFormatting" in sheet_xml and "dataValidation" in sheet_xml and "state=\"frozen\"" in sheet_xml and "width=\"18.0\"" in sheet_xml and recalculation_safe and any(entry["name"] == "InputBlock" for entry in rich_excel["definedNames"])
 
-        charts_xlsx = root / "chart-operations.xlsx"
-        chart_edit = run_helper(xlsx, "excel", action="edit", outputPath=str(charts_xlsx), operations=[
-            {"type": "createChart", "sheet": "Data", "chartType": "ColumnClustered", "sourceData": "A1:B2", "name": "Consumer Chart", "titleText": "Consumer Revenue", "left": 12, "top": 18, "width": 360, "height": 220},
-            {"type": "updateChart", "sheet": "Data", "chart": "Consumer Chart", "chartType": "Line", "sourceData": "A1:B2", "name": "Consumer Trend", "titleText": "Revenue Trend", "left": 20, "top": 24, "width": 400, "height": 240},
+        styled_xlsx = root / "styled-for-clear.xlsx"
+        run_helper(xlsx, "excel", action="edit", outputPath=str(styled_xlsx), operations=[
+            {"type": "setStyle", "sheet": "Data", "address": "B2", "styleIndex": 2},
         ])
-        chart_result = run_helper(charts_xlsx, "excel")
-        created_chart = next(chart for chart in chart_result["sheets"][0]["charts"] if chart.get("name") == "Consumer Trend")
-        checks["excelChartLifecycle"] = chart_edit["changeCount"] == 2 and created_chart["type"] == "lineChart" and created_chart["title"] == "Revenue Trend" and created_chart["seriesCount"] == 1 and round(created_chart["geometry"]["width"]) == 400 and round(created_chart["geometry"]["height"]) == 240
+        clear_contents_xlsx = root / "clear-contents.xlsx"
+        clear_contents_edit = run_helper(styled_xlsx, "excel", action="edit", outputPath=str(clear_contents_xlsx), operations=[
+            {"type": "clearRange", "sheet": "Data", "address": "B2", "contents": True, "format": False},
+        ])
+        clear_contents_cells = {cell["address"]: cell for cell in run_helper(clear_contents_xlsx, "excel")["sheets"][0]["cells"]}
+        clear_format_xlsx = root / "clear-format.xlsx"
+        clear_format_edit = run_helper(styled_xlsx, "excel", action="edit", outputPath=str(clear_format_xlsx), operations=[
+            {"type": "clearRange", "sheet": "Data", "address": "B2", "contents": False, "format": True},
+        ])
+        clear_format_cells = {cell["address"]: cell for cell in run_helper(clear_format_xlsx, "excel")["sheets"][0]["cells"]}
+        checks["excelClearRangeModes"] = (
+            clear_contents_edit["changeCount"] == 1
+            and clear_contents_cells["B2"]["value"] is None
+            and clear_contents_cells["B2"]["styleIndex"] == 2
+            and clear_format_edit["changeCount"] == 1
+            and clear_format_cells["B2"]["value"] == 10
+            and clear_format_cells["B2"]["styleIndex"] == 0
+        )
+        no_op_clear = subprocess.run(
+            [sys.executable, str(HELPER)],
+            input=json.dumps({"action": "edit", "inputPath": str(xlsx), "outputPath": str(root / "no-op-clear.xlsx"), "kind": "excel", "operations": [{"type": "clearRange", "sheet": "Data", "address": "B2", "contents": False, "format": False}]}),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        checks["excelClearRangeNoOpRejected"] = no_op_clear.returncode != 0 and "must clear contents, format, or both" in no_op_clear.stdout
+
+        created_chart_xlsx = root / "chart-created.xlsx"
+        create_chart_edit = run_helper(xlsx, "excel", action="edit", outputPath=str(created_chart_xlsx), operations=[
+            {"type": "createChart", "sheet": "Data", "chartType": "ColumnClustered", "sourceData": "A1:C3", "seriesBy": "Columns", "name": "Consumer Chart", "titleText": "Consumer Revenue", "left": 12, "top": 18, "width": 360, "height": 220},
+        ])
+        created_chart_result = run_helper(created_chart_xlsx, "excel")
+        created_chart = next(chart for chart in created_chart_result["sheets"][0]["charts"] if chart.get("name") == "Consumer Chart")
+        column_series_formulas = [entry["formulas"] for entry in created_chart["series"]]
+        checks["excelCreateChartOptions"] = (
+            create_chart_edit["changeCount"] == 1
+            and created_chart["type"] == "barChart"
+            and created_chart["title"] == "Consumer Revenue"
+            and created_chart["seriesCount"] == 2
+            and all(round(created_chart["geometry"][key]) == value for key, value in {"left": 12, "top": 18, "width": 360, "height": 220}.items())
+        )
+        checks["excelChartSeriesByColumns"] = column_series_formulas == [
+            ["'Data'!$B$1", "'Data'!$A$2:$A$3", "'Data'!$B$2:$B$3"],
+            ["'Data'!$C$1", "'Data'!$A$2:$A$3", "'Data'!$C$2:$C$3"],
+        ]
+        updated_chart_xlsx = root / "chart-updated.xlsx"
+        update_chart_edit = run_helper(created_chart_xlsx, "excel", action="edit", outputPath=str(updated_chart_xlsx), operations=[
+            {"type": "updateChart", "sheet": "Data", "chart": "Consumer Chart", "chartType": "Line", "sourceData": "A1:C3", "seriesBy": "Rows", "name": "Consumer Trend", "titleText": "Revenue Trend", "left": 20, "top": 24, "width": 400, "height": 240},
+        ])
+        updated_chart_result = run_helper(updated_chart_xlsx, "excel")
+        updated_chart = next(chart for chart in updated_chart_result["sheets"][0]["charts"] if chart.get("name") == "Consumer Trend")
+        row_series_formulas = [entry["formulas"] for entry in updated_chart["series"]]
+        checks["excelUpdateChartOptions"] = (
+            update_chart_edit["changeCount"] == 1
+            and updated_chart["type"] == "lineChart"
+            and updated_chart["title"] == "Revenue Trend"
+            and updated_chart["seriesCount"] == 2
+            and all(round(updated_chart["geometry"][key]) == value for key, value in {"left": 20, "top": 24, "width": 400, "height": 240}.items())
+        )
+        checks["excelChartSeriesByRows"] = row_series_formulas == [
+            ["'Data'!$A$2", "'Data'!$B$1:$C$1", "'Data'!$B$2:$C$2"],
+            ["'Data'!$A$3", "'Data'!$B$1:$C$1", "'Data'!$B$3:$C$3"],
+        ]
+        chart_type_only_xlsx = root / "chart-type-only.xlsx"
+        chart_type_only_edit = run_helper(updated_chart_xlsx, "excel", action="edit", outputPath=str(chart_type_only_xlsx), operations=[
+            {"type": "updateChart", "sheet": "Data", "chart": "Consumer Trend", "chartType": "Pie"},
+        ])
+        chart_type_only_result = run_helper(chart_type_only_xlsx, "excel")
+        chart_type_only = next(chart for chart in chart_type_only_result["sheets"][0]["charts"] if chart.get("name") == "Consumer Trend")
+        checks["excelChartTypeOnlyPreservesSeries"] = (
+            chart_type_only_edit["changeCount"] == 1
+            and chart_type_only["type"] == "pieChart"
+            and [entry["formulas"] for entry in chart_type_only["series"]] == row_series_formulas
+        )
+        series_by_only_xlsx = root / "chart-series-by-only.xlsx"
+        series_by_only_edit = run_helper(chart_type_only_xlsx, "excel", action="edit", outputPath=str(series_by_only_xlsx), operations=[
+            {"type": "updateChart", "sheet": "Data", "chart": "Consumer Trend", "seriesBy": "Columns"},
+        ])
+        series_by_only_result = run_helper(series_by_only_xlsx, "excel")
+        series_by_only = next(chart for chart in series_by_only_result["sheets"][0]["charts"] if chart.get("name") == "Consumer Trend")
+        checks["excelChartSeriesByOnlyInfersSource"] = (
+            series_by_only_edit["changeCount"] == 1
+            and series_by_only["type"] == "pieChart"
+            and [entry["formulas"] for entry in series_by_only["series"]] == column_series_formulas
+        )
 
         table_xlsx = root / "table-operations.xlsx"
         table_edit = run_helper(xlsx, "excel", action="edit", outputPath=str(table_xlsx), operations=[
@@ -235,13 +359,7 @@ def main():
         no_totals_table = no_totals_result["sheets"][0]["tables"][0]
         checks["excelDisableTotals"] = no_totals_edit["changeCount"] == 1 and no_totals_table["ref"] == "A1:B4" and no_totals_table["totalsRowCount"] == 0 and "A5" not in no_totals_cells and "B5" not in no_totals_cells
 
-        pptx = root / "sample.pptx"
-        write_package(pptx, {
-            "_rels/.rels": root_rels("ppt/presentation.xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"),
-            "ppt/presentation.xml": """<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="12192000" cy="6858000" type="screen16x9"/></p:presentation>""",
-            "ppt/_rels/presentation.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>""",
-            "ppt/slides/slide1.xml": """<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="2" name="Title 1"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr><a:xfrm><a:off x="1" y="2"/><a:ext cx="3" cy="4"/></a:xfrm></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Hello PowerPoint</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>""",
-        })
+        pptx = fixtures["powerpoint"]
         powerpoint = run_helper(pptx, "powerpoint", searchText="PowerPoint")
         checks["powerpoint"] = powerpoint["slideCount"] == 1 and powerpoint["slides"][0]["shapes"][0]["text"] == "Hello PowerPoint" and powerpoint["search"]["matchCount"] == 1
         edited_pptx = root / "edited.pptx"
@@ -252,14 +370,35 @@ def main():
         rich_ppt_edit = run_helper(pptx, "powerpoint", action="edit", outputPath=str(rich_pptx), operations=[
             {"type": "setShapeText", "slideIndex": 0, "shapeId": "2", "text": "Native PowerPoint"},
             {"type": "setShapeGeometry", "slideIndex": 0, "shapeId": "2", "x": 10, "y": 20, "width": 30, "height": 40},
+            {"type": "setTableCell", "slideIndex": 0, "shapeId": "4", "rowIndex": 0, "columnIndex": 0, "text": "Updated table value"},
+            {"type": "setNotes", "slideIndex": 0, "text": "Updated speaker notes"},
         ])
         rich_powerpoint = run_helper(rich_pptx, "powerpoint")
         shape = rich_powerpoint["slides"][0]["shapes"][0]
-        checks["powerpointStructuredEdits"] = rich_ppt_edit["changeCount"] == 2 and shape["text"] == "Native PowerPoint" and all(shape["geometry"][key] == value for key, value in {"x": 10, "y": 20, "width": 30, "height": 40}.items())
-        slides_pptx = root / "slides.pptx"
-        slides_edit = run_helper(pptx, "powerpoint", action="edit", outputPath=str(slides_pptx), operations=[{"type": "duplicateSlide", "slideIndex": 0}, {"type": "moveSlide", "slideIndex": 1, "toIndex": 0}])
-        slides_powerpoint = run_helper(slides_pptx, "powerpoint")
-        checks["powerpointSlideLifecycle"] = slides_edit["changeCount"] == 2 and slides_powerpoint["slideCount"] == 2 and all(slide["shapes"][0]["text"] == "Hello PowerPoint" for slide in slides_powerpoint["slides"])
+        table_shape = next(entry for entry in rich_powerpoint["slides"][0]["shapes"] if entry["id"] == "4")
+        checks["powerpointStructuredEdits"] = rich_ppt_edit["changeCount"] == 4 and shape["text"] == "Native PowerPoint" and all(shape["geometry"][key] == value for key, value in {"x": 10, "y": 20, "width": 30, "height": 40}.items()) and table_shape["table"]["rows"] == [["Updated table value"]] and rich_powerpoint["slides"][0]["notes"] == "Updated speaker notes"
+        duplicated_pptx = root / "slides-duplicated.pptx"
+        duplicate_edit = run_helper(pptx, "powerpoint", action="edit", outputPath=str(duplicated_pptx), operations=[{"type": "duplicateSlide", "slideIndex": 0}])
+        duplicated_powerpoint = run_helper(duplicated_pptx, "powerpoint")
+        distinguished_pptx = root / "slides-distinguished.pptx"
+        distinguish_edit = run_helper(duplicated_pptx, "powerpoint", action="edit", outputPath=str(distinguished_pptx), operations=[{"type": "setShapeText", "slideIndex": 1, "shapeId": "2", "text": "Duplicate copy"}])
+        moved_pptx = root / "slides-moved.pptx"
+        move_edit = run_helper(distinguished_pptx, "powerpoint", action="edit", outputPath=str(moved_pptx), operations=[{"type": "moveSlide", "slideIndex": 1, "toIndex": 0}])
+        moved_powerpoint = run_helper(moved_pptx, "powerpoint")
+        moved_text = [slide["shapes"][0]["text"] for slide in moved_powerpoint["slides"]]
+        deleted_pptx = root / "slides-deleted.pptx"
+        delete_edit = run_helper(moved_pptx, "powerpoint", action="edit", outputPath=str(deleted_pptx), operations=[{"type": "deleteSlide", "slideIndex": 1}])
+        deleted_powerpoint = run_helper(deleted_pptx, "powerpoint")
+        checks["powerpointSlideLifecycle"] = (
+            duplicate_edit["changeCount"] == 1
+            and duplicated_powerpoint["slideCount"] == 2
+            and distinguish_edit["changeCount"] == 1
+            and move_edit["changeCount"] == 1
+            and moved_text == ["Duplicate copy", "Hello PowerPoint"]
+            and delete_edit["changeCount"] == 1
+            and deleted_powerpoint["slideCount"] == 1
+            and deleted_powerpoint["slides"][0]["shapes"][0]["text"] == "Duplicate copy"
+        )
 
         media_pptx = root / "media.pptx"
         media_content_types = """<?xml version="1.0" encoding="UTF-8"?>
@@ -340,8 +479,22 @@ def main():
         )
         checks["macroEditRequiresOptIn"] = macro_result.returncode != 0 and "allowMacros=true" in macro_result.stdout
 
+    advertised_openxml_operations = production_openxml_operations()
+    checks["advertisedOpenXmlOperationCounts"] = {
+        kind: len(operations) for kind, operations in advertised_openxml_operations.items()
+    } == EXPECTED_OPENXML_OPERATION_COUNTS
+    coverage = {
+        kind: {
+            "covered": sorted(COVERED_OPENXML_OPERATIONS[kind]),
+            "expected": sorted(expected),
+            "coveredCount": len(COVERED_OPENXML_OPERATIONS[kind]),
+            "expectedCount": len(expected),
+        }
+        for kind, expected in advertised_openxml_operations.items()
+    }
+    checks["advertisedOpenXmlCoverage"] = all(set(entry["covered"]) == set(entry["expected"]) for entry in coverage.values())
     ok = all(checks.values())
-    print(json.dumps({"ok": ok, "checks": checks}, indent=2))
+    print(json.dumps({"ok": ok, "checks": checks, "operationCoverage": coverage}, indent=2))
     raise SystemExit(0 if ok else 1)
 
 

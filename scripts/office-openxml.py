@@ -1431,6 +1431,8 @@ def set_excel_cell(cell: ET.Element, value: Any = None, formula: Optional[str] =
         ET.SubElement(cell, q("s", "f")).text = formula
         if value is not None:
             ET.SubElement(cell, q("s", "v")).text = str(value)
+    elif value is None:
+        cell.attrib.pop("t", None)
     elif isinstance(value, bool):
         cell.attrib["t"] = "b"
         ET.SubElement(cell, q("s", "v")).text = "1" if value else "0"
@@ -1615,19 +1617,40 @@ def excel_source_range(sheet_name: str, source_data: str) -> Tuple[str, List[Lis
     return escaped_sheet, addresses
 
 
-def excel_chart_xml(sheet_name: str, source_data: str, chart_type: str, title: Optional[str]) -> bytes:
-    sheet_formula, addresses = excel_source_range(sheet_name, source_data)
+def excel_chart_type_definition(chart_type: str) -> Tuple[str, Optional[str]]:
     normalized = re.sub(r"[^a-z]", "", str(chart_type or "").lower())
     if normalized in {"bar", "barclustered"}:
-        element_name, bar_direction = "barChart", "bar"
+        return "barChart", "bar"
     elif normalized in {"column", "columnclustered", "clusteredcolumn"}:
-        element_name, bar_direction = "barChart", "col"
+        return "barChart", "col"
     elif normalized in {"line", "linechart"}:
-        element_name, bar_direction = "lineChart", None
+        return "lineChart", None
     elif normalized in {"pie", "piechart"}:
-        element_name, bar_direction = "pieChart", None
-    else:
-        raise OfficePackageError("OpenXML chartType must be BarClustered, ColumnClustered, Line, or Pie.")
+        return "pieChart", None
+    raise OfficePackageError("OpenXML chartType must be BarClustered, ColumnClustered, Line, or Pie.")
+
+
+def excel_chart_series_orientation(series_by: Optional[str]) -> str:
+    requested = "Auto" if series_by is None else str(series_by)
+    if requested not in {"Auto", "Columns", "Rows"}:
+        raise OfficePackageError("OpenXML seriesBy must be Auto, Columns, or Rows.")
+    # Match Excel's conventional interpretation of a rectangular range whose
+    # first row and first column contain labels.
+    return "Columns" if requested == "Auto" else requested
+
+
+def excel_add_chart_axes(plot: ET.Element, chart_element: ET.Element, axis_ids: Tuple[str, str] = ("123456", "123457")) -> None:
+    category_axis_id, value_axis_id = axis_ids
+    ET.SubElement(chart_element, q("c", "axId"), {"val": category_axis_id})
+    ET.SubElement(chart_element, q("c", "axId"), {"val": value_axis_id})
+    category_axis = ET.SubElement(plot, q("c", "catAx")); ET.SubElement(category_axis, q("c", "axId"), {"val": category_axis_id}); ET.SubElement(category_axis, q("c", "axPos"), {"val": "b"}); ET.SubElement(category_axis, q("c", "crossAx"), {"val": value_axis_id}); ET.SubElement(category_axis, q("c", "crosses"), {"val": "autoZero"})
+    value_axis = ET.SubElement(plot, q("c", "valAx")); ET.SubElement(value_axis, q("c", "axId"), {"val": value_axis_id}); ET.SubElement(value_axis, q("c", "axPos"), {"val": "l"}); ET.SubElement(value_axis, q("c", "crossAx"), {"val": category_axis_id}); ET.SubElement(value_axis, q("c", "crosses"), {"val": "autoZero"})
+
+
+def excel_chart_xml(sheet_name: str, source_data: str, chart_type: str, title: Optional[str], series_by: Optional[str] = None) -> bytes:
+    sheet_formula, addresses = excel_source_range(sheet_name, source_data)
+    element_name, bar_direction = excel_chart_type_definition(chart_type)
+    orientation = excel_chart_series_orientation(series_by)
     root = ET.Element(q("c", "chartSpace"))
     chart = ET.SubElement(root, q("c", "chart"))
     if title is not None:
@@ -1641,23 +1664,135 @@ def excel_chart_xml(sheet_name: str, source_data: str, chart_type: str, title: O
     if bar_direction:
         ET.SubElement(chart_element, q("c", "barDir"), {"val": bar_direction})
         ET.SubElement(chart_element, q("c", "grouping"), {"val": "clustered"})
+    elif element_name == "lineChart":
+        ET.SubElement(chart_element, q("c", "grouping"), {"val": "standard"})
     start = excel_address_parts(addresses[0][0]); end = excel_address_parts(addresses[-1][-1])
-    category_start = "%s%d" % (excel_column_name(start[0]), start[1] + 1)
-    category_end = "%s%d" % (excel_column_name(start[0]), end[1])
-    category_formula = "%s!$%s$%d:$%s$%d" % (sheet_formula, excel_column_name(start[0]), start[1] + 1, excel_column_name(start[0]), end[1])
-    for series_index, column in enumerate(range(start[0] + 1, end[0] + 1)):
+    if orientation == "Rows":
+        category_formula = "%s!$%s$%d:$%s$%d" % (sheet_formula, excel_column_name(start[0] + 1), start[1], excel_column_name(end[0]), start[1])
+        series_specs = [
+            (
+                "%s!$%s$%d" % (sheet_formula, excel_column_name(start[0]), row),
+                "%s!$%s$%d:$%s$%d" % (sheet_formula, excel_column_name(start[0] + 1), row, excel_column_name(end[0]), row),
+            )
+            for row in range(start[1] + 1, end[1] + 1)
+        ]
+    else:
+        category_formula = "%s!$%s$%d:$%s$%d" % (sheet_formula, excel_column_name(start[0]), start[1] + 1, excel_column_name(start[0]), end[1])
+        series_specs = [
+            (
+                "%s!$%s$%d" % (sheet_formula, excel_column_name(column), start[1]),
+                "%s!$%s$%d:$%s$%d" % (sheet_formula, excel_column_name(column), start[1] + 1, excel_column_name(column), end[1]),
+            )
+            for column in range(start[0] + 1, end[0] + 1)
+        ]
+    for series_index, (name_formula, values_formula) in enumerate(series_specs):
         series = ET.SubElement(chart_element, q("c", "ser"))
         ET.SubElement(series, q("c", "idx"), {"val": str(series_index)}); ET.SubElement(series, q("c", "order"), {"val": str(series_index)})
-        tx = ET.SubElement(series, q("c", "tx")); ref = ET.SubElement(tx, q("c", "strRef")); ET.SubElement(ref, q("c", "f")).text = "%s!$%s$%d" % (sheet_formula, excel_column_name(column), start[1])
+        tx = ET.SubElement(series, q("c", "tx")); ref = ET.SubElement(tx, q("c", "strRef")); ET.SubElement(ref, q("c", "f")).text = name_formula
         cat = ET.SubElement(series, q("c", "cat")); cat_ref = ET.SubElement(cat, q("c", "strRef")); ET.SubElement(cat_ref, q("c", "f")).text = category_formula
-        values = ET.SubElement(series, q("c", "val")); number_ref = ET.SubElement(values, q("c", "numRef")); ET.SubElement(number_ref, q("c", "f")).text = "%s!$%s$%d:$%s$%d" % (sheet_formula, excel_column_name(column), start[1] + 1, excel_column_name(column), end[1])
+        values = ET.SubElement(series, q("c", "val")); number_ref = ET.SubElement(values, q("c", "numRef")); ET.SubElement(number_ref, q("c", "f")).text = values_formula
     if element_name != "pieChart":
-        category_axis_id, value_axis_id = "123456", "123457"
-        ET.SubElement(chart_element, q("c", "axId"), {"val": category_axis_id}); ET.SubElement(chart_element, q("c", "axId"), {"val": value_axis_id})
-        category_axis = ET.SubElement(plot, q("c", "catAx")); ET.SubElement(category_axis, q("c", "axId"), {"val": category_axis_id}); ET.SubElement(category_axis, q("c", "axPos"), {"val": "b"}); ET.SubElement(category_axis, q("c", "crossAx"), {"val": value_axis_id}); ET.SubElement(category_axis, q("c", "crosses"), {"val": "autoZero"})
-        value_axis = ET.SubElement(plot, q("c", "valAx")); ET.SubElement(value_axis, q("c", "axId"), {"val": value_axis_id}); ET.SubElement(value_axis, q("c", "axPos"), {"val": "l"}); ET.SubElement(value_axis, q("c", "crossAx"), {"val": category_axis_id}); ET.SubElement(value_axis, q("c", "crosses"), {"val": "autoZero"})
+        excel_add_chart_axes(plot, chart_element)
     ET.SubElement(chart, q("c", "plotVisOnly"), {"val": "1"})
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def excel_existing_chart_type(chart_element: ET.Element) -> str:
+    local_name = chart_element.tag.split("}")[-1]
+    if local_name == "barChart":
+        direction = chart_element.find(q("c", "barDir"))
+        return "BarClustered" if direction is not None and direction.attrib.get("val") == "bar" else "ColumnClustered"
+    return {"lineChart": "Line", "pieChart": "Pie"}.get(local_name, "ColumnClustered")
+
+
+def excel_chart_series_for_type(series: ET.Element, element_name: str, series_index: int) -> ET.Element:
+    child_order = {
+        "barChart": ["idx", "order", "tx", "spPr", "invertIfNegative", "pictureOptions", "dPt", "dLbls", "trendline", "errBars", "cat", "val", "shape", "extLst"],
+        "lineChart": ["idx", "order", "tx", "spPr", "marker", "dPt", "dLbls", "trendline", "errBars", "cat", "val", "smooth", "extLst"],
+        "pieChart": ["idx", "order", "tx", "spPr", "explosion", "dPt", "dLbls", "cat", "val", "extLst"],
+    }[element_name]
+    rebuilt = ET.Element(q("c", "ser"))
+    children = list(series)
+    for local_name in child_order:
+        for child in children:
+            if child.tag == q("c", local_name):
+                rebuilt.append(child)
+    if rebuilt.find(q("c", "idx")) is None:
+        rebuilt.insert(0, ET.Element(q("c", "idx"), {"val": str(series_index)}))
+    if rebuilt.find(q("c", "order")) is None:
+        order_position = 1 if rebuilt.find(q("c", "idx")) is not None else 0
+        rebuilt.insert(order_position, ET.Element(q("c", "order"), {"val": str(series_index)}))
+    return rebuilt
+
+
+def excel_set_chart_type(root: ET.Element, chart_type: str) -> None:
+    plot = root.find(".//" + q("c", "plotArea"))
+    if plot is None:
+        raise OfficePackageError("Excel chart part has no plot area.")
+    existing = next((node for node in list(plot) if node.tag.endswith("Chart")), None)
+    if existing is None:
+        raise OfficePackageError("Excel chart part has no supported chart element.")
+    element_name, bar_direction = excel_chart_type_definition(chart_type)
+    series = list(existing.findall(q("c", "ser")))
+    if not series:
+        raise OfficePackageError("Excel chart has no series to preserve during chartType update.")
+    axis_ids = [node.attrib.get("val") for node in existing.findall(q("c", "axId")) if node.attrib.get("val")]
+    for axis in list(plot):
+        if axis.tag in {q("c", "catAx"), q("c", "valAx")}:
+            axis_id = axis.find(q("c", "axId"))
+            if axis_id is not None and axis_id.attrib.get("val") and axis_id.attrib["val"] not in axis_ids:
+                axis_ids.append(axis_id.attrib["val"])
+    new_chart = ET.Element(q("c", element_name))
+    if bar_direction:
+        ET.SubElement(new_chart, q("c", "barDir"), {"val": bar_direction})
+        ET.SubElement(new_chart, q("c", "grouping"), {"val": "clustered"})
+    elif element_name == "lineChart":
+        ET.SubElement(new_chart, q("c", "grouping"), {"val": "standard"})
+    for series_index, entry in enumerate(series):
+        new_chart.append(excel_chart_series_for_type(entry, element_name, series_index))
+    index = list(plot).index(existing)
+    plot.remove(existing)
+    plot.insert(index, new_chart)
+    if element_name == "pieChart":
+        for axis in list(plot):
+            if axis.tag in {q("c", "catAx"), q("c", "valAx")}:
+                plot.remove(axis)
+    else:
+        normalized_ids = tuple((axis_ids + ["123456", "123457"])[:2])
+        has_category_axis = plot.find(q("c", "catAx")) is not None
+        has_value_axis = plot.find(q("c", "valAx")) is not None
+        if not has_category_axis and not has_value_axis:
+            excel_add_chart_axes(plot, new_chart, normalized_ids)
+        else:
+            ET.SubElement(new_chart, q("c", "axId"), {"val": normalized_ids[0]})
+            ET.SubElement(new_chart, q("c", "axId"), {"val": normalized_ids[1]})
+
+
+def excel_infer_chart_source_data(root: ET.Element, sheet_name: str) -> str:
+    reference_pattern = re.compile(
+        r"^=?(?:(?:'((?:[^']|'')+)'|([A-Za-z_][A-Za-z0-9_.]*))!)?"
+        r"(\$?[A-Za-z]{1,3}\$?[1-9][0-9]*)(?::(\$?[A-Za-z]{1,3}\$?[1-9][0-9]*))?$"
+    )
+    coordinates: List[Tuple[int, int]] = []
+    for formula_node in root.findall(".//" + q("c", "ser") + "//" + q("c", "f")):
+        formula = str(formula_node.text or "").strip()
+        match = reference_pattern.fullmatch(formula)
+        if not match:
+            raise OfficePackageError("OpenXML seriesBy updates require sourceData when existing chart formulas are not simple worksheet ranges.")
+        referenced_sheet = (match.group(1) or match.group(2) or sheet_name).replace("''", "'")
+        if referenced_sheet != sheet_name:
+            raise OfficePackageError("OpenXML seriesBy updates require sourceData when existing chart formulas reference another worksheet.")
+        for address in (match.group(3), match.group(4) or match.group(3)):
+            coordinates.append(excel_address_parts(address.replace("$", "")))
+    if not coordinates:
+        raise OfficePackageError("OpenXML seriesBy updates require sourceData when the existing chart has no worksheet formulas.")
+    start_column = min(column for column, _ in coordinates)
+    end_column = max(column for column, _ in coordinates)
+    start_row = min(row for _, row in coordinates)
+    end_row = max(row for _, row in coordinates)
+    if start_column == end_column or start_row == end_row:
+        raise OfficePackageError("OpenXML seriesBy updates require sourceData when the existing chart range cannot be inferred safely.")
+    return "%s%d:%s%d" % (excel_column_name(start_column), start_row, excel_column_name(end_column), end_row)
 
 
 def excel_set_chart_title(root: ET.Element, title: str) -> None:
@@ -1708,9 +1843,9 @@ def excel_create_chart(package: zipfile.ZipFile, modifications: Dict[str, Option
     graphic = ET.SubElement(frame, q("a", "graphic")); data = ET.SubElement(graphic, q("a", "graphicData"), {"uri": NS["c"]}); ET.SubElement(data, q("c", "chart"), {q("r", "id"): rel_id})
     ET.SubElement(anchor, q("xdr", "clientData"))
     modifications[drawing_part] = ET.tostring(drawing, encoding="utf-8", xml_declaration=True)
-    modifications[chart_part] = excel_chart_xml(str(operation.get("sheet", "")), str(operation.get("sourceData", "")), str(operation.get("chartType", "")), operation.get("titleText"))
+    modifications[chart_part] = excel_chart_xml(str(operation.get("sheet", "")), str(operation.get("sourceData", "")), str(operation.get("chartType", "")), operation.get("titleText"), operation.get("seriesBy"))
     add_content_type_override(package, modifications, "/" + chart_part, "application/vnd.openxmlformats-officedocument.drawingml.chart+xml")
-    return {"name": name, "part": chart_part, "type": operation.get("chartType"), "sourceData": operation.get("sourceData"), "relationshipId": rel_id}
+    return {"name": name, "part": chart_part, "type": operation.get("chartType"), "sourceData": operation.get("sourceData"), "seriesBy": operation.get("seriesBy") or "Auto", "relationshipId": rel_id}
 
 
 def excel_update_chart(package: zipfile.ZipFile, modifications: Dict[str, Optional[bytes]], sheet_part: str, operation: Dict[str, Any]) -> Dict[str, Any]:
@@ -1733,16 +1868,23 @@ def excel_update_chart(package: zipfile.ZipFile, modifications: Dict[str, Option
                 raise OfficePackageError("Excel chart relationship is missing.")
             chart_part = resolved_relationship_target(drawing_part, chart_relationship.attrib.get("Target", ""))
             existing_root = ET.fromstring(modifications.get(chart_part) or package.read(chart_part))
-            existing_type = next((node.tag.split("}")[-1] for node in existing_root.findall(".//" + q("c", "plotArea") + "/*") if node.tag.endswith("Chart")), "barChart")
-            inferred_type = operation.get("chartType") or {"barChart": "ColumnClustered", "lineChart": "Line", "pieChart": "Pie"}.get(existing_type, "ColumnClustered")
+            existing_chart = next((node for node in existing_root.findall(".//" + q("c", "plotArea") + "/*") if node.tag.endswith("Chart")), None)
+            if existing_chart is None:
+                raise OfficePackageError("Excel chart part has no supported chart element.")
+            inferred_type = operation.get("chartType") or excel_existing_chart_type(existing_chart)
             source_data = operation.get("sourceData")
+            if source_data is None and operation.get("seriesBy") is not None:
+                source_data = excel_infer_chart_source_data(existing_root, str(operation.get("sheet", "")))
             title = operation.get("titleText")
             if title is None:
                 title_node = existing_root.find(".//" + q("c", "title")); title = text_of(title_node, (q("a", "t"), q("c", "v"))) if title_node is not None else None
             if source_data is not None:
-                modifications[chart_part] = excel_chart_xml(str(operation.get("sheet", "")), str(source_data), str(inferred_type), title)
+                modifications[chart_part] = excel_chart_xml(str(operation.get("sheet", "")), str(source_data), str(inferred_type), title, operation.get("seriesBy"))
             elif operation.get("chartType") is not None:
-                raise OfficePackageError("OpenXML chartType updates require sourceData so series can be rebuilt safely.")
+                excel_set_chart_type(existing_root, str(operation.get("chartType")))
+                if operation.get("titleText") is not None:
+                    excel_set_chart_title(existing_root, str(operation.get("titleText")))
+                modifications[chart_part] = ET.tostring(existing_root, encoding="utf-8", xml_declaration=True)
             elif operation.get("titleText") is not None:
                 excel_set_chart_title(existing_root, str(operation.get("titleText")))
                 modifications[chart_part] = ET.tostring(existing_root, encoding="utf-8", xml_declaration=True)
@@ -1757,7 +1899,7 @@ def excel_update_chart(package: zipfile.ZipFile, modifications: Dict[str, Option
                 if operation.get("width") is not None: extent.attrib["cx"] = str(round(float(operation["width"]) * 12700))
                 if operation.get("height") is not None: extent.attrib["cy"] = str(round(float(operation["height"]) * 12700))
             modifications[drawing_part] = ET.tostring(drawing, encoding="utf-8", xml_declaration=True)
-            return {"name": name_node.attrib.get("name"), "part": chart_part, "type": inferred_type, "sourceData": source_data, "title": title}
+            return {"name": name_node.attrib.get("name"), "part": chart_part, "type": inferred_type, "sourceData": source_data, "seriesBy": operation.get("seriesBy"), "title": title}
     raise OfficePackageError("Excel chart was not found: %s" % requested)
 
 
@@ -1907,6 +2049,8 @@ def edit_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[
             for matrix, label in ((values, "values"), (formulas, "formulas")):
                 if matrix is not None and (not isinstance(matrix, list) or len(matrix) != len(addresses) or any(not isinstance(row, list) or len(row) != len(addresses[0]) for row in matrix)):
                     raise OfficePackageError("Excel setRange.%s dimensions must match address." % label)
+        if op_type == "clearRange" and not operation.get("contents", True) and not operation.get("format", False):
+            raise OfficePackageError("Excel clearRange must clear contents, format, or both.")
         for row_index, row_addresses in enumerate(addresses):
             for column_index, cell_address in enumerate(row_addresses):
                 cell = find_or_create_excel_cell(root, cell_address)

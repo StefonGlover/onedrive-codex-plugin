@@ -1,107 +1,255 @@
 {
-  "decision": "Pass for personal OneDrive beta; Warn for broad tenant rollout",
-  "confidence": "High for tested scope",
-  "date": "2026-07-11",
-  "repository": "<plugin-root>",
-  "scope": [
-    "OneDrive plugin source",
-    "installed cache 0.1.0+codex.20260711152309",
-    "mock Microsoft Graph suite",
-    "CLI guards",
-    "performance benchmarks",
-    "personal-account live beta"
-  ],
-  "summary": [
-    "All discovered and reproduced defects from this beta run were fixed or turned into explicit safe behavior.",
-    "Official mocked Microsoft Graph suite passes on Node 26: 110 checks, 0 failures.",
-    "Independent fixed-hash verifier passes: 10/10 adversarial categories, 0 failures, no residue.",
-    "Source and installed-build live personal OneDrive betas each passed 81/81, covering all 58 tools with remote and isolated-local cleanup confirmed.",
-    "Installed-build read-only tenant matrix passed for common, consumers, and organizations.",
-    "Broad tenant rollout remains Warn because full work/school Microsoft 365 CRUD was not available in this account."
-  ],
-  "fixes": [
+  "schemaVersion": 2,
+  "decision": "Pass",
+  "date": "2026-07-13",
+  "generatedAt": "2026-07-13T21:47:14Z",
+  "source": {
+    "commit": "a94eb39f3cb5d21cfed305574a1a7d06f52b61ae",
+    "workingTree": "release-candidate changes present",
+    "pluginVersion": "0.4.0+codex.20260713202830",
+    "officeCompanionVersion": "1.1.1",
+    "contentDigest": "f0ddbc8a660bc1ccdf95d15fb06bcb253d7828a487f433623ea7a6a662ffda51"
+  },
+  "contract": {
+    "toolCount": 72,
+    "exact": true
+  },
+  "runtimes": {
+    "node20": "v20.20.2",
+    "node26": "v26.0.0",
+    "mockGraphMs": {
+      "node20": 28214,
+      "node26": 27784
+    },
+    "officeOpenXmlMs": 2172,
+    "officeSecurityMs": 1974,
+    "officeRealFixturesMs": 3964,
+    "pythonDependencies": {
+      "python-docx": "1.2.0",
+      "openpyxl": "3.1.5",
+      "python-pptx": "1.0.2",
+      "Pillow": "12.2.0"
+    },
+    "libreOffice": "available"
+  },
+  "offlineGates": [
     {
-      "area": "search speed",
-      "summary": "Canonical-first search, adaptive normal find stop, exhaustive find_all, batched search cache writes, and actual Graph search page accounting."
+      "name": "Node 20 and Node 26 syntax/self-checks",
+      "status": "pass",
+      "versions": [
+        "v20.20.2",
+        "v26.0.0"
+      ],
+      "syntaxChecks": 24,
+      "betaHarnessChecks": 33,
+      "benchmarkChecks": 7,
+      "installerChecks": 7
     },
     {
-      "area": "fallback scans",
-      "summary": "Completed hinted subtrees are excluded from the final root fallback while truncated subtrees remain eligible; controlled cold-miss time improved 12 percent and foldersSkipped exposes the optimization."
+      "name": "Exact MCP contract",
+      "status": "pass",
+      "toolCount": 72
     },
     {
-      "area": "cache correctness",
-      "summary": "Compact atomic writes, process/interprocess locks, generation-aware reloads, and cache version 3 cursor migration."
+      "name": "Manifest/version/icon alignment",
+      "status": "pass",
+      "iconSizes": [
+        16,
+        32,
+        64,
+        80
+      ]
     },
     {
-      "area": "delta sync",
-      "summary": "Delta-origin scoped cursor persistence, parent-ID hydration for pathless records, and unresolved path reporting."
+      "name": "Prepackage negative checks",
+      "status": "pass",
+      "checks": 23,
+      "transactionalInstallerVerified": true
     },
     {
-      "area": "content index",
-      "summary": "cTag/eTag handling preserves metadata-only renames and invalidates conservatively when content freshness is uncertain."
+      "name": "Office Open XML operations",
+      "status": "pass",
+      "checks": 32,
+      "operations": 38,
+      "word": 9,
+      "excel": 17,
+      "powerpoint": 12
     },
     {
-      "area": "local outputs",
-      "summary": "Concurrent downloads, exports, update checkouts, backups, and audit exports reserve unique paths or fail safely without clobbering."
+      "name": "Office security corpus",
+      "status": "pass",
+      "checks": 12
     },
     {
-      "area": "beta isolation",
-      "summary": "Each run uses unique temporary storage/cache roots, validates all 58 tools, exercises content indexing and batch revoke, and cleans isolated state on success or failure."
+      "name": "Genuine package reopening",
+      "status": "pass",
+      "fixtureChecks": 4,
+      "libreOfficeConversions": 6
     },
     {
-      "area": "Office downloads",
-      "summary": "Excel, Word, and PowerPoint helpers reuse resolved metadata and avoid one duplicate Graph request per download."
+      "name": "Office companion mocks",
+      "status": "pass",
+      "checks": 19,
+      "commands": 9
     },
     {
-      "area": "packaging",
-      "summary": "Replaced the stale 55-tool cache with a cache-busted 58-tool build and verified source/install parity."
+      "name": "Mock Microsoft Graph",
+      "status": "pass",
+      "checks": 137,
+      "nodeVersions": [
+        "v20.20.2",
+        "v26.0.0"
+      ]
     },
     {
-      "area": "audit/auth",
-      "summary": "Per-tool request IDs, failed-call localWarnings, audit locking, and device-login supersession are isolated under concurrency."
+      "name": "Read-only OneDrive doctor and tenant checks",
+      "status": "pass",
+      "doctorChecks": 6,
+      "tenantChecksPerTenant": 6,
+      "tenants": [
+        "common",
+        "consumers",
+        "organizations"
+      ]
     },
     {
-      "area": "utilities",
-      "summary": "Bounded cleanup, timestamp-safe stale handling, strict CLI flag parsing, benchmark error exits, and installed-cache guard validation."
+      "name": "Cleanup preview",
+      "status": "pass",
+      "checks": 6,
+      "candidates": 0,
+      "truncated": false,
+      "incomplete": false
+    },
+    {
+      "name": "Whitespace",
+      "status": "pass"
     }
   ],
-  "gates": [
-    { "name": "syntax", "status": "pass", "evidence": "node --check for server and scripts" },
-    { "name": "whitespace", "status": "pass", "evidence": "git diff --check" },
-    { "name": "prepackage", "status": "pass", "evidence": "24 files checked" },
-    { "name": "installed drift", "status": "pass", "evidence": "source vs installed cache 0.1.0+codex.20260711152309, 24 files checked" },
-    { "name": "beta self-check", "status": "pass", "evidence": "17/17 utility checks" },
-    { "name": "benchmark self-check", "status": "pass", "evidence": "7/7 utility checks" },
-    { "name": "mock suite Node 26", "status": "pass", "evidence": "110/110" },
-    { "name": "independent verifier", "status": "pass", "evidence": "10/10 adversarial categories; hashes stable; no residue" },
-    { "name": "negative CLI guards", "status": "pass", "evidence": "invalid stale days, cleanup page size, retry attempts, booleans, and installed-cache paths rejected" },
-    { "name": "source live beta", "status": "pass", "evidence": "81/81; 58/58 tools; isolated remote folder and local state deleted" },
-    { "name": "installed live beta", "status": "pass", "evidence": "81/81; 58/58 tools; isolated remote folder and local state deleted" },
-    { "name": "installed tenant matrix", "status": "pass", "evidence": "common 5/5, consumers 5/5, organizations 5/5" },
-    { "name": "installed cleanup dry-run", "status": "pass", "evidence": "stale-days=0; no beta folder candidates" },
-    { "name": "performance benchmark", "status": "pass", "evidence": "controlled cold miss improved 12 percent after completed hinted-subtree dedup" },
-    { "name": "shared cache repair", "status": "pass", "evidence": "full root scan rebuilt 2,147 metadata entries and stored a fresh delta cursor" },
-    { "name": "managed storage modes", "status": "pass", "evidence": "directories 0700; cache/index/audit files 0600" }
-  ],
-  "independent_verifier_coverage": [
-    "same-process and cross-process metadata/content-index retention",
-    "atomic JSON visibility under concurrent reads",
-    "same-name download/export reservation and checkout collision refusal",
-    "UUID default audit exports",
-    "root and scoped delta hydration with no cursor poisoning",
-    "cTag rename reuse and omitted-cTag invalidation",
-    "exhaustive find_all term execution and paginated search-call accounting",
-    "failed mutation localWarnings, concurrent request-ID isolation, and device-login supersession"
-  ],
-  "residual_risks": [
-    "Microsoft Graph batch live operations remain non-atomic by design; the plugin preflights, warns, and reports partial-state failures.",
-    "Full live CRUD was verified only against the available personal OneDrive account. Work/school tenant CRUD should be rerun before broad release.",
-    "Pattern-based redaction may need future expansion for new provider error shapes."
-  ],
-  "install_result": {
-    "installed_cache": "<personal-cache>/onedrive/0.1.0+codex.20260711152309",
-    "drift_check": "pass, 24 files checked",
-    "final_stale_cleanup": "pass, 0 beta folder candidates",
-    "local_test_residue": "cleaned from source and installed cache"
-  }
+  "readOnlyOneDrive": {
+    "doctor": {
+      "status": "pass",
+      "checks": 6,
+      "runtimeMs": 5834
+    },
+    "tenantMatrix": {
+      "status": "pass",
+      "tenants": [
+        "common",
+        "consumers",
+        "organizations"
+      ],
+      "checksPerTenant": 6,
+      "runtimeMs": 14161
+    },
+    "cleanupPreview": {
+      "status": "pass",
+      "checks": 6,
+      "candidates": 0,
+      "truncated": false,
+      "incomplete": false,
+      "runtimeMs": 5596
+    }
+  },
+  "liveRuns": {
+    "source": {
+      "status": "pass",
+      "runId": "codex-beta-20260713t162523z-source",
+      "folderName": "Codex OneDrive Plugin Beta Test codex-beta-20260713t162523z-source",
+      "runtimeMs": 855447,
+      "summary": {
+        "pass": 91,
+        "fail": 0,
+        "blocked": 8,
+        "total": 99
+      },
+      "toolCoverage": {
+        "contract": 72,
+        "exercised": 71,
+        "blocked": 1
+      },
+      "cleanupVerified": true,
+      "localWorkCleaned": true
+    },
+    "installed": {
+      "status": "pass",
+      "runId": "codex-beta-20260713t162523z-installed",
+      "folderName": "Codex OneDrive Plugin Beta Test codex-beta-20260713t162523z-installed",
+      "runtimeMs": 918660,
+      "summary": {
+        "pass": 91,
+        "fail": 0,
+        "blocked": 8,
+        "total": 99
+      },
+      "toolCoverage": {
+        "contract": 72,
+        "exercised": 71,
+        "blocked": 1
+      },
+      "cleanupVerified": true,
+      "localWorkCleaned": true
+    }
+  },
+  "installedBuild": {
+    "status": "pass",
+    "version": "0.4.0+codex.20260713202830",
+    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.4.0+codex.20260713202830",
+    "filesChecked": 44,
+    "oldCacheOverwritten": false
+  },
+  "officeHostMatrix": {
+    "status": "pass",
+    "companionVersion": "1.1.1",
+    "commandMatrixRunId": "office-20260713t184000z",
+    "ribbonRunId": "office-20260713t192000z",
+    "hosts": {
+      "Word": "pass",
+      "Excel": "pass",
+      "PowerPoint": "pass"
+    },
+    "commandsExercised": 9,
+    "requestEvidence": {
+      "total": 24,
+      "taskpaneHtml": 7,
+      "taskpaneJs": 6,
+      "icon16": 3,
+      "icon32": 2,
+      "icon64": 3,
+      "icon80": 3
+    },
+    "cleanupStatus": "pass"
+  },
+  "cleanup": {
+    "status": "pass",
+    "remoteTestRootsRemaining": 0,
+    "permissionsRemaining": 0,
+    "anonymousLinksRemaining": 0,
+    "isolatedLocalResidue": false,
+    "officeResidue": false
+  },
+  "sourceCacheParity": {
+    "status": "pass",
+    "bytes": "pass",
+    "modes": "pass",
+    "types": "pass",
+    "symlinkTargets": "pass"
+  },
+  "blockedCoverage": [
+    {
+      "area": "Business Graph Excel live backend",
+      "reason": "The authorized account is personal OneDrive; all eight operation types are mock-tested."
+    },
+    {
+      "area": "Organization-only sharing",
+      "reason": "A work or school tenant is unavailable; behavior is mock-tested."
+    },
+    {
+      "area": "Forced device-code polling and Keychain deletion",
+      "reason": "The existing credential and consent must remain untouched."
+    },
+    {
+      "area": "Live recycle-bin restore",
+      "reason": "Only mock and dry-run coverage are authorized."
+    }
+  ]
 }

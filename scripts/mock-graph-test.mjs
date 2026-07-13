@@ -2,16 +2,32 @@
 
 import { createServer } from "node:http";
 import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, "..");
 const serverPath = join(pluginRoot, "mcp", "server.mjs");
-const mockHome = join(pluginRoot, "work", "mock-home");
+const mockRunRoot = join(pluginRoot, "work", `mock-${process.pid}-${Date.now()}`);
+const mockHome = join(mockRunRoot, "home");
+const mockExportPdf = join(mockRunRoot, "mock-export.pdf");
+const mockExportText = join(mockRunRoot, "mock-export.txt");
+const mockDownloadWord = join(mockRunRoot, "mock-download-word.docx");
+const hostileInheritedRoot = join(pluginRoot, "work", `hostile-env-${process.pid}-${Date.now()}`);
 const keepWork = process.argv.includes("--keep-work");
-rmSync(mockHome, { recursive: true, force: true });
+function cleanupRunResidue() {
+  rmSync(hostileInheritedRoot, { recursive: true, force: true });
+  if (keepWork) return;
+  rmSync(mockRunRoot, { recursive: true, force: true });
+  try {
+    rmdirSync(join(pluginRoot, "work"));
+  } catch (error) {
+    if (!["ENOENT", "ENOTEMPTY"].includes(error.code)) throw error;
+  }
+}
+process.once("exit", cleanupRunResidue);
+rmSync(mockRunRoot, { recursive: true, force: true });
 mkdirSync(mockHome, { recursive: true });
 const officeFixtureDir = join(mockHome, "office-fixtures");
 execFileSync("/usr/bin/python3", [join(pluginRoot, "scripts", "office-openxml-test.py"), `--emit-fixtures=${officeFixtureDir}`], {
@@ -24,7 +40,15 @@ let officeBusinessBuffer = Buffer.from(officeExcelBuffer);
 let officePowerPointBuffer = readFileSync(join(officeFixtureDir, "sample.pptx"));
 let officeWordPostMetadataFailuresRemaining = 0;
 let failNextOfficeExcelPut = false;
+let officeMetadataRace = null;
 const officeVersions = { "office-word": 1, "office-excel": 1, "office-business": 1, "office-powerpoint": 1 };
+const mockAuthContextId = "mock-auth-context";
+const graphExcelRanges = new Map();
+const graphExcelCharts = new Map([["Chart 1", { id: "Chart 1", name: "Chart 1", type: "ColumnClustered", titleText: "", width: 300, height: 200, left: 0, top: 0 }]]);
+const graphExcelSheets = new Set(["Data"]);
+let graphExcelOmitExpectedChartField = null;
+let graphExcelExposeSeriesMetadata = true;
+let graphExcelExposeFormatMetadata = true;
 
 const requests = [];
 const authRequests = [];
@@ -35,7 +59,11 @@ let refreshFailureMode = null;
 let deviceStartResponseDelayMs = 0;
 let devicePollResponseDelayMs = 0;
 let devicePollShouldSucceed = false;
+let driveResponseDelayMs = 0;
+let delayedAccountItemResponseMs = 0;
+let delayedRootNoteContentMs = 0;
 let rootDeltaScenario = "empty";
+const replacementRaceState = new Map();
 
 function count(key) {
   const next = (counters.get(key) || 0) + 1;
@@ -51,10 +79,170 @@ async function waitForCounter(key, minimum, timeoutMs = 2000) {
   }
 }
 
-function createMcpClient(env) {
+const connectorEnvironmentKeys = [
+  "ONEDRIVE_ADDITIONAL_LOCAL_SYNC_ROOTS",
+  "ONEDRIVE_CACHE_ROOT",
+  "ONEDRIVE_CACHE_TTL_SECONDS",
+  "ONEDRIVE_CLIENT_ID",
+  "ONEDRIVE_CONCURRENCY_LIMIT",
+  "ONEDRIVE_CONTENT_INDEX_ENABLED",
+  "ONEDRIVE_DELTA_SYNC_ENABLED",
+  "ONEDRIVE_EXCEL_SESSION_POLL_MS",
+  "ONEDRIVE_EXCEL_SESSION_TIMEOUT_MS",
+  "ONEDRIVE_FETCH_TIMEOUT_MS",
+  "ONEDRIVE_GRAPH_BASE_URL",
+  "ONEDRIVE_IDENTITY_BASE_URL",
+  "ONEDRIVE_INDEX_EXTENSIONS",
+  "ONEDRIVE_INDEX_OFFICE_EXPORT",
+  "ONEDRIVE_KEYCHAIN_SERVICE",
+  "ONEDRIVE_MAX_INDEXED_FILE_SIZE",
+  "ONEDRIVE_MAX_SCAN_DEPTH",
+  "ONEDRIVE_OFFICE_PYTHON",
+  "ONEDRIVE_SCOPES",
+  "ONEDRIVE_STORAGE_ROOT",
+  "ONEDRIVE_TENANT",
+  "ONEDRIVE_TEST_ACCESS_TOKEN",
+  "ONEDRIVE_TEST_AUTH_CONTEXT_ID",
+  "ONEDRIVE_TEST_KEYCHAIN_PATH"
+];
+const isolatedEnvironmentKeys = ["HOME", "TMPDIR", "PYTHONPYCACHEPREFIX", ...connectorEnvironmentKeys];
+const inheritedEnvironment = new Map(isolatedEnvironmentKeys.map((key) => [key, process.env[key]]));
+const hostilePaths = {
+  home: join(hostileInheritedRoot, "home"),
+  storage: join(hostileInheritedRoot, "storage"),
+  cache: join(hostileInheritedRoot, "cache"),
+  temp: join(hostileInheritedRoot, "tmp"),
+  pythonCache: join(hostileInheritedRoot, "python-cache"),
+  keychain: join(hostileInheritedRoot, "keychain", "token.json"),
+  officePython: join(hostileInheritedRoot, "bin", "python3"),
+  officePythonExecuted: join(hostileInheritedRoot, "office-python-executed.txt")
+};
+let mockServerEnvironmentSequence = 0;
+
+function snapshotTree(root) {
+  const snapshot = [];
+  const visit = (directory) => {
+    for (const name of readdirSync(directory).sort()) {
+      const path = join(directory, name);
+      const stats = lstatSync(path);
+      const entry = {
+        path: relative(root, path),
+        mode: stats.mode & 0o7777,
+        type: stats.isDirectory() ? "directory" : stats.isSymbolicLink() ? "symlink" : stats.isFile() ? "file" : "other"
+      };
+      if (stats.isFile()) entry.content = readFileSync(path).toString("base64");
+      if (stats.isSymbolicLink()) entry.target = readlinkSync(path);
+      snapshot.push(entry);
+      if (stats.isDirectory()) visit(path);
+    }
+  };
+  visit(root);
+  return snapshot;
+}
+
+function seedHostileInheritedEnvironment() {
+  rmSync(hostileInheritedRoot, { recursive: true, force: true });
+  for (const directory of [
+    hostilePaths.home,
+    hostilePaths.storage,
+    hostilePaths.cache,
+    hostilePaths.temp,
+    hostilePaths.pythonCache,
+    dirname(hostilePaths.keychain),
+    dirname(hostilePaths.officePython)
+  ]) {
+    mkdirSync(directory, { recursive: true });
+  }
+  for (const [directory, marker] of [
+    [hostilePaths.home, "home-marker.txt"],
+    [hostilePaths.storage, "storage-marker.txt"],
+    [hostilePaths.cache, "cache-marker.txt"],
+    [hostilePaths.temp, "temp-marker.txt"],
+    [hostilePaths.pythonCache, "python-cache-marker.txt"]
+  ]) {
+    writeFileSync(join(directory, marker), `${marker}\n`, "utf8");
+  }
+  writeFileSync(hostilePaths.keychain, "hostile keychain marker\n", "utf8");
+  writeFileSync(hostilePaths.officePython, `#!/usr/bin/env node
+require("node:fs").writeFileSync(${JSON.stringify(hostilePaths.officePythonExecuted)}, "executed\\n");
+process.exit(99);
+`, "utf8");
+  chmodSync(hostilePaths.officePython, 0o755);
+
+  Object.assign(process.env, {
+    HOME: hostilePaths.home,
+    TMPDIR: hostilePaths.temp,
+    PYTHONPYCACHEPREFIX: hostilePaths.pythonCache,
+    ONEDRIVE_STORAGE_ROOT: hostilePaths.storage,
+    ONEDRIVE_CACHE_ROOT: hostilePaths.cache,
+    ONEDRIVE_OFFICE_PYTHON: hostilePaths.officePython,
+    ONEDRIVE_TEST_KEYCHAIN_PATH: hostilePaths.keychain,
+    ONEDRIVE_KEYCHAIN_SERVICE: "Hostile inherited OneDrive service",
+    ONEDRIVE_GRAPH_BASE_URL: "http://127.0.0.1:1/hostile-graph",
+    ONEDRIVE_IDENTITY_BASE_URL: "http://127.0.0.1:1/hostile-identity",
+    ONEDRIVE_TEST_ACCESS_TOKEN: "hostile-inherited-token",
+    ONEDRIVE_TEST_AUTH_CONTEXT_ID: "hostile-inherited-auth-context",
+    ONEDRIVE_CLIENT_ID: "hostile-inherited-client",
+    ONEDRIVE_TENANT: "organizations",
+    ONEDRIVE_SCOPES: "User.Read",
+    ONEDRIVE_CONTENT_INDEX_ENABLED: "false",
+    ONEDRIVE_DELTA_SYNC_ENABLED: "false"
+  });
+}
+
+function restoreInheritedEnvironment() {
+  for (const [key, value] of inheritedEnvironment) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
+function pathInsideMockRun(candidate, fallback) {
+  const resolvedCandidate = typeof candidate === "string" && candidate.trim() ? resolve(candidate) : resolve(fallback);
+  if (resolvedCandidate === mockRunRoot || resolvedCandidate.startsWith(`${mockRunRoot}/`)) return resolvedCandidate;
+  return resolve(fallback);
+}
+
+function mockServerEnvironment(overrides = {}, label = "server") {
+  const sequence = ++mockServerEnvironmentSequence;
+  const safeLabel = String(label).replace(/[^a-z0-9_-]+/gi, "-");
+  const processRoot = join(mockRunRoot, "server-processes", `${sequence}-${safeLabel}`);
+  const home = pathInsideMockRun(overrides.HOME, join(processRoot, "home"));
+  const storageRoot = pathInsideMockRun(overrides.ONEDRIVE_STORAGE_ROOT, join(home, ".codex", "onedrive-plugin"));
+  const cacheRoot = pathInsideMockRun(overrides.ONEDRIVE_CACHE_ROOT, join(storageRoot, "cache"));
+  const tempRoot = pathInsideMockRun(overrides.TMPDIR, join(processRoot, "tmp"));
+  const pythonCacheRoot = pathInsideMockRun(overrides.PYTHONPYCACHEPREFIX, join(processRoot, "python-cache"));
+  const keychainPath = pathInsideMockRun(overrides.ONEDRIVE_TEST_KEYCHAIN_PATH, join(processRoot, "keychain-token.json"));
+  mkdirSync(tempRoot, { recursive: true });
+
+  const environment = { ...process.env };
+  for (const key of connectorEnvironmentKeys) delete environment[key];
+  delete environment.HOME;
+  delete environment.TMPDIR;
+  delete environment.PYTHONPYCACHEPREFIX;
+  Object.assign(environment, overrides);
+  Object.assign(environment, {
+    HOME: home,
+    TMPDIR: tempRoot,
+    PYTHONPYCACHEPREFIX: pythonCacheRoot,
+    ONEDRIVE_STORAGE_ROOT: storageRoot,
+    ONEDRIVE_CACHE_ROOT: cacheRoot,
+    ONEDRIVE_OFFICE_PYTHON: "/usr/bin/python3",
+    ONEDRIVE_TEST_KEYCHAIN_PATH: keychainPath,
+    ONEDRIVE_KEYCHAIN_SERVICE: `Codex OneDrive Mock ${process.pid}-${sequence}`,
+    ONEDRIVE_GRAPH_BASE_URL: graphBaseUrl,
+    ONEDRIVE_IDENTITY_BASE_URL: identityBaseUrl,
+    ONEDRIVE_TEST_ACCESS_TOKEN: Object.hasOwn(overrides, "ONEDRIVE_TEST_ACCESS_TOKEN") ? String(overrides.ONEDRIVE_TEST_ACCESS_TOKEN ?? "") : "mock-token",
+    ONEDRIVE_TEST_AUTH_CONTEXT_ID: mockAuthContextId,
+    ONEDRIVE_CLIENT_ID: Object.hasOwn(overrides, "ONEDRIVE_CLIENT_ID") ? String(overrides.ONEDRIVE_CLIENT_ID ?? "") : "mock-client-id"
+  });
+  return environment;
+}
+
+function createMcpClient(overrides = {}, label = "isolated") {
   const processChild = spawn(process.execPath, [serverPath], {
     cwd: pluginRoot,
-    env,
+    env: mockServerEnvironment(overrides, label),
     stdio: ["pipe", "pipe", "pipe"]
   });
   let clientNextId = 1;
@@ -234,7 +422,11 @@ const graph = createServer(async (req, res) => {
 
   if (req.method === "GET" && path === "/v1.0/me/drive") {
     if (count("drive") === 1) return json(res, 429, { error: { code: "tooManyRequests", message: "retry please" } }, { "Retry-After": "0" });
-    return json(res, 200, { id: "drive", driveType: "personal", name: "Mock OneDrive" });
+    const authorization = String(req.headers.authorization || "");
+    const account = authorization.includes("device-access-") ? "b" : authorization.includes("refreshed-access-") ? "a" : "default";
+    count(`drive-account-${account}`);
+    if (driveResponseDelayMs && account !== "default") await new Promise((resolve) => setTimeout(resolve, driveResponseDelayMs));
+    return json(res, 200, { id: account === "default" ? "drive" : `drive-${account}`, driveType: "personal", name: account === "default" ? "Mock OneDrive" : `Mock OneDrive ${account}` });
   }
   if (req.method === "GET" && path === "/v1.0/drives/business-drive") {
     return json(res, 200, { id: "business-drive", driveType: "business", name: "Mock Business Drive" });
@@ -298,7 +490,13 @@ const graph = createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/root-note/content") {
+    count("root-note-content-read");
+    if (delayedRootNoteContentMs) await new Promise((resolve) => setTimeout(resolve, delayedRootNoteContentMs));
     return text(res, 200, "root note mock content\n");
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/recent") {
+    return json(res, 200, { value: [item("root-note", "root-note.txt")] });
   }
 
   const officeDefinitions = {
@@ -327,7 +525,16 @@ const graph = createServer(async (req, res) => {
       officeWordPostMetadataFailuresRemaining -= 1;
       return json(res, 503, { error: { code: "serviceUnavailable", message: "mock post-commit metadata failure" } }, { "Retry-After": "0" });
     }
-    if (req.method === "GET") return json(res, 200, officeItem(id, definition.name, definition.buffer, definition.mime, definition.driveId ? { parentReference: { driveId: definition.driveId, path: `/drives/${definition.driveId}/root:` } } : {}));
+    if (req.method === "GET") {
+      if (officeMetadataRace?.id === id) {
+        officeMetadataRace.seen += 1;
+        if (!officeMetadataRace.triggered && officeMetadataRace.seen === officeMetadataRace.triggerGet) {
+          officeVersions[id] += 1;
+          officeMetadataRace.triggered = true;
+        }
+      }
+      return json(res, 200, officeItem(id, definition.name, definition.buffer, definition.mime, definition.driveId ? { parentReference: { driveId: definition.driveId, path: `/drives/${definition.driveId}/root:` } } : {}));
+    }
   }
   if (req.method === "POST" && path === "/v1.0/drives/business-drive/items/office-business/workbook/createSession") {
     const attempt = count("excel-create-session");
@@ -360,9 +567,99 @@ const graph = createServer(async (req, res) => {
   if (req.method === "GET" && path === "/v1.0/drives/business-drive/items/office-business/workbook/sessionInfoResource(key='create-session')") {
     return json(res, 200, { id: "business-session", persistChanges: true });
   }
-  if (["PATCH", "POST"].includes(req.method) && path.startsWith("/v1.0/drives/business-drive/items/office-business/workbook/worksheets/")) {
-    await readBufferBody(req);
-    return json(res, 200, { address: "Data!A1", values: [["Graph updated"]] });
+  const businessWorkbookBase = "/v1.0/drives/business-drive/items/office-business/workbook";
+  const rangeFormatMatch = path.match(/^\/v1\.0\/drives\/business-drive\/items\/office-business\/workbook\/worksheets\/([^/]+)\/range\(address='([^']+)'\)\/format$/);
+  if (req.method === "GET" && rangeFormatMatch) {
+    const sheet = decodeURIComponent(rangeFormatMatch[1]);
+    const address = decodeURIComponent(rangeFormatMatch[2]);
+    const current = graphExcelRanges.get(`${sheet}!${address}`);
+    if (!graphExcelExposeFormatMetadata) return json(res, 200, {});
+    return json(res, 200, current?.formatCleared
+      ? { columnWidth: 8.43, rowHeight: 15, horizontalAlignment: "General", verticalAlignment: "Bottom", wrapText: false }
+      : { columnWidth: 24, rowHeight: 20, horizontalAlignment: "Center", verticalAlignment: "Center", wrapText: true });
+  }
+  const rangeMatch = path.match(/^\/v1\.0\/drives\/business-drive\/items\/office-business\/workbook\/worksheets\/([^/]+)\/range\(address='([^']+)'\)(\/clear)?$/);
+  if (rangeMatch) {
+    const sheet = decodeURIComponent(rangeMatch[1]);
+    const address = decodeURIComponent(rangeMatch[2]);
+    const key = `${sheet}!${address}`;
+    if (req.method === "PATCH" && !rangeMatch[3]) {
+      const body = await readJsonBody(req);
+      const current = graphExcelRanges.get(key) || { address: key, values: [[null]], formulas: [[null]] };
+      const updated = { ...current, ...body, address: key };
+      graphExcelRanges.set(key, updated);
+      return json(res, 200, updated);
+    }
+    if (req.method === "POST" && rangeMatch[3]) {
+      const body = await readJsonBody(req);
+      const current = graphExcelRanges.get(key) || { address: key, values: [["existing"]], formulas: [[null]] };
+      if (body.applyTo === "Contents" || body.applyTo === "All") {
+        current.values = [[null]];
+        current.formulas = [[null]];
+      }
+      if (body.applyTo === "Formats" || body.applyTo === "All") current.formatCleared = true;
+      current.lastClearApplyTo = body.applyTo;
+      graphExcelRanges.set(key, current);
+      return json(res, 200, {});
+    }
+    if (req.method === "GET" && !rangeMatch[3]) {
+      return json(res, 200, graphExcelRanges.get(key) || { address: key, values: [[null]], formulas: [[null]] });
+    }
+  }
+  const chartsAddMatch = path.match(/^\/v1\.0\/drives\/business-drive\/items\/office-business\/workbook\/worksheets\/([^/]+)\/charts\/add$/);
+  if (req.method === "POST" && chartsAddMatch) {
+    const body = await readJsonBody(req);
+    const id = `chart-created-${count("excel-chart-created")}`;
+    const chart = { id, name: id, type: body.type, sourceData: body.sourceData, seriesBy: body.seriesBy, titleText: "", width: 300, height: 200, left: 0, top: 0 };
+    graphExcelCharts.set(id, chart);
+    return json(res, 201, chart);
+  }
+  const chartMatch = path.match(/^\/v1\.0\/drives\/business-drive\/items\/office-business\/workbook\/worksheets\/([^/]+)\/charts\/([^/]+)(?:\/(title|setData|series))?$/);
+  if (chartMatch) {
+    const chartId = decodeURIComponent(chartMatch[2]);
+    const child = chartMatch[3];
+    const chart = graphExcelCharts.get(chartId) || { id: chartId, name: chartId, type: "ColumnClustered", titleText: "", width: 300, height: 200, left: 0, top: 0 };
+    graphExcelCharts.set(chartId, chart);
+    if (req.method === "PATCH" && child === "title") {
+      const body = await readJsonBody(req);
+      chart.titleText = body.text;
+      return json(res, 200, { text: chart.titleText });
+    }
+    if (req.method === "GET" && child === "title") return json(res, 200, { text: chart.titleText });
+    if (req.method === "POST" && child === "setData") {
+      const body = await readJsonBody(req);
+      chart.sourceData = body.sourceData;
+      chart.seriesBy = body.seriesBy;
+      return json(res, 200, {});
+    }
+    if (req.method === "GET" && child === "series") {
+      if (!graphExcelExposeSeriesMetadata) return json(res, 200, { value: [{ name: "Series 1" }] });
+      return json(res, 200, {
+        sourceData: chart.sourceData,
+        seriesBy: chart.seriesBy,
+        value: [{ name: "Series 1", formula: `=${chart.sourceData || "Data!A1:B2"}`, sourceData: chart.sourceData, seriesBy: chart.seriesBy }]
+      });
+    }
+    if (req.method === "PATCH" && !child) {
+      Object.assign(chart, await readJsonBody(req));
+      return json(res, 200, chart);
+    }
+    if (req.method === "GET" && !child) {
+      const observed = { ...chart };
+      if (graphExcelOmitExpectedChartField) delete observed[graphExcelOmitExpectedChartField];
+      return json(res, 200, observed);
+    }
+  }
+  const worksheetMatch = path.match(/^\/v1\.0\/drives\/business-drive\/items\/office-business\/workbook\/worksheets\/([^/]+)$/);
+  if (worksheetMatch) {
+    const sheet = decodeURIComponent(worksheetMatch[1]);
+    if (req.method === "PATCH") {
+      const body = await readJsonBody(req);
+      graphExcelSheets.delete(sheet);
+      graphExcelSheets.add(body.name);
+      return json(res, 200, { id: body.name, name: body.name });
+    }
+    if (req.method === "GET" && graphExcelSheets.has(sheet)) return json(res, 200, { id: sheet, name: sheet });
   }
   if (req.method === "POST" && path.startsWith("/v1.0/drives/business-drive/items/office-business/workbook/tables/")) {
     await readBufferBody(req);
@@ -399,6 +696,31 @@ const graph = createServer(async (req, res) => {
   if (req.method === "DELETE" && path === "/v1.0/me/drive/items/beta-note") {
     count("delete-beta-note");
     return empty(res, 204);
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/delta-max-pages") {
+    return json(res, 200, folder("delta-max-pages", "Bounded Delta", { parentReference: { id: "root", path: "/drive/root:" } }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/delta-max-pages/delta") {
+    count("delta-max-pages-page");
+    const token = url.searchParams.get("token");
+    if (token === "page-2") {
+      return json(res, 200, {
+        value: [item("delta-max-pages-b", "bounded-b.txt")],
+        "@odata.deltaLink": `http://127.0.0.1:${graph.address().port}/v1.0/me/drive/items/delta-max-pages/delta?token=complete`
+      });
+    }
+    if (token === "complete") {
+      return json(res, 200, {
+        value: [],
+        "@odata.deltaLink": `http://127.0.0.1:${graph.address().port}/v1.0/me/drive/items/delta-max-pages/delta?token=complete-2`
+      });
+    }
+    return json(res, 200, {
+      value: [item("delta-max-pages-a", "bounded-a.txt")],
+      "@odata.nextLink": `http://127.0.0.1:${graph.address().port}/v1.0/me/drive/items/delta-max-pages/delta?token=page-2`
+    });
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/delta-parent") {
@@ -469,6 +791,12 @@ const graph = createServer(async (req, res) => {
     return json(res, 200, item("concurrent-b", "concurrent-b.txt"));
   }
 
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/account-race-a") {
+    count("account-race-item-a");
+    if (delayedAccountItemResponseMs) await new Promise((resolve) => setTimeout(resolve, delayedAccountItemResponseMs));
+    return json(res, 200, item("account-race-a", "account-a-private.txt", { parentReference: { id: "root", path: "/drive/root:" } }));
+  }
+
   if (req.method === "GET" && path === "/v1.0/me/drive/items/concurrent-a/content") return text(res, 200, "concurrent alpha phrase\n");
   if (req.method === "GET" && path === "/v1.0/me/drive/items/concurrent-b/content") return text(res, 200, "concurrent beta phrase\n");
 
@@ -524,6 +852,48 @@ const graph = createServer(async (req, res) => {
   if (req.method === "PUT" && path === "/v1.0/me/drive/root:/empty-session.txt:/content") {
     count("empty-session-simple-upload");
     return json(res, 200, item("empty-session", "empty-session.txt", { size: 0 }));
+  }
+
+  const replacementRacePath = path.match(/^\/v1\.0\/me\/drive\/root:\/(race-(?:simple|text)\.(?:txt|bin))(?::\/content|:)$/);
+  if (replacementRacePath && req.method === "GET") {
+    count(`replacement-preflight-${replacementRacePath[1]}`);
+    return json(res, 404, { error: { code: "itemNotFound", message: "absent during replacement preflight" } });
+  }
+  if (replacementRacePath && req.method === "PUT") {
+    await readBufferBody(req);
+    const name = replacementRacePath[1];
+    const observation = {
+      conflictBehavior: url.searchParams.get("@microsoft.graph.conflictBehavior"),
+      ifNoneMatch: req.headers["if-none-match"] || null,
+      ifMatch: req.headers["if-match"] || null
+    };
+    replacementRaceState.set(name, observation);
+    if (observation.conflictBehavior === "fail" && observation.ifNoneMatch === "*") {
+      return json(res, 412, { error: { code: "preconditionFailed", message: "concurrent creator won the race" } });
+    }
+    count(`replacement-race-overwrite-${name}`);
+    return json(res, 200, item(`overwritten-${name}`, name));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/root:/race-session.bin:") {
+    count("replacement-preflight-race-session.bin");
+    return json(res, 404, { error: { code: "itemNotFound", message: "absent during replacement preflight" } });
+  }
+  if (req.method === "POST" && (path === "/v1.0/me/drive/items/root:/race-session.bin:/createUploadSession" || path === "/v1.0/me/drive/root:/race-session.bin:/createUploadSession")) {
+    const body = await readJsonBody(req);
+    const observation = {
+      conflictBehavior: body?.item?.["@microsoft.graph.conflictBehavior"] || null,
+      ifNoneMatch: req.headers["if-none-match"] || null,
+      ifMatch: req.headers["if-match"] || null
+    };
+    const attempts = replacementRaceState.get("race-session.bin") || [];
+    attempts.push(observation);
+    replacementRaceState.set("race-session.bin", attempts);
+    if (observation.conflictBehavior === "fail" && observation.ifNoneMatch === "*") {
+      return json(res, 409, { error: { code: "nameAlreadyExists", message: "concurrent creator won the race" } });
+    }
+    count("replacement-race-overwrite-race-session.bin");
+    return json(res, 200, { uploadUrl: `http://127.0.0.1:${graph.address().port}/v1.0/mock/upload-session/race-session` });
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/big-text") {
@@ -655,6 +1025,15 @@ const graph = createServer(async (req, res) => {
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/copy-http-sharepoint") {
     return json(res, 200, item("copy-http-sharepoint", "copy-http-sharepoint.txt"));
+  }
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/copy-failed") {
+    return json(res, 200, item("copy-failed", "copy-failed.txt"));
+  }
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/copy-unknown") {
+    return json(res, 200, item("copy-unknown", "copy-unknown.txt"));
+  }
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/copy-no-location") {
+    return json(res, 200, item("copy-no-location", "copy-no-location.txt"));
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/postverify-fail") {
@@ -846,6 +1225,12 @@ const graph = createServer(async (req, res) => {
   if (req.method === "PUT" && path === "/v1.0/mock/upload-session/trusted") {
     count("trusted-upload-session-put");
     return json(res, 201, item("trusted-session", "trusted-session.txt"));
+  }
+
+  if (req.method === "PUT" && path === "/v1.0/mock/upload-session/race-session") {
+    await readBufferBody(req);
+    count("replacement-race-session-put");
+    return json(res, 201, item("overwritten-race-session", "race-session.bin"));
   }
 
   if (req.method === "POST" && path === "/v1.0/me/drive/items/root:/evil-session.txt:/createUploadSession") {
@@ -1061,9 +1446,23 @@ const graph = createServer(async (req, res) => {
     return empty(res, 202, { Location: "http://tenant.sharepoint.com/monitor/copy?token=copy-secret" });
   }
 
+  if (req.method === "POST" && path === "/v1.0/me/drive/items/copy-failed/copy") {
+    return empty(res, 202, { Location: `http://127.0.0.1:${graph.address().port}/monitor/copy-failed` });
+  }
+
+  if (req.method === "POST" && path === "/v1.0/me/drive/items/copy-unknown/copy") {
+    return empty(res, 202, { Location: `http://127.0.0.1:${graph.address().port}/monitor/copy-unknown` });
+  }
+
+  if (req.method === "POST" && path === "/v1.0/me/drive/items/copy-no-location/copy") {
+    return empty(res, 202);
+  }
+
   if (req.method === "GET" && path === "/monitor/copy") {
     return empty(res, 303, { Location: `http://127.0.0.1:${graph.address().port}/v1.0/me/drive/items/copied?downloadToken=secret` });
   }
+  if (req.method === "GET" && path === "/monitor/copy-failed") return json(res, 200, { status: "failed", error: { code: "mockFailure" } });
+  if (req.method === "GET" && path === "/monitor/copy-unknown") return json(res, 200, { status: "mysteryState" });
 
   if (req.method === "GET" && path === "/v1.0/me/drive/root:/Documents/Pictures:") {
     return json(res, 200, item("pictures", "Pictures", { folder: { childCount: 0 }, file: undefined }));
@@ -1149,17 +1548,23 @@ const identity = createServer(async (req, res) => {
 
 await new Promise((resolve) => identity.listen(0, "127.0.0.1", resolve));
 const identityBaseUrl = `http://127.0.0.1:${identity.address().port}`;
+const mainStorageRoot = join(mockHome, ".codex", "onedrive-plugin");
+const mainCacheRoot = join(mainStorageRoot, "cache");
+const mainAdditionalSyncRoot = join(mockRunRoot, "synthetic-local-sync-root");
+
+seedHostileInheritedEnvironment();
+const hostileInheritedSnapshot = snapshotTree(hostileInheritedRoot);
 
 const child = spawn(process.execPath, [serverPath], {
   cwd: pluginRoot,
-  env: {
-    ...process.env,
+  env: mockServerEnvironment({
     HOME: mockHome,
+    ONEDRIVE_STORAGE_ROOT: mainStorageRoot,
+    ONEDRIVE_CACHE_ROOT: mainCacheRoot,
+    ONEDRIVE_ADDITIONAL_LOCAL_SYNC_ROOTS: JSON.stringify([mainAdditionalSyncRoot]),
     ONEDRIVE_CLIENT_ID: "mock-client-id",
-    ONEDRIVE_TEST_ACCESS_TOKEN: "mock-token",
-    ONEDRIVE_GRAPH_BASE_URL: graphBaseUrl,
-    ONEDRIVE_IDENTITY_BASE_URL: identityBaseUrl
-  },
+    ONEDRIVE_TEST_ACCESS_TOKEN: "mock-token"
+  }, "main"),
   stdio: ["pipe", "pipe", "pipe"]
 });
 
@@ -1282,7 +1687,41 @@ try {
     }
     const authStart = utilities.find((entry) => entry.name === "onedrive_auth_device_start");
     assert(authStart.inputSchema?.properties?.forceReauth?.default === false, "device login should expose an explicit false-by-default forceReauth guard", authStart.inputSchema);
-    return { checked: utilities.map((entry) => entry.name).sort() };
+    assert(toolList.length === 72 && new Set(toolList.map((entry) => entry.name)).size === 72, "server must expose exactly 72 unique tools", { count: toolList.length });
+    return { checked: utilities.map((entry) => entry.name).sort(), exactToolCount: toolList.length };
+  });
+
+  await check("server configuration honors environment then config then defaults", async () => {
+    const configHome = join(mockHome, "config-precedence-home");
+    const configStorage = join(configHome, ".codex", "onedrive-plugin");
+    mkdirSync(configStorage, { recursive: true });
+    writeFileSync(join(configStorage, "config.json"), JSON.stringify({ clientId: "config-client", tenant: "config-tenant", scopes: "config-scope" }), "utf8");
+    const configClient = createMcpClient({
+      HOME: configHome,
+      ONEDRIVE_STORAGE_ROOT: configStorage,
+      ONEDRIVE_CLIENT_ID: "env-client",
+      ONEDRIVE_TENANT: "env-tenant",
+      ONEDRIVE_SCOPES: "env-scope"
+    });
+    const fallbackClient = createMcpClient({
+      HOME: configHome,
+      ONEDRIVE_STORAGE_ROOT: configStorage,
+      ONEDRIVE_CLIENT_ID: "",
+      ONEDRIVE_TENANT: "",
+      ONEDRIVE_SCOPES: ""
+    });
+    try {
+      await Promise.all([
+        configClient.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "config-env", version: "1" } }),
+        fallbackClient.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "config-file", version: "1" } })
+      ]);
+      const [environment, configured] = await Promise.all([configClient.tool("onedrive_config"), fallbackClient.tool("onedrive_config")]);
+      assert(environment.value.tenant === "env-tenant" && environment.value.scopes === "env-scope", "environment configuration should win", environment.value);
+      assert(configured.value.clientIdConfigured === true && configured.value.tenant === "config-tenant" && configured.value.scopes === "config-scope", "config.json should supply values when environment variables are empty", configured.value);
+      return { environmentTenant: environment.value.tenant, configTenant: configured.value.tenant };
+    } finally {
+      await Promise.all([configClient.close(), fallbackClient.close()]);
+    }
   });
 
   await check("new efficiency and cleanup tools are registered", async () => {
@@ -1337,7 +1776,137 @@ try {
     assert(capabilities.value.backends.openXml.readOnlyToolsReady === true, "Open XML read tools should report ready", capabilities.value);
     assert(capabilities.value.backends.openXml.operations.excel.includes("addTableRow") && capabilities.value.backends.openXml.operations.excel.includes("setTableTotals"), "Open XML table operations should be advertised", capabilities.value);
     assert(capabilities.value.backends.graphExcel.availableForAccount === false, "mock personal drive should report Graph Excel unavailable", capabilities.value);
+    assert(capabilities.value.backends.officeJs.companionVersion === "1.1.1", "Office companion capability version should match the packaged companion", capabilities.value);
     return { checked: expected, runtime: capabilities.value.runtime.pythonVersion };
+  });
+
+  await check("Office preview proofs are deterministic and remain bound to operations and source identity", async () => {
+    const fixture = readFileSync(join(officeFixtureDir, "sample.docx"));
+    const wordPutCount = () => requests.filter((entry) => entry.method === "PUT" && entry.path === "/v1.0/me/drive/items/office-word/content").length;
+    try {
+      const commentOperations = [{ type: "addComment", paragraphIndex: 0, text: "Deterministic preview comment", author: "Codex", initials: "CX" }];
+      const commentPreview = await tool("onedrive_word_batch_update", {
+        itemId: "office-word",
+        operations: commentOperations,
+        createBackup: false,
+        verify: false
+      });
+      assert(!commentPreview.isError && commentPreview.value.previewToken && commentPreview.value.semanticDiff?.operationCounts?.addComment === 1, "Word addComment preview should issue a semantic preview token", commentPreview);
+      const putsBeforeComment = wordPutCount();
+      const commentLive = await tool("onedrive_word_batch_update", {
+        itemId: "office-word",
+        operations: commentOperations,
+        createBackup: false,
+        verify: false,
+        dryRun: false,
+        confirmed: true,
+        expectedId: "office-word",
+        previewToken: commentPreview.value.previewToken
+      });
+      officeWordPostMetadataFailuresRemaining = 0;
+      assert(!commentLive.isError && commentLive.value.previewTokenRequired !== true && commentLive.value.dryRun === false && commentLive.value.changeCount === 1, "Word addComment preview token should converge despite volatile comment timestamps", commentLive);
+      assert(wordPutCount() === putsBeforeComment + 1, "Word addComment live commit should upload exactly once", { putsBeforeComment, putsAfterComment: wordPutCount() });
+      const commentedWord = await tool("onedrive_word_get_document", { itemId: "office-word" });
+      assert(!commentedWord.isError && commentedWord.value.comments?.some((comment) => comment.text === "Deterministic preview comment"), "Word addComment live commit should persist the reviewed comment", commentedWord);
+
+      const reviewedOperations = [{ type: "addComment", paragraphIndex: 0, text: "Reviewed operation", author: "Codex", initials: "CX" }];
+      const changedOperations = [{ type: "addComment", paragraphIndex: 0, text: "Changed operation", author: "Codex", initials: "CX" }];
+      const operationPreview = await tool("onedrive_word_batch_update", {
+        itemId: "office-word",
+        operations: reviewedOperations,
+        createBackup: false,
+        verify: false
+      });
+      assert(!operationPreview.isError && operationPreview.value.previewToken, "Changed-operation guard preview should issue a token", operationPreview);
+      const putsBeforeChangedOperation = wordPutCount();
+      const changedOperationLive = await tool("onedrive_word_batch_update", {
+        itemId: "office-word",
+        operations: changedOperations,
+        createBackup: false,
+        verify: false,
+        dryRun: false,
+        confirmed: true,
+        expectedId: "office-word",
+        previewToken: operationPreview.value.previewToken
+      });
+      assert(!changedOperationLive.isError && changedOperationLive.value.previewTokenRequired === true && changedOperationLive.value.previewTokenStatus === "mismatch", "Preview token should reject changed Office operations", changedOperationLive);
+      assert(wordPutCount() === putsBeforeChangedOperation, "Changed Office operations must be refused before upload", { putsBeforeChangedOperation, putsAfterChangedOperation: wordPutCount() });
+
+      const sourceBoundOperations = [{ type: "addComment", paragraphIndex: 0, text: "Source-bound operation", author: "Codex", initials: "CX" }];
+      const sourcePreview = await tool("onedrive_word_batch_update", {
+        itemId: "office-word",
+        operations: sourceBoundOperations,
+        createBackup: false,
+        verify: false
+      });
+      assert(!sourcePreview.isError && sourcePreview.value.previewToken, "Source-identity guard preview should issue a token", sourcePreview);
+      const putsBeforeSourceChange = wordPutCount();
+      const previewedSourceVersion = officeVersions["office-word"];
+      officeVersions["office-word"] += 1;
+      const changedSourceLive = await tool("onedrive_word_batch_update", {
+        itemId: "office-word",
+        operations: sourceBoundOperations,
+        createBackup: false,
+        verify: false,
+        dryRun: false,
+        confirmed: true,
+        expectedId: "office-word",
+        previewToken: sourcePreview.value.previewToken
+      });
+      assert(!changedSourceLive.isError && changedSourceLive.value.previewTokenRequired === true && changedSourceLive.value.previewTokenStatus === "mismatch", "Preview token should reject changed Office source eTag/cTag identity", changedSourceLive);
+      assert(officeVersions["office-word"] === previewedSourceVersion + 1 && wordPutCount() === putsBeforeSourceChange, "Changed Office source identity must be refused before upload", {
+        previewedSourceVersion,
+        currentSourceVersion: officeVersions["office-word"],
+        putsBeforeSourceChange,
+        putsAfterSourceChange: wordPutCount()
+      });
+
+      const batchOperations = [{ type: "addComment", paragraphIndex: 0, text: "Deterministic batch comment", author: "Codex", initials: "CX" }];
+      const batchItems = [{ itemId: "office-word", expectedId: "office-word", kind: "word", operations: batchOperations }];
+      const batchPreview = await tool("onedrive_office_batch_transform", { items: batchItems, createBackup: false, verify: false });
+      assert(!batchPreview.isError && batchPreview.value.previewToken && batchPreview.value.preflightComplete === true, "Office batch addComment preview should issue an outer token", batchPreview);
+      const changedBatchItems = [{ ...batchItems[0], operations: [{ ...batchOperations[0], text: "Changed batch comment" }] }];
+      const putsBeforeChangedBatch = wordPutCount();
+      const changedBatchLive = await tool("onedrive_office_batch_transform", {
+        items: changedBatchItems,
+        createBackup: false,
+        verify: false,
+        dryRun: false,
+        confirmed: true,
+        previewToken: batchPreview.value.previewToken
+      });
+      assert(!changedBatchLive.isError && changedBatchLive.value.previewTokenRequired === true && changedBatchLive.value.previewTokenStatus === "mismatch", "Outer Office batch token should reject changed operations", changedBatchLive);
+      assert(wordPutCount() === putsBeforeChangedBatch, "Changed Office batch operations must be refused before upload", { putsBeforeChangedBatch, putsAfterChangedBatch: wordPutCount() });
+
+      const putsBeforeBatch = wordPutCount();
+      const batchLive = await tool("onedrive_office_batch_transform", {
+        items: batchItems,
+        createBackup: false,
+        verify: false,
+        dryRun: false,
+        confirmed: true,
+        previewToken: batchPreview.value.previewToken
+      });
+      officeWordPostMetadataFailuresRemaining = 0;
+      const batchResult = batchLive.value.completed?.[0]?.result;
+      assert(!batchLive.isError && batchLive.value.mutationStarted === true && batchLive.value.partialState === false && batchLive.value.completed?.length === 1, "Office batch addComment token should converge", batchLive);
+      assert(batchResult?.previewTokenRequired !== true && batchResult?.dryRun === false && batchResult?.changeCount === 1, "Office batch should commit the individually preflighted addComment", batchLive);
+      assert(wordPutCount() === putsBeforeBatch + 1, "Office batch addComment should upload exactly once", { putsBeforeBatch, putsAfterBatch: wordPutCount() });
+      const batchCommentedWord = await tool("onedrive_word_get_document", { itemId: "office-word" });
+      assert(!batchCommentedWord.isError && batchCommentedWord.value.comments?.some((comment) => comment.text === "Deterministic batch comment"), "Office batch addComment should persist the reviewed comment", batchCommentedWord);
+
+      return {
+        individualCommentCommitted: true,
+        changedOperationsRejected: true,
+        changedSourceIdentityRejected: true,
+        batchCommentCommitted: true,
+        uploads: wordPutCount() - putsBeforeComment
+      };
+    } finally {
+      officeWordBuffer = Buffer.from(fixture);
+      officeVersions["office-word"] += 1;
+      officeWordPostMetadataFailuresRemaining = 0;
+    }
   });
 
   await check("Office Open XML read and preview-token edit workflows", async () => {
@@ -1368,10 +1937,10 @@ try {
     const pptLive = await tool("onedrive_powerpoint_batch_update", { itemId: "office-powerpoint", operations: [{ type: "replaceText", slideIndex: 0, shapeId: "2", find: "Hello", replace: "Updated" }], dryRun: false, confirmed: true, expectedId: "office-powerpoint", previewToken: pptPreview.value.previewToken });
     assert(!pptLive.isError && pptLive.value.changeCount === 1, "PowerPoint live edit failed", pptLive);
     const nativePptOperations = [
-      { type: "addTextBox", slideIndex: 0, shapeId: 4, name: "Added box", text: "Native text", x: 100, y: 200, width: 300, height: 400 },
-      { type: "setTextStyle", slideIndex: 0, shapeId: "4", fontFamily: "Aptos", fontSize: 18, bold: true, color: "12AB34" },
-      { type: "addTextBox", slideIndex: 0, shapeId: 5, text: "Delete me", x: 10, y: 20, width: 30, height: 40 },
-      { type: "deleteShape", slideIndex: 0, shapeId: "5" },
+      { type: "addTextBox", slideIndex: 0, shapeId: 5, name: "Added box", text: "Native text", x: 100, y: 200, width: 300, height: 400 },
+      { type: "setTextStyle", slideIndex: 0, shapeId: "5", fontFamily: "Aptos", fontSize: 18, bold: true, color: "12AB34" },
+      { type: "addTextBox", slideIndex: 0, shapeId: 6, text: "Delete me", x: 10, y: 20, width: 30, height: 40 },
+      { type: "deleteShape", slideIndex: 0, shapeId: "6" },
       { type: "replaceImage", slideIndex: 0, shapeId: "3", base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", contentType: "image/png" }
     ];
     const nativePptPreview = await tool("onedrive_powerpoint_batch_update", { itemId: "office-powerpoint", operations: nativePptOperations });
@@ -1386,12 +1955,14 @@ try {
     assert(updatedExcel.value.sheets[0].cells.some((cell) => cell.address === "B2" && cell.value === "Updated"), "Excel edit did not persist", updatedExcel);
     assert(updatedPowerpoint.value.slides[0].shapes[0].text === "Updated PowerPoint", "PowerPoint edit did not persist", updatedPowerpoint);
     const pptShapes = new Map(updatedPowerpoint.value.slides[0].shapes.map((shape) => [shape.id, shape]));
-    assert(pptShapes.get("4")?.text === "Native text" && !pptShapes.has("5"), "PowerPoint text-box/style/delete edits did not persist", updatedPowerpoint);
+    assert(pptShapes.get("5")?.text === "Native text" && !pptShapes.has("6"), "PowerPoint text-box/style/delete edits did not persist", updatedPowerpoint);
     assert(pptShapes.get("3")?.image?.target?.endsWith(".png"), "PowerPoint image relationship was not replaced", updatedPowerpoint);
     for (const id of ["office-word", "office-excel", "office-powerpoint"]) {
       assert(requests.some((entry) => entry.method === "PUT" && entry.path === `/v1.0/me/drive/items/${id}/content`), "Office commit did not target the stable item ID", { id });
     }
     assert(wordLive.value.backup?.backupId, "Word live edit should create a managed backup manifest", wordLive);
+    const backupManifest = JSON.parse(readFileSync(join(mockHome, ".codex", "onedrive-plugin", "backups", `office-${wordLive.value.backup.backupId}.json`), "utf8"));
+    assert(backupManifest.version === 2 && backupManifest.scope?.authContextId === mockAuthContextId && backupManifest.scope?.driveId === "drive", "Office backup manifest should be scoped to the authentication context and drive", backupManifest);
     const backups = await tool("onedrive_office_backups", { itemId: "office-word" });
     assert(!backups.isError && backups.value.items.some((entry) => entry.backupId === wordLive.value.backup.backupId), "Managed Word backup should be listed", backups);
     const comparison = await tool("onedrive_office_compare_backup", { backupId: wordLive.value.backup.backupId });
@@ -1457,6 +2028,61 @@ try {
     return { itemCount: live.value.itemCount, totalChangeCount: live.value.totalChangeCount };
   });
 
+  await check("cross-file Office batch fails closed when the first item changes after outer preflight", async () => {
+    const items = [
+      { itemId: "office-word", expectedId: "office-word", kind: "word", operations: [{ type: "setParagraphText", paragraphIndex: 0, text: "Race Refused Word" }] }
+    ];
+    const preview = await tool("onedrive_office_batch_transform", { items });
+    assert(!preview.isError && preview.value.preflightComplete && preview.value.previewToken, "first-item race preview failed", preview);
+    const beforePuts = requests.filter((entry) => entry.method === "PUT" && entry.path === "/v1.0/me/drive/items/office-word/content").length;
+    officeMetadataRace = { id: "office-word", seen: 0, triggerGet: 2, triggered: false };
+    let live;
+    let race;
+    try {
+      live = await tool("onedrive_office_batch_transform", { items, dryRun: false, confirmed: true, previewToken: preview.value.previewToken });
+    } finally {
+      race = officeMetadataRace;
+      officeMetadataRace = null;
+    }
+    const afterPuts = requests.filter((entry) => entry.method === "PUT" && entry.path === "/v1.0/me/drive/items/office-word/content").length;
+    assert(race?.triggered === true, "mock did not trigger the between-preflight metadata race", race);
+    assert(!live.isError && live.value.failed?.refused === true && live.value.failed?.index === 0, "first-item guarded refusal was not surfaced as a batch failure", live);
+    assert(live.value.failed?.result?.previewTokenRequired === true, "batch failure should preserve the inner preview-token refusal", live.value);
+    assert(live.value.completed?.length === 0 && live.value.mutationStarted === false && live.value.partialState === false, "a first-item refusal must not claim any mutation", live.value);
+    assert(afterPuts === beforePuts, "a first-item preview-token refusal must not upload", { beforePuts, afterPuts });
+    return { refusedIndex: live.value.failed.index, mutationStarted: live.value.mutationStarted, uploads: afterPuts - beforePuts };
+  });
+
+  await check("cross-file Office batch stops after a guarded refusal without touching later items", async () => {
+    const items = [
+      { itemId: "office-powerpoint", expectedId: "office-powerpoint", kind: "powerpoint", operations: [{ type: "setShapeText", slideIndex: 0, shapeId: "2", text: "Race Partial PowerPoint" }] },
+      { itemId: "office-excel", expectedId: "office-excel", kind: "excel", operations: [{ type: "setCell", sheet: "Data", address: "F6", value: "Race Refused Excel" }] },
+      { itemId: "office-word", expectedId: "office-word", kind: "word", operations: [{ type: "setParagraphText", paragraphIndex: 0, text: "Race Untouched Word" }] }
+    ];
+    const preview = await tool("onedrive_office_batch_transform", { items });
+    assert(!preview.isError && preview.value.preflightComplete && preview.value.previewToken, "partial race preview failed", preview);
+    const putCount = (id) => requests.filter((entry) => entry.method === "PUT" && entry.path === `/v1.0/me/drive/items/${id}/content`).length;
+    const before = Object.fromEntries(["office-powerpoint", "office-excel", "office-word"].map((id) => [id, putCount(id)]));
+    officeMetadataRace = { id: "office-excel", seen: 0, triggerGet: 2, triggered: false };
+    let live;
+    let race;
+    try {
+      live = await tool("onedrive_office_batch_transform", { items, dryRun: false, confirmed: true, previewToken: preview.value.previewToken });
+    } finally {
+      race = officeMetadataRace;
+      officeMetadataRace = null;
+    }
+    const after = Object.fromEntries(["office-powerpoint", "office-excel", "office-word"].map((id) => [id, putCount(id)]));
+    assert(race?.triggered === true, "mock did not trigger the second-item metadata race", race);
+    assert(!live.isError && live.value.partialState === true && live.value.mutationStarted === true, "batch should report a recoverable partial state after one committed item", live);
+    assert(live.value.completed?.length === 1 && live.value.completed[0].index === 0, "only the first item should be committed", live.value);
+    assert(live.value.failed?.index === 1 && live.value.failed?.refused === true && live.value.failed?.result?.previewTokenRequired === true, "second-item guarded refusal was not surfaced", live.value);
+    assert(live.value.remaining?.length === 1 && live.value.remaining[0].index === 2, "later items should remain explicitly untouched", live.value);
+    assert(after["office-powerpoint"] - before["office-powerpoint"] === 1, "the first item should upload exactly once", { before, after });
+    assert(after["office-excel"] === before["office-excel"] && after["office-word"] === before["office-word"], "the refused and later items must not upload", { before, after });
+    return { completed: live.value.completed.length, refusedIndex: live.value.failed.index, remaining: live.value.remaining.length };
+  });
+
   await check("cross-file Office batch reports recoverable partial state without replaying writes", async () => {
     const items = [
       { itemId: "office-word", expectedId: "office-word", kind: "word", operations: [{ type: "setParagraphText", paragraphIndex: 0, text: "Partial Word" }] },
@@ -1469,6 +2095,17 @@ try {
     assert(!live.isError && live.value.partialState === true && live.value.completed.length === 1 && live.value.failed.index === 1, "batch should surface one completed and one failed item", live);
     assert(live.value.recovery?.[0]?.backup?.backupId, "partial-state result should include a managed recovery backup", live.value);
     return { completed: live.value.completed.length, failedIndex: live.value.failed.index, recoveryBackupId: live.value.recovery[0].backup.backupId };
+  });
+
+  await check("Office search evicts stale structured-index hits before returning them", async () => {
+    const seeded = await tool("onedrive_office_index_refresh", { itemId: "office-word", refreshMetadata: false, force: true });
+    assert(!seeded.isError && seeded.value.indexed === 1, "stale-index test could not seed the current Office package", seeded);
+    officeWordBuffer = readFileSync(join(officeFixtureDir, "sample.docx"));
+    officeVersions["office-word"] += 1;
+    const stale = await tool("onedrive_office_search", { query: "Partial Word" });
+    assert(!stale.isError && stale.value.items.length === 0, "stale Office content must not be returned after the remote package changes", stale);
+    assert(stale.value.staleEntriesRemoved?.includes("office-word"), "Office search should report the stale index entry it evicted", stale.value);
+    return { staleEntriesRemoved: stale.value.staleEntriesRemoved };
   });
 
   await check("Graph Excel async session rejects untrusted operation URLs", async () => {
@@ -1487,7 +2124,7 @@ try {
   await check("business Excel Graph supports typed table rows and chart lifecycle", async () => {
     const operations = [
       { type: "addTableRow", table: "RevenueTable", values: [["Q4", 42]] },
-      { type: "createChart", sheet: "Data", chartType: "ColumnClustered", sourceData: "A1:B4", seriesBy: "Columns" },
+      { type: "createChart", sheet: "Data", chartType: "ColumnClustered", sourceData: "A1:B4", seriesBy: "Columns", name: "Created Revenue", titleText: "Created title", width: 420, height: 240, left: 12, top: 18 },
       { type: "updateChart", sheet: "Data", chart: "Chart 1", titleText: "Revenue", width: 480, sourceData: "A1:B5", seriesBy: "Columns" }
     ];
     const preview = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations });
@@ -1495,13 +2132,89 @@ try {
     const before = requests.length;
     const live = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations, dryRun: false, confirmed: true, expectedId: "office-business", previewToken: preview.value.previewToken });
     assert(!live.isError && live.value.changeCount === 3, "typed Graph Excel live update failed", live);
+    assert(live.value.uploaded?.semanticVerification?.length === 3 && live.value.uploaded.semanticVerification.every((entry) => entry.succeeded), "Graph Excel should return semantic post-verification for each operation", live.value);
     const added = requests.slice(before);
     assert(added.some((entry) => entry.method === "POST" && entry.path.includes("/tables/RevenueTable/rows/add")), "table row endpoint was not called", { added });
     assert(added.some((entry) => entry.method === "POST" && entry.path.includes("/worksheets/Data/charts/add")), "chart add endpoint was not called", { added });
     assert(added.some((entry) => entry.method === "PATCH" && entry.path.includes("/charts/Chart%201")), "chart update endpoint was not called", { added });
     assert(added.some((entry) => entry.method === "PATCH" && entry.path.endsWith("/title")), "chart title endpoint was not called", { added });
     assert(added.some((entry) => entry.method === "POST" && entry.path.endsWith("/setData")), "chart setData endpoint was not called", { added });
+    const createdChart = [...graphExcelCharts.values()].find((entry) => entry.name === "Created Revenue");
+    assert(createdChart?.titleText === "Created title" && createdChart.width === 420 && createdChart.height === 240 && createdChart.left === 12 && createdChart.top === 18, "createChart options were not applied to the returned chart", createdChart);
     return { changeCount: live.value.changeCount, graphCalls: added.filter((entry) => entry.path.includes("/workbook/")).length };
+  });
+
+  await check("Graph Excel covers ranges, clear modes, sheet rename, and semantic verification", async () => {
+    const operations = [
+      { type: "setFormula", sheet: "Data", address: "C2", formula: "=A1+B1" },
+      { type: "setRange", sheet: "Data", address: "D2:E2", values: [[11, 12]] },
+      { type: "clearRange", sheet: "Data", address: "F2", contents: true, format: false },
+      { type: "clearRange", sheet: "Data", address: "G2", contents: false, format: true },
+      { type: "clearRange", sheet: "Data", address: "H2", contents: true, format: true },
+      { type: "renameSheet", sheet: "Data", newName: "Data Renamed" }
+    ];
+    const preview = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations });
+    assert(!preview.isError && preview.value.backend === "graph", "Graph Excel range preview failed", preview);
+    const live = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations, dryRun: false, confirmed: true, expectedId: "office-business", previewToken: preview.value.previewToken });
+    assert(!live.isError && live.value.uploaded?.semanticVerification?.length === operations.length, "Graph Excel range operations were not semantically verified", live);
+    assert(graphExcelRanges.get("Data!F2")?.lastClearApplyTo === "Contents", "contents-only clear mapped incorrectly", graphExcelRanges.get("Data!F2"));
+    assert(graphExcelRanges.get("Data!G2")?.lastClearApplyTo === "Formats", "format-only clear mapped incorrectly", graphExcelRanges.get("Data!G2"));
+    assert(graphExcelRanges.get("Data!H2")?.lastClearApplyTo === "All", "combined clear mapped incorrectly", graphExcelRanges.get("Data!H2"));
+    assert(graphExcelSheets.has("Data Renamed"), "renameSheet did not persist", [...graphExcelSheets]);
+    const before = requests.length;
+    const invalid = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations: [{ type: "clearRange", sheet: "Data Renamed", address: "A1", contents: false, format: false }] });
+    assert(invalid.isError && String(invalid.value).includes("no-op"), "clearRange false/false should be rejected", invalid);
+    assert(!requests.slice(before).some((entry) => entry.path.endsWith("/createSession")), "invalid clearRange must not create a workbook session", requests.slice(before));
+    return { clearModes: ["Contents", "Formats", "All"], semanticChecks: live.value.uploaded.semanticVerification.length };
+  });
+
+  await check("Graph Excel verification refuses absent chart fields and reports unobservable data or formats", async () => {
+    const strictOperation = [{ type: "updateChart", sheet: "Data Renamed", chart: "Chart 1", width: 512, titleText: "Strict title" }];
+    const strictPreview = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations: strictOperation });
+    assert(!strictPreview.isError && strictPreview.value.previewToken, "strict chart verification preview failed", strictPreview);
+    graphExcelOmitExpectedChartField = "width";
+    const strictLive = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations: strictOperation, dryRun: false, confirmed: true, expectedId: "office-business", previewToken: strictPreview.value.previewToken });
+    graphExcelOmitExpectedChartField = null;
+    assert(strictLive.isError && String(strictLive.value?.message || strictLive.value).includes("could not observe expected updated chart field width"), "missing requested chart fields must not be marked verified", strictLive);
+
+    const dataOperation = [{ type: "updateChart", sheet: "Data Renamed", chart: "Chart 1", sourceData: "Data Renamed!A1:B6", seriesBy: "Rows" }];
+    const dataPreview = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations: dataOperation });
+    graphExcelExposeSeriesMetadata = false;
+    const dataLive = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations: dataOperation, dryRun: false, confirmed: true, expectedId: "office-business", previewToken: dataPreview.value.previewToken });
+    graphExcelExposeSeriesMetadata = true;
+    const dataVerification = dataLive.value?.uploaded?.semanticVerification?.[0];
+    assert(!dataLive.isError && dataLive.value.verificationIncomplete === true && dataVerification?.succeeded === false && dataVerification?.verificationLimited === true && dataVerification.limitations?.length >= 1, "unobservable setData/seriesBy should return an explicit verification limitation", dataLive);
+
+    const formatOperation = [{ type: "clearRange", sheet: "Data", address: "J2", contents: false, format: true }];
+    const formatPreview = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations: formatOperation });
+    graphExcelExposeFormatMetadata = false;
+    const formatLive = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations: formatOperation, dryRun: false, confirmed: true, expectedId: "office-business", previewToken: formatPreview.value.previewToken });
+    graphExcelExposeFormatMetadata = true;
+    const formatVerification = formatLive.value?.uploaded?.semanticVerification?.[0];
+    assert(!formatLive.isError && formatLive.value.verificationIncomplete === true && formatVerification?.succeeded === false && formatVerification?.formatVerified === false && formatVerification?.verificationLimited === true, "unobservable format clear should return an explicit limitation", formatLive);
+    return { missingChartFieldRejected: true, dataVerificationLimited: true, formatVerificationLimited: true };
+  });
+
+  await check("Graph Excel chartType updates route safely", async () => {
+    const beforeWorkbook = await tool("onedrive_excel_get_workbook", { itemId: "office-business" });
+    const beforeChart = beforeWorkbook.value?.sheets?.[0]?.charts?.find((entry) => entry.name === "Chart 1");
+    const beforeFormulas = beforeChart?.series?.map((entry) => entry.formulas);
+    assert(!beforeWorkbook.isError && beforeChart?.type === "barChart" && beforeFormulas?.length, "chartType-only mock could not inspect the source chart", beforeWorkbook);
+    const operation = { type: "updateChart", sheet: "Data", chart: "Chart 1", chartType: "Line" };
+    const forced = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations: [operation] });
+    assert(forced.isError && String(forced.value).includes("cannot change an existing chart's chartType"), "forced Graph chartType update should be rejected", forced);
+    const before = requests.length;
+    const auto = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "auto", operations: [operation], createBackup: false, verify: false });
+    assert(!auto.isError && auto.value.backend === "openxml" && auto.value.previewToken, "auto chartType-only update should preview through Open XML", auto);
+    const live = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "auto", operations: [operation], createBackup: false, verify: false, dryRun: false, confirmed: true, expectedId: "office-business", previewToken: auto.value.previewToken });
+    assert(!requests.slice(before).some((entry) => entry.path.endsWith("/createSession")), "auto chartType update must not use Graph workbook sessions", requests.slice(before));
+    assert(!live.isError && live.value.backend === "openxml" && live.value.changeCount === 1, "auto chartType-only update should commit through Open XML", live);
+    const afterWorkbook = await tool("onedrive_excel_get_workbook", { itemId: "office-business" });
+    const afterChart = afterWorkbook.value?.sheets?.[0]?.charts?.find((entry) => entry.name === "Chart 1");
+    const afterFormulas = afterChart?.series?.map((entry) => entry.formulas);
+    assert(!afterWorkbook.isError && afterChart?.type === "lineChart", "chartType-only update did not change the chart type", afterWorkbook);
+    assert(JSON.stringify(afterFormulas) === JSON.stringify(beforeFormulas), "chartType-only update must preserve existing chart series formulas", { beforeFormulas, afterFormulas });
+    return { forcedGraphRejected: true, autoGraphSessionCalls: 0, formulasPreserved: true };
   });
 
   await check("find schemas expose bounded adaptive search concurrency", async () => {
@@ -1576,15 +2289,18 @@ if (command === "delete-generic-password") {
 process.exit(2);
 `);
     chmodSync(fakeSecurity, 0o755);
+    const existingAuthContextId = "existing-auth-context";
     const expiredToken = () => writeFileSync(keychainPath, JSON.stringify({
       token_type: "Bearer",
       access_token: "expired-access",
       refresh_token: "initial-refresh",
-      expires_at: 1
+      expires_at: 1,
+      auth_context_id: existingAuthContextId
     }));
     expiredToken();
+    const authStorageRoot = join(authHome, ".codex", "onedrive-plugin");
+    const authCacheRoot = join(authStorageRoot, "cache");
     const authClient = createMcpClient({
-      ...process.env,
       PATH: `${fakeBin}:${process.env.PATH}`,
       HOME: authHome,
       ONEDRIVE_CLIENT_ID: "mock-client-id",
@@ -1592,8 +2308,8 @@ process.exit(2);
       ONEDRIVE_GRAPH_BASE_URL: graphBaseUrl,
       ONEDRIVE_IDENTITY_BASE_URL: identityBaseUrl,
       ONEDRIVE_TEST_KEYCHAIN_PATH: keychainPath,
-      ONEDRIVE_STORAGE_ROOT: join(authHome, ".codex", "onedrive-plugin"),
-      ONEDRIVE_CACHE_ROOT: join(authHome, ".codex", "onedrive-plugin", "cache")
+      ONEDRIVE_STORAGE_ROOT: authStorageRoot,
+      ONEDRIVE_CACHE_ROOT: authCacheRoot
     });
     try {
       await authClient.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "auth-race-test", version: "1" } });
@@ -1609,6 +2325,124 @@ process.exit(2);
         before: refreshBefore,
         after: counters.get("identity-refresh") || 0
       });
+      assert(JSON.parse(readFileSync(keychainPath, "utf8")).auth_context_id === existingAuthContextId, "token refresh should preserve the opaque authentication context ID", JSON.parse(readFileSync(keychainPath, "utf8")));
+
+      expiredToken();
+      await authClient.tool("onedrive_logout", { deleteKeychainToken: false });
+      const refreshSwitchStart = await authClient.tool("onedrive_auth_device_start", { tenant: "consumers", forceReauth: true });
+      assert(!refreshSwitchStart.isError, "refresh-vs-device account switch should start", refreshSwitchStart);
+      refreshResponseDelayMs = 120;
+      devicePollShouldSucceed = true;
+      const staleRefreshTarget = (counters.get("identity-refresh") || 0) + 1;
+      const staleRefresh = authClient.tool("onedrive_get_info", { itemId: "root-note" });
+      await waitForCounter("identity-refresh", staleRefreshTarget);
+      const switchedLogin = await authClient.tool("onedrive_auth_device_poll");
+      assert(!switchedLogin.isError && switchedLogin.value.authenticated === true, "new device login should publish during delayed old refresh", switchedLogin);
+      const staleRefreshResult = await staleRefresh;
+      assert(staleRefreshResult.isError && String(staleRefreshResult.value).includes("authentication state changed"), "old delayed refresh should be rejected after new device login", staleRefreshResult);
+      const switchedToken = JSON.parse(readFileSync(keychainPath, "utf8"));
+      assert(String(switchedToken.access_token).startsWith("device-access-") && switchedToken.auth_context_id !== existingAuthContextId, "late refresh overwrote the new account token or authentication context", switchedToken);
+      refreshResponseDelayMs = 0;
+
+      const scopeSwitchStart = await authClient.tool("onedrive_auth_device_start", { tenant: "consumers", forceReauth: true });
+      assert(!scopeSwitchStart.isError, "storage-scope account switch should start", scopeSwitchStart);
+      driveResponseDelayMs = 120;
+      const delayedDriveTarget = (counters.get("drive-account-b") || 0) + 1;
+      const staleScopeLoad = authClient.tool("onedrive_sync_status", { includeSamples: true });
+      await waitForCounter("drive-account-b", delayedDriveTarget);
+      const scopeSwitchPoll = await authClient.tool("onedrive_auth_device_poll");
+      assert(!scopeSwitchPoll.isError, "storage-scope account switch poll should succeed", scopeSwitchPoll);
+      const staleScopeResult = await staleScopeLoad;
+      assert(staleScopeResult.isError && String(staleScopeResult.value).includes("authentication or storage scope changed"), "stale activeStorageScope result should fail closed", staleScopeResult);
+      driveResponseDelayMs = 0;
+
+      await authClient.tool("onedrive_cache_clear");
+      await authClient.tool("onedrive_get_info", { itemId: "root-note" });
+      const metadataPath = join(authCacheRoot, "metadata-cache.json");
+      const metadataLockPath = join(authCacheRoot, "metadata-cache.lock");
+      const metadataBeforeSwitch = JSON.parse(readFileSync(metadataPath, "utf8"));
+      const metadataSwitchStart = await authClient.tool("onedrive_auth_device_start", { tenant: "consumers", forceReauth: true });
+      assert(!metadataSwitchStart.isError, "metadata account switch should start", metadataSwitchStart);
+      writeFileSync(metadataPath, `${JSON.stringify({ ...metadataBeforeSwitch, raceNonce: "account-a" })}\n`);
+      writeFileSync(metadataLockPath, "held by account-switch mock\n");
+      const staleMetadataLoad = authClient.tool("onedrive_sync_status", { includeSamples: true });
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      const metadataSwitchPoll = await authClient.tool("onedrive_auth_device_poll");
+      assert(!metadataSwitchPoll.isError, "metadata account switch poll should succeed", metadataSwitchPoll);
+      rmSync(metadataLockPath, { force: true });
+      const staleMetadataResult = await staleMetadataLoad;
+      assert(staleMetadataResult.isError && String(staleMetadataResult.value).includes("authentication or storage scope changed"), "stale account metadata load should fail closed", staleMetadataResult);
+      const metadataAfterSwitch = await authClient.tool("onedrive_sync_status", { includeSamples: true });
+      assert(!metadataAfterSwitch.isError && metadataAfterSwitch.value.itemCount === 0 && !(metadataAfterSwitch.value.samples || []).some((entry) => entry.id === "root-note"), "new account returned old metadata cache state", metadataAfterSwitch);
+
+      await authClient.tool("onedrive_cache_clear");
+      await authClient.tool("onedrive_content_index_clear");
+      await authClient.tool("onedrive_get_info", { itemId: "root-note" });
+      const seededIndex = await authClient.tool("onedrive_content_index_refresh", { itemId: "root-note", maxFiles: 1, maxBytesPerFile: 4096 });
+      assert(!seededIndex.isError && seededIndex.value.indexed === 1, "content account-switch fixture should index one item", seededIndex);
+      const contentPath = join(authCacheRoot, "content-index.json");
+      const contentLockPath = join(authCacheRoot, "content-index.lock");
+      const contentBeforeSwitch = JSON.parse(readFileSync(contentPath, "utf8"));
+      const contentSwitchStart = await authClient.tool("onedrive_auth_device_start", { tenant: "consumers", forceReauth: true });
+      assert(!contentSwitchStart.isError, "content-index account switch should start", contentSwitchStart);
+      writeFileSync(contentPath, `${JSON.stringify({ ...contentBeforeSwitch, raceNonce: "account-b" })}\n`);
+      writeFileSync(contentLockPath, "held by account-switch mock\n");
+      const staleContentLoad = authClient.tool("onedrive_content_search", { query: "mock content", maxResults: 5 });
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      const contentSwitchPoll = await authClient.tool("onedrive_auth_device_poll");
+      assert(!contentSwitchPoll.isError, "content-index account switch poll should succeed", contentSwitchPoll);
+      rmSync(contentLockPath, { force: true });
+      const staleContentResult = await staleContentLoad;
+      assert(staleContentResult.isError && String(staleContentResult.value).includes("authentication or storage scope changed"), "stale account content-index load should fail closed", staleContentResult);
+      const contentAfterSwitch = await authClient.tool("onedrive_content_search", { query: "mock content", maxResults: 5 });
+      assert(!contentAfterSwitch.isError && contentAfterSwitch.value.items.length === 0, "new account returned old content-index state", contentAfterSwitch);
+
+      await authClient.tool("onedrive_sync_status");
+      const graphSwitchStart = await authClient.tool("onedrive_auth_device_start", { tenant: "consumers", forceReauth: true });
+      assert(!graphSwitchStart.isError, "Graph-response account switch should start", graphSwitchStart);
+      delayedAccountItemResponseMs = 120;
+      const accountItemTarget = (counters.get("account-race-item-a") || 0) + 1;
+      const staleGraphItem = authClient.tool("onedrive_get_info", { itemId: "account-race-a" });
+      await waitForCounter("account-race-item-a", accountItemTarget);
+      const graphSwitchPoll = await authClient.tool("onedrive_auth_device_poll");
+      assert(!graphSwitchPoll.isError, "Graph-response account switch poll should succeed", graphSwitchPoll);
+      const staleGraphResult = await staleGraphItem;
+      assert(staleGraphResult.isError && String(staleGraphResult.value).includes("authentication or storage scope changed"), "stale Graph response should not reach the new account cache", staleGraphResult);
+      delayedAccountItemResponseMs = 0;
+      await authClient.tool("onedrive_cache_clear");
+      const switchedCache = JSON.parse(readFileSync(metadataPath, "utf8"));
+      assert(!switchedCache.itemsById["account-race-a"], "stale Graph item was published after the account switch", switchedCache.itemsById);
+
+      const downloadSwitchStart = await authClient.tool("onedrive_auth_device_start", { tenant: "consumers", forceReauth: true });
+      assert(!downloadSwitchStart.isError, "download account switch should start", downloadSwitchStart);
+      const staleDownloadPath = join(authHome, "stale-account-download.txt");
+      delayedRootNoteContentMs = 120;
+      const downloadContentTarget = (counters.get("root-note-content-read") || 0) + 1;
+      const staleDownload = authClient.tool("onedrive_download", { itemId: "root-note", localPath: staleDownloadPath, overwrite: false });
+      await waitForCounter("root-note-content-read", downloadContentTarget);
+      const downloadSwitchPoll = await authClient.tool("onedrive_auth_device_poll");
+      assert(!downloadSwitchPoll.isError, "download account switch poll should succeed", downloadSwitchPoll);
+      const staleDownloadResult = await staleDownload;
+      assert(staleDownloadResult.isError && String(staleDownloadResult.value).includes("authentication or storage scope changed"), "old-account download should fail closed", staleDownloadResult);
+      assert(!existsSync(staleDownloadPath), "old-account download target remained after account switch", { staleDownloadPath });
+      delayedRootNoteContentMs = 0;
+
+      await authClient.tool("onedrive_cache_clear");
+      await authClient.tool("onedrive_content_index_clear");
+      await authClient.tool("onedrive_get_info", { itemId: "root-note" });
+      const boundedSwitchStart = await authClient.tool("onedrive_auth_device_start", { tenant: "consumers", forceReauth: true });
+      assert(!boundedSwitchStart.isError, "bounded-content account switch should start", boundedSwitchStart);
+      delayedRootNoteContentMs = 120;
+      const boundedContentTarget = (counters.get("root-note-content-read") || 0) + 1;
+      const staleBoundedRead = authClient.tool("onedrive_content_index_refresh", { itemId: "root-note", maxFiles: 1, maxBytesPerFile: 4096 });
+      await waitForCounter("root-note-content-read", boundedContentTarget);
+      const boundedSwitchPoll = await authClient.tool("onedrive_auth_device_poll");
+      assert(!boundedSwitchPoll.isError, "bounded-content account switch poll should succeed", boundedSwitchPoll);
+      const staleBoundedResult = await staleBoundedRead;
+      assert(staleBoundedResult.isError && String(staleBoundedResult.value).includes("authentication or storage scope changed"), "old-account bounded content should fail closed", staleBoundedResult);
+      delayedRootNoteContentMs = 0;
+      const boundedAfterSwitch = await authClient.tool("onedrive_content_search", { query: "mock content", maxResults: 5 });
+      assert(!boundedAfterSwitch.isError && boundedAfterSwitch.value.items.length === 0, "old-account bounded content reached the new account index", boundedAfterSwitch);
 
       const healthyDeviceStarts = counters.get("identity-device-start") || 0;
       const healthyStart = await authClient.tool("onedrive_auth_device_start", { tenant: "consumers" });
@@ -1681,6 +2515,7 @@ process.exit(2);
       assert(!existsSync(keychainPath), "superseded poll must not persist a Keychain token");
       return {
         refreshRequests: (counters.get("identity-refresh") || 0) - refreshBefore,
+        authContextPreserved: true,
         healthyDeviceCodeSuppressed: true,
         transientFailureSuppressed: true,
         revokedTokenPrompted: true,
@@ -1695,6 +2530,11 @@ process.exit(2);
       deviceStartResponseDelayMs = 0;
       devicePollResponseDelayMs = 0;
       devicePollShouldSucceed = false;
+      driveResponseDelayMs = 0;
+      delayedAccountItemResponseMs = 0;
+      delayedRootNoteContentMs = 0;
+      rmSync(join(authCacheRoot, "metadata-cache.lock"), { force: true });
+      rmSync(join(authCacheRoot, "content-index.lock"), { force: true });
       await authClient.close();
     }
   });
@@ -1752,6 +2592,26 @@ process.exit(2);
       flakyAttempts: counters.get("batch-flaky"),
       ids: result.value.items.map((entry) => entry.id)
     };
+  });
+
+  await check("previously registration-only read and download tools execute", async () => {
+    const me = await tool("onedrive_me");
+    const presets = await tool("onedrive_presets");
+    const validated = await tool("onedrive_office_validate", { itemId: "office-word", expectedKind: "word" });
+    const excelPath = join(mockHome, "registration-tools", "downloaded.xlsx");
+    const powerpointPath = join(mockHome, "registration-tools", "downloaded.pptx");
+    const excelDownload = await tool("onedrive_download_excel", { itemId: "office-excel", localPath: excelPath, overwrite: true });
+    const powerpointDownload = await tool("onedrive_download_powerpoint", { itemId: "office-powerpoint", localPath: powerpointPath, overwrite: true });
+    const batchPermissionResult = await tool("onedrive_batch_permissions", { items: [{ itemId: "copy-src" }, { itemId: "root-note" }] });
+    const recentResult = await tool("onedrive_recent", { limit: 5 });
+    assert(!me.isError && me.value.userPrincipalName === "mock@example.test", "onedrive_me failed", me);
+    assert(!presets.isError && presets.value.pathPresets?.documents === "Documents", "onedrive_presets failed", presets);
+    assert(!validated.isError && validated.value.kind === "word", "onedrive_office_validate failed", validated);
+    assert(!excelDownload.isError && existsSync(excelPath), "onedrive_download_excel failed", excelDownload);
+    assert(!powerpointDownload.isError && existsSync(powerpointPath), "onedrive_download_powerpoint failed", powerpointDownload);
+    assert(!batchPermissionResult.isError && batchPermissionResult.value.count === 2, "onedrive_batch_permissions failed", batchPermissionResult);
+    assert(!recentResult.isError && recentResult.value.items?.[0]?.id === "root-note", "onedrive_recent failed", recentResult);
+    return { executed: ["onedrive_me", "onedrive_presets", "onedrive_office_validate", "onedrive_download_excel", "onedrive_download_powerpoint", "onedrive_batch_permissions", "onedrive_recent"] };
   });
 
   await check("GET requests retry transient network failures", async () => {
@@ -1840,6 +2700,38 @@ process.exit(2);
     return { count: result.value.count, unsafePageTruncation: result.value.unsafePageTruncation };
   });
 
+  await check("delta maxPages stops after one Graph page and returns a safe advanced cursor", async () => {
+    const deltaTool = (await listTools()).find((entry) => entry.name === "onedrive_delta");
+    assert(deltaTool?.inputSchema?.properties?.maxPages?.minimum === 1 && deltaTool.inputSchema.properties.maxPages.maximum === 100, "delta maxPages should be publicly bounded to 1..100", deltaTool?.inputSchema);
+    const beforePages = counters.get("delta-max-pages-page") || 0;
+    const first = await tool("onedrive_delta", { itemId: "delta-max-pages", pageSize: 1, maxItems: 10, maxPages: 1 });
+    assert(!first.isError, "bounded delta page should return cleanly", first);
+    assert(first.value.pagesFetched === 1 && first.value.count === 1, "maxPages:1 should fetch exactly one Graph delta page", first.value);
+    assert(first.value.maxPagesReached === true && first.value.truncated === true, "bounded delta should report the explicit page limit", first.value);
+    assert(first.value.items?.[0]?.id === "delta-max-pages-a", "bounded delta should return the first page item", first.value);
+    assert(first.value.nextLink?.includes("token=page-2") && first.value.deltaLink === null, "bounded delta should preserve the advanced nextLink without inventing a deltaLink", first.value);
+    assert((counters.get("delta-max-pages-page") || 0) === beforePages + 1, "maxPages:1 should make one delta-page request", {
+      beforePages,
+      afterPages: counters.get("delta-max-pages-page") || 0
+    });
+
+    const continued = await tool("onedrive_delta", { nextLink: first.value.nextLink, maxItems: 10, maxPages: 1 });
+    assert(!continued.isError, "advanced delta nextLink should remain usable", continued);
+    assert(continued.value.pagesFetched === 1 && continued.value.items?.[0]?.id === "delta-max-pages-b", "continued bounded delta should fetch only the next page", continued.value);
+    assert(continued.value.nextLink === null && continued.value.deltaLink?.includes("token=complete"), "continued bounded delta should preserve the terminal deltaLink", continued.value);
+    assert(continued.value.maxPagesReached === false && continued.value.truncated === false, "terminal delta page should not report page-limit truncation", continued.value);
+    assert((counters.get("delta-max-pages-page") || 0) === beforePages + 2, "continuation should add exactly one delta-page request", {
+      beforePages,
+      afterPages: counters.get("delta-max-pages-page") || 0
+    });
+    return {
+      firstPagesFetched: first.value.pagesFetched,
+      firstNextLink: first.value.nextLink,
+      continuationPagesFetched: continued.value.pagesFetched,
+      terminalDeltaLink: continued.value.deltaLink
+    };
+  });
+
   await check("ordinary pagination never seeds delta cursors", async () => {
     await tool("onedrive_cache_clear");
     const boundedList = await tool("onedrive_list_all", { itemId: "root", pageSize: 2, maxItems: 2 });
@@ -1875,7 +2767,6 @@ process.exit(2);
       pathsByLower: {}
     }));
     const legacyClient = createMcpClient({
-      ...process.env,
       HOME: legacyHome,
       ONEDRIVE_CLIENT_ID: "mock-client-id",
       ONEDRIVE_TEST_ACCESS_TOKEN: "mock-token",
@@ -1901,6 +2792,37 @@ process.exit(2);
       deltaCursorStored: true,
       legacyCursorCleared: true
     };
+  });
+
+  await check("account-scoped content indexes fail closed on scope mismatch", async () => {
+    const scopedHome = join(mockHome, "scope-mismatch-home");
+    const scopedCacheRoot = join(scopedHome, ".codex", "onedrive-plugin", "cache");
+    mkdirSync(scopedCacheRoot, { recursive: true });
+    writeFileSync(join(scopedCacheRoot, "content-index.json"), JSON.stringify({
+      version: 3,
+      scope: { authContextId: "different-auth-context", driveId: "drive" },
+      itemCount: 1,
+      entriesById: {
+        leaked: { item: item("leaked", "leaked.txt"), text: "cross account secret", normalizedText: "cross account secret", tokens: ["cross", "account", "secret"], source: "text-read" }
+      }
+    }));
+    const scopedClient = createMcpClient({
+      HOME: scopedHome,
+      ONEDRIVE_CLIENT_ID: "mock-client-id",
+      ONEDRIVE_TEST_ACCESS_TOKEN: "mock-token",
+      ONEDRIVE_GRAPH_BASE_URL: graphBaseUrl,
+      ONEDRIVE_IDENTITY_BASE_URL: identityBaseUrl,
+      ONEDRIVE_STORAGE_ROOT: join(scopedHome, ".codex", "onedrive-plugin"),
+      ONEDRIVE_CACHE_ROOT: scopedCacheRoot
+    });
+    try {
+      await scopedClient.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "scope-mismatch", version: "1" } });
+      const result = await scopedClient.tool("onedrive_content_search", { query: "cross account secret" });
+      assert(!result.isError && result.value.items.length === 0 && result.value.itemCount === 0, "scope-mismatched index content must not be returned", result);
+      return { failClosed: true };
+    } finally {
+      await scopedClient.close();
+    }
   });
 
   await check("preset traversal is blocked before Graph", async () => {
@@ -1932,7 +2854,12 @@ process.exit(2);
         name: "onedrive_write_text",
         args: { remotePath: "root-target.txt", remotePreset: "documents", remoteRelativePath: "preset-target.txt", content: "x" },
         label: "ambiguous write target"
-      }
+      },
+      { name: "onedrive_move", args: { itemId: "root-note", destinationParentRelativePath: "Archive" }, label: "orphan destination relative path" },
+      { name: "onedrive_create_folder", args: { name: "Child", parentRelativePath: "Archive" }, label: "orphan parent relative path" },
+      { name: "onedrive_write_text", args: { remotePath: "root-target.txt", remoteRelativePath: "orphan.txt", content: "x" }, label: "orphan remote relative path" },
+      { name: "onedrive_office_batch_transform", args: { items: [{ kind: "word", itemId: "office-word", operations: [{ type: "mysteryOfficeEdit", payload: true }] }] }, label: "unknown nested Office operation" },
+      { name: "onedrive_office_batch_transform", args: { items: [{ kind: "word", itemId: "office-word", operations: [{ type: "setCell", sheet: "Data", address: "A1", value: "wrong kind" }] }] }, label: "kind-mismatched Office operation" }
     ];
     const before = requests.length;
     const outputs = [];
@@ -2102,6 +3029,14 @@ process.exit(2);
     return result.value.monitor;
   });
 
+  await check("copy monitor explicitly distinguishes failed and unknown terminal states", async () => {
+    const failed = await tool("onedrive_copy", { itemId: "copy-failed", destinationParentItemId: "folder-a", dryRun: false, confirmed: true, expectedId: "copy-failed", waitForCompletion: true, timeoutSeconds: 5 });
+    assert(!failed.isError && failed.value.monitor?.terminal === true && failed.value.monitor?.succeeded === false && failed.value.monitor?.terminalState === "failed", "failed copy monitor state was ambiguous", failed);
+    const unknown = await tool("onedrive_copy", { itemId: "copy-unknown", destinationParentItemId: "folder-a", dryRun: false, confirmed: true, expectedId: "copy-unknown", waitForCompletion: true, timeoutSeconds: 5 });
+    assert(!unknown.isError && unknown.value.monitor?.terminal === true && unknown.value.monitor?.succeeded === false && unknown.value.monitor?.terminalState === "unknown", "unknown copy monitor state must not resemble success", unknown);
+    return { failed: failed.value.monitor.terminalState, unknown: unknown.value.monitor.terminalState };
+  });
+
   await check("copy monitor rejects untrusted and insecure external URLs", async () => {
     const result = await tool("onedrive_copy", {
       itemId: "copy-evil",
@@ -2114,6 +3049,7 @@ process.exit(2);
     assert(!result.isError, "copy acceptance should not be converted into a failed mutation", result);
     assert(result.value.accepted === true, "copy should still report accepted mutation", result.value);
     assert(result.value.monitorError?.includes("untrusted copy monitor URL"), "unexpected monitor rejection", result.value);
+    assert(result.value.monitor?.terminal === false && result.value.monitor?.succeeded === false && result.value.monitor?.terminalState === "monitor_error", "monitor errors need an explicit non-success state", result.value);
     const insecure = await tool("onedrive_copy", {
       itemId: "copy-http-sharepoint",
       dryRun: false,
@@ -2125,7 +3061,24 @@ process.exit(2);
     assert(!insecure.isError, "insecure monitor acceptance should not be converted into a failed mutation", insecure);
     assert(insecure.value.monitorError?.includes("untrusted copy monitor URL"), "insecure external monitor should be rejected", insecure.value);
     assert(!insecure.value.monitorError?.includes("copy-secret"), "monitor rejection should not echo query tokens", insecure.value);
+    assert(insecure.value.monitor?.terminal === false && insecure.value.monitor?.succeeded === false && insecure.value.monitor?.terminalState === "monitor_error", "insecure monitor rejection needs an explicit non-success state", insecure.value);
     return { monitorError: result.value.monitorError, insecureMonitorError: insecure.value.monitorError };
+  });
+
+  await check("copy wait reports an explicit non-success state when Graph omits the monitor URL", async () => {
+    const result = await tool("onedrive_copy", {
+      itemId: "copy-no-location",
+      destinationParentItemId: "folder-a",
+      dryRun: false,
+      confirmed: true,
+      expectedId: "copy-no-location",
+      waitForCompletion: true,
+      timeoutSeconds: 5
+    });
+    assert(!result.isError && result.value.accepted === true, "copy should preserve the accepted mutation", result);
+    assert(result.value.monitorUrl === null, "missing Location should remain explicit", result.value);
+    assert(result.value.monitor?.complete === false && result.value.monitor?.terminal === false && result.value.monitor?.succeeded === false && result.value.monitor?.terminalState === "missing_monitor_url", "missing monitor URL must never resemble successful completion", result.value);
+    return result.value.monitor;
   });
 
   await check("sharing dry-run includes before permission audit", async () => {
@@ -2438,11 +3391,12 @@ process.exit(2);
   await check("download refuses local OneDrive sync destination by default", async () => {
     const result = await tool("onedrive_download", {
       itemId: "delete-target",
-      localPath: join(mockHome, "Library", "CloudStorage", "OneDrive-Personal", "blocked-download.txt")
+      localPath: join(mainAdditionalSyncRoot, "blocked-download.txt")
     });
-    assert(result.isError, "download to local OneDrive sync path should fail");
+    assert(result.isError, "download to an additional local OneDrive sync path should fail");
     assert(String(result.value).includes("local OneDrive sync folder"), "unexpected sync-path guard message", result);
-    return { blocked: true };
+    assert(!existsSync(join(mainAdditionalSyncRoot, "blocked-download.txt")), "blocked download should not create the destination", {});
+    return { blocked: true, additionalRoot: mainAdditionalSyncRoot };
   });
 
   await check("upload refuses local OneDrive sync source before local or Graph work", async () => {
@@ -2455,6 +3409,73 @@ process.exit(2);
     assert(String(result.value).includes("local OneDrive sync folder"), "unexpected sync-path guard message", result);
     assert(requests.length === before, "upload guard should not reach mock Graph", { before, after: requests.length });
     return { graphRequestsAdded: requests.length - before };
+  });
+
+  await check("public upload and write_text replacements require scoped previews and identity", async () => {
+    const localPath = join(mockHome, "work", "replace-root-note.txt");
+    mkdirSync(dirname(localPath), { recursive: true });
+    writeFileSync(localPath, "replacement upload\n", "utf8");
+    const beforePuts = requests.filter((entry) => entry.method === "PUT" && entry.path === "/v1.0/me/drive/root:/root-note.txt:/content").length;
+    const uploadPreview = await tool("onedrive_upload", { localPath, remotePath: "root-note.txt", conflictBehavior: "replace" });
+    assert(!uploadPreview.isError && uploadPreview.value.dryRun === true && uploadPreview.value.previewToken && uploadPreview.value.wouldReplace?.id === "root-note", "upload replacement should return a guarded preview", uploadPreview);
+    const uploadMissingIdentity = await tool("onedrive_upload", { localPath, remotePath: "root-note.txt", conflictBehavior: "replace", dryRun: false, confirmed: true, previewToken: uploadPreview.value.previewToken });
+    assert(!uploadMissingIdentity.isError && uploadMissingIdentity.value.requiredToReplace?.includes("expectedName or expectedId"), "upload replacement should require expected identity", uploadMissingIdentity);
+    const uploadLive = await tool("onedrive_upload", { localPath, remotePath: "root-note.txt", conflictBehavior: "replace", dryRun: false, confirmed: true, expectedId: "root-note", previewToken: uploadPreview.value.previewToken });
+    assert(!uploadLive.isError && uploadLive.value.item?.id === "root-note", "guarded upload replacement failed", uploadLive);
+
+    const writePreview = await tool("onedrive_write_text", { remotePath: "root-note.txt", content: "replacement text", conflictBehavior: "replace" });
+    assert(!writePreview.isError && writePreview.value.previewToken && writePreview.value.wouldReplace?.id === "root-note", "write_text replacement should return a guarded preview", writePreview);
+    const mismatched = await tool("onedrive_write_text", { remotePath: "root-note.txt", content: "different text", conflictBehavior: "replace", dryRun: false, confirmed: true, expectedId: "root-note", previewToken: writePreview.value.previewToken });
+    assert(!mismatched.isError && mismatched.value.previewTokenStatus === "mismatch", "preview token must bind the exact write_text content", mismatched);
+    const writeLive = await tool("onedrive_write_text", { remotePath: "root-note.txt", content: "replacement text", conflictBehavior: "replace", dryRun: false, confirmed: true, expectedId: "root-note", previewToken: writePreview.value.previewToken });
+    assert(!writeLive.isError && writeLive.value.item?.id === "root-note", "guarded write_text replacement failed", writeLive);
+    const afterPuts = requests.filter((entry) => entry.method === "PUT" && entry.path === "/v1.0/me/drive/root:/root-note.txt:/content").length;
+    assert(afterPuts === beforePuts + 2, "replacement guards should permit exactly two reviewed PUTs", { beforePuts, afterPuts });
+    return { uploadPreviewScoped: true, writePreviewBoundToContent: true, reviewedPuts: afterPuts - beforePuts };
+  });
+
+  await check("replace-after-absent preflight is create-only for simple, session, and text uploads", async () => {
+    replacementRaceState.clear();
+    const simplePath = join(mockHome, "work", "race-simple.txt");
+    const sessionPath = join(mockHome, "work", "race-session.bin");
+    mkdirSync(dirname(simplePath), { recursive: true });
+    writeFileSync(simplePath, "simple create-only race\n", "utf8");
+    writeFileSync(sessionPath, Buffer.alloc(400000, 7));
+
+    const simple = await tool("onedrive_upload", {
+      localPath: simplePath,
+      remotePath: "race-simple.txt",
+      conflictBehavior: "replace",
+      uploadMode: "simple"
+    });
+    const session = await tool("onedrive_upload", {
+      localPath: sessionPath,
+      remotePath: "race-session.bin",
+      conflictBehavior: "replace",
+      uploadMode: "session",
+      chunkSize: 327680
+    });
+    const written = await tool("onedrive_write_text", {
+      remotePath: "race-text.txt",
+      content: "text create-only race",
+      conflictBehavior: "replace"
+    });
+
+    assert(simple.isError && String(simple.value).includes("concurrent creator won the race"), "simple replacement race should refuse the concurrent item", simple);
+    assert(session.isError && String(session.value).includes("Could not create upload session"), "session replacement race should refuse the concurrent item", session);
+    assert(written.isError && String(written.value).includes("concurrent creator won the race"), "write_text replacement race should refuse the concurrent item", written);
+    for (const name of ["race-simple.txt", "race-text.txt"]) {
+      const observation = replacementRaceState.get(name);
+      assert(observation?.conflictBehavior === "fail" && observation?.ifNoneMatch === "*" && !observation?.ifMatch, `${name} was not create-only`, observation);
+      assert((counters.get(`replacement-race-overwrite-${name}`) || 0) === 0, `${name} was overwritten`, { count: counters.get(`replacement-race-overwrite-${name}`) || 0 });
+    }
+    const sessionAttempts = replacementRaceState.get("race-session.bin") || [];
+    assert(sessionAttempts.length >= 2 && sessionAttempts.every((entry) => entry.conflictBehavior === "fail" && entry.ifNoneMatch === "*" && !entry.ifMatch), "upload-session creation was not create-only on every compatible request shape", sessionAttempts);
+    assert((counters.get("replacement-race-overwrite-race-session.bin") || 0) === 0 && (counters.get("replacement-race-session-put") || 0) === 0, "session race reached an overwrite or chunk upload", {
+      createOverwrite: counters.get("replacement-race-overwrite-race-session.bin") || 0,
+      chunkPuts: counters.get("replacement-race-session-put") || 0
+    });
+    return { simpleCreateOnly: true, sessionCreateOnlyAttempts: sessionAttempts.length, writeTextCreateOnly: true };
   });
 
   await check("zero-byte session upload falls back to simple upload", async () => {
@@ -2503,7 +3524,7 @@ process.exit(2);
   });
 
   await check("document PDF export writes converted content", async () => {
-    const localPath = join(pluginRoot, "work", "mock-export.pdf");
+    const localPath = mockExportPdf;
     const result = await tool("onedrive_export_pdf", { itemId: "quarterly-report", localPath, overwrite: true });
     assert(!result.isError, "PDF export should succeed", result);
     assert(result.value.exportFormat === "pdf", "unexpected export format", result.value);
@@ -2512,7 +3533,7 @@ process.exit(2);
   });
 
   await check("document text export writes converted content", async () => {
-    const localPath = join(pluginRoot, "work", "mock-export.txt");
+    const localPath = mockExportText;
     const result = await tool("onedrive_export_text", { itemId: "quarterly-report", localPath, overwrite: true });
     assert(!result.isError, "text export should succeed", result);
     assert(result.value.exportFormat === "text", "unexpected export format", result.value);
@@ -2521,7 +3542,7 @@ process.exit(2);
   });
 
   await check("Office download helpers reuse resolved metadata", async () => {
-    const localPath = join(pluginRoot, "work", "mock-download-word.docx");
+    const localPath = mockDownloadWord;
     const before = requests.length;
     const result = await tool("onedrive_download_word", { itemId: "quarterly-report", localPath, overwrite: true });
     assert(!result.isError, "Word download helper should succeed", result);
@@ -2630,13 +3651,28 @@ process.exit(2);
     return { graphRequestsAdded: requests.length - before };
   });
 
+  await check("update_file refuses legacy unscoped manifests even with force", async () => {
+    const localPath = join(mockHome, "work", "legacy-update.txt");
+    const manifestPath = `${localPath}.onedrive-update.json`;
+    mkdirSync(dirname(localPath), { recursive: true });
+    writeFileSync(localPath, "legacy edit", "utf8");
+    writeFileSync(manifestPath, JSON.stringify({ version: 1, remotePath: "root-note.txt", localPath, item: item("root-note", "root-note.txt") }), "utf8");
+    const beforePuts = requests.filter((entry) => entry.method === "PUT" && entry.path === "/v1.0/me/drive/root:/root-note.txt:/content").length;
+    const result = await tool("onedrive_update_file", { mode: "commit", remotePath: "root-note.txt", localPath, manifestPath, force: true });
+    assert(result.isError && String(result.value).includes("legacy and unscoped"), "legacy update manifest should be refused", result);
+    const afterPuts = requests.filter((entry) => entry.method === "PUT" && entry.path === "/v1.0/me/drive/root:/root-note.txt:/content").length;
+    assert(afterPuts === beforePuts, "legacy manifest refusal must happen before upload", { beforePuts, afterPuts });
+    return { refused: true };
+  });
+
   await check("update_file commit sends checkout eTag as If-Match", async () => {
     const localPath = join(mockHome, "work", "commit-root-note.txt");
     const manifestPath = `${localPath}.onedrive-update.json`;
     mkdirSync(dirname(localPath), { recursive: true });
     writeFileSync(localPath, "edited root note\n", "utf8");
     writeFileSync(manifestPath, JSON.stringify({
-      version: 1,
+      version: 2,
+      scope: { authContextId: mockAuthContextId, driveId: "drive" },
       checkedOutAt: "2026-07-04T00:00:00.000Z",
       remotePath: "root-note.txt",
       item: item("root-note", "root-note.txt"),
@@ -2671,6 +3707,15 @@ process.exit(2);
     const added = requests.slice(before);
     assert(added.length === 0, "batch_download should reject unsafe local path before Graph", { added });
     return { error: result.value.results[0].error };
+  });
+
+  await check("batch_download inherits top-level overwrite when item omits it", async () => {
+    const localPath = join(mockHome, "batch-download-overwrite.txt");
+    writeFileSync(localPath, "stale", "utf8");
+    const inherited = await tool("onedrive_batch_download", { items: [{ itemId: "root-note", localPath }], overwrite: true });
+    assert(!inherited.isError && inherited.value.results[0]?.localPath === localPath, "batch download should inherit top-level overwrite", inherited);
+    assert(readFileSync(localPath, "utf8") === "root note mock content\n", "inherited overwrite did not replace the local file", readFileSync(localPath, "utf8"));
+    return { inheritedOverwrite: true };
   });
 
   await check("batch_download gives duplicate generated filenames unique targets", async () => {
@@ -2868,7 +3913,8 @@ process.exit(2);
   await check("metadata and content caches preserve concurrent same-process and cross-process updates", async () => {
     await tool("onedrive_cache_clear");
     const cacheFile = join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json");
-    assert(JSON.parse(readFileSync(cacheFile, "utf8")).version === 3, "cleared cache should use the migration-safe version", {});
+    const clearedCache = JSON.parse(readFileSync(cacheFile, "utf8"));
+    assert(clearedCache.version === 4 && clearedCache.scope?.authContextId === mockAuthContextId && clearedCache.scope?.driveId === "drive", "cleared cache should use the account-scoped version", clearedCache);
     const sameProcess = await Promise.all([
       tool("onedrive_get_info", { itemId: "concurrent-a" }),
       tool("onedrive_get_info", { itemId: "concurrent-b" })
@@ -2882,7 +3928,6 @@ process.exit(2);
     const sharedCacheRoot = join(sharedStorage, "cache");
     rmSync(sharedHome, { recursive: true, force: true });
     const env = {
-      ...process.env,
       HOME: sharedHome,
       ONEDRIVE_CLIENT_ID: "mock-client-id",
       ONEDRIVE_TEST_ACCESS_TOKEN: "mock-token",
@@ -3447,7 +4492,7 @@ process.exit(2);
       confirmed: true
     });
     assert(failed.isError, "failed live delete should return tool error", failed);
-    const recent = await tool("onedrive_audit_recent", { limit: 20 });
+    const recent = await tool("onedrive_audit_recent", { limit: 100 });
     assert(!recent.isError, "audit recent should succeed", recent);
     const entries = recent.value.entries || [];
     const tools = entries.map((entry) => entry.tool);
@@ -3470,7 +4515,10 @@ process.exit(2);
     assert(!serialized.includes("11111111-1111-1111-1111-111111111111"), "audit should not include object identifiers echoed in errors", entries);
     assert(!serialized.includes("https://example.test/invite"), "audit should not include URLs echoed in errors", entries);
     assert(!serialized.includes("abc.def.ghi"), "audit should not include bearer-looking tokens echoed in errors", entries);
-    return { count: entries.length, tools };
+    const exportPath = join(mockHome, "audit-export.jsonl");
+    const exported = await tool("onedrive_audit_export", { localPath: exportPath, overwrite: true });
+    assert(!exported.isError && existsSync(exportPath) && readFileSync(exportPath, "utf8").includes("onedrive_delete"), "onedrive_audit_export failed", exported);
+    return { count: entries.length, tools, auditExported: true };
   });
 
   await check("plugin-managed OneDrive data is private on disk", async () => {
@@ -3482,7 +4530,7 @@ process.exit(2);
       metadata: join(storage, "cache", "metadata-cache.json"),
       contentIndex: join(storage, "cache", "content-index.json"),
       auditLog: join(storage, "audit", "mutations.jsonl"),
-      exportedPdf: join(pluginRoot, "work", "mock-export.pdf")
+      exportedPdf: mockExportPdf
     };
     const mode = (path) => statSync(path).mode & 0o777;
     for (const path of [paths.storage, paths.cache, paths.audit]) {
@@ -3523,18 +4571,47 @@ process.exit(2);
     assert(auditEntries().length === 0, "audit log should be removed after confirmed clear", auditEntries());
     return { cleared: cleared.value.cleared };
   });
+
+  await check("mock server processes ignore hostile inherited state paths", async () => {
+    const cacheClear = await tool("onedrive_cache_clear");
+    const indexClear = await tool("onedrive_content_index_clear");
+    const status = await tool("onedrive_sync_status");
+    const capabilities = await tool("onedrive_office_capabilities");
+    assert(!cacheClear.isError && !indexClear.isError && !status.isError && !capabilities.isError, "isolated local-state probes should succeed", {
+      cacheClear,
+      indexClear,
+      status,
+      capabilities
+    });
+    assert(resolve(status.value.storageRoot) === resolve(mainStorageRoot), "main server storage must remain under the per-run root", status.value);
+    assert(resolve(status.value.cachePath) === resolve(join(mainCacheRoot, "metadata-cache.json")), "main server cache must remain under the per-run root", status.value);
+    assert(resolve(status.value.contentIndexPath) === resolve(join(mainCacheRoot, "content-index.json")), "main server content index must remain under the per-run root", status.value);
+    assert(capabilities.value.runtime.pythonPath === "/usr/bin/python3", "Office probes must ignore an inherited Python override", capabilities.value.runtime);
+    assert(!existsSync(hostilePaths.officePythonExecuted), "inherited Office Python executable must never run", hostilePaths);
+    const currentSnapshot = snapshotTree(hostileInheritedRoot);
+    assert(JSON.stringify(currentSnapshot) === JSON.stringify(hostileInheritedSnapshot), "hostile inherited state roots were modified", {
+      before: hostileInheritedSnapshot,
+      after: currentSnapshot
+    });
+    return {
+      storageRoot: status.value.storageRoot,
+      cachePath: status.value.cachePath,
+      pythonPath: capabilities.value.runtime.pythonPath,
+      hostileEntryCount: currentSnapshot.length
+    };
+  });
 } finally {
   child.stdin.end();
   child.kill("SIGTERM");
   graph.close();
   identity.close();
+  restoreInheritedEnvironment();
+  rmSync(hostileInheritedRoot, { recursive: true, force: true });
 }
 
 const failCount = results.filter((result) => result.status === "fail").length;
-console.log(JSON.stringify({ graphBaseUrl, results, stderr: stderr.join(""), summary: { total: results.length, failCount } }, null, 2));
+console.log(JSON.stringify({ graphBaseUrl, results, stderr: stderr.join(""), summary: { total: results.length, failCount }, ...(keepWork ? { mockRunRoot } : {}) }, null, 2));
 if (failCount === 0 && !keepWork) {
-  rmSync(mockHome, { recursive: true, force: true });
-  rmSync(join(pluginRoot, "work", "mock-export.pdf"), { force: true });
-  rmSync(join(pluginRoot, "work", "mock-export.txt"), { force: true });
+  cleanupRunResidue();
 }
 if (failCount > 0) process.exitCode = 1;
