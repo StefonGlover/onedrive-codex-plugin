@@ -330,6 +330,7 @@ const exportTextDownload = join(outDir, "exported-doc.txt");
 const updateCheckout = join(outDir, "update-checkout.txt");
 const updateManifest = join(outDir, "update-checkout.json");
 const officeFixtureDir = join(outDir, "office-fixtures");
+const richOfficeFixtureDir = join(outDir, "rich-office-fixtures");
 const blockedSyncDownload = join(syntheticSyncRoot, `${unique}-blocked-download.txt`);
 const blockedSyncUpload = join(syntheticSyncRoot, `${unique}-blocked-upload.txt`);
 const blockedSyncUploadSentinel = `Synthetic local sync-path guard fixture: ${unique}\n`;
@@ -343,6 +344,7 @@ const content = [
   "This file was created by Codex and should be deleted during cleanup.",
   ""
 ].join("\n");
+let richOfficeFixtures = null;
 
 async function cleanupLocalWorkDir() {
   await rm(outDir, { recursive: true, force: true });
@@ -366,6 +368,9 @@ if (live && !cleanupStale && !tenantMatrix) {
   execFileSync(fixturePython, [join(pluginRoot, "scripts", "office-openxml-test.py"), `--emit-fixtures=${officeFixtureDir}`], {
     env: { ...process.env, PYTHONPYCACHEPREFIX: join(outDir, "pycache") }, stdio: "ignore"
   });
+  richOfficeFixtures = JSON.parse(execFileSync(fixturePython, [join(pluginRoot, "scripts", "office-fixture-factory.py"), richOfficeFixtureDir], {
+    env: { ...process.env, PYTHONPYCACHEPREFIX: join(outDir, "pycache") }, encoding: "utf8"
+  }));
   await writeFile(localUpload, `Uploaded through onedrive_upload: ${unique}\n`, "utf8");
   await writeFile(localSessionUpload, Buffer.alloc(400 * 1024, `session-${unique}\n`));
   await writeFile(localBinary, Buffer.from([0, 1, 2, 3, 4, 0, 255, 128]));
@@ -602,7 +607,7 @@ async function toolWithPreview(name, args = {}, options = {}) {
   if (refusalReasons.length) {
     return {
       isError: true,
-      value: `${name} did not commit (${refusalReasons.join("; ")}).`,
+      value: `${name} did not commit (${refusalReasons.join("; ")}). Response: ${JSON.stringify(result.value)}`,
       previewRefusal: result.value,
       previewRefreshes: 0
     };
@@ -918,7 +923,7 @@ try {
   const listed = await request("tools/list");
   const toolNames = listed.result.tools.map((entry) => entry.name).sort();
   const toolContract = compareToolContract(toolNames);
-  record("tools/list exactly matches the 72-tool contract", toolContract.ok ? "pass" : "fail", toolContract);
+  record("tools/list exactly matches the 84-tool contract", toolContract.ok ? "pass" : "fail", toolContract);
 
   const config = assertOk("onedrive_config", await tool("onedrive_config", { checkToken: true }));
   record("configured and token available", config.clientIdConfigured && config.accessTokenAvailable ? "pass" : "fail", {
@@ -1031,6 +1036,125 @@ try {
   }));
   record("read text file", readBack.content === content ? "pass" : "fail", { bytes: Buffer.byteLength(readBack.content || "", "utf8") });
 
+  const noteBeforePatch = assertOk("note info before remote-edit workflows", await tool("onedrive_get_info", { path: `${folderName}/note.txt`, format: "full" }));
+  const versionsBefore = assertOk("version history", await tool("onedrive_versions", { itemId: noteBeforePatch.id, maxItems: 20 }));
+  record("version history returns bounded metadata", Array.isArray(versionsBefore.versions) && versionsBefore.count === versionsBefore.versions.length ? "pass" : "fail", {
+    count: versionsBefore.count,
+    versions: versionsBefore.versions?.map((entry) => entry.id)
+  });
+  const patchDiff = [
+    "@@ -1,2 +1,2 @@",
+    ` OneDrive plugin beta test token: ${unique}`,
+    "-This file was created by Codex and should be deleted during cleanup.",
+    "+This file was safely patched remotely and should be deleted during cleanup.",
+    ""
+  ].join("\n");
+  const patchedNote = assertCommitted("guarded text patch", await toolWithPreview("onedrive_patch_text", {
+    itemId: noteBeforePatch.id,
+    patch: { mode: "unified", diff: patchDiff },
+    expectedId: noteBeforePatch.id,
+    expectedETag: noteBeforePatch.eTag,
+    dryRun: false,
+    confirmed: true
+  }), (value) => value.verified === true && value.item?.id === noteBeforePatch.id);
+  const patchedRead = assertOk("patched text readback", await tool("onedrive_read_text", { itemId: noteBeforePatch.id, maxBytes: 10000 }));
+  record("structured text patch preserves stable identity and verifies bytes", patchedRead.content.includes("safely patched remotely") && patchedNote.item.id === noteBeforePatch.id ? "pass" : "fail", {
+    itemId: patchedNote.item.id,
+    preservation: patchedNote.preservation,
+    sha256: patchedNote.sha256
+  });
+
+  const comparedVersion = versionsBefore.versions?.[0]
+    ? await tool("onedrive_compare_version", { itemId: noteBeforePatch.id, versionId: versionsBefore.versions[0].id, maxChanges: 50 })
+    : await tool("onedrive_compare_version", { itemId: noteBeforePatch.id, versionId: "unavailable", maxChanges: 50 });
+  record("version comparison classifies text semantics", !comparedVersion.isError && comparedVersion.value.comparison?.comparisonType === "text" ? "pass" : "blocked", {
+    reason: comparedVersion.isError ? errorText(comparedVersion.value) : undefined,
+    comparison: comparedVersion.value?.comparison
+  });
+
+  const patchInfo = assertOk("note info after patch", await tool("onedrive_get_info", { itemId: noteBeforePatch.id, format: "full" }));
+  const workspaceCreated = assertCommitted("workspace create", await toolWithPreview("onedrive_workspace_create", {
+    itemId: noteBeforePatch.id,
+    expectedId: noteBeforePatch.id,
+    expectedETag: patchInfo.eTag,
+    dryRun: false,
+    confirmed: true
+  }), (value) => value.workspace?.workspaceId && value.draft?.id);
+  const workspaceList = assertOk("workspace list", await tool("onedrive_workspace_list"));
+  const draftBeforeEdit = workspaceCreated.draft;
+  const draftEdited = assertCommitted("workspace draft patch", await toolWithPreview("onedrive_patch_text", {
+    itemId: draftBeforeEdit.id,
+    patch: { mode: "unified", diff: ["@@ -1,2 +1,2 @@", ` OneDrive plugin beta test token: ${unique}`, "-This file was safely patched remotely and should be deleted during cleanup.", "+This managed draft was promoted and should be deleted during cleanup.", ""].join("\n") },
+    expectedId: draftBeforeEdit.id,
+    expectedETag: draftBeforeEdit.eTag,
+    dryRun: false,
+    confirmed: true
+  }), (value) => value.verified === true);
+  const workspaceStatus = assertOk("workspace status", await tool("onedrive_workspace_status", { workspaceId: workspaceCreated.workspace.workspaceId, maxChanges: 50 }));
+  const sourceBeforePromote = assertOk("workspace source info", await tool("onedrive_get_info", { itemId: noteBeforePatch.id, format: "full" }));
+  const promoted = assertCommitted("workspace promote", await toolWithPreview("onedrive_workspace_promote", {
+    workspaceId: workspaceCreated.workspace.workspaceId,
+    expectedId: noteBeforePatch.id,
+    expectedETag: sourceBeforePromote.eTag,
+    dryRun: false,
+    confirmed: true
+  }), (value) => value.promoted === true && value.cleanedUp === true && value.item?.id === noteBeforePatch.id);
+  record("managed workspace detects draft drift, preserves source identity, and cleans up after promotion", workspaceList.count >= 1
+    && workspaceStatus.draftDrift === true
+    && workspaceStatus.promotionReady === true
+    && draftEdited.item?.id === draftBeforeEdit.id
+    && promoted.item.id === noteBeforePatch.id ? "pass" : "fail", {
+    workspaceId: workspaceCreated.workspace.workspaceId,
+    status: workspaceStatus.status,
+    sourceId: promoted.item.id,
+    cleanedUp: promoted.cleanedUp
+  });
+
+  const sourceAfterPromote = assertOk("source after workspace promotion", await tool("onedrive_get_info", { itemId: noteBeforePatch.id, format: "full" }));
+  const disposableWorkspace = assertCommitted("disposable workspace create", await toolWithPreview("onedrive_workspace_create", {
+    itemId: noteBeforePatch.id,
+    expectedId: noteBeforePatch.id,
+    expectedETag: sourceAfterPromote.eTag,
+    dryRun: false,
+    confirmed: true
+  }), (value) => value.workspace?.workspaceId && value.draft?.id);
+  const abandoned = assertCommitted("workspace abandon", await toolWithPreview("onedrive_workspace_abandon", {
+    workspaceId: disposableWorkspace.workspace.workspaceId,
+    expectedId: disposableWorkspace.draft.id,
+    expectedETag: disposableWorkspace.draft.eTag,
+    dryRun: false,
+    confirmed: true
+  }), (value) => value.abandoned === true && value.sourceUnaffected === true);
+  record("workspace abandonment is independently guarded", abandoned.abandoned === true ? "pass" : "fail", { workspaceId: abandoned.workspaceId });
+
+  const watchStarted = assertOk("watch start", await tool("onedrive_watch_start", { itemId: folder.id, intervalSeconds: 30, expiresInSeconds: 3600 }));
+  const watchId = watchStarted.watch?.watchId;
+  const watchStatus = assertOk("watch status", await tool("onedrive_watch_status", { watchId, maxEvents: 10 }));
+  const watchStopped = assertOk("watch stop", await tool("onedrive_watch_stop", { watchId }));
+  record("change watch establishes a scoped baseline and stops deterministically", watchId && watchStatus.count === 1 && watchStopped.stopped === true && watchStopped.watch?.status === "stopped" ? "pass" : "fail", {
+    watchId,
+    baselineItemCount: watchStarted.baselineItemCount,
+    stopped: watchStopped.stopped
+  });
+
+  const versionsAfter = assertOk("version history after remote edits", await tool("onedrive_versions", { itemId: noteBeforePatch.id, maxItems: 20 }));
+  const restoreCandidate = versionsAfter.versions?.at(-1);
+  if (restoreCandidate) {
+    const beforeRestore = assertOk("note info before native restore", await tool("onedrive_get_info", { itemId: noteBeforePatch.id, format: "full" }));
+    const restoredVersion = assertCommitted("native version restore", await toolWithPreview("onedrive_restore_version", {
+      itemId: noteBeforePatch.id,
+      versionId: restoreCandidate.id,
+      expectedId: noteBeforePatch.id,
+      expectedETag: beforeRestore.eTag,
+      dryRun: false,
+      confirmed: true
+    }), (value) => value.verified === true && value.item?.id === noteBeforePatch.id);
+    record("native version restore verifies a new current version", "pass", { restoredVersionId: restoredVersion.restoredVersionId, itemId: restoredVersion.item.id });
+  } else {
+    await tool("onedrive_restore_version", { itemId: noteBeforePatch.id, versionId: "unavailable" });
+    record("native version restore verifies a new current version", "blocked", { reason: "Microsoft Graph returned no restorable version for the newly created personal OneDrive fixture." });
+  }
+
   await assertOk("write csv", await tool("onedrive_write_text", {
     remotePath: `${folderName}/sheet.csv`,
     content: `name,value\n${unique},42\n`,
@@ -1051,6 +1175,9 @@ try {
     localPath: join(officeFixtureDir, "sample.pptx"),
     conflictBehavior: "fail"
   }));
+  await assertOk("upload rich docx", await tool("onedrive_upload", { remotePath: `${folderName}/rich.docx`, localPath: richOfficeFixtures.word, conflictBehavior: "fail" }));
+  await assertOk("upload rich xlsx", await tool("onedrive_upload", { remotePath: `${folderName}/rich.xlsx`, localPath: richOfficeFixtures.excel, conflictBehavior: "fail" }));
+  await assertOk("upload rich pptx", await tool("onedrive_upload", { remotePath: `${folderName}/rich.pptx`, localPath: richOfficeFixtures.powerpoint, conflictBehavior: "fail" }));
   await assertOk("write duplicate A", await tool("onedrive_write_text", {
     remotePath: `${folderName}/duplicate.txt`,
     content: `Duplicate helper test ${unique}\n`,
@@ -1171,10 +1298,66 @@ try {
   const powerpointOfficePreview = assertOk("powerpoint native edit preview", await tool("onedrive_powerpoint_batch_update", { path: `${folderName}/deck.pptx`, operations: powerpointOfficeOperations }));
   const powerpointOfficeLiveResult = await toolWithPreview("onedrive_powerpoint_batch_update", { path: `${folderName}/deck.pptx`, operations: powerpointOfficeOperations, dryRun: false, confirmed: true, expectedName: "deck.pptx" }, { previewToken: powerpointOfficePreview.previewToken });
   const powerpointOfficeLive = assertOk("powerpoint native edit live", powerpointOfficeLiveResult);
+  const imageBase64 = richOfficeFixtures.imageBase64;
+  const wordRichOperations = [
+    { type: "insertImage", paragraphIndex: 0, base64: imageBase64, contentType: "image/png", width: 457200, height: 457200, altText: "Beta image" },
+    { type: "replaceImage", imageIndex: 0, base64: imageBase64, contentType: "image/png" },
+    { type: "createContentControl", paragraphIndex: 1, tag: "beta-rich", title: "Beta rich", text: `Controlled ${unique}` },
+    { type: "deleteContentControl", tag: "beta-rich", preserveContent: true },
+    { type: "createBookmark", paragraphIndex: 0, name: "CodexBetaBookmark" },
+    { type: "deleteBookmark", name: "CodexBetaBookmark" },
+    { type: "insertTableRow", tableIndex: 0, rowIndex: 1, values: ["E", "F"] },
+    { type: "insertTableColumn", tableIndex: 0, columnIndex: 1, values: ["X", "Y", "Z"] },
+    { type: "deleteTableRow", tableIndex: 0, rowIndex: 2 },
+    { type: "deleteTableColumn", tableIndex: 0, columnIndex: 2 },
+    { type: "setHeaderFooterText", part: "word/header1.xml", text: `Beta header ${unique}` },
+    { type: "setSectionProperties", sectionIndex: 0, orientation: "landscape", pageWidth: 15840, pageHeight: 12240, marginLeft: 720, marginRight: 720 }
+  ];
+  const wordRichLive = assertOk("word rich native operations", await toolWithPreview("onedrive_word_batch_update", {
+    path: `${folderName}/rich.docx`, operations: wordRichOperations, dryRun: false, confirmed: true, expectedName: "rich.docx"
+  }));
+  const excelRichOperations = [
+    { type: "addWorksheet", name: "Scratch" }, { type: "deleteWorksheet", sheet: "Scratch" },
+    { type: "addTable", sheet: "Data", address: "F1:G3", name: "CodexTable" }, { type: "deleteTable", table: "CodexTable", preserveData: true },
+    { type: "mergeRange", sheet: "Data", address: "H1:I1" }, { type: "unmergeRange", sheet: "Data", address: "H1:I1" },
+    { type: "sortRange", sheet: "Data", address: "D2:E3", keys: [{ column: 1, descending: true }], hasHeaders: false },
+    { type: "setAutoFilter", sheet: "Data", address: "D1:E3" },
+    { type: "setHyperlink", sheet: "Data", address: "J1", url: "https://openai.com", display: "OpenAI" },
+    { type: "addNote", sheet: "Data", address: "K1", text: `Beta note ${unique}`, author: "Codex" }, { type: "deleteNote", sheet: "Data", address: "K1" },
+    { type: "insertImage", sheet: "Data", fromAddress: "N1", base64: imageBase64, contentType: "image/png", altText: "Beta image" },
+    { type: "formatChart", sheet: "Data", chart: "0", titleText: "Formatted beta chart", legendPosition: "bottom", style: 10 },
+    { type: "setSheetProtection", sheet: "Data", enabled: true, allowSelectUnlockedCells: true },
+    { type: "refreshPivot" }
+  ];
+  const excelRichLive = assertOk("excel rich native operations", await toolWithPreview("onedrive_excel_batch_update", {
+    path: `${folderName}/rich.xlsx`, backend: "openxml", operations: excelRichOperations, dryRun: false, confirmed: true, expectedName: "rich.xlsx"
+  }));
+  const selectors = richOfficeFixtures.powerpointSelectors;
+  const powerpointRichOperations = [
+    { type: "addSlide", afterIndex: 0 },
+    { type: "addImage", slideIndex: 0, base64: imageBase64, contentType: "image/png", x: 457200, y: 4572000, width: 457200, height: 457200, altText: "Added beta image" },
+    { type: "cropImage", slideIndex: 0, shapeId: selectors.pictureId, left: 0.1, right: 0.1 },
+    { type: "addTable", slideIndex: 0, rows: [["One", "Two"], ["Three", "Four"]], x: 3657600, y: 4572000, width: 1828800, height: 914400 },
+    { type: "insertTableRow", slideIndex: 0, shapeId: selectors.tableId, rowIndex: 1, values: ["R1", "R2"] },
+    { type: "insertTableColumn", slideIndex: 0, shapeId: selectors.tableId, columnIndex: 1, values: ["C1", "C2", "C3"] },
+    { type: "deleteTableRow", slideIndex: 0, shapeId: selectors.tableId, rowIndex: 2 },
+    { type: "deleteTableColumn", slideIndex: 0, shapeId: selectors.tableId, columnIndex: 2 },
+    { type: "setShapeAltText", slideIndex: 0, shapeId: selectors.boxId, title: "Main beta box", description: `Edited ${unique}` },
+    { type: "setZOrder", slideIndex: 0, shapeId: selectors.boxId, position: "front" },
+    { type: "groupShapes", slideIndex: 0, shapeIds: [selectors.groupAId, selectors.groupBId], name: "Codex Beta Group" },
+    { type: "ungroupShape", slideIndex: 0, shapeId: selectors.existingGroupId },
+    { type: "applySlideLayout", slideIndex: 1, layoutName: selectors.blankLayoutName }
+  ];
+  const powerpointRichLive = assertOk("powerpoint rich native operations", await toolWithPreview("onedrive_powerpoint_batch_update", {
+    path: `${folderName}/rich.pptx`, operations: powerpointRichOperations, dryRun: false, confirmed: true, expectedName: "rich.pptx"
+  }));
   const officeOperationCoverage = {
-    word: wordOfficeOperations.every((operation) => wordOfficeLive.semanticDiff?.operationCounts?.[operation.type] > 0),
-    excel: excelOfficeOperations.every((operation) => excelOfficeLive.semanticDiff?.operationCounts?.[operation.type] > 0),
+    word: wordOfficeOperations.every((operation) => wordOfficeLive.semanticDiff?.operationCounts?.[operation.type] > 0)
+      && wordRichOperations.every((operation) => wordRichLive.semanticDiff?.operationCounts?.[operation.type] > 0),
+    excel: excelOfficeOperations.every((operation) => excelOfficeLive.semanticDiff?.operationCounts?.[operation.type] > 0)
+      && excelRichOperations.every((operation) => excelRichLive.semanticDiff?.operationCounts?.[operation.type] > 0),
     powerpoint: powerpointOfficeOperations.every((operation) => powerpointOfficeLive.semanticDiff?.operationCounts?.[operation.type] > 0)
+      && powerpointRichOperations.every((operation) => powerpointRichLive.semanticDiff?.operationCounts?.[operation.type] > 0)
   };
   const wordAfterEditResult = await pollIndexedSearch(
     "onedrive_word_get_document",
@@ -1197,7 +1380,7 @@ try {
   const wordAfterEdit = assertOk("word post-edit semantic read", wordAfterEditResult);
   const excelAfterEdit = assertOk("excel post-edit semantic read", excelAfterEditResult);
   const powerpointAfterEdit = assertOk("powerpoint post-edit semantic read", powerpointAfterEditResult);
-  record("all 38 advertised Open XML operations commit with semantic verification", Object.values(officeOperationCoverage).every(Boolean)
+  record("all 78 advertised Open XML operations commit with semantic verification", Object.values(officeOperationCoverage).every(Boolean)
     && wordOfficeLive.verificationIncomplete !== true
     && excelOfficeLive.verificationIncomplete !== true
     && powerpointOfficeLive.verificationIncomplete !== true
@@ -1208,7 +1391,7 @@ try {
     wordChanges: wordOfficeLive.changeCount,
     excelChanges: excelOfficeLive.changeCount,
     powerpointChanges: powerpointOfficeLive.changeCount,
-    requestedOperationCounts: { word: wordOfficeOperations.length, excel: excelOfficeOperations.length, powerpoint: powerpointOfficeOperations.length },
+    requestedOperationCounts: { word: wordOfficeOperations.length + wordRichOperations.length, excel: excelOfficeOperations.length + excelRichOperations.length, powerpoint: powerpointOfficeOperations.length + powerpointRichOperations.length },
     coverage: officeOperationCoverage,
     commitVerificationIncomplete: {
       word: wordOfficeLive.verificationIncomplete,
@@ -1230,9 +1413,9 @@ try {
       powerpointPollAttempts: powerpointAfterEditResult.pollAttempts
     },
     operationCounts: {
-      word: wordOfficeLive.semanticDiff?.operationCounts,
-      excel: excelOfficeLive.semanticDiff?.operationCounts,
-      powerpoint: powerpointOfficeLive.semanticDiff?.operationCounts
+      word: { ...wordOfficeLive.semanticDiff?.operationCounts, ...wordRichLive.semanticDiff?.operationCounts },
+      excel: { ...excelOfficeLive.semanticDiff?.operationCounts, ...excelRichLive.semanticDiff?.operationCounts },
+      powerpoint: { ...powerpointOfficeLive.semanticDiff?.operationCounts, ...powerpointRichLive.semanticDiff?.operationCounts }
     }
   });
 
@@ -2254,7 +2437,7 @@ try {
   const expectedLiveTools = ONEDRIVE_TOOL_CONTRACT.filter((name) => !blockedLiveTools.has(name));
   const missingLiveTools = expectedLiveTools.filter((name) => !calledTools.has(name));
   const unexpectedLiveTools = [...calledTools].filter((name) => !ONEDRIVE_TOOL_CONTRACT.includes(name));
-  record("live beta exercises every non-blocked tool in the exact 72-tool contract", missingLiveTools.length === 0 && unexpectedLiveTools.length === 0 ? "pass" : "fail", {
+  record("live beta exercises every non-blocked tool in the exact 84-tool contract", missingLiveTools.length === 0 && unexpectedLiveTools.length === 0 ? "pass" : "fail", {
     contractCount: ONEDRIVE_TOOL_CONTRACT.length,
     exercisedCount: calledTools.size,
     blockedTools: [...blockedLiveTools],

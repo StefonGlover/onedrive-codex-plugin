@@ -18,8 +18,13 @@ OPENXML_TOOL_NAMES = {
     "excel": "onedrive_excel_batch_update",
     "powerpoint": "onedrive_powerpoint_batch_update",
 }
-EXPECTED_OPENXML_OPERATION_COUNTS = {"word": 9, "excel": 17, "powerpoint": 12}
+EXPECTED_OPENXML_OPERATION_COUNTS = {"word": 21, "excel": 32, "powerpoint": 25}
 COVERED_OPENXML_OPERATIONS = {kind: set() for kind in OPENXML_TOOL_NAMES}
+RICH_REAL_FIXTURE_OPERATIONS = {
+    "word": {"insertImage", "replaceImage", "createContentControl", "deleteContentControl", "createBookmark", "deleteBookmark", "insertTableRow", "deleteTableRow", "insertTableColumn", "deleteTableColumn", "setHeaderFooterText", "setSectionProperties"},
+    "excel": {"addWorksheet", "deleteWorksheet", "addTable", "deleteTable", "mergeRange", "unmergeRange", "sortRange", "setAutoFilter", "setHyperlink", "addNote", "deleteNote", "insertImage", "formatChart", "setSheetProtection", "refreshPivot"},
+    "powerpoint": {"addSlide", "addImage", "cropImage", "addTable", "insertTableRow", "deleteTableRow", "insertTableColumn", "deleteTableColumn", "setShapeAltText", "setZOrder", "groupShapes", "ungroupShape", "applySlideLayout"},
+}
 
 
 CONTENT_TYPES = """<?xml version="1.0" encoding="UTF-8"?>
@@ -480,14 +485,19 @@ def main():
         checks["macroEditRequiresOptIn"] = macro_result.returncode != 0 and "allowMacros=true" in macro_result.stdout
 
     advertised_openxml_operations = production_openxml_operations()
+    real_fixture_source = (ROOT / "scripts" / "office-real-fixture-test.py").read_text()
+    checks["richFixtureContractDeclared"] = all(
+        ('"type": "%s"' % operation) in real_fixture_source
+        for operations in RICH_REAL_FIXTURE_OPERATIONS.values() for operation in operations
+    )
     checks["advertisedOpenXmlOperationCounts"] = {
         kind: len(operations) for kind, operations in advertised_openxml_operations.items()
     } == EXPECTED_OPENXML_OPERATION_COUNTS
     coverage = {
         kind: {
-            "covered": sorted(COVERED_OPENXML_OPERATIONS[kind]),
+            "covered": sorted(COVERED_OPENXML_OPERATIONS[kind] | RICH_REAL_FIXTURE_OPERATIONS[kind]),
             "expected": sorted(expected),
-            "coveredCount": len(COVERED_OPENXML_OPERATIONS[kind]),
+            "coveredCount": len(COVERED_OPENXML_OPERATIONS[kind] | RICH_REAL_FIXTURE_OPERATIONS[kind]),
             "expectedCount": len(expected),
         }
         for kind, expected in advertised_openxml_operations.items()

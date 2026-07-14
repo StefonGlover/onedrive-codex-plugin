@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 const scriptsRoot = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(scriptsRoot, "..");
 const manifest = JSON.parse(readFileSync(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"));
-const versionPattern = /^0\.4\.0\+codex\.\d{14}$/;
+const versionPattern = /^0\.5\.0\+codex\.\d{14}$/;
 const excludedTopLevelNames = new Set([".git", "work", "downloads", "onedrive-beta", "node_modules", "dist", "build", "coverage"]);
 
 function parseArgs(argv) {
@@ -97,7 +97,7 @@ async function assertInstalledTargetDirectory() {
 if (args.selfCheck) {
   const checks = {
     releaseVersionAccepted: versionPattern.test(manifest.version),
-    staleVersionRejected: !versionPattern.test("0.3.0+codex.20260711223300"),
+    staleVersionRejected: !versionPattern.test("0.4.0+codex.20260713202830"),
     duplicateConfirmationRejected: (() => { try { parseArgs(["--confirmed", "--confirmed"]); return false; } catch { return true; } })(),
     unknownOptionRejected: (() => { try { parseArgs(["--overwrite"]); return false; } catch { return true; } })(),
     evidenceModeParsed: parseArgs(["--sync-evidence"]).syncEvidence === true,
@@ -132,7 +132,7 @@ if (args.syncEvidence) {
   if (!args.confirmed) {
     console.log(JSON.stringify({
       ...evidencePreview,
-      requiredToSync: `Review this exact existing 0.4.0 target, then rerun with --sync-evidence --confirmed --target=${expectedTarget}. Only qa-report.md and qa-report.json are replaced.`
+      requiredToSync: `Review this exact existing ${manifest.version} target, then rerun with --sync-evidence --confirmed --target=${expectedTarget}. Only qa-report.md and qa-report.json are replaced.`
     }, null, 2));
     process.exit(0);
   }

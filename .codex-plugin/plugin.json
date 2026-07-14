@@ -1,6 +1,6 @@
 {
   "name": "onedrive",
-  "version": "0.4.0+codex.20260713202830",
+  "version": "0.5.0+codex.20260714034051",
   "description": "Manage OneDrive files and natively inspect or edit Word, Excel, and PowerPoint content from Codex.",
   "author": {
     "name": "Stefon Glover"
@@ -16,7 +16,7 @@
   "interface": {
     "displayName": "OneDrive",
     "shortDescription": "Search, manage, and natively edit OneDrive Office files.",
-    "longDescription": "Connect Codex to Microsoft OneDrive through Microsoft Graph without relying on the laptop's local sync folder. Alongside safe file, search, sharing, permission, and cleanup workflows, the plugin can structurally inspect and preview-first edit Word, Excel, and PowerPoint Open XML content. Excel automatically uses scoped Graph workbook sessions for supported business .xlsx files and a local Open XML engine for personal drives and other supported packages.",
+    "longDescription": "Connect Codex to Microsoft OneDrive through Microsoft Graph without relying on the laptop's local sync folder. Safely search, patch, version, watch, share, and manage files; use owner-only editing workspaces; and structurally inspect and preview-first edit Word, Excel, and PowerPoint with durable semantic anchors. Personal OneDrive remains fully supported, while supported business Excel writes use scoped Graph workbook sessions.",
     "developerName": "Stefon Glover",
     "category": "Productivity",
     "capabilities": [
@@ -28,7 +28,10 @@
       "Permission management",
       "Keychain auth",
       "Microsoft Graph",
-      "Native Office editing"
+      "Native Office editing",
+      "Version history",
+      "Managed editing workspaces",
+      "Local change watches"
     ],
     "defaultPrompt": [
       "Run a OneDrive plugin health check.",

@@ -46,6 +46,18 @@ export const ONEDRIVE_TOOL_CONTRACT = Object.freeze([
   "onedrive_export_text",
   "onedrive_upload",
   "onedrive_write_text",
+  "onedrive_patch_text",
+  "onedrive_versions",
+  "onedrive_compare_version",
+  "onedrive_restore_version",
+  "onedrive_workspace_list",
+  "onedrive_workspace_create",
+  "onedrive_workspace_status",
+  "onedrive_workspace_promote",
+  "onedrive_workspace_abandon",
+  "onedrive_watch_start",
+  "onedrive_watch_status",
+  "onedrive_watch_stop",
   "onedrive_create_folder",
   "onedrive_rename",
   "onedrive_move",
@@ -73,8 +85,8 @@ export const ONEDRIVE_TOOL_CONTRACT = Object.freeze([
   "onedrive_delete"
 ]);
 
-if (ONEDRIVE_TOOL_CONTRACT.length !== 72 || new Set(ONEDRIVE_TOOL_CONTRACT).size !== 72) {
-  throw new Error("OneDrive tool contract must contain exactly 72 unique tool names.");
+if (ONEDRIVE_TOOL_CONTRACT.length !== 84 || new Set(ONEDRIVE_TOOL_CONTRACT).size !== 84) {
+  throw new Error("OneDrive tool contract must contain exactly 84 unique tool names.");
 }
 
 export function compareToolContract(actualNames = []) {

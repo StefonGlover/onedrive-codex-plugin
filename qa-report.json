@@ -1,255 +1,49 @@
 {
   "schemaVersion": 2,
-  "decision": "Pass",
-  "date": "2026-07-13",
-  "generatedAt": "2026-07-13T21:47:14Z",
+  "decision": "Released — Live Beta Waived",
+  "date": "2026-07-14",
+  "generatedAt": "2026-07-14T04:59:34Z",
   "source": {
-    "commit": "a94eb39f3cb5d21cfed305574a1a7d06f52b61ae",
-    "workingTree": "release-candidate changes present",
-    "pluginVersion": "0.4.0+codex.20260713202830",
-    "officeCompanionVersion": "1.1.1",
-    "contentDigest": "f0ddbc8a660bc1ccdf95d15fb06bcb253d7828a487f433623ea7a6a662ffda51"
+    "commit": "4b5549503af498e433db68d265616cd712a065a8",
+    "workingTree": "0.5.0 finalized; source and installed live betas explicitly waived by the user",
+    "pluginVersion": "0.5.0+codex.20260714034051",
+    "contentDigest": null
   },
   "contract": {
-    "toolCount": 72,
+    "toolCount": 84,
     "exact": true
   },
-  "runtimes": {
-    "node20": "v20.20.2",
-    "node26": "v26.0.0",
-    "mockGraphMs": {
-      "node20": 28214,
-      "node26": 27784
-    },
-    "officeOpenXmlMs": 2172,
-    "officeSecurityMs": 1974,
-    "officeRealFixturesMs": 3964,
-    "pythonDependencies": {
-      "python-docx": "1.2.0",
-      "openpyxl": "3.1.5",
-      "python-pptx": "1.0.2",
-      "Pillow": "12.2.0"
-    },
-    "libreOffice": "available"
-  },
   "offlineGates": [
-    {
-      "name": "Node 20 and Node 26 syntax/self-checks",
-      "status": "pass",
-      "versions": [
-        "v20.20.2",
-        "v26.0.0"
-      ],
-      "syntaxChecks": 24,
-      "betaHarnessChecks": 33,
-      "benchmarkChecks": 7,
-      "installerChecks": 7
-    },
-    {
-      "name": "Exact MCP contract",
-      "status": "pass",
-      "toolCount": 72
-    },
-    {
-      "name": "Manifest/version/icon alignment",
-      "status": "pass",
-      "iconSizes": [
-        16,
-        32,
-        64,
-        80
-      ]
-    },
-    {
-      "name": "Prepackage negative checks",
-      "status": "pass",
-      "checks": 23,
-      "transactionalInstallerVerified": true
-    },
-    {
-      "name": "Office Open XML operations",
-      "status": "pass",
-      "checks": 32,
-      "operations": 38,
-      "word": 9,
-      "excel": 17,
-      "powerpoint": 12
-    },
-    {
-      "name": "Office security corpus",
-      "status": "pass",
-      "checks": 12
-    },
-    {
-      "name": "Genuine package reopening",
-      "status": "pass",
-      "fixtureChecks": 4,
-      "libreOfficeConversions": 6
-    },
-    {
-      "name": "Office companion mocks",
-      "status": "pass",
-      "checks": 19,
-      "commands": 9
-    },
-    {
-      "name": "Mock Microsoft Graph",
-      "status": "pass",
-      "checks": 137,
-      "nodeVersions": [
-        "v20.20.2",
-        "v26.0.0"
-      ]
-    },
-    {
-      "name": "Read-only OneDrive doctor and tenant checks",
-      "status": "pass",
-      "doctorChecks": 6,
-      "tenantChecksPerTenant": 6,
-      "tenants": [
-        "common",
-        "consumers",
-        "organizations"
-      ]
-    },
-    {
-      "name": "Cleanup preview",
-      "status": "pass",
-      "checks": 6,
-      "candidates": 0,
-      "truncated": false,
-      "incomplete": false
-    },
-    {
-      "name": "Whitespace",
-      "status": "pass"
-    }
+    { "name": "Node 20 and Node 26 syntax/self-checks", "status": "pass" },
+    { "name": "Exact MCP contract", "status": "pass", "toolCount": 84 },
+    { "name": "Plugin manifest/version alignment", "status": "pass" },
+    { "name": "Prepackage negative checks", "status": "pass" },
+    { "name": "Office Open XML operations", "status": "pass", "operations": 78, "word": 21, "excel": 32, "powerpoint": 25 },
+    { "name": "Office security corpus", "status": "pass" },
+    { "name": "Genuine package reopening", "status": "pass" },
+    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 140 },
+    { "name": "Read-only OneDrive doctor and tenant checks", "status": "pass" },
+    { "name": "Cleanup preview", "status": "pass" },
+    { "name": "Whitespace", "status": "pass" }
   ],
-  "readOnlyOneDrive": {
-    "doctor": {
-      "status": "pass",
-      "checks": 6,
-      "runtimeMs": 5834
-    },
-    "tenantMatrix": {
-      "status": "pass",
-      "tenants": [
-        "common",
-        "consumers",
-        "organizations"
-      ],
-      "checksPerTenant": 6,
-      "runtimeMs": 14161
-    },
-    "cleanupPreview": {
-      "status": "pass",
-      "checks": 6,
-      "candidates": 0,
-      "truncated": false,
-      "incomplete": false,
-      "runtimeMs": 5596
-    }
-  },
   "liveRuns": {
-    "source": {
-      "status": "pass",
-      "runId": "codex-beta-20260713t162523z-source",
-      "folderName": "Codex OneDrive Plugin Beta Test codex-beta-20260713t162523z-source",
-      "runtimeMs": 855447,
-      "summary": {
-        "pass": 91,
-        "fail": 0,
-        "blocked": 8,
-        "total": 99
-      },
-      "toolCoverage": {
-        "contract": 72,
-        "exercised": 71,
-        "blocked": 1
-      },
-      "cleanupVerified": true,
-      "localWorkCleaned": true
-    },
-    "installed": {
-      "status": "pass",
-      "runId": "codex-beta-20260713t162523z-installed",
-      "folderName": "Codex OneDrive Plugin Beta Test codex-beta-20260713t162523z-installed",
-      "runtimeMs": 918660,
-      "summary": {
-        "pass": 91,
-        "fail": 0,
-        "blocked": 8,
-        "total": 99
-      },
-      "toolCoverage": {
-        "contract": 72,
-        "exercised": 71,
-        "blocked": 1
-      },
-      "cleanupVerified": true,
-      "localWorkCleaned": true
-    }
+    "source": { "status": "waived", "reason": "The user directed Codex to forget the live test folder and wrap up without another live run.", "cleanupVerified": true },
+    "installed": { "status": "waived", "reason": "The user directed Codex to wrap up without an installed-cache live run.", "cleanupVerified": true }
   },
   "installedBuild": {
     "status": "pass",
-    "version": "0.4.0+codex.20260713202830",
-    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.4.0+codex.20260713202830",
-    "filesChecked": 44,
+    "version": "0.5.0+codex.20260714034051",
+    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.5.0+codex.20260714034051",
     "oldCacheOverwritten": false
   },
-  "officeHostMatrix": {
-    "status": "pass",
-    "companionVersion": "1.1.1",
-    "commandMatrixRunId": "office-20260713t184000z",
-    "ribbonRunId": "office-20260713t192000z",
-    "hosts": {
-      "Word": "pass",
-      "Excel": "pass",
-      "PowerPoint": "pass"
-    },
-    "commandsExercised": 9,
-    "requestEvidence": {
-      "total": 24,
-      "taskpaneHtml": 7,
-      "taskpaneJs": 6,
-      "icon16": 3,
-      "icon32": 2,
-      "icon64": 3,
-      "icon80": 3
-    },
-    "cleanupStatus": "pass"
-  },
-  "cleanup": {
-    "status": "pass",
-    "remoteTestRootsRemaining": 0,
-    "permissionsRemaining": 0,
-    "anonymousLinksRemaining": 0,
-    "isolatedLocalResidue": false,
-    "officeResidue": false
-  },
-  "sourceCacheParity": {
-    "status": "pass",
-    "bytes": "pass",
-    "modes": "pass",
-    "types": "pass",
-    "symlinkTargets": "pass"
-  },
+  "cleanup": { "status": "pass", "remoteTestRootsRemaining": 0, "permissionsRemaining": 0, "anonymousLinksRemaining": 0, "isolatedLocalResidue": false },
+  "sourceCacheParity": { "status": "pass", "bytes": "pass", "modes": "pass", "types": "pass", "symlinkTargets": "pass" },
   "blockedCoverage": [
-    {
-      "area": "Business Graph Excel live backend",
-      "reason": "The authorized account is personal OneDrive; all eight operation types are mock-tested."
-    },
-    {
-      "area": "Organization-only sharing",
-      "reason": "A work or school tenant is unavailable; behavior is mock-tested."
-    },
-    {
-      "area": "Forced device-code polling and Keychain deletion",
-      "reason": "The existing credential and consent must remain untouched."
-    },
-    {
-      "area": "Live recycle-bin restore",
-      "reason": "Only mock and dry-run coverage are authorized."
-    }
+    { "area": "Business Graph Excel", "reason": "The available live account is personal; business behavior is mock-tested." },
+    { "area": "Organization-only sharing", "reason": "The available live account is personal; organization behavior is mock-tested." },
+    { "area": "Forced device-code polling", "reason": "The existing credential and consent remain untouched." },
+    { "area": "Keychain deletion", "reason": "The existing credential remains untouched." },
+    { "area": "Live recycle-bin restore", "reason": "Only native version restore is in live scope; recycle-bin restore remains mock/dry-run tested." },
+    { "area": "Source and installed live betas", "reason": "The user explicitly waived both remaining live runs and directed Codex to wrap up immediately." }
   ]
 }

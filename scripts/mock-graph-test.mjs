@@ -64,6 +64,13 @@ let delayedAccountItemResponseMs = 0;
 let delayedRootNoteContentMs = 0;
 let rootDeltaScenario = "empty";
 const replacementRaceState = new Map();
+let versionTextBuffer = Buffer.from("alpha\ncurrent\n", "utf8");
+let versionTextRevision = 1;
+let workspaceDraftBuffer = Buffer.from("workspace base\n", "utf8");
+let workspaceSourceBuffer = Buffer.from("workspace base\n", "utf8");
+let workspaceSourceRevision = 1;
+let workspaceDraftRevision = 1;
+let workspaceFolderDeleted = false;
 
 function count(key) {
   const next = (counters.get(key) || 0) + 1;
@@ -1468,6 +1475,72 @@ const graph = createServer(async (req, res) => {
     return json(res, 200, item("pictures", "Pictures", { folder: { childCount: 0 }, file: undefined }));
   }
 
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/version-text") {
+    return json(res, 200, item("version-text", "versioned.txt", { size: versionTextBuffer.length, eTag: `etag-version-text-${versionTextRevision}`, cTag: `ctag-version-text-${versionTextRevision}` }));
+  }
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/version-text/versions") {
+    return json(res, 200, { value: [
+      { id: "2.0", size: 14, lastModifiedDateTime: "2026-07-13T00:00:00Z", lastModifiedBy: { user: { displayName: "Mock User" } } },
+      { id: "1.0", size: 12, lastModifiedDateTime: "2026-07-12T00:00:00Z", lastModifiedBy: { user: { displayName: "Mock User" } } }
+    ] });
+  }
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/version-text/content") return binary(res, 200, versionTextBuffer, { "Content-Type": "text/plain" });
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/version-text/versions/1.0/content") return text(res, 200, "alpha\nold\n");
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/version-text/versions/2.0/content") return text(res, 200, "alpha\ncurrent\n");
+  if (req.method === "PUT" && path === "/v1.0/me/drive/items/version-text/content") {
+    if (req.headers["if-match"] !== `etag-version-text-${versionTextRevision}`) return json(res, 412, { error: { code: "preconditionFailed", message: "stale patch" } });
+    versionTextBuffer = await readBufferBody(req);
+    versionTextRevision += 1;
+    return json(res, 200, item("version-text", "versioned.txt", { size: versionTextBuffer.length, eTag: `etag-version-text-${versionTextRevision}`, cTag: `ctag-version-text-${versionTextRevision}` }));
+  }
+  if (req.method === "POST" && path === "/v1.0/me/drive/items/version-text/versions/1.0/restore") {
+    if (req.headers["if-match"] !== `etag-version-text-${versionTextRevision}`) return json(res, 412, { error: { code: "preconditionFailed", message: "stale restore" } });
+    versionTextBuffer = Buffer.from("alpha\nold\n", "utf8");
+    versionTextRevision += 1;
+    return empty(res, 204);
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/workspace-source") {
+    return json(res, 200, item("workspace-source", "draft.txt", { size: workspaceSourceBuffer.length, eTag: `etag-workspace-source-${workspaceSourceRevision}`, cTag: `ctag-workspace-source-${workspaceSourceRevision}` }));
+  }
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/workspace-source/content") return binary(res, 200, workspaceSourceBuffer, { "Content-Type": "text/plain" });
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/workspace-source/versions") return json(res, 200, { value: [{ id: "1.0", size: workspaceSourceBuffer.length, lastModifiedDateTime: "2026-07-13T00:00:00Z" }] });
+  if (req.method === "PUT" && path === "/v1.0/me/drive/items/workspace-source/content") {
+    if (req.headers["if-match"] !== `etag-workspace-source-${workspaceSourceRevision}`) return json(res, 412, { error: { code: "preconditionFailed", message: "workspace source drift" } });
+    workspaceSourceBuffer = await readBufferBody(req);
+    workspaceSourceRevision += 1;
+    return json(res, 200, item("workspace-source", "draft.txt", { size: workspaceSourceBuffer.length, eTag: `etag-workspace-source-${workspaceSourceRevision}`, cTag: `ctag-workspace-source-${workspaceSourceRevision}` }));
+  }
+  if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root:/Codex Editing Drafts:")) {
+    return json(res, 200, folder("workspace-root", "Codex Editing Drafts", { folder: { childCount: workspaceFolderDeleted ? 0 : 1 } }));
+  }
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/workspace-root/permissions") {
+    return json(res, 200, { value: [{ id: "workspace-owner", roles: ["owner"], grantedToV2: { user: { id: "mock-owner", displayName: "Mock User" } } }] });
+  }
+  if (req.method === "POST" && path === "/v1.0/me/drive/items/workspace-root/children") {
+    const body = await readJsonBody(req);
+    workspaceFolderDeleted = false;
+    return json(res, 201, folder("workspace-folder", body.name, { parentReference: { id: "workspace-root", path: "/drive/root:/Codex Editing Drafts" } }));
+  }
+  if (req.method === "PUT" && decodedUrl.includes("/v1.0/me/drive/items/workspace-folder:/draft.txt:/content")) {
+    workspaceDraftBuffer = await readBufferBody(req);
+    workspaceDraftRevision += 1;
+    return json(res, 200, item("workspace-draft", "draft.txt", { size: workspaceDraftBuffer.length, eTag: `etag-workspace-draft-${workspaceDraftRevision}`, cTag: `ctag-workspace-draft-${workspaceDraftRevision}`, parentReference: { id: "workspace-folder" } }));
+  }
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/workspace-draft") {
+    return json(res, 200, item("workspace-draft", "draft.txt", { size: workspaceDraftBuffer.length, eTag: `etag-workspace-draft-${workspaceDraftRevision}`, cTag: `ctag-workspace-draft-${workspaceDraftRevision}`, parentReference: { id: "workspace-folder" } }));
+  }
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/workspace-draft/content") return binary(res, 200, workspaceDraftBuffer, { "Content-Type": "text/plain" });
+  if (req.method === "DELETE" && path === "/v1.0/me/drive/items/workspace-folder") {
+    workspaceFolderDeleted = true;
+    return empty(res, 204);
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/watch-folder") return json(res, 200, folder("watch-folder", "Watch Folder"));
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/watch-folder/delta") {
+    return json(res, 200, { value: [], "@odata.deltaLink": `http://127.0.0.1:${graph.address().port}/v1.0/me/drive/items/watch-folder/delta?token=baseline` });
+  }
+
   json(res, 404, { error: { code: "notFound", message: `${req.method} ${req.url}` } });
 });
 
@@ -1687,7 +1760,7 @@ try {
     }
     const authStart = utilities.find((entry) => entry.name === "onedrive_auth_device_start");
     assert(authStart.inputSchema?.properties?.forceReauth?.default === false, "device login should expose an explicit false-by-default forceReauth guard", authStart.inputSchema);
-    assert(toolList.length === 72 && new Set(toolList.map((entry) => entry.name)).size === 72, "server must expose exactly 72 unique tools", { count: toolList.length });
+    assert(toolList.length === 84 && new Set(toolList.map((entry) => entry.name)).size === 84, "server must expose exactly 84 unique tools", { count: toolList.length });
     return { checked: utilities.map((entry) => entry.name).sort(), exactToolCount: toolList.length };
   });
 
@@ -1752,6 +1825,67 @@ try {
     return { checked: expected.length };
   });
 
+  await check("version history, semantic text comparison, guarded patch, and native restore", async () => {
+    const listed = await tool("onedrive_versions", { itemId: "version-text", maxItems: 10 });
+    assert(!listed.isError && listed.value.count === 2 && listed.value.versions[1].id === "1.0", "version listing failed", listed);
+    const compared = await tool("onedrive_compare_version", { itemId: "version-text", versionId: "1.0", maxChanges: 20 });
+    assert(!compared.isError && compared.value.comparison.comparisonType === "text" && compared.value.comparison.sameContent === false, "text version comparison failed", compared);
+    const patched = await tool("onedrive_patch_text", {
+      itemId: "version-text", patch: { mode: "json", operations: [{ op: "replace", path: "/status", value: "ready" }] }
+    });
+    assert(patched.isError && String(patched.value).includes("valid JSON"), "JSON patch must reject non-JSON source", patched);
+    const unified = await toolWithPreview("onedrive_patch_text", {
+      itemId: "version-text", expectedId: "version-text", expectedETag: "etag-version-text-1",
+      patch: { mode: "unified", diff: "@@ -1,2 +1,2 @@\n alpha\n-current\n+patched\n" },
+      dryRun: false, confirmed: true
+    });
+    assert(!unified.isError && unified.value.verified === true && versionTextBuffer.toString("utf8") === "alpha\npatched\n", "guarded unified patch failed", unified);
+    const restored = await toolWithPreview("onedrive_restore_version", {
+      itemId: "version-text", versionId: "1.0", expectedId: "version-text", expectedETag: "etag-version-text-2", dryRun: false, confirmed: true
+    });
+    assert(!restored.isError && restored.value.verified === true && versionTextBuffer.toString("utf8") === "alpha\nold\n", "native version restore failed", restored);
+    return { versions: listed.value.count, comparison: compared.value.comparison.comparisonType, patchVerified: unified.value.verified, restoreVerified: restored.value.verified };
+  });
+
+  await check("managed workspaces preserve identity, detect draft edits, promote, clean up, and abandon safely", async () => {
+    const created = await toolWithPreview("onedrive_workspace_create", {
+      itemId: "workspace-source", expectedId: "workspace-source", expectedETag: "etag-workspace-source-1", dryRun: false, confirmed: true
+    });
+    assert(!created.isError && created.value.workspace?.workspaceId && created.value.draft?.id === "workspace-draft", "workspace creation failed", created);
+    const workspaceId = created.value.workspace.workspaceId;
+    workspaceDraftBuffer = Buffer.from("workspace edited\n", "utf8");
+    workspaceDraftRevision += 1;
+    const status = await tool("onedrive_workspace_status", { workspaceId });
+    assert(!status.isError && status.value.status === "edited" && status.value.draftDrift === true && status.value.promotionReady === true, "workspace draft drift status failed", status);
+    const promoted = await toolWithPreview("onedrive_workspace_promote", {
+      workspaceId, expectedId: "workspace-source", expectedETag: "etag-workspace-source-1", dryRun: false, confirmed: true
+    });
+    assert(!promoted.isError && promoted.value.promoted === true && promoted.value.cleanedUp === true && workspaceFolderDeleted, "workspace promotion/cleanup failed", promoted);
+    assert(workspaceSourceBuffer.toString("utf8") === "workspace edited\n", "workspace promotion did not preserve original item identity/content", workspaceSourceBuffer.toString("utf8"));
+    const second = await toolWithPreview("onedrive_workspace_create", {
+      itemId: "workspace-source", expectedId: "workspace-source", expectedETag: "etag-workspace-source-2", dryRun: false, confirmed: true
+    });
+    assert(!second.isError, "second workspace creation failed", second);
+    const abandoned = await toolWithPreview("onedrive_workspace_abandon", {
+      workspaceId: second.value.workspace.workspaceId, expectedId: "workspace-draft", expectedETag: second.value.draft.eTag, dryRun: false, confirmed: true
+    });
+    assert(!abandoned.isError && abandoned.value.abandoned === true && abandoned.value.sourceUnaffected === true, "guarded workspace abandonment failed", abandoned);
+    const list = await tool("onedrive_workspace_list");
+    assert(!list.isError && list.value.count === 0, "workspace manifests should be empty after promotion and abandonment", list);
+    return { promoted: true, abandoned: true, remaining: list.value.count };
+  });
+
+  await check("delta watches establish a baseline, persist bounded status, and stop cleanly", async () => {
+    const started = await tool("onedrive_watch_start", { itemId: "watch-folder", intervalSeconds: 15, expiresInSeconds: 60 });
+    assert(!started.isError && started.value.watch?.status === "active" && started.value.baselineItemCount === 0, "watch baseline failed", started);
+    const watchId = started.value.watch.watchId;
+    const status = await tool("onedrive_watch_status", { watchId, maxEvents: 5 });
+    assert(!status.isError && status.value.count === 1 && status.value.watches[0].events.length === 0, "watch status failed", status);
+    const stopped = await tool("onedrive_watch_stop", { watchId });
+    assert(!stopped.isError && stopped.value.stopped === true && stopped.value.watch.status === "stopped", "watch stop failed", stopped);
+    return { watchId, status: stopped.value.watch.status };
+  });
+
   await check("Office Open XML inspection tools and runtime are available", async () => {
     const toolList = await listTools();
     const names = new Set(toolList.map((entry) => entry.name));
@@ -1776,7 +1910,6 @@ try {
     assert(capabilities.value.backends.openXml.readOnlyToolsReady === true, "Open XML read tools should report ready", capabilities.value);
     assert(capabilities.value.backends.openXml.operations.excel.includes("addTableRow") && capabilities.value.backends.openXml.operations.excel.includes("setTableTotals"), "Open XML table operations should be advertised", capabilities.value);
     assert(capabilities.value.backends.graphExcel.availableForAccount === false, "mock personal drive should report Graph Excel unavailable", capabilities.value);
-    assert(capabilities.value.backends.officeJs.companionVersion === "1.1.1", "Office companion capability version should match the packaged companion", capabilities.value);
     return { checked: expected, runtime: capabilities.value.runtime.pythonVersion };
   });
 
@@ -1996,9 +2129,8 @@ try {
     const createRequest = sessionRequests.find((entry) => entry.path.endsWith("/createSession"));
     assert(createRequest?.headers?.prefer === "respond-async", "Graph createSession should request asynchronous completion", { createRequest });
     assert(rangeRequest?.headers?.["workbook-session-id"] === "business-session", "Graph range write omitted workbook-session-id", { rangeRequest });
-    assert(sessionRequests.some((entry) => entry.path.endsWith("/closeSession")), "Graph closeSession was not called", { sessionRequests });
-    assert(live.value.uploaded?.sessionClosed === false, "failed Graph closeSession should not be reported as closed", live.value);
-    assert(live.value.localWarnings?.some((entry) => entry.operation === "Graph Excel session close"), "failed Graph closeSession should be a non-fatal warning", live.value);
+    assert(live.value.uploaded?.sessionManaged === true && live.value.uploaded?.sessionPersistent === true, "Graph write should use the bounded persistent session manager", live.value);
+    assert(live.value.uploaded?.sessionClosed === false, "a reusable managed session should remain open until idle cleanup", live.value);
     return { calls: sessionRequests.length, backend: live.value.backend, sessionClosed: live.value.uploaded.sessionClosed };
   });
 
@@ -2112,11 +2244,11 @@ try {
     const operations = [{ type: "setCell", sheet: "Data", address: "B2", value: "Blocked" }];
     const preview = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations });
     const untrustedResource = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations, dryRun: false, confirmed: true, expectedId: "office-business", previewToken: preview.value.previewToken });
-    assert(untrustedResource.isError && String(untrustedResource.value).includes("untrusted Excel session resourceLocation"), "untrusted Excel resourceLocation should be rejected", untrustedResource);
+    assert(untrustedResource.isError && JSON.stringify(untrustedResource.value).includes("untrusted Excel session resourceLocation"), "untrusted Excel resourceLocation should be rejected", untrustedResource);
 
     const secondPreview = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations });
     const untrustedLocation = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations, dryRun: false, confirmed: true, expectedId: "office-business", previewToken: secondPreview.value.previewToken });
-    assert(untrustedLocation.isError && String(untrustedLocation.value).includes("untrusted Excel session Location"), "untrusted Excel Location should be rejected", untrustedLocation);
+    assert(untrustedLocation.isError && JSON.stringify(untrustedLocation.value).includes("untrusted Excel session Location"), "untrusted Excel Location should be rejected", untrustedLocation);
     assert(!requests.some((entry) => entry.path.startsWith("/workbook/operations/session") || entry.path.startsWith("/sessionInfoResource")), "untrusted Excel async URL should never be fetched", { requests });
     return { rejected: ["Location", "resourceLocation"] };
   });

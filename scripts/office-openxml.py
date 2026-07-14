@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import base64
 import binascii
+import copy
 import hashlib
+import io
 import json
 import posixpath
 import re
+import shutil
 import sys
+import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -28,11 +32,15 @@ MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 250
 MAX_TEXT_CHARS = 2_000_000
 
+EXCEL_RICH_OPERATIONS = {"addWorksheet", "deleteWorksheet", "addTable", "deleteTable", "mergeRange", "unmergeRange", "sortRange", "setAutoFilter", "setHyperlink", "addNote", "deleteNote", "insertImage", "formatChart", "setSheetProtection", "refreshPivot"}
+POWERPOINT_RICH_OPERATIONS = {"addSlide", "addImage", "cropImage", "addTable", "insertTableRow", "deleteTableRow", "insertTableColumn", "deleteTableColumn", "setShapeAltText", "setZOrder", "groupShapes", "ungroupShape", "applySlideLayout"}
+
 NS = {
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
     "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
     "ct": "http://schemas.openxmlformats.org/package/2006/content-types",
     "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
+    "pic": "http://schemas.openxmlformats.org/drawingml/2006/picture",
     "pr": "http://schemas.openxmlformats.org/package/2006/relationships",
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
     "s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
@@ -863,6 +871,7 @@ def add_word_relationship(package: zipfile.ZipFile, modifications: Dict[str, byt
     if external:
         attributes["TargetMode"] = "External"
     ET.SubElement(root, q("pr", "Relationship"), attributes)
+    ET.register_namespace("", NS["pr"])
     modifications[rel_part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
     return rel_id
 
@@ -875,6 +884,7 @@ def add_content_type_override(package: zipfile.ZipFile, modifications: Dict[str,
         ET.SubElement(root, q("ct", "Override"), {"PartName": part_name, "ContentType": content_type})
     else:
         existing.attrib["ContentType"] = content_type
+    ET.register_namespace("", NS["ct"])
     modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
@@ -908,6 +918,93 @@ def new_word_table(rows: List[List[str]], style: Optional[str] = None) -> ET.Ele
     return table
 
 
+WORD_IMAGE_CONTENT_TYPES = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/bmp": "bmp", "image/tiff": "tiff"}
+
+
+def decode_image_payload(operation: Dict[str, Any], supported: Dict[str, str]) -> Tuple[bytes, str, str]:
+    content_type = str(operation.get("contentType", ""))
+    extension = supported.get(content_type)
+    if not extension:
+        raise OfficePackageError("Unsupported image contentType: %s" % content_type)
+    try:
+        payload = base64.b64decode(str(operation.get("base64", "")), validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise OfficePackageError("Image base64 payload is invalid.") from error
+    if not payload or len(payload) > 25 * 1024 * 1024:
+        raise OfficePackageError("Image payload must be between 1 byte and 25 MiB.")
+    return payload, content_type, extension
+
+
+def add_content_type_default(package: zipfile.ZipFile, modifications: Dict[str, bytes], extension: str, content_type: str) -> None:
+    root = ET.fromstring(modifications.get("[Content_Types].xml", package.read("[Content_Types].xml")))
+    existing = next((node for node in root.findall(q("ct", "Default")) if node.attrib.get("Extension", "").lower() == extension.lower()), None)
+    if existing is None:
+        ET.SubElement(root, q("ct", "Default"), {"Extension": extension, "ContentType": content_type})
+    elif existing.attrib.get("ContentType") != content_type:
+        raise OfficePackageError("Package already maps .%s to a different content type." % extension)
+    ET.register_namespace("", NS["ct"])
+    modifications["[Content_Types].xml"] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def word_insert_image(package: zipfile.ZipFile, modifications: Dict[str, bytes], operation: Dict[str, Any]) -> Dict[str, Any]:
+    part = str(operation.get("part", "word/document.xml"))
+    root = word_part(package, modifications, part)
+    paragraphs = word_paragraphs(root)
+    index = int(operation.get("paragraphIndex", -1))
+    if index < 0 or index >= len(paragraphs):
+        raise OfficePackageError("Word paragraphIndex is out of range.")
+    payload, content_type, extension = decode_image_payload(operation, WORD_IMAGE_CONTENT_TYPES)
+    existing = set(package.namelist()) | set(modifications)
+    number = 1
+    while "word/media/codex-image-%d.%s" % (number, extension) in existing:
+        number += 1
+    media_part = "word/media/codex-image-%d.%s" % (number, extension)
+    modifications[media_part] = payload
+    rel_id = add_word_relationship(package, modifications, part, "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image", posixpath.relpath(media_part, posixpath.dirname(part)))
+    add_content_type_default(package, modifications, extension, content_type)
+    width = int(operation.get("width", 914400))
+    height = int(operation.get("height", 914400))
+    drawing_ids = [int(node.attrib.get("id", "0")) for node in root.iter(q("wp", "docPr")) if node.attrib.get("id", "").isdigit()]
+    drawing_id = max(drawing_ids or [0]) + 1
+    run = ET.SubElement(paragraphs[index], q("w", "r")); drawing = ET.SubElement(run, q("w", "drawing"))
+    inline = ET.SubElement(drawing, q("wp", "inline")); ET.SubElement(inline, q("wp", "extent"), {"cx": str(width), "cy": str(height)})
+    ET.SubElement(inline, q("wp", "docPr"), {"id": str(drawing_id), "name": "Codex Image %d" % drawing_id, "descr": str(operation.get("altText", ""))})
+    ET.SubElement(inline, q("wp", "cNvGraphicFramePr"))
+    graphic = ET.SubElement(inline, q("a", "graphic")); data = ET.SubElement(graphic, q("a", "graphicData"), {"uri": NS["pic"]})
+    picture = ET.SubElement(data, q("pic", "pic")); nv = ET.SubElement(picture, q("pic", "nvPicPr"))
+    ET.SubElement(nv, q("pic", "cNvPr"), {"id": "0", "name": posixpath.basename(media_part), "descr": str(operation.get("altText", ""))}); ET.SubElement(nv, q("pic", "cNvPicPr"))
+    fill = ET.SubElement(picture, q("pic", "blipFill")); ET.SubElement(fill, q("a", "blip"), {q("r", "embed"): rel_id}); stretch = ET.SubElement(fill, q("a", "stretch")); ET.SubElement(stretch, q("a", "fillRect"))
+    shape = ET.SubElement(picture, q("pic", "spPr")); transform = ET.SubElement(shape, q("a", "xfrm")); ET.SubElement(transform, q("a", "off"), {"x": "0", "y": "0"}); ET.SubElement(transform, q("a", "ext"), {"cx": str(width), "cy": str(height)})
+    geometry = ET.SubElement(shape, q("a", "prstGeom"), {"prst": "rect"}); ET.SubElement(geometry, q("a", "avLst"))
+    modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    return {"part": part, "paragraphIndex": index, "relationshipId": rel_id, "mediaPart": media_part, "bytes": len(payload)}
+
+
+def word_replace_image(package: zipfile.ZipFile, modifications: Dict[str, bytes], operation: Dict[str, Any]) -> Dict[str, Any]:
+    part = str(operation.get("part", "word/document.xml"))
+    root = word_part(package, modifications, part)
+    images = list(root.iter(q("a", "blip")))
+    index = int(operation.get("imageIndex", -1))
+    if index < 0 or index >= len(images):
+        raise OfficePackageError("Word imageIndex is out of range.")
+    payload, content_type, extension = decode_image_payload(operation, WORD_IMAGE_CONTENT_TYPES)
+    rel_id = images[index].attrib.get(q("r", "embed"))
+    rel_part, rel_root = word_relationship_root(package, modifications, part)
+    relationship = next((entry for entry in rel_root.findall(q("pr", "Relationship")) if entry.attrib.get("Id") == rel_id), None)
+    if relationship is None:
+        raise OfficePackageError("Word image relationship is missing.")
+    old_part = resolved_relationship_target(part, relationship.attrib.get("Target", ""))
+    new_part = posixpath.splitext(old_part)[0] + "." + extension
+    if new_part != old_part:
+        relationship.attrib["Target"] = posixpath.relpath(new_part, posixpath.dirname(part))
+        modifications[old_part] = None
+    modifications[new_part] = payload
+    ET.register_namespace("", NS["pr"])
+    modifications[rel_part] = ET.tostring(rel_root, encoding="utf-8", xml_declaration=True)
+    add_content_type_default(package, modifications, extension, content_type)
+    return {"part": part, "imageIndex": index, "relationshipId": rel_id, "mediaPart": new_part, "bytes": len(payload)}
+
+
 def edit_word(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[str, bytes], List[Dict[str, Any]]]:
     names = set(package.namelist())
     modifications: Dict[str, bytes] = {}
@@ -917,6 +1014,115 @@ def edit_word(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[s
     assert_word_has_no_tracked_changes(package, modifications)
     for operation in request.get("operations", []):
         op_type = operation.get("type")
+        if op_type in {"insertImage", "replaceImage"}:
+            result = word_insert_image(package, modifications, operation) if op_type == "insertImage" else word_replace_image(package, modifications, operation)
+            changes.append({"operation": op_type, **result})
+            continue
+        if op_type in {"createContentControl", "deleteContentControl"}:
+            part = str(operation.get("part", "word/document.xml")); root = word_part(package, modifications, part)
+            if op_type == "createContentControl":
+                paragraphs = word_paragraphs(root); index = int(operation.get("paragraphIndex", -1))
+                if index < 0 or index >= len(paragraphs): raise OfficePackageError("Word paragraphIndex is out of range.")
+                paragraph = paragraphs[index]; parent = direct_parent(root, paragraph)
+                if parent is None: raise OfficePackageError("Could not locate the Word paragraph parent.")
+                control = ET.Element(q("w", "sdt")); props = ET.SubElement(control, q("w", "sdtPr"))
+                control_id = str(operation.get("id") or (max([int(node.attrib.get(q("w", "val"), "0")) for node in root.iter(q("w", "id")) if node.attrib.get(q("w", "val"), "").isdigit()] or [0]) + 1))
+                ET.SubElement(props, q("w", "id"), {q("w", "val"): control_id})
+                if operation.get("tag") is not None: ET.SubElement(props, q("w", "tag"), {q("w", "val"): str(operation["tag"])})
+                if operation.get("title") is not None: ET.SubElement(props, q("w", "alias"), {q("w", "val"): str(operation["title"])})
+                content = ET.SubElement(control, q("w", "sdtContent")); position = list(parent).index(paragraph); parent.remove(paragraph); content.append(paragraph); parent.insert(position, control)
+                if operation.get("text") is not None: set_text_nodes(list(paragraph.iter(q("w", "t"))), operation.get("text"))
+                changes.append({"operation": op_type, "part": part, "paragraphIndex": index, "id": control_id})
+            else:
+                controls = list(root.iter(q("w", "sdt"))); selected = None
+                for index, control in enumerate(controls):
+                    props = control.find(q("w", "sdtPr")); tag = props.find(q("w", "tag")) if props is not None else None; node_id = props.find(q("w", "id")) if props is not None else None
+                    if operation.get("contentControlIndex") is not None and index != int(operation["contentControlIndex"]): continue
+                    if operation.get("tag") is not None and (tag is None or tag.attrib.get(q("w", "val")) != str(operation["tag"])): continue
+                    if operation.get("id") is not None and (node_id is None or node_id.attrib.get(q("w", "val")) != str(operation["id"])): continue
+                    selected = (index, control); break
+                if selected is None: raise OfficePackageError("Word content control was not found.")
+                index, control = selected; parent = direct_parent(root, control)
+                if parent is None: raise OfficePackageError("Could not locate content control parent.")
+                position = list(parent).index(control); content = control.find(q("w", "sdtContent")); parent.remove(control)
+                if operation.get("preserveContent", True) and content is not None:
+                    for child in list(content): parent.insert(position, child); position += 1
+                changes.append({"operation": op_type, "part": part, "contentControlIndex": index, "preservedContent": bool(operation.get("preserveContent", True))})
+            modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True); continue
+        if op_type in {"createBookmark", "deleteBookmark"}:
+            part = str(operation.get("part", "word/document.xml")); root = word_part(package, modifications, part); name = str(operation.get("name", ""))
+            if op_type == "createBookmark":
+                if any(node.attrib.get(q("w", "name")) == name for node in root.iter(q("w", "bookmarkStart"))): raise OfficePackageError("Word bookmark name already exists.")
+                paragraphs = word_paragraphs(root); index = int(operation.get("paragraphIndex", -1))
+                if index < 0 or index >= len(paragraphs): raise OfficePackageError("Word paragraphIndex is out of range.")
+                used = [int(node.attrib.get(q("w", "id"), "0")) for node in root.iter(q("w", "bookmarkStart")) if node.attrib.get(q("w", "id"), "").isdigit()]; bookmark_id = str(max(used or [0]) + 1)
+                paragraph = paragraphs[index]; insert_at = 1 if len(paragraph) and paragraph[0].tag == q("w", "pPr") else 0
+                paragraph.insert(insert_at, ET.Element(q("w", "bookmarkStart"), {q("w", "id"): bookmark_id, q("w", "name"): name})); paragraph.append(ET.Element(q("w", "bookmarkEnd"), {q("w", "id"): bookmark_id}))
+                changes.append({"operation": op_type, "part": part, "paragraphIndex": index, "name": name, "id": bookmark_id})
+            else:
+                starts = [node for node in root.iter(q("w", "bookmarkStart")) if node.attrib.get(q("w", "name")) == name]
+                if len(starts) != 1: raise OfficePackageError("Word bookmark name must resolve exactly once.")
+                bookmark_id = starts[0].attrib.get(q("w", "id")); removed = 0
+                for node in list(root.iter()):
+                    if node.tag in {q("w", "bookmarkStart"), q("w", "bookmarkEnd")} and node.attrib.get(q("w", "id")) == bookmark_id:
+                        parent = direct_parent(root, node)
+                        if parent is not None: parent.remove(node); removed += 1
+                changes.append({"operation": op_type, "part": part, "name": name, "id": bookmark_id, "removedNodes": removed})
+            modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True); continue
+        if op_type in {"insertTableRow", "deleteTableRow", "insertTableColumn", "deleteTableColumn"}:
+            part = str(operation.get("part", "word/document.xml")); root = word_part(package, modifications, part); tables = list(root.iter(q("w", "tbl"))); table_index = int(operation.get("tableIndex", -1))
+            if table_index < 0 or table_index >= len(tables): raise OfficePackageError("Word tableIndex is out of range.")
+            table = tables[table_index]; rows = table.findall(q("w", "tr"))
+            if op_type in {"insertTableRow", "deleteTableRow"}:
+                row_index = int(operation.get("rowIndex", -1))
+                if op_type == "insertTableRow":
+                    if row_index < 0 or row_index > len(rows): raise OfficePackageError("Word rowIndex is out of range.")
+                    values = operation.get("values", []); width = len(rows[0].findall(q("w", "tc"))) if rows else len(values)
+                    if len(values) != width: raise OfficePackageError("Word inserted row width must match the table.")
+                    row = ET.Element(q("w", "tr")); [row.append(ET.Element(q("w", "tc"))) for _ in []]
+                    for value in values: cell = ET.SubElement(row, q("w", "tc")); cell.append(new_word_paragraph(value))
+                    table.insert(list(table).index(rows[row_index]) if row_index < len(rows) else len(table), row)
+                else:
+                    if row_index < 0 or row_index >= len(rows) or len(rows) <= 1: raise OfficePackageError("Word rowIndex is out of range or would delete the final row.")
+                    table.remove(rows[row_index])
+                changes.append({"operation": op_type, "part": part, "tableIndex": table_index, "rowIndex": row_index})
+            else:
+                column_index = int(operation.get("columnIndex", -1)); widths = [len(row.findall(q("w", "tc"))) for row in rows]
+                if not rows or len(set(widths)) != 1: raise OfficePackageError("Word column operations require a rectangular table.")
+                width = widths[0]
+                if op_type == "insertTableColumn":
+                    if column_index < 0 or column_index > width: raise OfficePackageError("Word columnIndex is out of range.")
+                    values = operation.get("values", [])
+                    if values and len(values) != len(rows): raise OfficePackageError("Word inserted column values must match row count.")
+                    for row_index, row in enumerate(rows):
+                        cell = ET.Element(q("w", "tc")); cell.append(new_word_paragraph(values[row_index] if values else "")); row.insert(column_index, cell)
+                    grid = table.find(q("w", "tblGrid"));
+                    if grid is not None: grid.insert(column_index, ET.Element(q("w", "gridCol")))
+                else:
+                    if column_index < 0 or column_index >= width or width <= 1: raise OfficePackageError("Word columnIndex is out of range or would delete the final column.")
+                    for row in rows: row.remove(row.findall(q("w", "tc"))[column_index])
+                    grid = table.find(q("w", "tblGrid"));
+                    if grid is not None and column_index < len(grid): grid.remove(list(grid)[column_index])
+                changes.append({"operation": op_type, "part": part, "tableIndex": table_index, "columnIndex": column_index})
+            modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True); continue
+        if op_type == "setHeaderFooterText":
+            part = str(operation.get("part")); root = word_part(package, modifications, part); nodes = list(root.iter(q("w", "t")))
+            if nodes: before = set_text_nodes(nodes, operation.get("text"))
+            else: before = ""; root.append(new_word_paragraph(operation.get("text")))
+            changes.append({"operation": op_type, "part": part, "before": before, "after": operation.get("text", "")}); modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True); continue
+        if op_type == "setSectionProperties":
+            part = "word/document.xml"; root = word_part(package, modifications, part); sections = list(root.iter(q("w", "sectPr"))); index = int(operation.get("sectionIndex", -1))
+            if index < 0 or index >= len(sections): raise OfficePackageError("Word sectionIndex is out of range.")
+            section = sections[index]; page = section.find(q("w", "pgSz"))
+            if page is None: page = ET.SubElement(section, q("w", "pgSz"))
+            if operation.get("orientation") is not None: page.attrib[q("w", "orient")] = str(operation["orientation"])
+            if operation.get("pageWidth") is not None: page.attrib[q("w", "w")] = str(int(operation["pageWidth"]))
+            if operation.get("pageHeight") is not None: page.attrib[q("w", "h")] = str(int(operation["pageHeight"]))
+            margins = section.find(q("w", "pgMar"))
+            if margins is None: margins = ET.SubElement(section, q("w", "pgMar"))
+            for field, attr in (("marginTop", "top"), ("marginRight", "right"), ("marginBottom", "bottom"), ("marginLeft", "left")):
+                if operation.get(field) is not None: margins.attrib[q("w", attr)] = str(int(operation[field]))
+            changes.append({"operation": op_type, "part": part, "sectionIndex": index, "after": {key: operation[key] for key in operation if key not in {"type", "sectionIndex"}}}); modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True); continue
         if op_type == "addHyperlink":
             part = str(operation.get("part", "word/document.xml"))
             root = word_part(package, modifications, part)
@@ -2452,6 +2658,236 @@ def edit_powerpoint(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[
     return modifications, changes
 
 
+def openpyxl_chart_title(chart: Any) -> str:
+    try:
+        paragraphs = chart.title.tx.rich.p
+        return "".join(run.t or "" for paragraph in paragraphs for run in paragraph.r)
+    except Exception:
+        return ""
+
+
+def apply_excel_rich(path: Path, operations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.comments import Comment
+        from openpyxl.drawing.image import Image as ExcelImage
+        from openpyxl.worksheet.table import Table, TableStyleInfo
+    except ImportError as error:
+        raise OfficePackageError("Rich Excel operations require the pinned openpyxl and Pillow runtime.") from error
+    workbook = load_workbook(path, keep_vba=path.suffix.lower() == ".xlsm")
+    changes: List[Dict[str, Any]] = []
+    for operation in operations:
+        op_type = operation["type"]
+        if op_type == "addWorksheet":
+            name = str(operation["name"])
+            if name in workbook.sheetnames: raise OfficePackageError("Excel worksheet already exists: %s" % name)
+            workbook.create_sheet(name); changes.append({"operation": op_type, "sheet": name}); continue
+        sheet_name = operation.get("sheet")
+        if sheet_name is not None and sheet_name not in workbook.sheetnames: raise OfficePackageError("Excel worksheet was not found: %s" % sheet_name)
+        if op_type == "deleteWorksheet":
+            if len(workbook.worksheets) <= 1: raise OfficePackageError("Excel cannot delete its final worksheet.")
+            workbook.remove(workbook[sheet_name]); changes.append({"operation": op_type, "sheet": sheet_name}); continue
+        if op_type == "refreshPivot":
+            matched = 0
+            for worksheet in workbook.worksheets:
+                for pivot in getattr(worksheet, "_pivots", []):
+                    cache = getattr(pivot, "cacheDefinition", None)
+                    cache_id = getattr(cache, "cacheId", None)
+                    if operation.get("cacheId") is not None and cache_id != int(operation["cacheId"]): continue
+                    if cache is not None: cache.refreshOnLoad = True; matched += 1
+            if operation.get("cacheId") is not None and matched == 0: raise OfficePackageError("Excel pivot cache was not found.")
+            changes.append({"operation": op_type, "cacheId": operation.get("cacheId"), "cacheCount": matched, "refreshOnOpen": True}); continue
+        if op_type == "deleteTable":
+            matches = [(worksheet, name) for worksheet in workbook.worksheets for name in worksheet.tables if name == str(operation["table"])]
+            if len(matches) != 1: raise OfficePackageError("Excel table name must resolve exactly once.")
+            worksheet, name = matches[0]; del worksheet.tables[name]
+            changes.append({"operation": op_type, "table": name, "sheet": worksheet.title, "preservedData": bool(operation.get("preserveData", True))}); continue
+        worksheet = workbook[sheet_name]
+        address = operation.get("address")
+        if op_type == "addTable":
+            name = str(operation["name"])
+            if any(name in entry.tables for entry in workbook.worksheets): raise OfficePackageError("Excel table name already exists.")
+            table = Table(displayName=name, ref=str(address)); table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showFirstColumn=False, showLastColumn=False, showRowStripes=True, showColumnStripes=False)
+            worksheet.add_table(table); changes.append({"operation": op_type, "sheet": sheet_name, "address": address, "table": name}); continue
+        if op_type in {"mergeRange", "unmergeRange"}:
+            if op_type == "mergeRange": worksheet.merge_cells(str(address))
+            else: worksheet.unmerge_cells(str(address))
+            changes.append({"operation": op_type, "sheet": sheet_name, "address": address}); continue
+        if op_type == "sortRange":
+            cells = worksheet[str(address)]; rows = [list(row) for row in cells]
+            if not rows: raise OfficePackageError("Excel sortRange resolved no cells.")
+            header = rows[:1] if operation.get("hasHeaders", False) else []
+            data = rows[1:] if header else rows
+            snapshots = [[(cell.value, copy.copy(cell._style), cell.number_format, copy.copy(cell.alignment), copy.copy(cell.fill), copy.copy(cell.font), copy.copy(cell.border), copy.copy(cell.protection)) for cell in row] for row in data]
+            for key in reversed(operation.get("keys", [])):
+                column = int(key["column"])
+                if column < 0 or column >= len(rows[0]): raise OfficePackageError("Excel sort key column is out of range.")
+                snapshots.sort(key=lambda row: (row[column][0] is None, str(row[column][0]) if row[column][0] is not None else ""), reverse=bool(key.get("descending", False)))
+            target_rows = rows[1:] if header else rows
+            for target_row, source_row in zip(target_rows, snapshots):
+                for cell, source in zip(target_row, source_row):
+                    cell.value, cell._style, cell.number_format, cell.alignment, cell.fill, cell.font, cell.border, cell.protection = source
+            changes.append({"operation": op_type, "sheet": sheet_name, "address": address, "rowCount": len(data)}); continue
+        if op_type == "setAutoFilter":
+            if operation.get("clear", False): worksheet.auto_filter.ref = None
+            else:
+                worksheet.auto_filter.ref = str(address)
+                if operation.get("column") is not None and operation.get("criteria") is not None: worksheet.auto_filter.add_filter_column(int(operation["column"]), [str(operation["criteria"])])
+            changes.append({"operation": op_type, "sheet": sheet_name, "address": address, "cleared": bool(operation.get("clear", False))}); continue
+        if op_type == "setHyperlink":
+            cell = worksheet[str(address).split(":")[0]]; cell.hyperlink = str(operation["url"])
+            if operation.get("display") is not None: cell.value = str(operation["display"])
+            cell.style = "Hyperlink"; changes.append({"operation": op_type, "sheet": sheet_name, "address": cell.coordinate, "url": operation["url"]}); continue
+        if op_type in {"addNote", "deleteNote"}:
+            cell = worksheet[str(address).split(":")[0]]; before = cell.comment.text if cell.comment else None
+            cell.comment = Comment(str(operation.get("text", "")), str(operation.get("author", "Codex"))) if op_type == "addNote" else None
+            changes.append({"operation": op_type, "sheet": sheet_name, "address": cell.coordinate, "before": before, "after": cell.comment.text if cell.comment else None}); continue
+        if op_type == "insertImage":
+            payload, content_type, _extension = decode_image_payload(operation, {"image/png": "png", "image/jpeg": "jpg"})
+            image = ExcelImage(io.BytesIO(payload)); image.anchor = str(operation["fromAddress"]); worksheet.add_image(image)
+            changes.append({"operation": op_type, "sheet": sheet_name, "fromAddress": operation["fromAddress"], "bytes": len(payload), "contentType": content_type}); continue
+        if op_type == "formatChart":
+            chart_name = str(operation["chart"]); charts = [chart for index, chart in enumerate(worksheet._charts) if chart_name in {str(index), openpyxl_chart_title(chart)}]
+            if len(charts) != 1: raise OfficePackageError("Excel chart must resolve by zero-based index or exact title.")
+            chart = charts[0]
+            if operation.get("titleText") is not None: chart.title = str(operation["titleText"])
+            if operation.get("style") is not None: chart.style = int(operation["style"])
+            if operation.get("legendPosition") is not None:
+                position = operation["legendPosition"]
+                if position == "none": chart.legend = None
+                elif chart.legend is not None: chart.legend.position = {"top": "t", "bottom": "b", "left": "l", "right": "r"}[position]
+            changes.append({"operation": op_type, "sheet": sheet_name, "chart": chart_name}); continue
+        if op_type == "setSheetProtection":
+            worksheet.protection.sheet = bool(operation["enabled"])
+            worksheet.protection.selectLockedCells = bool(operation.get("allowSelectLockedCells", True))
+            worksheet.protection.selectUnlockedCells = bool(operation.get("allowSelectUnlockedCells", True))
+            worksheet.protection.formatCells = bool(operation.get("allowFormatCells", False))
+            changes.append({"operation": op_type, "sheet": sheet_name, "enabled": bool(operation["enabled"]), "passwordless": True}); continue
+        raise OfficePackageError("Unsupported rich Excel operation: %s" % op_type)
+    workbook.save(path)
+    return changes
+
+
+def pptx_shape(slide: Any, shape_id: Any) -> Any:
+    matches = [shape for shape in slide.shapes if str(shape.shape_id) == str(shape_id)]
+    if len(matches) != 1: raise OfficePackageError("PowerPoint shapeId must resolve exactly once.")
+    return matches[0]
+
+
+def pptx_layout(presentation: Any, name: Optional[str]) -> Any:
+    if name is None: return presentation.slide_layouts[6 if len(presentation.slide_layouts) > 6 else 0]
+    matches = [layout for layout in presentation.slide_layouts if layout.name == str(name)]
+    if len(matches) != 1: raise OfficePackageError("PowerPoint layoutName must resolve exactly once.")
+    return matches[0]
+
+
+def apply_powerpoint_rich(path: Path, operations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    try:
+        from pptx import Presentation
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+        from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+    except ImportError as error:
+        raise OfficePackageError("Rich PowerPoint operations require the pinned python-pptx and Pillow runtime.") from error
+    presentation = Presentation(path)
+    changes: List[Dict[str, Any]] = []
+    for operation in operations:
+        op_type = operation["type"]
+        if op_type == "addSlide":
+            slide = presentation.slides.add_slide(pptx_layout(presentation, operation.get("layoutName")))
+            if operation.get("afterIndex") is not None:
+                destination = int(operation["afterIndex"]) + 1
+                slide_ids = presentation.slides._sldIdLst; node = list(slide_ids)[-1]; slide_ids.remove(node); slide_ids.insert(destination, node)
+            changes.append({"operation": op_type, "slideIndex": list(presentation.slides).index(slide), "layoutName": slide.slide_layout.name}); continue
+        slide_index = int(operation.get("slideIndex", -1))
+        if slide_index < 0 or slide_index >= len(presentation.slides): raise OfficePackageError("PowerPoint slideIndex is out of range.")
+        slide = presentation.slides[slide_index]
+        if op_type == "addImage":
+            payload, content_type, _extension = decode_image_payload(operation, {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif"})
+            shape = slide.shapes.add_picture(io.BytesIO(payload), int(operation["x"]), int(operation["y"]), int(operation["width"]), int(operation["height"]))
+            if operation.get("name") is not None: shape.name = str(operation["name"])
+            c_nv_pr = shape._element.find(".//" + q("p", "cNvPr"))
+            if c_nv_pr is not None and operation.get("altText") is not None: c_nv_pr.set("descr", str(operation["altText"]))
+            changes.append({"operation": op_type, "slideIndex": slide_index, "shapeId": shape.shape_id, "bytes": len(payload), "contentType": content_type}); continue
+        if op_type == "addTable":
+            rows = operation["rows"]; width = max(len(row) for row in rows)
+            if any(len(row) != width for row in rows): raise OfficePackageError("PowerPoint addTable rows must be rectangular.")
+            shape = slide.shapes.add_table(len(rows), width, int(operation["x"]), int(operation["y"]), int(operation["width"]), int(operation["height"]))
+            for row_index, values in enumerate(rows):
+                for column_index, value in enumerate(values): shape.table.cell(row_index, column_index).text = str(value)
+            changes.append({"operation": op_type, "slideIndex": slide_index, "shapeId": shape.shape_id, "rowCount": len(rows), "columnCount": width}); continue
+        if op_type == "groupShapes":
+            shapes = [pptx_shape(slide, shape_id) for shape_id in operation["shapeIds"]]
+            if any(shape.shape_type == MSO_SHAPE_TYPE.PLACEHOLDER for shape in shapes): raise OfficePackageError("PowerPoint placeholders cannot be grouped headlessly.")
+            try: group = slide.shapes.add_group_shape(shapes=shapes)
+            except TypeError: group = slide.shapes.add_group_shape(shapes)
+            if operation.get("name") is not None: group.name = str(operation["name"])
+            changes.append({"operation": op_type, "slideIndex": slide_index, "shapeId": group.shape_id, "groupedShapeIds": operation["shapeIds"]}); continue
+        shape = pptx_shape(slide, operation.get("shapeId")) if operation.get("shapeId") is not None else None
+        if op_type == "cropImage":
+            if shape.shape_type != MSO_SHAPE_TYPE.PICTURE: raise OfficePackageError("PowerPoint cropImage requires a picture shape.")
+            for key in ("left", "top", "right", "bottom"):
+                if operation.get(key) is not None: setattr(shape, "crop_" + key, float(operation[key]))
+            if shape.crop_left + shape.crop_right >= 1 or shape.crop_top + shape.crop_bottom >= 1: raise OfficePackageError("PowerPoint crop values remove the entire image.")
+            changes.append({"operation": op_type, "slideIndex": slide_index, "shapeId": shape.shape_id, "after": {key: getattr(shape, "crop_" + key) for key in ("left", "top", "right", "bottom")}}); continue
+        if op_type in {"insertTableRow", "deleteTableRow", "insertTableColumn", "deleteTableColumn"}:
+            if shape.shape_type != MSO_SHAPE_TYPE.TABLE: raise OfficePackageError("PowerPoint table operation requires a table shape.")
+            table = shape.table; table_xml = table._tbl
+            if op_type == "insertTableRow":
+                index = int(operation["rowIndex"])
+                if index < 0 or index > len(table.rows): raise OfficePackageError("PowerPoint rowIndex is out of range.")
+                template = copy.deepcopy(table_xml.tr_lst[min(index, len(table.rows) - 1)]); table_xml.insert(list(table_xml).index(table_xml.tr_lst[index]) if index < len(table.rows) else len(table_xml), template)
+                values = operation.get("values", [])
+                for column, cell in enumerate(shape.table.rows[index].cells): cell.text = str(values[column]) if column < len(values) else ""
+            elif op_type == "deleteTableRow":
+                index = int(operation["rowIndex"])
+                if index < 0 or index >= len(table.rows) or len(table.rows) <= 1: raise OfficePackageError("PowerPoint rowIndex is out of range or would delete the final row.")
+                table_xml.remove(table_xml.tr_lst[index])
+            elif op_type == "insertTableColumn":
+                index = int(operation["columnIndex"])
+                if index < 0 or index > len(table.columns): raise OfficePackageError("PowerPoint columnIndex is out of range.")
+                grid = table_xml.tblGrid; template_grid = copy.deepcopy(grid.gridCol_lst[min(index, len(table.columns) - 1)]); grid.insert(index, template_grid)
+                values = operation.get("values", [])
+                for row_index, row in enumerate(table_xml.tr_lst):
+                    template_cell = copy.deepcopy(row.tc_lst[min(index, len(row.tc_lst) - 1)]); row.insert(index, template_cell)
+                for row_index, row in enumerate(shape.table.rows): row.cells[index].text = str(values[row_index]) if row_index < len(values) else ""
+            else:
+                index = int(operation["columnIndex"])
+                if index < 0 or index >= len(table.columns) or len(table.columns) <= 1: raise OfficePackageError("PowerPoint columnIndex is out of range or would delete the final column.")
+                table_xml.tblGrid.remove(table_xml.tblGrid.gridCol_lst[index])
+                for row in table_xml.tr_lst: row.remove(row.tc_lst[index])
+            changes.append({"operation": op_type, "slideIndex": slide_index, "shapeId": shape.shape_id, "rowIndex": operation.get("rowIndex"), "columnIndex": operation.get("columnIndex")}); continue
+        if op_type == "setShapeAltText":
+            c_nv_pr = shape._element.find(".//" + q("p", "cNvPr"))
+            if c_nv_pr is None: raise OfficePackageError("PowerPoint shape has no non-visual properties.")
+            before = {"title": c_nv_pr.get("title"), "description": c_nv_pr.get("descr")}
+            if operation.get("title") is not None: c_nv_pr.set("title", str(operation["title"]))
+            if operation.get("description") is not None: c_nv_pr.set("descr", str(operation["description"]))
+            changes.append({"operation": op_type, "slideIndex": slide_index, "shapeId": shape.shape_id, "before": before, "after": {"title": c_nv_pr.get("title"), "description": c_nv_pr.get("descr")}}); continue
+        if op_type == "setZOrder":
+            tree = slide.shapes._spTree; element = shape._element; position = operation["position"]; index = list(tree).index(element); tree.remove(element)
+            minimum = 2
+            if position == "front": tree.append(element)
+            elif position == "back": tree.insert(minimum, element)
+            elif position == "forward": tree.insert(min(len(tree), index + 1), element)
+            else: tree.insert(max(minimum, index - 1), element)
+            changes.append({"operation": op_type, "slideIndex": slide_index, "shapeId": shape.shape_id, "position": position}); continue
+        if op_type == "ungroupShape":
+            if shape.shape_type != MSO_SHAPE_TYPE.GROUP: raise OfficePackageError("PowerPoint ungroupShape requires a group shape.")
+            tree = slide.shapes._spTree; group = shape._element; index = list(tree).index(group); children = [child for child in list(group) if child.tag in {q("p", "sp"), q("p", "pic"), q("p", "graphicFrame"), q("p", "grpSp")}]
+            tree.remove(group)
+            for child in children: group.remove(child); tree.insert(index, child); index += 1
+            changes.append({"operation": op_type, "slideIndex": slide_index, "shapeId": shape.shape_id, "ungroupedCount": len(children)}); continue
+        if op_type == "applySlideLayout":
+            layout = pptx_layout(presentation, operation["layoutName"]); slide_part = slide.part
+            for rel in list(slide_part.rels.values()):
+                if rel.reltype == RT.SLIDE_LAYOUT: slide_part.drop_rel(rel.rId)
+            slide_part.relate_to(layout.part, RT.SLIDE_LAYOUT)
+            changes.append({"operation": op_type, "slideIndex": slide_index, "layoutName": layout.name}); continue
+        raise OfficePackageError("Unsupported rich PowerPoint operation: %s" % op_type)
+    presentation.save(path)
+    return changes
+
+
 def write_modified_package(source: Path, destination: Path, modifications: Dict[str, Optional[bytes]]) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(source, "r") as input_package, zipfile.ZipFile(destination, "w") as output_package:
@@ -2483,11 +2919,39 @@ def edit_package(path: Path, request: Dict[str, Any]) -> Dict[str, Any]:
             raise OfficePackageError("Macro-enabled Office packages require allowMacros=true and explicit confirmation.")
         if kind == "word":
             modifications, changes = edit_word(package, request)
-        elif kind == "excel":
-            modifications, changes = edit_excel(package, request)
+            write_modified_package(path, destination, modifications)
         else:
-            modifications, changes = edit_powerpoint(package, request)
-    write_modified_package(path, destination, modifications)
+            operations = request.get("operations", [])
+            rich_types = EXCEL_RICH_OPERATIONS if kind == "excel" else POWERPOINT_RICH_OPERATIONS
+            if inventory["hasMacros"] and any(operation.get("type") in rich_types for operation in operations):
+                raise OfficePackageError("Rich Office operations are refused for macro-enabled packages because the pinned high-level library cannot prove VBA preservation.")
+            segments: List[Tuple[bool, List[Dict[str, Any]]]] = []
+            for operation in operations:
+                rich = operation.get("type") in rich_types
+                if not segments or segments[-1][0] != rich:
+                    segments.append((rich, []))
+                segments[-1][1].append(operation)
+            changes = []
+    if kind != "word":
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="codex-office-segments-", dir=str(destination.parent)) as temporary:
+            current = path
+            if not segments:
+                shutil.copyfile(path, destination)
+            for index, (rich, segment_operations) in enumerate(segments):
+                segment_path = Path(temporary) / ("segment-%03d%s" % (index, destination.suffix))
+                if rich:
+                    shutil.copyfile(current, segment_path)
+                    segment_changes = apply_excel_rich(segment_path, segment_operations) if kind == "excel" else apply_powerpoint_rich(segment_path, segment_operations)
+                else:
+                    with zipfile.ZipFile(current, "r") as segment_package:
+                        segment_request = {**request, "operations": segment_operations}
+                        segment_modifications, segment_changes = edit_excel(segment_package, segment_request) if kind == "excel" else edit_powerpoint(segment_package, segment_request)
+                    write_modified_package(current, segment_path, segment_modifications)
+                changes.extend(segment_changes)
+                current = segment_path
+            if segments:
+                shutil.copyfile(current, destination)
     validation = validate_package(destination, {"kind": kind, "strictRelationships": True})
     return {"kind": kind, "outputPath": str(destination), "changes": changes, "changeCount": len(changes), "validation": validation}
 

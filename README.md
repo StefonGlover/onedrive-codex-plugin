@@ -2,7 +2,7 @@
 
 Local Codex plugin for OneDrive file operations through Microsoft Graph.
 
-Release `0.4.0+codex.20260713202830` exposes an exact 72-tool contract. The optional Office companion is version `1.1.1`.
+Release `0.5.0+codex.20260714034051` exposes an exact 84-tool contract.
 
 This is an unofficial integration and is not affiliated with, endorsed by, or sponsored by Microsoft.
 
@@ -174,10 +174,10 @@ The plugin can inspect and edit modern Open XML files without requiring Word, Ex
 
 Managed Office backups have opaque IDs and manifests containing the original stable item ID and version metadata. Use `onedrive_office_backups` to list them and `onedrive_office_compare_backup` for a bounded semantic comparison with the current remote content. `onedrive_office_restore_backup` defaults to dry-run and requires the preview token, original `expectedId`, and current `expectedETag`; it restores by item ID, creates a rollback backup, audits the mutation, and verifies the restored fingerprint.
 
-- Word supports text replacement, paragraph text/style changes, paragraph/table insertion, table-cell and content-control updates, safe external hyperlinks, and anchored comments. Documents containing tracked changes are refused instead of silently changing review semantics.
-- Excel reads support worksheet/range selectors, bounded value/formula text search, table/chart/pivot metadata, and formula dependency tracing. Open XML edits support cells, ranges, styles/number formats, conditional formatting, data validation, frozen panes, column widths, sheet names, defined names, table-row insertion, totals-row configuration, basic clustered bar/column, line, and pie chart creation/update, and full recalculation on next open. `addTableRow` inserts at a zero-based data-row `index` or appends when it is omitted/null; existing totals rows are moved and preserved. `setTableTotals` enables or disables the totals row and can configure columns by name or zero-based index with a label, built-in function, or custom formula. Chart operations accept a same-sheet rectangular source range plus title, name, and point-based geometry; changing chart type requires `sourceData`. Business `.xlsx` Graph sessions additionally support table-row insertion and chart creation/update. `backend: auto` uses Graph only when every requested operation is supported there and otherwise uses Open XML.
-- PowerPoint supports shape text, run styling and geometry, text-box creation, shape deletion, validated raster-image replacement, table cells, notes, text replacement, and slide duplicate/delete/reorder.
-- The optional Office.js companion negotiates protocol `codex-office-companion/1` against the active Word, Excel, or PowerPoint requirement set and exposes a bounded typed command list. It remains local/manual-paste only: no remote command or telemetry transport is enabled. See `office-addin/README.md` for development and centralized production deployment.
+- Word exposes durable paragraph, table, and content-control anchors and 21 headless operations, including image insertion/replacement, bookmarks, content controls, table row/column changes, headers/footers, and section properties. Documents containing tracked changes are refused instead of silently changing review semantics.
+- Excel exposes worksheet, range, defined-name, and table/row-key anchors and 32 headless operations, including worksheet/table lifecycle, merge/unmerge, sort/filter, hyperlinks, notes, images, chart formatting, passwordless sheet protection, and pivot refresh-on-open. Business `.xlsx` Graph writes use scoped persistent sessions; personal workbooks and unsupported Graph operations use Open XML automatically.
+- PowerPoint exposes persistent slide and shape anchors and 25 headless operations, including slides, images/cropping, tables and row/column changes, alternative text, z-order, grouping/ungrouping, and layout application.
+- Positional selectors remain valid. An anchor defaults to `rebasePolicy:"unique"`; moved targets re-resolve only when exactly one match exists. Missing, duplicate, or selector/anchor disagreement returns a structured conflict. Every live commit remains bound to the eTag used by its preview.
 - Encrypted and legacy binary files are refused. Macro-enabled edits require `allowMacros: true`; signed-package edits are always refused because any edit invalidates the signature.
 
 Run the corresponding structured read tool first, then call the batch-update tool as a dry run. A live commit requires `dryRun: false`, `confirmed: true`, `expectedName` or `expectedId`, and the exact returned `previewToken`.
@@ -185,6 +185,13 @@ Run the corresponding structured read tool first, then call the batch-update too
 For faster research inside a known Office file, pass `searchText` to any structured read. Excel can additionally restrict reads to `sheetNames` and a bounded A1 `address`, avoiding a full-workbook response.
 
 For cross-drive research, `onedrive_office_index_refresh` stores structured paragraph, cell, formula, table, content-control, comment, shape, and notes segments with semantic anchors. It reuses unchanged eTag/cTag entries and prefers the existing OneDrive delta cursor before scanning. `onedrive_office_search` searches that private local index without Graph calls. `onedrive_office_batch_transform` preflights every requested file before the first write and returns recovery backup IDs if a later item fails.
+
+## Remote editing workflows
+
+- `onedrive_versions`, `onedrive_compare_version`, and `onedrive_restore_version` expose bounded Graph version history, semantic/text/binary comparisons, and native restore. Restore never falls back to replacing content and requires current identity, eTag, confirmation, and its preview token.
+- `onedrive_patch_text` applies bounded unified diffs, RFC 6902 JSON Patch, restricted safe-YAML path operations, or RFC 4180 CSV row-key operations. It preserves supported BOM/encoding, newline style, and trailing-newline state while refusing binary and oversized inputs.
+- `onedrive_workspace_*` manages owner-only drafts under `Codex Editing Drafts`. Workspaces record the original stable item ID and base eTag/version, surface source/draft drift, block promotion after source drift, preserve the original item identity/version history on success, and retain failed/conflicted drafts for recovery.
+- `onedrive_watch_*` manages auth-context/drive-scoped delta watches with 15–300 second polling, one-hour default expiry, eight-hour maximum, throttling backoff, and a 500-event ring buffer. Events invalidate affected previews and mark source workspaces stale.
 
 ## Safety
 
@@ -320,14 +327,14 @@ Preview the exact new versioned cache directory, then install only after reviewi
 
 ```bash
 node scripts/install-versioned-cache.mjs
-node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.4.0+codex.20260713202830"
+node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.0+codex.20260714034051"
 ```
 
-After both live betas and the real Office matrix, regenerate the two QA reports, preview their exact sync into that new cache, then apply only those evidence files and re-run parity:
+After both live betas, regenerate the two QA reports, preview their exact sync into that new cache, then apply only those evidence files and re-run parity:
 
 ```bash
-node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.4.0+codex.20260713202830"
-node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.4.0+codex.20260713202830"
+node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.0+codex.20260714034051"
+node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.0+codex.20260714034051"
 ```
 
 Office compatibility checks are split by purpose:
@@ -335,11 +342,12 @@ Office compatibility checks are split by purpose:
 ```bash
 python3 scripts/office-openxml-test.py
 python3 scripts/office-security-test.py
-node office-addin/taskpane-test.mjs
+node scripts/semantic-anchors-test.mjs
+node scripts/text-patch-test.mjs
 SOFFICE="$(command -v soffice)" python3 scripts/office-real-fixture-test.py
 ```
 
-Install the pinned fixture dependencies with `python3 -m pip install -r scripts/requirements-office-test.txt`. The security corpus includes malformed ZIP/XML/relationship cases, deterministic mutation fuzzing, every possible two-run PowerPoint split of a target phrase, and a 5,000-run deck. The real-fixture gate generates packages with `python-docx`, `openpyxl`, and `python-pptx`, edits them, reopens them with their native libraries, and requires LibreOffice PDF conversion without repair/corruption diagnostics. Microsoft Office itself is not available in headless CI; release candidates should additionally run the Word, Excel, and PowerPoint matrix documented in `office-addin/README.md`.
+Install the pinned fixture dependencies with `python3 -m pip install -r scripts/requirements-office-test.txt`. The security corpus includes malformed ZIP/XML/relationship cases, deterministic mutation fuzzing, every possible two-run PowerPoint split of a target phrase, and a 5,000-run deck. The real-fixture gate generates packages with `python-docx`, `openpyxl`, and `python-pptx`, edits them, reopens them with their native libraries, and requires LibreOffice PDF conversion without repair/corruption diagnostics.
 
 After installing a refreshed build, compare source with the installed cache:
 
@@ -384,7 +392,7 @@ The plugin manifest includes a file-manager flow screenshot at `assets/screensho
 
 ## CI
 
-The GitHub Actions workflow in `.github/workflows/ci.yml` runs syntax checks, pinned Office fixture/security checks, the companion mocks, the Microsoft Graph regression suite, and the prepackage guard on Node.js 20 and 26 for every push and pull request.
+The GitHub Actions workflow in `.github/workflows/ci.yml` runs syntax checks, pinned Office fixture/security checks, semantic-anchor and structured-patch tests, task-pane and loopback-broker security tests, the Microsoft Graph regression suite, and the prepackage guard on Node.js 20 and 26 for every push and pull request.
 
 ## Microsoft References
 

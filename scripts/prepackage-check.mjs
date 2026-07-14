@@ -7,7 +7,6 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { ONEDRIVE_TOOL_CONTRACT, compareToolContract } from "./tool-contract.mjs";
-import { OFFICE_ICON_SIZES, officeManifestProblems } from "../office-addin/manifest-contract.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, "..");
@@ -47,21 +46,27 @@ const ignoredPackageFileExtensions = new Set([".log", ".tmp", ".temp", ".bak", "
 const forbiddenResidueDirs = new Set([".codex", ".pytest_cache", "__pycache__"]);
 const sensitivePackageFileNames = new Set([".env", ".env.local", ".env.development", ".env.production", "credentials.json", "token.json"]);
 const sensitivePackageFileExtensions = new Set([".key", ".pem", ".p12", ".pfx"]);
-const expectedPluginVersion = /^0\.4\.0\+codex\.\d{14}$/;
-const expectedOfficeVersion = "1.1.1.0";
+const expectedPluginVersion = /^0\.5\.0\+codex\.\d{14}$/;
 const expectedOfficeOperationKinds = {
   word: [
     "replaceText", "setParagraphText", "setParagraphStyle", "insertParagraph", "setTableCell",
-    "setContentControlText", "addHyperlink", "addComment", "insertTable"
+    "setContentControlText", "addHyperlink", "addComment", "insertTable", "insertImage", "replaceImage",
+    "createContentControl", "deleteContentControl", "createBookmark", "deleteBookmark", "insertTableRow",
+    "deleteTableRow", "insertTableColumn", "deleteTableColumn", "setHeaderFooterText", "setSectionProperties"
   ],
   excel: [
     "setCell", "setFormula", "setRange", "clearRange", "setStyle", "setNumberFormat",
     "addConditionalFormat", "setDataValidation", "freezePanes", "setColumnWidth", "addTableRow",
-    "setTableTotals", "createChart", "updateChart", "renameSheet", "setDefinedName", "recalculate"
+    "setTableTotals", "createChart", "updateChart", "renameSheet", "setDefinedName", "recalculate",
+    "addWorksheet", "deleteWorksheet", "addTable", "deleteTable", "mergeRange", "unmergeRange", "sortRange",
+    "setAutoFilter", "setHyperlink", "addNote", "deleteNote", "insertImage", "formatChart",
+    "setSheetProtection", "refreshPivot"
   ],
   powerpoint: [
     "replaceText", "setShapeText", "setShapeGeometry", "setTableCell", "addTextBox", "deleteShape",
-    "setTextStyle", "replaceImage", "setNotes", "duplicateSlide", "deleteSlide", "moveSlide"
+    "setTextStyle", "replaceImage", "setNotes", "duplicateSlide", "deleteSlide", "moveSlide", "addSlide",
+    "addImage", "cropImage", "addTable", "insertTableRow", "deleteTableRow", "insertTableColumn",
+    "deleteTableColumn", "setShapeAltText", "setZOrder", "groupShapes", "ungroupShape", "applySlideLayout"
   ]
 };
 const officeOperationToolNames = {
@@ -72,19 +77,16 @@ const officeOperationToolNames = {
 const requiredQaOfflineGates = [
   "Node 20 and Node 26 syntax/self-checks",
   "Exact MCP contract",
-  "Manifest/version/icon alignment",
+  "Plugin manifest/version alignment",
   "Prepackage negative checks",
   "Office Open XML operations",
   "Office security corpus",
   "Genuine package reopening",
-  "Office companion mocks",
   "Mock Microsoft Graph",
   "Read-only OneDrive doctor and tenant checks",
   "Cleanup preview",
   "Whitespace"
 ];
-const requiredOfficeHosts = ["Word", "Excel", "PowerPoint"];
-
 const textExtensions = new Set([
   ".json", ".md", ".mjs", ".js", ".zsh", ".sh", ".txt", ".example", ".yaml", ".yml"
 ]);
@@ -92,29 +94,21 @@ const requiredFiles = [
   ".codex-plugin/plugin.json",
   ".mcp.json",
   "mcp/server.mjs",
+  "mcp/semantic-anchors.mjs",
+  "mcp/text-patch.mjs",
   "scripts/benchmark.mjs",
   "scripts/beta-test.mjs",
   "scripts/tool-contract.mjs",
   "scripts/install-versioned-cache.mjs",
   "scripts/requirements-office-test.txt",
   "scripts/mock-graph-test.mjs",
+  "scripts/semantic-anchors-test.mjs",
+  "scripts/text-patch-test.mjs",
   "scripts/office-openxml.py",
+  "scripts/office-fixture-factory.py",
   "scripts/office-openxml-test.py",
   "scripts/office-real-fixture-test.py",
   "scripts/office-security-test.py",
-  "office-addin/manifest.xml",
-  "office-addin/manifest-contract.mjs",
-  "office-addin/taskpane.html",
-  "office-addin/taskpane.js",
-  "office-addin/taskpane-test.mjs",
-  "office-addin/serve.mjs",
-  "office-addin/prepare-test-manifest.mjs",
-  "office-addin/host-test-runner.zsh",
-  "office-addin/README.md",
-  "office-addin/icon-16.png",
-  "office-addin/icon-32.png",
-  "office-addin/icon-64.png",
-  "office-addin/icon-80.png",
   "scripts/prepackage-check.mjs",
   "skills/onedrive/SKILL.md",
   "README.md",
@@ -189,7 +183,7 @@ function checkManifest() {
   if (!manifest) return;
   if (manifest.name !== "onedrive") fail(`Unexpected plugin name: ${manifest.name}`);
   if (!expectedPluginVersion.test(manifest.version || "")) {
-    fail(`Plugin version must match 0.4.0+codex.<14-digit timestamp>: ${manifest.version}`);
+    fail(`Plugin version must match 0.5.0+codex.<14-digit timestamp>: ${manifest.version}`);
   }
   const readme = readFileSync(join(pluginRoot, "README.md"), "utf8");
   if (!readme.includes(`Release \`${manifest.version}\``)) {
@@ -208,26 +202,6 @@ function checkManifest() {
     if (!existsSync(join(pluginRoot, screenshot))) fail(`Missing screenshot asset: ${screenshot}`);
   }
 }
-
-function checkOfficeCompanionHostFiles() {
-  const taskpaneHtml = readFileSync(join(pluginRoot, "office-addin", "taskpane.html"), "utf8");
-  for (const attribute of ['autocomplete="off"', 'autocapitalize="off"', 'autocorrect="off"', 'spellcheck="false"']) {
-    if (!taskpaneHtml.includes(attribute)) fail(`Office command textarea must disable smart-input behavior with ${attribute}.`);
-  }
-  const server = readFileSync(join(pluginRoot, "office-addin", "serve.mjs"), "utf8");
-  for (const size of OFFICE_ICON_SIZES) {
-    if (!server.includes(`/office-addin/icon-${size}.png`)) fail(`Office HTTPS server must allow icon-${size}.png.`);
-  }
-  if (!server.includes('event: "office-companion-request"')) {
-    fail("Office HTTPS server must emit structured request evidence.");
-  }
-  const hostRunner = readFileSync(join(pluginRoot, "office-addin", "host-test-runner.zsh"), "utf8");
-  if (!hostRunner.includes('${MANIFEST_ID}.${MANIFEST_NAME}')) {
-    fail("Office host runner must use an ID-prefixed developer manifest registration.");
-  }
-}
-
-checkOfficeCompanionHostFiles();
 
 function currentHeadCommit() {
   const result = spawnSync("git", ["rev-parse", "HEAD"], {
@@ -252,10 +226,9 @@ function qaAlignmentProblems(qa, markdown, pluginVersion, headCommit = null, con
   const statusValues = new Set(["pass", "pending", "blocked", "fail", "in_progress"]);
   if (qa?.schemaVersion !== 2) issues.push("qa-report.json schemaVersion must be 2.");
   if (qa?.source?.pluginVersion !== pluginVersion) issues.push("qa-report.json plugin version does not match plugin.json.");
-  if (qa?.source?.officeCompanionVersion !== expectedOfficeVersion.replace(/\.0$/, "")) issues.push("qa-report.json Office companion version is stale.");
   if (!/^[0-9a-f]{40}$/.test(qa?.source?.commit || "")) issues.push("qa-report.json must record a full 40-character source commit.");
   if (headCommit && qa?.source?.commit !== headCommit) issues.push("qa-report.json source commit does not match the current HEAD commit.");
-  if (qa?.contract?.toolCount !== ONEDRIVE_TOOL_CONTRACT.length || qa?.contract?.exact !== true) issues.push("qa-report.json must record the exact 72-tool contract.");
+  if (qa?.contract?.toolCount !== ONEDRIVE_TOOL_CONTRACT.length || qa?.contract?.exact !== true) issues.push("qa-report.json must record the exact 84-tool contract.");
   if (qa?.installedBuild?.version !== pluginVersion) issues.push("qa-report.json installed-build target version does not match plugin.json.");
   if (qa?.installedBuild?.oldCacheOverwritten !== false) issues.push("qa-report.json must attest that the old installed cache was not overwritten.");
   if (!Array.isArray(qa?.blockedCoverage) || qa.blockedCoverage.length < 4) issues.push("qa-report.json must preserve explicit blocked-resource reasons.");
@@ -264,16 +237,13 @@ function qaAlignmentProblems(qa, markdown, pluginVersion, headCommit = null, con
   }
   if (!markdown.includes(`Decision: ${qa?.decision}`)) issues.push("qa-report.md decision does not match qa-report.json.");
   if (!markdown.includes(`Plugin version: \`${pluginVersion}\``)) issues.push("qa-report.md plugin version does not match plugin.json.");
-  if (!markdown.includes(`Office companion version: \`${expectedOfficeVersion.replace(/\.0$/, "")}\``)) issues.push("qa-report.md Office companion version is stale.");
-  if (!markdown.includes(`Tool contract: ${ONEDRIVE_TOOL_CONTRACT.length} exact tool names`)) issues.push("qa-report.md must record the exact 72-tool contract.");
+  if (!markdown.includes(`Tool contract: ${ONEDRIVE_TOOL_CONTRACT.length} exact tool names`)) issues.push("qa-report.md must record the exact 84-tool contract.");
   if (/\b58(?:-tool| tools?)\b/i.test(markdown) || /0\.[13]\.0\+codex\./.test(markdown)) issues.push("qa-report.md contains stale release evidence.");
   if (/^pass\b/i.test(String(qa?.decision || ""))) {
     const requiredPasses = [
       ["source live beta", qa?.liveRuns?.source?.status],
       ["installed live beta", qa?.liveRuns?.installed?.status],
       ["installed build", qa?.installedBuild?.status],
-      ["Office host matrix", qa?.officeHostMatrix?.status],
-      ["Office cleanup", qa?.officeHostMatrix?.cleanupStatus],
       ["final cleanup", qa?.cleanup?.status],
       ["source/cache parity", qa?.sourceCacheParity?.status]
     ];
@@ -301,15 +271,6 @@ function qaAlignmentProblems(qa, markdown, pluginVersion, headCommit = null, con
     if (qa?.installedBuild?.path !== expectedInstalledQaPath) {
       issues.push(`qa-report.json Pass must record the exact versioned cache path relative to CODEX_HOME: ${expectedInstalledQaPath}.`);
     }
-    const hostEntries = Object.entries(qa?.officeHostMatrix?.hosts || {});
-    const hostNames = hostEntries.map(([host]) => host).sort();
-    if (JSON.stringify(hostNames) !== JSON.stringify([...requiredOfficeHosts].sort())) {
-      issues.push(`qa-report.json Pass must record exactly these Office hosts: ${requiredOfficeHosts.join(", ")}.`);
-    }
-    for (const host of requiredOfficeHosts) {
-      const status = qa?.officeHostMatrix?.hosts?.[host];
-      if (status !== "pass") issues.push(`qa-report.json cannot claim Pass while Office host ${host} is ${status || "missing"}.`);
-    }
     const offlineGateEntries = Array.isArray(qa?.offlineGates) ? qa.offlineGates : [];
     const offlineGateCounts = new Map();
     for (const gate of offlineGateEntries) {
@@ -330,8 +291,7 @@ function qaAlignmentProblems(qa, markdown, pluginVersion, headCommit = null, con
     if (qa?.cleanup?.remoteTestRootsRemaining !== 0
       || qa?.cleanup?.permissionsRemaining !== 0
       || qa?.cleanup?.anonymousLinksRemaining !== 0
-      || qa?.cleanup?.isolatedLocalResidue !== false
-      || qa?.cleanup?.officeResidue !== false) {
+      || qa?.cleanup?.isolatedLocalResidue !== false) {
       issues.push("qa-report.json cannot claim Pass without explicit zero-residue cleanup evidence.");
     }
     for (const component of ["bytes", "modes", "types", "symlinkTargets"]) {
@@ -350,45 +310,6 @@ function checkQaReports(contentDigest) {
   const markdown = readFileSync(join(pluginRoot, "qa-report.md"), "utf8");
   const headCommit = currentHeadCommit();
   for (const issue of qaAlignmentProblems(qa, markdown, pluginManifest.version, headCommit, contentDigest)) fail(issue);
-}
-
-function pngDimensions(path) {
-  const bytes = readFileSync(path);
-  if (bytes.length < 24 || bytes.subarray(0, 8).toString("hex") !== "89504e470d0a1a0a") {
-    fail(`Invalid PNG file: ${relative(pluginRoot, path)}`);
-    return null;
-  }
-  return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
-}
-
-function checkOfficeManifestAndIcons() {
-  const manifestPath = join(pluginRoot, "office-addin", "manifest.xml");
-  const manifest = readFileSync(manifestPath, "utf8");
-  const version = manifest.match(/<Version>([^<]+)<\/Version>/)?.[1];
-  if (version !== expectedOfficeVersion) {
-    fail(`Office companion version must be ${expectedOfficeVersion}: ${version || "missing"}`);
-  }
-  const companionVersion = expectedOfficeVersion.replace(/\.0$/, "");
-  const taskpane = readFileSync(join(pluginRoot, "office-addin", "taskpane.js"), "utf8");
-  const companionReadme = readFileSync(join(pluginRoot, "office-addin", "README.md"), "utf8");
-  if (!taskpane.includes(`const companionVersion = "${companionVersion}"`)) {
-    fail(`Office task-pane runtime version must match manifest ${expectedOfficeVersion}.`);
-  }
-  if (!companionReadme.includes(`Version \`${companionVersion}\``)) {
-    fail(`Office companion README version must match manifest ${expectedOfficeVersion}.`);
-  }
-  for (const issue of officeManifestProblems(manifest)) fail(issue);
-  for (const size of OFFICE_ICON_SIZES) {
-    const iconPath = join(pluginRoot, "office-addin", `icon-${size}.png`);
-    if (!existsSync(iconPath)) continue;
-    const dimensions = pngDimensions(iconPath);
-    if (dimensions && (dimensions.width !== size || dimensions.height !== size)) {
-      fail(`office-addin/icon-${size}.png must be ${size}x${size}, got ${dimensions.width}x${dimensions.height}.`);
-    }
-    if (!manifest.includes(`office-addin/icon-${size}.png`)) {
-      fail(`Office manifest must reference office-addin/icon-${size}.png.`);
-    }
-  }
 }
 
 function checkMcp() {
@@ -569,7 +490,7 @@ function checkToolSchemas() {
   const tools = listMessage?.result?.tools;
   if (!Array.isArray(tools)) return fail("MCP tools/list did not return a tools array during schema inspection.");
   const contract = compareToolContract(tools.map((tool) => tool.name));
-  if (!contract.ok) fail(`MCP tool set does not exactly match the 72-tool contract: ${JSON.stringify(contract)}`);
+  if (!contract.ok) fail(`MCP tool set does not exactly match the 84-tool contract: ${JSON.stringify(contract)}`);
   const seenToolNames = new Set();
   for (const tool of tools) {
     if (seenToolNames.has(tool.name)) fail(`Duplicate MCP tool registered: ${tool.name}`);
@@ -609,13 +530,6 @@ if (selfCheck) {
   const missingContract = compareToolContract(ONEDRIVE_TOOL_CONTRACT.slice(1));
   const extraContract = compareToolContract([...ONEDRIVE_TOOL_CONTRACT, "onedrive_unexpected"]);
   const duplicateContract = compareToolContract([...ONEDRIVE_TOOL_CONTRACT.slice(0, -1), ONEDRIVE_TOOL_CONTRACT[0]]);
-  const iconDimensions = Object.fromEntries(OFFICE_ICON_SIZES.map((size) => [
-    size,
-    pngDimensions(join(pluginRoot, "office-addin", `icon-${size}.png`))
-  ]));
-  const officeManifest = readFileSync(join(pluginRoot, "office-addin", "manifest.xml"), "utf8");
-  const officeHostBlocks = [...officeManifest.matchAll(/<Host\s+xsi:type="([^"]+)">([\s\S]*?)<\/Host>/g)];
-  const missingPresentationManifest = officeManifest.replace(officeHostBlocks.find((match) => match[1] === "Presentation")?.[0] || "", "");
   const qaFixture = JSON.parse(readFileSync(join(pluginRoot, "qa-report.json"), "utf8"));
   const qaMarkdownFixture = readFileSync(join(pluginRoot, "qa-report.md"), "utf8");
   const headCommit = currentHeadCommit();
@@ -625,23 +539,16 @@ if (selfCheck) {
     source: { ...qaFixture.source, contentDigest: "a".repeat(64) },
     offlineGates: requiredQaOfflineGates.map((name) => ({ name, status: "pass" })),
     liveRuns: {
-      source: { status: "pass", runId: "source-run", folderName: "source-folder", runtimeMs: 1, toolCoverage: { contract: 72, exercised: 71, blocked: 1 }, cleanupVerified: true },
-      installed: { status: "pass", runId: "installed-run", folderName: "installed-folder", runtimeMs: 1, toolCoverage: { contract: 72, exercised: 71, blocked: 1 }, cleanupVerified: true }
+      source: { status: "pass", runId: "source-run", folderName: "source-folder", runtimeMs: 1, toolCoverage: { contract: 84, exercised: 83, blocked: 1 }, cleanupVerified: true },
+      installed: { status: "pass", runId: "installed-run", folderName: "installed-folder", runtimeMs: 1, toolCoverage: { contract: 84, exercised: 83, blocked: 1 }, cleanupVerified: true }
     },
     installedBuild: { ...qaFixture.installedBuild, status: "pass", path: `$CODEX_HOME/plugins/cache/personal/onedrive/${qaFixture.source.pluginVersion}` },
-    officeHostMatrix: {
-      ...qaFixture.officeHostMatrix,
-      status: "pass",
-      cleanupStatus: "pass",
-      hosts: Object.fromEntries(requiredOfficeHosts.map((host) => [host, "pass"]))
-    },
     cleanup: {
       status: "pass",
       remoteTestRootsRemaining: 0,
       permissionsRemaining: 0,
       anonymousLinksRemaining: 0,
-      isolatedLocalResidue: false,
-      officeResidue: false
+      isolatedLocalResidue: false
     },
     sourceCacheParity: { status: "pass", bytes: "pass", modes: "pass", types: "pass", symlinkTargets: "pass" }
   };
@@ -657,14 +564,8 @@ if (selfCheck) {
     missingToolRejected: !missingContract.ok && missingContract.missing.length === 1,
     extraToolRejected: !extraContract.ok && extraContract.extra.includes("onedrive_unexpected"),
     duplicateToolRejected: !duplicateContract.ok && duplicateContract.duplicates.length === 1,
-    currentVersionAccepted: expectedPluginVersion.test("0.4.0+codex.20260713105951"),
-    staleVersionRejected: !expectedPluginVersion.test("0.3.0+codex.20260711223300"),
-    iconDimensionsValidated: OFFICE_ICON_SIZES.every((size) => iconDimensions[size]?.width === size && iconDimensions[size]?.height === size),
-    officeManifestContractAccepted: officeManifestProblems(officeManifest).length === 0,
-    missingOfficeRibbonHostRejected: officeManifestProblems(missingPresentationManifest)
-      .some((issue) => issue.includes("hosts must be exactly")),
-    executeFunctionRibbonRejected: officeManifestProblems(officeManifest.replace('xsi:type="ShowTaskpane"', 'xsi:type="ExecuteFunction"'))
-      .some((issue) => issue.includes("must not use ExecuteFunction")),
+    currentVersionAccepted: expectedPluginVersion.test("0.5.0+codex.20260714034051"),
+    staleVersionRejected: !expectedPluginVersion.test("0.4.0+codex.20260713105951"),
     sensitiveFileNamesRecognized: sensitivePackageFileNames.has(".env.local") && sensitivePackageFileExtensions.has(".pem"),
     residueDirectoriesRecognized: forbiddenResidueDirs.has("__pycache__"),
     nestedLooseObjectSchemaRejected: schemaConsistencyProblems("negative", {
@@ -679,15 +580,9 @@ if (selfCheck) {
     }).some((issue) => issue.includes("requires undeclared property: missing")),
     exactValueComparisonRejectsDuplicates: !exactValuesMatch(["word", "word", "excel"], ["word", "excel", "powerpoint"]),
     staleQaToolCountRejected: qaAlignmentProblems({ ...qaFixture, contract: { toolCount: 58, exact: true } }, qaMarkdownFixture, qaFixture.source.pluginVersion)
-      .some((issue) => issue.includes("72-tool")),
+      .some((issue) => issue.includes("84-tool")),
     falsePassQaDecisionRejected: qaAlignmentProblems(intentionallyIncompletePassFixture, qaMarkdownFixture.replace(qaFixture.decision, "Pass"), qaFixture.source.pluginVersion)
       .some((issue) => issue.includes("cannot claim Pass")),
-    missingOfficeHostRejected: qaAlignmentProblems(
-      { ...finalPassFixture, officeHostMatrix: { ...finalPassFixture.officeHostMatrix, hosts: {} } },
-      qaMarkdownFixture.replace(qaFixture.decision, "Pass"),
-      qaFixture.source.pluginVersion,
-      headCommit
-    ).some((issue) => issue.includes("exactly these Office hosts")),
     missingOfflineGateRejected: qaAlignmentProblems(
       { ...finalPassFixture, offlineGates: finalPassFixture.offlineGates.slice(1) },
       qaMarkdownFixture.replace(qaFixture.decision, "Pass"),
@@ -731,7 +626,6 @@ const files = await walk(pluginRoot);
 checkRequiredFiles();
 checkManifest();
 checkMcp();
-checkOfficeManifestAndIcons();
 checkToolSchemas();
 checkNoAbsoluteLocalPaths(files);
 const sourceSnapshot = await packageSnapshot(pluginRoot);
