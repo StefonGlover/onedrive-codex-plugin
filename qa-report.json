@@ -1,10 +1,10 @@
 {
   "schemaVersion": 2,
-  "decision": "Finalizing Immutable Build",
+  "decision": "Released — Live Beta Waived",
   "date": "2026-07-14",
-  "generatedAt": "2026-07-14T05:01:00Z",
+  "generatedAt": "2026-07-14T05:02:19Z",
   "source": {
-    "commit": "ad711b5b08bc81d289bbcb8ca008d5053603f651",
+    "commit": "fd1b102b50bf0b0e8104c1b7c85848167e7d4bed",
     "workingTree": "clean tested source commit; source and installed live betas explicitly waived by the user",
     "pluginVersion": "0.5.0+codex.20260714050128",
     "contentDigest": null
@@ -31,13 +31,13 @@
     "installed": { "status": "waived", "reason": "The user directed Codex to wrap up without an installed-cache live run.", "cleanupVerified": true }
   },
   "installedBuild": {
-    "status": "pending",
+    "status": "pass",
     "version": "0.5.0+codex.20260714050128",
     "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.5.0+codex.20260714050128",
     "oldCacheOverwritten": false
   },
   "cleanup": { "status": "pass", "remoteTestRootsRemaining": 0, "permissionsRemaining": 0, "anonymousLinksRemaining": 0, "isolatedLocalResidue": false },
-  "sourceCacheParity": { "status": "pending" },
+  "sourceCacheParity": { "status": "pass", "bytes": "pass", "modes": "pass", "types": "pass", "symlinkTargets": "pass" },
   "blockedCoverage": [
     { "area": "Business Graph Excel", "reason": "The available live account is personal; business behavior is mock-tested." },
     { "area": "Organization-only sharing", "reason": "The available live account is personal; organization behavior is mock-tested." },
