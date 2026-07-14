@@ -221,13 +221,34 @@ function currentHeadCommit() {
   return commit;
 }
 
+function qaSourceCommitMatchesRelease(commit, headCommit) {
+  if (commit === headCommit) return true;
+  if (!/^[0-9a-f]{40}$/.test(commit || "") || !/^[0-9a-f]{40}$/.test(headCommit || "")) return false;
+  const ancestor = spawnSync("git", ["merge-base", "--is-ancestor", commit, headCommit], {
+    cwd: pluginRoot,
+    encoding: "utf8",
+    timeout: 5_000
+  });
+  if (ancestor.status !== 0) return false;
+  const diff = spawnSync("git", ["diff", "--name-only", `${commit}..${headCommit}`], {
+    cwd: pluginRoot,
+    encoding: "utf8",
+    timeout: 5_000
+  });
+  if (diff.status !== 0) return false;
+  const changed = (diff.stdout || "").trim().split("\n").filter(Boolean);
+  return changed.length > 0 && changed.every((file) => file === "qa-report.md" || file === "qa-report.json");
+}
+
 function qaAlignmentProblems(qa, markdown, pluginVersion, headCommit = null, contentDigest = null) {
   const issues = [];
   const statusValues = new Set(["pass", "pending", "blocked", "fail", "in_progress"]);
   if (qa?.schemaVersion !== 2) issues.push("qa-report.json schemaVersion must be 2.");
   if (qa?.source?.pluginVersion !== pluginVersion) issues.push("qa-report.json plugin version does not match plugin.json.");
   if (!/^[0-9a-f]{40}$/.test(qa?.source?.commit || "")) issues.push("qa-report.json must record a full 40-character source commit.");
-  if (headCommit && qa?.source?.commit !== headCommit) issues.push("qa-report.json source commit does not match the current HEAD commit.");
+  if (headCommit && !qaSourceCommitMatchesRelease(qa?.source?.commit, headCommit)) {
+    issues.push("qa-report.json source commit must match HEAD or an ancestor followed only by qa-report.md/qa-report.json evidence changes.");
+  }
   if (qa?.contract?.toolCount !== ONEDRIVE_TOOL_CONTRACT.length || qa?.contract?.exact !== true) issues.push("qa-report.json must record the exact 84-tool contract.");
   if (qa?.installedBuild?.version !== pluginVersion) issues.push("qa-report.json installed-build target version does not match plugin.json.");
   if (qa?.installedBuild?.oldCacheOverwritten !== false) issues.push("qa-report.json must attest that the old installed cache was not overwritten.");
@@ -594,7 +615,7 @@ if (selfCheck) {
       qaMarkdownFixture,
       qaFixture.source.pluginVersion,
       headCommit
-    ).some((issue) => issue.includes("current HEAD")),
+    ).some((issue) => issue.includes("source commit must match HEAD")),
     incompleteLiveEvidenceRejected: qaAlignmentProblems(
       { ...finalPassFixture, liveRuns: { ...finalPassFixture.liveRuns, source: { status: "pass" } } },
       qaMarkdownFixture.replace(qaFixture.decision, "Pass"),

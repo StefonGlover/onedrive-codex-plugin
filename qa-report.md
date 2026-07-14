@@ -1,15 +1,15 @@
 # OneDrive 0.5.0 Release Gate Report
 
-Decision: Released — Live Beta Waived
+Decision: Finalizing Immutable Build
 Date: 2026-07-14
-Generated: 2026-07-14T04:59:34Z
-Source commit: `4b5549503af498e433db68d265616cd712a065a8` with finalized working-tree changes
-Plugin version: `0.5.0+codex.20260714034051`
+Generated: 2026-07-14T05:01:00Z
+Tested source commit: `ad711b5b08bc81d289bbcb8ca008d5053603f651`
+Plugin version: `0.5.0+codex.20260714050128`
 Tool contract: 84 exact tool names
 
 ## Current outcome
 
-Release `0.5.0+codex.20260714034051` is installed in a new immutable cache with exact byte, mode, type, and symlink-target parity. The exact 84-tool contract, 140-case mock Graph suite, 78 headless Office operations, semantic anchors, structured text patches, managed workspaces, watches, Office security corpus, genuine-package reopening, cleanup, and packaging checks pass. The source and installed live betas are explicitly recorded as waived by user direction, so this report does not label them as passed.
+Release `0.5.0+codex.20260714050128` is ready for immutable-cache installation. The exact 84-tool contract, 140-case mock Graph suite, 78 headless Office operations, semantic anchors, structured text patches, managed workspaces, watches, Office security corpus, genuine-package reopening, cleanup, and packaging checks pass. The source and installed live betas are explicitly recorded as waived by user direction, so this report does not label them as passed.
 
 ## Explicitly constrained coverage
 
