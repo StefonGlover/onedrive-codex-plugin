@@ -1,12 +1,12 @@
 {
   "schemaVersion": 2,
-  "decision": "Released — Live Beta Waived",
-  "date": "2026-07-14",
-  "generatedAt": "2026-07-14T05:02:19Z",
+  "decision": "Beta Pending — Installed Cache Verification Required",
+  "date": "2026-07-17",
+  "generatedAt": "2026-07-17T03:38:35Z",
   "source": {
     "commit": "fd1b102b50bf0b0e8104c1b7c85848167e7d4bed",
-    "workingTree": "clean tested source commit; source and installed live betas explicitly waived by the user",
-    "pluginVersion": "0.5.0+codex.20260714050128",
+    "workingTree": "tested hardening changes on top of the recorded source commit; fresh immutable cache installed with parity; a new Codex task is required to load it",
+    "pluginVersion": "0.5.0+codex.20260717033601",
     "contentDigest": null
   },
   "contract": {
@@ -21,19 +21,19 @@
     { "name": "Office Open XML operations", "status": "pass", "operations": 78, "word": 21, "excel": 32, "powerpoint": 25 },
     { "name": "Office security corpus", "status": "pass" },
     { "name": "Genuine package reopening", "status": "pass" },
-    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 140 },
-    { "name": "Read-only OneDrive doctor and tenant checks", "status": "pass" },
+    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 153 },
+    { "name": "Read-only OneDrive doctor and tenant checks", "status": "pass", "checks": 6 },
     { "name": "Cleanup preview", "status": "pass" },
     { "name": "Whitespace", "status": "pass" }
   ],
   "liveRuns": {
-    "source": { "status": "waived", "reason": "The user directed Codex to forget the live test folder and wrap up without another live run.", "cleanupVerified": true },
-    "installed": { "status": "waived", "reason": "The user directed Codex to wrap up without an installed-cache live run.", "cleanupVerified": true }
+    "source": { "status": "pass", "scope": "read-only health harness", "checks": 6, "contractTools": 84, "runId": "codex-beta-20260717t033726496z-35285", "folderName": "Codex OneDrive Plugin Beta Test codex-beta-20260717t033726496z-35285", "runtimeMs": 1926, "cleanupVerified": true },
+    "installed": { "status": "pass", "scope": "read-only health harness", "checks": 6, "contractTools": 84, "runId": "codex-beta-20260717t033833268z-35644", "folderName": "Codex OneDrive Plugin Beta Test codex-beta-20260717t033833268z-35644", "runtimeMs": 1993, "cleanupVerified": true }
   },
   "installedBuild": {
     "status": "pass",
-    "version": "0.5.0+codex.20260714050128",
-    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.5.0+codex.20260714050128",
+    "version": "0.5.0+codex.20260717033601",
+    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.5.0+codex.20260717033601",
     "oldCacheOverwritten": false
   },
   "cleanup": { "status": "pass", "remoteTestRootsRemaining": 0, "permissionsRemaining": 0, "anonymousLinksRemaining": 0, "isolatedLocalResidue": false },
@@ -44,6 +44,6 @@
     { "area": "Forced device-code polling", "reason": "The existing credential and consent remain untouched." },
     { "area": "Keychain deletion", "reason": "The existing credential remains untouched." },
     { "area": "Live recycle-bin restore", "reason": "Only native version restore is in live scope; recycle-bin restore remains mock/dry-run tested." },
-    { "area": "Source and installed live betas", "reason": "The user explicitly waived both remaining live runs and directed Codex to wrap up immediately." }
+    { "area": "Fresh-cache full CRUD", "reason": "The newly installed cache passed the read-only live harness and exact parity. Full CRUD requires a fresh task because the current connector process remains loaded from the prior cache." }
   ]
 }

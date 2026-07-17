@@ -32,8 +32,10 @@ const [path, clientId, tenant, scopes, keychainService] = process.argv.slice(2);
 let existing = {};
 try {
   existing = JSON.parse(readFileSync(path, "utf8"));
-} catch {
-  existing = {};
+} catch (error) {
+  if (error.code !== "ENOENT") {
+    throw new Error(`Refusing to overwrite unreadable or malformed existing config ${path}: ${error.message}`);
+  }
 }
 writeFileSync(path, JSON.stringify({
   ...existing,

@@ -46,6 +46,7 @@ const ignoredPackageFileExtensions = new Set([".log", ".tmp", ".temp", ".bak", "
 const forbiddenResidueDirs = new Set([".codex", ".pytest_cache", "__pycache__"]);
 const sensitivePackageFileNames = new Set([".env", ".env.local", ".env.development", ".env.production", "credentials.json", "token.json"]);
 const sensitivePackageFileExtensions = new Set([".key", ".pem", ".p12", ".pfx"]);
+const sensitivePackageNamePattern = /(token|secret|credential)/i;
 const expectedPluginVersion = /^0\.5\.0\+codex\.\d{14}$/;
 const expectedOfficeOperationKinds = {
   word: [
@@ -132,11 +133,17 @@ function readJson(path) {
   }
 }
 
+function isSensitivePackageEntryName(name) {
+  return sensitivePackageFileNames.has(name)
+    || sensitivePackageFileExtensions.has(extname(name).toLowerCase())
+    || sensitivePackageNamePattern.test(name);
+}
+
 async function walk(dir, files = []) {
   for (const entry of await readdir(dir, { withFileTypes: true })) {
     const path = join(dir, entry.name);
     const extension = extname(entry.name).toLowerCase();
-    if (sensitivePackageFileNames.has(entry.name) || sensitivePackageFileExtensions.has(extension)) {
+    if (isSensitivePackageEntryName(entry.name)) {
       fail(`Sensitive file must not be packaged: ${relative(pluginRoot, path)}`);
       continue;
     }
@@ -243,6 +250,8 @@ function qaSourceCommitMatchesRelease(commit, headCommit) {
 function qaAlignmentProblems(qa, markdown, pluginVersion, headCommit = null, contentDigest = null) {
   const issues = [];
   const statusValues = new Set(["pass", "pending", "blocked", "fail", "in_progress"]);
+  const decisionMatch = String(qa?.decision || "").match(/^\s*(?:beta\s+)?(pass|passed|pending|blocked|fail|failed)\b/i);
+  const decisionStatus = decisionMatch?.[1]?.toLowerCase();
   if (qa?.schemaVersion !== 2) issues.push("qa-report.json schemaVersion must be 2.");
   if (qa?.source?.pluginVersion !== pluginVersion) issues.push("qa-report.json plugin version does not match plugin.json.");
   if (!/^[0-9a-f]{40}$/.test(qa?.source?.commit || "")) issues.push("qa-report.json must record a full 40-character source commit.");
@@ -260,7 +269,8 @@ function qaAlignmentProblems(qa, markdown, pluginVersion, headCommit = null, con
   if (!markdown.includes(`Plugin version: \`${pluginVersion}\``)) issues.push("qa-report.md plugin version does not match plugin.json.");
   if (!markdown.includes(`Tool contract: ${ONEDRIVE_TOOL_CONTRACT.length} exact tool names`)) issues.push("qa-report.md must record the exact 84-tool contract.");
   if (/\b58(?:-tool| tools?)\b/i.test(markdown) || /0\.[13]\.0\+codex\./.test(markdown)) issues.push("qa-report.md contains stale release evidence.");
-  if (/^pass\b/i.test(String(qa?.decision || ""))) {
+  if (!decisionStatus) issues.push("qa-report.json decision must begin with Pass, Pending, Blocked, Fail, or the corresponding Beta form.");
+  if (decisionStatus === "pass" || decisionStatus === "passed") {
     const requiredPasses = [
       ["source live beta", qa?.liveRuns?.source?.status],
       ["installed live beta", qa?.liveRuns?.installed?.status],
@@ -580,6 +590,10 @@ if (selfCheck) {
       source: { ...finalPassFixture.liveRuns.source, status: "pending" }
     }
   };
+  const naturalLanguageIncompletePassFixture = {
+    ...intentionallyIncompletePassFixture,
+    decision: "Beta Passed — Restart Required"
+  };
   const checks = {
     exactToolContractAccepted: exactContract.ok,
     missingToolRejected: !missingContract.ok && missingContract.missing.length === 1,
@@ -587,7 +601,12 @@ if (selfCheck) {
     duplicateToolRejected: !duplicateContract.ok && duplicateContract.duplicates.length === 1,
     currentVersionAccepted: expectedPluginVersion.test("0.5.0+codex.20260714034051"),
     staleVersionRejected: !expectedPluginVersion.test("0.4.0+codex.20260713105951"),
-    sensitiveFileNamesRecognized: sensitivePackageFileNames.has(".env.local") && sensitivePackageFileExtensions.has(".pem"),
+    sensitiveFileNamesRecognized: isSensitivePackageEntryName(".env.local")
+      && isSensitivePackageEntryName("signing.pem")
+      && isSensitivePackageEntryName("refresh-token.txt")
+      && isSensitivePackageEntryName("client-secret.json")
+      && isSensitivePackageEntryName("azure-credentials.backup")
+      && !isSensitivePackageEntryName("tool-contract.mjs"),
     residueDirectoriesRecognized: forbiddenResidueDirs.has("__pycache__"),
     nestedLooseObjectSchemaRejected: schemaConsistencyProblems("negative", {
       type: "object",
@@ -604,6 +623,11 @@ if (selfCheck) {
       .some((issue) => issue.includes("84-tool")),
     falsePassQaDecisionRejected: qaAlignmentProblems(intentionallyIncompletePassFixture, qaMarkdownFixture.replace(qaFixture.decision, "Pass"), qaFixture.source.pluginVersion)
       .some((issue) => issue.includes("cannot claim Pass")),
+    naturalLanguageFalsePassRejected: qaAlignmentProblems(
+      naturalLanguageIncompletePassFixture,
+      qaMarkdownFixture.replace(qaFixture.decision, naturalLanguageIncompletePassFixture.decision),
+      qaFixture.source.pluginVersion
+    ).some((issue) => issue.includes("cannot claim Pass")),
     missingOfflineGateRejected: qaAlignmentProblems(
       { ...finalPassFixture, offlineGates: finalPassFixture.offlineGates.slice(1) },
       qaMarkdownFixture.replace(qaFixture.decision, "Pass"),

@@ -2373,6 +2373,74 @@ def ppt_add_text_box(root: ET.Element, operation: Dict[str, Any]) -> Dict[str, A
     return {"shapeId": str(shape_id), "name": name, "text": str(operation.get("text", "")), "geometry": {"x": x, "y": y, "width": width, "height": height}}
 
 
+def ppt_ensure_table_cell_text_nodes(cell: ET.Element) -> List[ET.Element]:
+    nodes = list(cell.iter(q("a", "t")))
+    if nodes:
+        return nodes
+    text_body = cell.find(q("a", "txBody"))
+    if text_body is None:
+        text_body = ET.Element(q("a", "txBody"))
+        cell.insert(0, text_body)
+    if text_body.find(q("a", "bodyPr")) is None:
+        text_body.insert(0, ET.Element(q("a", "bodyPr")))
+    if text_body.find(q("a", "lstStyle")) is None:
+        body_properties = text_body.find(q("a", "bodyPr"))
+        insert_at = list(text_body).index(body_properties) + 1 if body_properties is not None else 0
+        text_body.insert(insert_at, ET.Element(q("a", "lstStyle")))
+    paragraph = text_body.find(q("a", "p"))
+    if paragraph is None:
+        paragraph = ET.SubElement(text_body, q("a", "p"))
+    run = ET.SubElement(paragraph, q("a", "r"))
+    ET.SubElement(run, q("a", "rPr"), {"lang": "en-US"})
+    return [ET.SubElement(run, q("a", "t"))]
+
+
+def ppt_create_notes_part(package: zipfile.ZipFile, modifications: Dict[str, Optional[bytes]], slide_part: str) -> Tuple[str, ET.Element]:
+    existing_numbers = [
+        int(match.group(1))
+        for name in set(package.namelist()) | set(modifications)
+        if (match := re.fullmatch(r"ppt/notesSlides/notesSlide(\d+)\.xml", name))
+        and not (name in modifications and modifications[name] is None)
+    ]
+    notes_part = "ppt/notesSlides/notesSlide%d.xml" % (max(existing_numbers or [0]) + 1)
+    notes_root = ET.Element(q("p", "notes"))
+    common_slide = ET.SubElement(notes_root, q("p", "cSld"))
+    shape_tree = ET.SubElement(common_slide, q("p", "spTree"))
+    non_visual_group = ET.SubElement(shape_tree, q("p", "nvGrpSpPr"))
+    ET.SubElement(non_visual_group, q("p", "cNvPr"), {"id": "1", "name": ""})
+    ET.SubElement(non_visual_group, q("p", "cNvGrpSpPr"))
+    ET.SubElement(non_visual_group, q("p", "nvPr"))
+    ET.SubElement(shape_tree, q("p", "grpSpPr"))
+    ppt_add_text_box(notes_root, {"shapeId": 2, "name": "Notes Placeholder", "text": ""})
+    modifications[notes_part] = ET.tostring(notes_root, encoding="utf-8", xml_declaration=True)
+
+    rels_name = posixpath.join(posixpath.dirname(slide_part), "_rels", posixpath.basename(slide_part) + ".rels")
+    if rels_name in modifications and modifications[rels_name] is not None:
+        rels_root = ET.fromstring(modifications[rels_name])
+    elif rels_name in package.namelist():
+        rels_root = ET.fromstring(package.read(rels_name))
+    else:
+        rels_root = ET.Element(q("pr", "Relationships"))
+    used_rids = {entry.attrib.get("Id") for entry in rels_root.findall(q("pr", "Relationship"))}
+    rid_number = 1
+    while "rId%d" % rid_number in used_rids:
+        rid_number += 1
+    ET.SubElement(rels_root, q("pr", "Relationship"), {
+        "Id": "rId%d" % rid_number,
+        "Type": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide",
+        "Target": posixpath.relpath(notes_part, posixpath.dirname(slide_part)),
+    })
+    ET.register_namespace("", NS["pr"])
+    modifications[rels_name] = ET.tostring(rels_root, encoding="utf-8", xml_declaration=True)
+    add_content_type_override(
+        package,
+        modifications,
+        "/" + notes_part,
+        "application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml",
+    )
+    return notes_part, notes_root
+
+
 def ppt_set_text_style(shape: ET.Element, operation: Dict[str, Any]) -> Dict[str, Any]:
     style_keys = {"fontFamily", "fontSize", "bold", "italic", "underline", "color"}
     if not any(key in operation for key in style_keys):
@@ -2572,10 +2640,14 @@ def edit_powerpoint(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[
                     if rel.get("Type", "").endswith("/notesSlide"):
                         notes_part = resolved_relationship_target(part, rel.get("Target", ""))
                         break
-                if not notes_part or notes_part not in package.namelist():
-                    raise OfficePackageError("PowerPoint slide has no editable notes part.")
-                notes_root = ET.fromstring(modifications.get(notes_part, package.read(notes_part)))
+                if not notes_part or (notes_part not in package.namelist() and notes_part not in modifications):
+                    notes_part, notes_root = ppt_create_notes_part(package, modifications, part)
+                else:
+                    notes_root = ET.fromstring(modifications.get(notes_part, package.read(notes_part)))
                 nodes = list(notes_root.iter(q("a", "t")))
+                if not nodes:
+                    ppt_add_text_box(notes_root, {"text": ""})
+                    nodes = list(notes_root.iter(q("a", "t")))
                 before = set_text_nodes(nodes, operation.get("text"))
                 changes.append({"operation": op_type, "slideIndex": slide["index"], "before": before, "after": operation.get("text", "")})
                 modifications[notes_part] = ET.tostring(notes_root, encoding="utf-8", xml_declaration=True)
@@ -2634,7 +2706,7 @@ def edit_powerpoint(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[
                     cells = rows[row_index].findall(q("a", "tc"))
                     if column_index < 0 or column_index >= len(cells):
                         raise OfficePackageError("PowerPoint table columnIndex is out of range.")
-                    before = set_text_nodes(list(cells[column_index].iter(q("a", "t"))), operation.get("text"))
+                    before = set_text_nodes(ppt_ensure_table_cell_text_nodes(cells[column_index]), operation.get("text"))
                     part_changes = [{"before": before, "after": operation.get("text", ""), "rowIndex": row_index, "columnIndex": column_index}]
                 else:
                     part_changes = replace_text_nodes(

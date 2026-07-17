@@ -2,7 +2,7 @@
 
 Local Codex plugin for OneDrive file operations through Microsoft Graph.
 
-Release `0.5.0+codex.20260714050128` exposes an exact 84-tool contract.
+Release `0.5.0+codex.20260717033601` exposes an exact 84-tool contract.
 
 This is an unofficial integration and is not affiliated with, endorsed by, or sponsored by Microsoft.
 
@@ -327,14 +327,14 @@ Preview the exact new versioned cache directory, then install only after reviewi
 
 ```bash
 node scripts/install-versioned-cache.mjs
-node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.0+codex.20260714050128"
+node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.0+codex.20260717033601"
 ```
 
 After both live betas, regenerate the two QA reports, preview their exact sync into that new cache, then apply only those evidence files and re-run parity:
 
 ```bash
-node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.0+codex.20260714050128"
-node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.0+codex.20260714050128"
+node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.0+codex.20260717033601"
+node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.0+codex.20260717033601"
 ```
 
 Office compatibility checks are split by purpose:

@@ -18,6 +18,7 @@ const pluginRoot = resolve(__dirname, "..");
 const pluginManifest = JSON.parse(readFileSync(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"));
 const defaultStorageRoot = join(homedir(), ".codex", "onedrive-plugin");
 const configPath = join(defaultStorageRoot, "config.json");
+let localConfigReadError = null;
 const localConfig = readLocalConfig();
 const storageRoot = resolve(process.env.ONEDRIVE_STORAGE_ROOT || localConfig.storageRoot || defaultStorageRoot);
 const downloadRoot = join(storageRoot, "downloads");
@@ -70,6 +71,25 @@ const textMimeTypes = new Set([
   "application/xml",
   "image/svg+xml"
 ]);
+const canonicalTextMimeTypes = new Map([
+  [".csv", "text/csv"],
+  [".css", "text/css"],
+  [".htm", "text/html"],
+  [".html", "text/html"],
+  [".js", "text/javascript"],
+  [".json", "application/json"],
+  [".jsonl", "application/x-ndjson"],
+  [".md", "text/markdown"],
+  [".mjs", "text/javascript"],
+  [".svg", "image/svg+xml"],
+  [".ts", "text/plain"],
+  [".tsx", "text/plain"],
+  [".txt", "text/plain"],
+  [".xml", "application/xml"],
+  [".yaml", "application/yaml"],
+  [".yml", "application/yaml"]
+]);
+const searchTombstoneTtlMs = 24 * 60 * 60 * 1000;
 const officeKinds = {
   excel: {
     label: "Excel",
@@ -1357,8 +1377,8 @@ const tools = [
           default: false,
           description: "Must be true after explicit user confirmation because this renames a file or folder."
         },
-        expectedName: { type: "string", description: "Optional safety check: item name must match before renaming." },
-        expectedId: { type: "string", description: "Optional safety check: item ID must match before renaming." }
+        expectedName: { type: "string", description: "Required for a live rename unless expectedId is provided; item name must match. Optional for dry-run." },
+        expectedId: { type: "string", description: "Required for a live rename unless expectedName is provided; item ID must match. Optional for dry-run." }
       },
       additionalProperties: false
     }
@@ -1384,8 +1404,8 @@ const tools = [
           default: false,
           description: "Must be true after explicit user confirmation because this moves a file or folder."
         },
-        expectedName: { type: "string", description: "Optional safety check: source item name must match." },
-        expectedId: { type: "string", description: "Optional safety check: source item ID must match." }
+        expectedName: { type: "string", description: "Required for a live move unless expectedId is provided; source item name must match. Optional for dry-run." },
+        expectedId: { type: "string", description: "Required for a live move unless expectedName is provided; source item ID must match. Optional for dry-run." }
       },
       additionalProperties: false
     }
@@ -1413,8 +1433,8 @@ const tools = [
         },
         waitForCompletion: { type: "boolean", default: false },
         timeoutSeconds: { type: "integer", minimum: 1, maximum: 300, default: 60 },
-        expectedName: { type: "string", description: "Optional safety check: source item name must match." },
-        expectedId: { type: "string", description: "Optional safety check: source item ID must match." }
+        expectedName: { type: "string", description: "Required for a live copy unless expectedId is provided; source item name must match. Optional for dry-run." },
+        expectedId: { type: "string", description: "Required for a live copy unless expectedName is provided; source item ID must match. Optional for dry-run." }
       },
       additionalProperties: false
     }
@@ -1896,8 +1916,8 @@ const tools = [
           description: "Must be true after explicit user confirmation because this deletes a file or folder."
         },
         previewToken: previewTokenSchema,
-        expectedName: { type: "string", description: "Optional safety check: item name must match before deleting." },
-        expectedId: { type: "string", description: "Optional safety check: item ID must match before deleting." }
+        expectedName: { type: "string", description: "Required for a live delete unless expectedId is provided; item name must match. Optional for dry-run." },
+        expectedId: { type: "string", description: "Required for a live delete unless expectedName is provided; item ID must match. Optional for dry-run." }
       },
       additionalProperties: false
     }
@@ -1922,6 +1942,23 @@ function validationDetail(path, message) {
 function cloneDefault(value) {
   if (value === null || typeof value !== "object") return value;
   return JSON.parse(JSON.stringify(value));
+}
+
+function jsonSchemaValuesEqual(left, right) {
+  if (left === right) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left)
+      && Array.isArray(right)
+      && left.length === right.length
+      && left.every((value, index) => jsonSchemaValuesEqual(value, right[index]));
+  }
+  if (left && right && typeof left === "object" && typeof right === "object") {
+    const leftKeys = Object.keys(left).sort();
+    const rightKeys = Object.keys(right).sort();
+    return leftKeys.length === rightKeys.length
+      && leftKeys.every((key, index) => key === rightKeys[index] && jsonSchemaValuesEqual(left[key], right[key]));
+  }
+  return false;
 }
 
 function validateSchemaValue(value, schema = {}, path = "$") {
@@ -1999,6 +2036,14 @@ function validateSchemaValue(value, schema = {}, path = "$") {
         details.push(...child.details);
         return child.value;
       });
+    }
+    if (schema.uniqueItems === true) {
+      const duplicateIndex = normalized.findIndex((item, index) =>
+        normalized.slice(0, index).some((candidate) => jsonSchemaValuesEqual(candidate, item))
+      );
+      if (duplicateIndex !== -1) {
+        details.push(validationDetail(`${path}[${duplicateIndex}]`, "Must not duplicate another array item."));
+      }
     }
   }
 
@@ -2096,8 +2141,16 @@ function readAdditionalLocalSyncRoots() {
 
 function readLocalConfig() {
   try {
-    return JSON.parse(readFileSync(configPath, "utf8"));
-  } catch {
+    const parsed = JSON.parse(readFileSync(configPath, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      localConfigReadError = `Could not read ${configPath}: top-level JSON value must be an object.`;
+      return {};
+    }
+    return parsed;
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      localConfigReadError = `Could not read ${configPath}: ${error.message}`;
+    }
     return {};
   }
 }
@@ -2338,7 +2391,7 @@ function isReauthenticationRequiredError(error) {
     "interaction_required",
     "login_required",
     "consent_required"
-  ]).has(code);
+  ]).has(code) || String(error?.message || "").includes("does not match the requested client, tenant, or scopes");
 }
 
 async function postFormWithConsumerFallback(kind, cfg, params) {
@@ -2408,6 +2461,7 @@ function publicConfig() {
     keychainService: cfg.keychainService,
     keychainTokenConfigured: Boolean(stored?.refresh_token),
     configPath,
+    ...(localConfigReadError ? { configReadError: localConfigReadError } : {}),
     pathPresets: pathPresets(),
     settings: pluginSettings()
   };
@@ -2426,7 +2480,8 @@ function emptyMetadataCache(scope = null) {
     pathRootsById: {},
     itemCount: 0,
     itemsById: {},
-    pathsByLower: {}
+    pathsByLower: {},
+    searchTombstones: []
   };
 }
 
@@ -2559,7 +2614,8 @@ function normalizeMetadataCache(parsed = {}, scope = null) {
     scope,
     itemsById: parsed.itemsById || {},
     pathsByLower: parsed.pathsByLower || {},
-    pathRootsById: parsed.pathRootsById || {}
+    pathRootsById: parsed.pathRootsById || {},
+    searchTombstones: Array.isArray(parsed.searchTombstones) ? parsed.searchTombstones : []
   };
   if ((cache.deltaLink || cache.deltaNextLink) && !parsed.deltaTarget) {
     cache.deltaLink = null;
@@ -2758,9 +2814,13 @@ function updateCachedDescendantPaths(cache, previousPath, nextPath) {
 function cachePutSimplified(cache, item) {
   if (!item?.id) return { current: null, previous: null, removed: [], descendants: [] };
   if (item.deleted) {
-    return { current: null, previous: cache.itemsById?.[item.id] || null, removed: cacheRemoveItemAndDescendants(cache, item), descendants: [] };
+    const previous = cache.itemsById?.[item.id] || null;
+    const removed = cacheRemoveItemAndDescendants(cache, item);
+    recordSearchTombstones(cache, [previous, ...removed, Object.hasOwn(item, "remotePath") ? item : simplifyItem(item)].filter(Boolean));
+    return { current: null, previous, removed, descendants: [] };
   }
   const simplified = Object.hasOwn(item, "remotePath") ? item : simplifyItem(item);
+  clearMatchingSearchTombstones(cache, simplified);
   const previous = cache.itemsById?.[simplified.id] || null;
   const current = mergeDefinedMetadata(previous || {}, simplified);
   const eTagChanged = simplified.eTag !== undefined
@@ -2792,6 +2852,47 @@ function cachePutSimplified(cache, item) {
   cache.itemsById[current.id] = current;
   if (pathKey) cache.pathsByLower[pathKey] = current.id;
   return { current, previous, removed, descendants };
+}
+
+function pruneSearchTombstones(cache, now = Date.now()) {
+  cache.searchTombstones = (cache.searchTombstones || []).filter((entry) => {
+    const recordedAt = Date.parse(entry?.recordedAt || "");
+    return entry?.id && Number.isFinite(recordedAt) && now - recordedAt <= searchTombstoneTtlMs;
+  }).slice(-2000);
+  return cache.searchTombstones;
+}
+
+function recordSearchTombstones(cache, items = []) {
+  const tombstones = pruneSearchTombstones(cache);
+  const byId = new Map(tombstones.map((entry) => [entry.id, entry]));
+  const recordedAt = new Date().toISOString();
+  for (const item of items) {
+    if (!item?.id) continue;
+    byId.set(item.id, {
+      id: item.id,
+      remotePath: cleanPath(item.remotePath || "") || null,
+      recordedAt
+    });
+  }
+  cache.searchTombstones = [...byId.values()].slice(-2000);
+}
+
+function clearMatchingSearchTombstones(cache, item = {}) {
+  const itemPath = cachePathKey(item.remotePath || "");
+  cache.searchTombstones = pruneSearchTombstones(cache).filter((entry) => {
+    if (entry.id === item.id) return false;
+    const tombstonePath = cachePathKey(entry.remotePath || "");
+    return !(itemPath && tombstonePath && itemPath === tombstonePath);
+  });
+}
+
+function isSearchTombstoned(item = {}, tombstones = []) {
+  const itemPath = cachePathKey(item.remotePath || "");
+  return tombstones.some((entry) => {
+    if (entry.id === item.id) return true;
+    const deletedPath = cachePathKey(entry.remotePath || "");
+    return Boolean(deletedPath && itemPath && (itemPath === deletedPath || itemPath.startsWith(`${deletedPath}/`)));
+  });
 }
 
 function cacheRemoveItemAndDescendants(cache, item) {
@@ -3633,12 +3734,13 @@ async function doctor(args = {}) {
   };
 
   const cfgStatus = publicConfig();
-  addCheck("config", cfgStatus.clientIdConfigured ? "pass" : "fail", {
+  addCheck("config", cfgStatus.clientIdConfigured && !cfgStatus.configReadError ? "pass" : "fail", {
     clientIdConfigured: cfgStatus.clientIdConfigured,
     tenant: cfgStatus.tenant,
     scopes: cfgStatus.scopes,
     keychainTokenConfigured: cfgStatus.keychainTokenConfigured,
-    configPath: cfgStatus.configPath
+    configPath: cfgStatus.configPath,
+    ...(cfgStatus.configReadError ? { configReadError: cfgStatus.configReadError } : {})
   });
 
   await runCheck("access token", async () => {
@@ -3697,6 +3799,24 @@ function normalizeToken(raw) {
   };
 }
 
+function normalizedScopeSet(scopes = "") {
+  return [...new Set(String(scopes).trim().split(/\s+/).filter(Boolean))].sort().join(" ");
+}
+
+function tokenMatchesAuthConfig(token = {}, cfg = config()) {
+  if (token.auth_client_id && token.auth_client_id !== cfg.clientId) return false;
+  const tenantMatches = !token.auth_tenant
+    || token.auth_tenant === cfg.tenant
+    || (cfg.tenant === "common" && token.auth_tenant === "consumers");
+  if (!tenantMatches) return false;
+  if (token.auth_scopes && normalizedScopeSet(token.auth_scopes) !== normalizedScopeSet(cfg.scopes)) return false;
+  const defaultCfg = config();
+  const requestedOverride = cfg.clientId !== defaultCfg.clientId
+    || cfg.tenant !== defaultCfg.tenant
+    || normalizedScopeSet(cfg.scopes) !== normalizedScopeSet(defaultCfg.scopes);
+  return !requestedOverride || Boolean(token.auth_client_id && token.auth_tenant && token.auth_scopes);
+}
+
 async function postForm(url, params) {
   const response = await fetch(url, {
     method: "POST",
@@ -3720,7 +3840,7 @@ async function startDeviceLogin(args = {}) {
   let reauthenticationReason = args.forceReauth === true ? "explicitly-forced" : "no-stored-credential";
   if (args.forceReauth !== true) {
     try {
-      await getAccessToken();
+      await getAccessToken(cfg);
       return {
         authenticated: true,
         alreadyAuthenticated: true,
@@ -3799,7 +3919,13 @@ async function pollDeviceLogin(args = {}) {
   authGeneration += 1;
   invalidateActiveStorageScope();
   tokenRefreshPromise = null;
-  tokenCache = normalizeToken({ ...result, auth_context_id: randomUUID() });
+  tokenCache = normalizeToken({
+    ...result,
+    auth_client_id: cfg.clientId,
+    auth_tenant: tokenResponse.tenant || cfg.tenant,
+    auth_scopes: cfg.scopes,
+    auth_context_id: randomUUID()
+  });
   setKeychainToken(tokenCache, cfg);
   pendingDevice = null;
   adoptCurrentToolAccountGeneration();
@@ -3825,7 +3951,9 @@ async function refreshAccessToken(refreshToken, cfg = config(), generation = aut
   }
   tokenCache = normalizeToken({
     ...result,
+    auth_client_id: cfg.clientId,
     auth_tenant: tenant,
+    auth_scopes: cfg.scopes,
     refresh_token: result.refresh_token || refreshToken,
     auth_context_id: authContextId || randomUUID()
   });
@@ -3833,13 +3961,15 @@ async function refreshAccessToken(refreshToken, cfg = config(), generation = aut
   return tokenCache;
 }
 
-async function getAccessToken() {
+async function getAccessToken(cfg = config()) {
   if (process.env.ONEDRIVE_TEST_ACCESS_TOKEN) return process.env.ONEDRIVE_TEST_ACCESS_TOKEN;
-  const cfg = config();
   requireClientId(cfg);
   let current = tokenCache || getKeychainToken(cfg);
   if (!current?.refresh_token && !current?.access_token) {
     throw new Error("OneDrive is not authenticated. Run onedrive_auth_device_start, complete browser login, then run onedrive_auth_device_poll.");
+  }
+  if (!tokenMatchesAuthConfig(current, cfg)) {
+    throw new Error("Stored OneDrive authentication does not match the requested client, tenant, or scopes. Start device-code login for the requested authentication context.");
   }
   if (!current.auth_context_id) {
     current = normalizeAuthContextToken(current);
@@ -4532,6 +4662,17 @@ function mutationMatchHeaders(rawItem) {
   return rawItem?.eTag ? { "If-Match": rawItem.eTag } : {};
 }
 
+function itemVersionProof(rawItem = {}) {
+  return {
+    id: rawItem.id,
+    name: rawItem.name,
+    eTag: rawItem.eTag || null,
+    cTag: rawItem.cTag || null,
+    size: Number.isFinite(rawItem.size) ? rawItem.size : null,
+    lastModifiedDateTime: rawItem.lastModifiedDateTime || null
+  };
+}
+
 function permissionAuditSummary(permission = {}) {
   return {
     id: permission.id,
@@ -4773,15 +4914,20 @@ function simplifyItem(item) {
     webUrl: item.remoteItem.webUrl || item.webUrl,
     parentReference: item.remoteItem.parentReference || item.parentReference
   } : item;
+  const extension = extname(source.name || "").toLowerCase();
+  const reportedMimeType = source.file?.mimeType;
+  const normalizedMimeType = canonicalTextMimeTypes.get(extension)
+    || (reportedMimeType === "application/octet-stream" ? undefined : reportedMimeType);
+  const numericSize = Number(source.size);
   return {
     id: source.id,
     name: source.name,
     remotePath: itemRemotePath(source),
-    path: source.parentReference?.path,
+    path: source.parentReference?.path ? decodeGraphPath(source.parentReference.path) : source.parentReference?.path,
     parentId: source.parentReference?.id,
-    driveId: source.parentReference?.driveId,
+    driveId: source.parentReference?.driveId ? String(source.parentReference.driveId).toUpperCase() : source.parentReference?.driveId,
     webUrl: source.webUrl,
-    size: source.size,
+    size: Number.isFinite(numericSize) && numericSize >= 0 ? numericSize : null,
     createdDateTime: source.createdDateTime,
     lastModifiedDateTime: source.lastModifiedDateTime,
     eTag: source.eTag,
@@ -4789,7 +4935,7 @@ function simplifyItem(item) {
     deleted: source.deleted,
     folder: source.folder ? { childCount: source.folder.childCount } : undefined,
     file: source.file ? {
-      mimeType: source.file.mimeType,
+      mimeType: normalizedMimeType || reportedMimeType,
       ...(source.file.hashes !== undefined ? { hashes: source.file.hashes } : {})
     } : undefined
   };
@@ -4876,12 +5022,14 @@ async function collectPages(firstPath, maxItems, format = "compact", formatter =
         deltaNextLink: pageNextLink && !pageDeltaLink ? pageNextLink : undefined,
         deltaTarget: options.deltaTarget
       } : {};
+      const preparedItems = options.prepareItems ? await options.prepareItems(acceptedItems) : acceptedItems;
       const cacheableItems = options.prepareCacheItems
-        ? await options.prepareCacheItems(acceptedItems)
-        : acceptedItems;
+        ? await options.prepareCacheItems(preparedItems)
+        : preparedItems;
       if (options.cacheResults !== false) pendingCacheItems.push(...cacheableItems);
       if (Object.keys(cursorMetadata).length) pendingCursorMetadata = cursorMetadata;
-      items.push(...acceptedItems.map((item) => formatter(item, format)));
+      const outputFormatter = options.formatter || formatter;
+      items.push(...preparedItems.map((item) => outputFormatter(item, format)));
       if (pageTruncated) {
         unsafePageTruncation = true;
         nextLink = null;
@@ -5117,15 +5265,35 @@ async function scan(args = {}) {
 }
 
 async function search(args = {}) {
-  const escaped = String(args.query).replace(/'/g, "''");
+  const query = String(args.query);
+  const escaped = query.replace(/'/g, "''");
   const params = new URLSearchParams();
   params.set("$top", String(clampInteger(args.limit, 50, 1, 200)));
   params.set("$select", defaultSelect);
-  const result = await graph(`/me/drive/root/search(q='${encodeURIComponent(escaped)}')?${params.toString()}`);
-  if (args.cacheResults !== false) {
-    await bestEffortLocalWrite("metadata cache update", async () => await cacheItems(result.value || []));
+  let result = await graph(`/me/drive/root/search(q='${encodeURIComponent(escaped)}')?${params.toString()}`);
+  let extensionFallback = null;
+  const suffixMatch = query.trim().match(/^(.+?)\.([A-Za-z0-9]{1,10})$/);
+  if (!(result.value || []).length && suffixMatch) {
+    const fallbackQuery = suffixMatch[1].trim();
+    const fallbackEscaped = fallbackQuery.replace(/'/g, "''");
+    const fallbackResult = await graph(`/me/drive/root/search(q='${encodeURIComponent(fallbackEscaped)}')?${params.toString()}`);
+    const expectedSuffix = `.${suffixMatch[2].toLowerCase()}`;
+    result = {
+      ...fallbackResult,
+      value: (fallbackResult.value || []).filter((item) => String(item.name || "").toLowerCase().endsWith(expectedSuffix))
+    };
+    extensionFallback = fallbackQuery;
   }
-  return { items: (result.value || []).map((item) => formatDriveItem(item, args.format)), nextLink: result["@odata.nextLink"] || null };
+  const prepared = await prepareSearchItems(result.value || [], { useCache: args.cacheResults !== false });
+  if (args.cacheResults !== false) {
+    await bestEffortLocalWrite("metadata cache update", async () => await cacheItems(prepared.items));
+  }
+  return {
+    items: prepared.items.map((item) => formatSimplifiedItem(item, args.format)),
+    nextLink: result["@odata.nextLink"] || null,
+    staleItemsFiltered: prepared.staleItemsFiltered,
+    ...(extensionFallback ? { extensionFallback } : {})
+  };
 }
 
 async function searchAll(args = {}) {
@@ -5139,8 +5307,41 @@ async function searchAll(args = {}) {
     maxItems,
     args.format,
     formatDriveItem,
-    { cacheResults: args.cacheResults !== false }
+    {
+      cacheResults: args.cacheResults !== false,
+      prepareItems: async (items) => (await prepareSearchItems(items, { useCache: args.cacheResults !== false })).items,
+      formatter: formatSimplifiedItem
+    }
   );
+}
+
+function preferCachedSearchItem(cached = {}, incoming = {}) {
+  if (!cached?.id || cached.id !== incoming?.id) return false;
+  const cachedTime = Date.parse(cached.lastModifiedDateTime || "");
+  const incomingTime = Date.parse(incoming.lastModifiedDateTime || "");
+  if (Number.isFinite(cachedTime) && Number.isFinite(incomingTime) && cachedTime > incomingTime) return true;
+  return cached.eTag && incoming.eTag && cached.eTag !== incoming.eTag
+    && (!Number.isFinite(cachedTime) || !Number.isFinite(incomingTime) || cachedTime >= incomingTime);
+}
+
+async function prepareSearchItems(items = [], options = {}) {
+  if (options.useCache === false) {
+    return { items: items.map((item) => simplifyItem(item)), staleItemsFiltered: 0 };
+  }
+  const cache = await loadMetadataCache();
+  const tombstones = pruneSearchTombstones(cache);
+  let staleItemsFiltered = 0;
+  const prepared = [];
+  for (const rawItem of items) {
+    const incoming = simplifyItem(rawItem);
+    if (isSearchTombstoned(incoming, tombstones)) {
+      staleItemsFiltered += 1;
+      continue;
+    }
+    const cached = cache.itemsById?.[incoming.id];
+    prepared.push(preferCachedSearchItem(cached, incoming) ? cached : incoming);
+  }
+  return { items: prepared, staleItemsFiltered };
 }
 
 const findStopWords = new Set([
@@ -5560,6 +5761,7 @@ async function find(args = {}) {
   const searchTerms = buildFindSearchTerms(query, maxSearchTerms);
   const extensionInfo = inferFindExtensions(query, args.extensions || []);
   const scoringFolderHints = pruneFolderHints(args.folderHints || []);
+  const explicitFolderHintKeys = new Set(scoringFolderHints.map(normalizeFolderHintKey));
   const folderHints = pruneFolderHints([...scoringFolderHints, ...defaultFindFolderHints(query), ""]);
   const candidates = new Map();
   const searchRuns = [];
@@ -5787,7 +5989,12 @@ async function find(args = {}) {
             scannedFolderKeys.add(key);
             targetBatch.push({ folder, root });
           } catch (error) {
-            scanRuns.push({ folder: folder || "root", reason: plan.reason, error: safeToolErrorMessage(error) });
+            const errorMessage = safeToolErrorMessage(error);
+            if (folder && !explicitFolderHintKeys.has(normalizeFolderHintKey(folder)) && /\b(?:itemNotFound|notFound)\b/i.test(errorMessage)) {
+              scanRuns.push({ folder, reason: plan.reason, skipped: "missing-optional-folder" });
+            } else {
+              scanRuns.push({ folder: folder || "root", reason: plan.reason, error: errorMessage });
+            }
           }
         }
         if (!targetBatch.length) continue;
@@ -6033,6 +6240,13 @@ async function hydrateDeltaParentItems(items = [], pathRoot = null) {
 }
 
 async function delta(args = {}) {
+  const cursorCount = Number(Boolean(args.nextLink)) + Number(Boolean(args.deltaLink));
+  const targetSelectorCount = Number(Boolean(args.itemId))
+    + Number(Boolean(args.path))
+    + Number(Boolean(args.preset));
+  if (cursorCount > 1) throw new Error("Provide only one of nextLink or deltaLink.");
+  if (targetSelectorCount > 1) throw new Error("Provide only one delta target: itemId, path, or preset.");
+  if (cursorCount && targetSelectorCount) throw new Error("Delta cursors cannot be combined with itemId, path, or preset targets.");
   const maxItems = clampInteger(args.maxItems, 1000, 1, 5000);
   let firstPath = args.nextLink || args.deltaLink;
   let target = args._deltaTarget || (args.nextLink ? "nextLink" : args.deltaLink ? "deltaLink" : "root");
@@ -6427,12 +6641,15 @@ async function batchDelete(args = {}) {
 
   const preflight = [];
   const preflightErrors = [];
+  const resolvedIds = new Set();
   for (const [index, item] of items.entries()) {
     try {
       requireNonRootTarget(item, "Delete");
       const rawItem = await getRawInfo(item);
       if (rawItem.root) throw new Error("Delete refuses to operate on the OneDrive root.");
       assertExpectedItem(rawItem, item, "Delete");
+      if (resolvedIds.has(rawItem.id)) throw new Error(`Batch delete target resolves to duplicate item ID ${rawItem.id}.`);
+      resolvedIds.add(rawItem.id);
       preflight.push({ targetArgs: item, rawItem, item: simplifyItem(rawItem) });
     } catch (error) {
       preflightErrors.push({ index, target: item, error: safeToolErrorMessage(error) });
@@ -6450,7 +6667,7 @@ async function batchDelete(args = {}) {
     };
   }
   const previewProof = {
-    items: preflight.map((entry) => ({ id: entry.rawItem.id, name: entry.rawItem.name })),
+    items: preflight.map((entry) => itemVersionProof(entry.rawItem)),
     operation: "batch-delete"
   };
 
@@ -6695,8 +6912,12 @@ async function resolveDestinationParent(args = {}) {
     { label: "parentPath", keys: ["parentPath"] },
     { label: "parentPreset", keys: ["parentPreset"] }
   ]);
-  if (args.destinationParentItemId) return { id: args.destinationParentItemId };
-  if (args.parentItemId) return { id: args.parentItemId };
+  const explicitParentId = args.destinationParentItemId || args.parentItemId;
+  if (explicitParentId) {
+    const raw = await getRawInfo({ itemId: explicitParentId });
+    if (!raw.folder && !raw.root) throw new Error(`Destination parent is not a folder: ${raw.name}`);
+    return { id: raw.id, path: raw.parentReference?.path, name: raw.name };
+  }
   let parentPath = "";
   if (args.destinationParentPreset) {
     parentPath = resolvePresetPath(args, {
@@ -9894,9 +10115,14 @@ async function batchRevokePermissions(args = {}) {
 
   const preflight = [];
   const preflightErrors = [];
+  const resolvedPermissionTargets = new Set();
   for (const [index, item] of items.entries()) {
     try {
-      preflight.push(await preflightRevokePermission(item, { includePermissions: args.includePermissions }));
+      const entry = await preflightRevokePermission(item, { includePermissions: args.includePermissions });
+      const key = `${entry.rawItem.id}\u0000${entry.targetArgs.permissionId}`;
+      if (resolvedPermissionTargets.has(key)) throw new Error(`Batch revoke target duplicates item ${entry.rawItem.id} permission ${entry.targetArgs.permissionId}.`);
+      resolvedPermissionTargets.add(key);
+      preflight.push(entry);
     } catch (error) {
       preflightErrors.push({ index, target: item, error: safeToolErrorMessage(error) });
     }
@@ -10053,9 +10279,13 @@ async function batchMove(args = {}) {
   const destination = await resolveDestinationParent(args);
   const preflight = [];
   const preflightErrors = [];
+  const resolvedIds = new Set();
   for (const [index, item] of items.entries()) {
     try {
-      preflight.push(await preflightMoveItem(item, destination));
+      const entry = await preflightMoveItem(item, destination);
+      if (resolvedIds.has(entry.rawItem.id)) throw new Error(`Batch move target resolves to duplicate item ID ${entry.rawItem.id}.`);
+      resolvedIds.add(entry.rawItem.id);
+      preflight.push(entry);
     } catch (error) {
       preflightErrors.push({ index, target: item, error: safeToolErrorMessage(error) });
     }
@@ -10140,7 +10370,7 @@ async function deleteItem(args = {}) {
   if (rawItem.root) throw new Error("Delete refuses to operate on the OneDrive root.");
   assertExpectedItem(rawItem, args, "Delete");
   const item = simplifyItem(rawItem);
-  const previewProof = { items: [{ id: rawItem.id, name: rawItem.name }], operation: "delete" };
+  const previewProof = { items: [itemVersionProof(rawItem)], operation: "delete" };
   if (args.dryRun !== false) {
     return previewWithToken({ dryRun: true, wouldDelete: item }, "onedrive_delete", previewProof);
   }
@@ -10206,6 +10436,8 @@ async function restoreDeleted(args = {}) {
   if (args.expectedId && args.expectedId !== args.itemId) {
     throw new Error(`Restore expected item ID ${args.expectedId}, but got ${args.itemId}. Refusing to continue.`);
   }
+  const hasExplicitDestination = Boolean(args.destinationParentPath || args.destinationParentItemId || args.destinationParentPreset);
+  const destinationParent = hasExplicitDestination ? await resolveDestinationParent(args) : null;
   const preview = {
     dryRun: args.dryRun !== false,
     confirmed: args.confirmed === true,
@@ -10215,6 +10447,7 @@ async function restoreDeleted(args = {}) {
       destinationParentItemId: args.destinationParentItemId,
       destinationParentPreset: args.destinationParentPreset,
       destinationParentRelativePath: args.destinationParentRelativePath,
+      resolvedDestinationParent: destinationParent ? simplifyItem(destinationParent) : null,
       newName: args.newName
     },
     permissionNote: "OneDrive Personal restore may require Microsoft Graph delegated Files.ReadWrite.All in addition to the plugin's standard Files.ReadWrite scope."
@@ -10225,6 +10458,7 @@ async function restoreDeleted(args = {}) {
     destinationParentItemId: args.destinationParentItemId,
     destinationParentPreset: args.destinationParentPreset,
     destinationParentRelativePath: args.destinationParentRelativePath,
+    destinationParentId: destinationParent?.id || null,
     newName: args.newName
   };
   if (args.dryRun !== false || args.confirmed !== true) {
@@ -10244,10 +10478,7 @@ async function restoreDeleted(args = {}) {
   const previewTokenRequired = previewTokenRequiredResult(preview, "onedrive_restore_deleted", previewProof, args.previewToken, "requiredToRestore");
   if (previewTokenRequired) return previewTokenRequired;
   const body = {};
-  if (args.destinationParentPath || args.destinationParentItemId || args.destinationParentPreset) {
-    const parent = await resolveDestinationParent(args);
-    body.parentReference = { id: parent.id };
-  }
+  if (destinationParent) body.parentReference = { id: destinationParent.id };
   if (args.newName) body.name = args.newName;
   try {
     const result = await graph(`/me/drive/items/${encodeURIComponent(args.itemId)}/restore`, {

@@ -183,6 +183,10 @@ function errorText(value) {
   }
 }
 
+function parseChildMessageLine(line) {
+  return JSON.parse(line);
+}
+
 function clearlyTransientReadError(value) {
   const message = errorText(value).trim();
   const wrapped = message.match(/^Microsoft Graph transport error after \d+ attempts?:\s*(.+)$/i);
@@ -304,7 +308,8 @@ if (selfCheck) {
     previewTokenRefusalFailsClosed: commitRefusalReasons({ dryRun: false, confirmed: true, previewTokenRequired: true, requiredToDelete: "preview again" }).length === 2,
     preflightRefusalFailsClosed: commitRefusalReasons({ dryRun: false, confirmed: true, preflightComplete: false, mutationStarted: false }).length === 2,
     partialMutationFailsClosed: commitRefusalReasons({ dryRun: false, confirmed: true, mutationStarted: true, partialState: true, failed: { index: 1 } }).length === 2,
-    concreteMutationSuccessAccepted: commitRefusalReasons({ dryRun: false, confirmed: true, mutationStarted: true, partialState: false, deleted: { id: "exact" } }).length === 0
+    concreteMutationSuccessAccepted: commitRefusalReasons({ dryRun: false, confirmed: true, mutationStarted: true, partialState: false, deleted: { id: "exact" } }).length === 0,
+    malformedChildOutputDetected: throws(() => parseChildMessageLine("not-json"))
   };
   const ok = Object.values(checks).every(Boolean);
   console.log(JSON.stringify({ ok, checks }, null, 2));
@@ -441,7 +446,15 @@ child.stdout.on("data", (chunk) => {
     const line = buffer.slice(0, newline).trim();
     buffer = buffer.slice(newline + 1);
     if (!line) continue;
-    const message = JSON.parse(line);
+    let message;
+    try {
+      message = parseChildMessageLine(line);
+    } catch (error) {
+      childExitError ||= new Error(`OneDrive MCP child emitted malformed JSON: ${error.message}`);
+      rejectPendingRequests(childExitError);
+      child.kill();
+      return;
+    }
     const waiter = pending.get(message.id);
     if (waiter) {
       pending.delete(message.id);

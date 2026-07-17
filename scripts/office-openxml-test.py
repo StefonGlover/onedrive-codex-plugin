@@ -382,6 +382,31 @@ def main():
         shape = rich_powerpoint["slides"][0]["shapes"][0]
         table_shape = next(entry for entry in rich_powerpoint["slides"][0]["shapes"] if entry["id"] == "4")
         checks["powerpointStructuredEdits"] = rich_ppt_edit["changeCount"] == 4 and shape["text"] == "Native PowerPoint" and all(shape["geometry"][key] == value for key, value in {"x": 10, "y": 20, "width": 30, "height": 40}.items()) and table_shape["table"]["rows"] == [["Updated table value"]] and rich_powerpoint["slides"][0]["notes"] == "Updated speaker notes"
+        empty_pptx = root / "empty-table-no-notes.pptx"
+        with zipfile.ZipFile(pptx, "r") as source, zipfile.ZipFile(empty_pptx, "w", zipfile.ZIP_DEFLATED) as target:
+            for info in source.infolist():
+                if info.filename == "ppt/notesSlides/notesSlide1.xml":
+                    continue
+                payload = source.read(info.filename)
+                if info.filename == "[Content_Types].xml":
+                    payload = payload.replace(b'<Override PartName="/ppt/notesSlides/notesSlide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml"/>', b"")
+                elif info.filename == "ppt/slides/_rels/slide1.xml.rels":
+                    payload = payload.replace(b'<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/>', b"")
+                elif info.filename == "ppt/slides/slide1.xml":
+                    payload = payload.replace(b"<a:r><a:t>Old table value</a:t></a:r>", b"")
+                target.writestr(info, payload)
+        repaired_pptx = root / "empty-table-notes-repaired.pptx"
+        repaired_edit = run_helper(empty_pptx, "powerpoint", action="edit", outputPath=str(repaired_pptx), operations=[
+            {"type": "setTableCell", "slideIndex": 0, "shapeId": "4", "rowIndex": 0, "columnIndex": 0, "text": "Created table text"},
+            {"type": "setNotes", "slideIndex": 0, "text": "Created speaker notes"},
+        ])
+        repaired_powerpoint = run_helper(repaired_pptx, "powerpoint")
+        repaired_table = next(entry for entry in repaired_powerpoint["slides"][0]["shapes"] if entry["id"] == "4")
+        checks["powerpointCreatesMissingTextAndNotes"] = (
+            repaired_edit["changeCount"] == 2
+            and repaired_table["table"]["rows"] == [["Created table text"]]
+            and repaired_powerpoint["slides"][0]["notes"] == "Created speaker notes"
+        )
         duplicated_pptx = root / "slides-duplicated.pptx"
         duplicate_edit = run_helper(pptx, "powerpoint", action="edit", outputPath=str(duplicated_pptx), operations=[{"type": "duplicateSlide", "slideIndex": 0}])
         duplicated_powerpoint = run_helper(duplicated_pptx, "powerpoint")

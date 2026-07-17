@@ -63,6 +63,7 @@ let driveResponseDelayMs = 0;
 let delayedAccountItemResponseMs = 0;
 let delayedRootNoteContentMs = 0;
 let rootDeltaScenario = "empty";
+let deleteTargetRevision = 1;
 const replacementRaceState = new Map();
 let versionTextBuffer = Buffer.from("alpha\ncurrent\n", "utf8");
 let versionTextRevision = 1;
@@ -480,7 +481,11 @@ const graph = createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/delete-target") {
-    return json(res, 200, item("delete-target", "delete-me.txt"));
+    return json(res, 200, item("delete-target", "delete-me.txt", {
+      eTag: `etag-delete-target-${deleteTargetRevision}`,
+      cTag: `ctag-delete-target-${deleteTargetRevision}`,
+      lastModifiedDateTime: `2026-07-04T00:00:0${deleteTargetRevision}Z`
+    }));
   }
 
   if (req.method === "PATCH" && path === "/v1.0/me/drive/items/delete-target") {
@@ -702,6 +707,17 @@ const graph = createServer(async (req, res) => {
 
   if (req.method === "DELETE" && path === "/v1.0/me/drive/items/beta-note") {
     count("delete-beta-note");
+    return empty(res, 204);
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/stale-delete-item") {
+    return json(res, 200, item("stale-delete-item", "Stale Deleted.txt", {
+      parentReference: { id: "stale-delete-folder", path: "/drive/root:/Stale Delete Folder" }
+    }));
+  }
+
+  if (req.method === "DELETE" && path === "/v1.0/me/drive/items/stale-delete-item") {
+    count("delete-stale-search-item");
     return empty(res, 204);
   }
 
@@ -1276,6 +1292,30 @@ const graph = createServer(async (req, res) => {
     });
   }
 
+  if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='Metadata Normalization')")) {
+    return json(res, 200, { value: [item("metadata-normalization", "Metadata Normalization.md", {
+      size: -53,
+      parentReference: { id: "folder-a", path: "/drive/root:/Encoded%20Folder", driveId: "b8c89db91f19c763" },
+      file: { mimeType: "application/octet-stream" }
+    })] });
+  }
+
+  if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='9037.csv')")) {
+    return json(res, 200, { value: [] });
+  }
+
+  if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='9037')")) {
+    return json(res, 200, { value: [item("suffix-csv", "Cobalt-Ledger-9037.csv", {
+      file: { mimeType: "application/octet-stream" }
+    })] });
+  }
+
+  if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='Stale Deleted')")) {
+    return json(res, 200, { value: [item("stale-delete-item", "Stale Deleted.txt", {
+      parentReference: { id: "stale-delete-folder", path: "/drive/root:/Stale Delete Folder" }
+    })] });
+  }
+
   if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='Paged Research')")) {
     return json(res, 200, {
       value: [item("paged-research-a", "Paged Research A.txt")],
@@ -1558,7 +1598,7 @@ const identity = createServer(async (req, res) => {
     });
   }
 
-  if (req.method === "POST" && url.pathname === "/consumers/oauth2/v2.0/devicecode") {
+  if (req.method === "POST" && ["/consumers/oauth2/v2.0/devicecode", "/organizations/oauth2/v2.0/devicecode"].includes(url.pathname)) {
     const attempt = count("identity-device-start");
     const delayMs = deviceStartResponseDelayMs;
     if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -1795,6 +1835,61 @@ try {
     } finally {
       await Promise.all([configClient.close(), fallbackClient.close()]);
     }
+  });
+
+  await check("malformed local config is reported instead of silently discarded", async () => {
+    const configHome = join(mockHome, "malformed-config-home");
+    const configStorage = join(configHome, ".codex", "onedrive-plugin");
+    mkdirSync(configStorage, { recursive: true });
+    writeFileSync(join(configStorage, "config.json"), "{ not valid json\n", "utf8");
+    const configClient = createMcpClient({
+      HOME: configHome,
+      ONEDRIVE_STORAGE_ROOT: configStorage
+    });
+    try {
+      await configClient.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "malformed-config", version: "1" } });
+      const [configured, diagnosed] = await Promise.all([
+        configClient.tool("onedrive_config"),
+        configClient.tool("onedrive_doctor", { checkRootList: false })
+      ]);
+      assert(/Could not read .*config\.json/.test(configured.value.configReadError || ""), "config should expose its parse failure", configured.value);
+      const configCheck = diagnosed.value.checks?.find((entry) => entry.name === "config");
+      assert(configCheck?.status === "fail" && configCheck.details?.configReadError, "doctor should fail the config check with the read error", diagnosed.value);
+      return { configReadErrorReported: true, doctorConfigStatus: configCheck.status };
+    } finally {
+      await configClient.close();
+    }
+  });
+
+  await check("non-object local config is reported without crashing startup", async () => {
+    const outcomes = [];
+    for (const [label, value] of [["null", null], ["array", []], ["string", "invalid"]]) {
+      const configHome = join(mockHome, `non-object-config-${label}`);
+      const configStorage = join(configHome, ".codex", "onedrive-plugin");
+      mkdirSync(configStorage, { recursive: true });
+      writeFileSync(join(configStorage, "config.json"), JSON.stringify(value), "utf8");
+      const configClient = createMcpClient({ HOME: configHome, ONEDRIVE_STORAGE_ROOT: configStorage });
+      try {
+        await configClient.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: `non-object-${label}`, version: "1" } });
+        const configured = await configClient.tool("onedrive_config");
+        assert(!configured.isError && configured.value.configReadError?.includes("top-level JSON value must be an object"), `${label} config should fail closed without crashing`, configured);
+        outcomes.push(label);
+      } finally {
+        await configClient.close();
+      }
+    }
+    return { rejected: outcomes };
+  });
+
+  await check("runtime validation enforces schema uniqueItems", async () => {
+    const result = await tool("onedrive_excel_get_workbook", {
+      itemId: "office-excel",
+      sheetNames: ["Summary", "Summary"]
+    });
+    assert(result.isError, "duplicate sheet selectors should be rejected", result);
+    assert(result.value?.error === "invalid_arguments", "duplicate sheet selectors should fail argument validation", result.value);
+    assert(result.value?.details?.some((detail) => /duplicate/i.test(detail.message || "")), "validation should identify the duplicate", result.value);
+    return { rejected: true };
   });
 
   await check("new efficiency and cleanup tools are registered", async () => {
@@ -2427,6 +2522,9 @@ process.exit(2);
       access_token: "expired-access",
       refresh_token: "initial-refresh",
       expires_at: 1,
+      auth_client_id: "mock-client-id",
+      auth_tenant: "consumers",
+      auth_scopes: "offline_access User.Read Files.ReadWrite",
       auth_context_id: existingAuthContextId
     }));
     expiredToken();
@@ -2584,6 +2682,12 @@ process.exit(2);
         after: counters.get("identity-device-start") || 0
       });
 
+      const overrideDeviceStarts = counters.get("identity-device-start") || 0;
+      const overrideStart = await authClient.tool("onedrive_auth_device_start", { tenant: "organizations" });
+      assert(!overrideStart.isError && overrideStart.value.userCode && overrideStart.value.reauthenticationReason === "stored-credential-rejected", "a different tenant must not silently reuse the healthy token", overrideStart);
+      assert((counters.get("identity-device-start") || 0) === overrideDeviceStarts + 1, "tenant override should start a new device flow", overrideStart);
+      await authClient.tool("onedrive_logout", { deleteKeychainToken: false });
+
       expiredToken();
       await authClient.tool("onedrive_logout", { deleteKeychainToken: false });
       refreshFailureMode = "transient";
@@ -2649,6 +2753,7 @@ process.exit(2);
         refreshRequests: (counters.get("identity-refresh") || 0) - refreshBefore,
         authContextPreserved: true,
         healthyDeviceCodeSuppressed: true,
+        tenantOverrideValidated: true,
         transientFailureSuppressed: true,
         revokedTokenPrompted: true,
         lateRefreshDiscarded: true,
@@ -2811,6 +2916,27 @@ process.exit(2);
     return { listUrl: listRequest.url, searchUrl: searchRequest.url, searchAllUrl: searchAllRequest.url };
   });
 
+  await check("search normalizes negative sizes, MIME types, encoded paths, and drive ID casing", async () => {
+    await tool("onedrive_cache_clear");
+    const result = await tool("onedrive_search", { query: "Metadata Normalization", format: "full" });
+    assert(!result.isError, "metadata normalization search should succeed", result);
+    const found = result.value.items[0];
+    assert(found.size === null, "negative folder/file size should normalize to null", found);
+    assert(found.file?.mimeType === "text/markdown", "Markdown MIME should be normalized", found);
+    assert(found.path === "/drive/root:/Encoded Folder", "Graph path should be decoded", found);
+    assert(found.driveId === "B8C89DB91F19C763", "drive ID casing should be normalized", found);
+    return found;
+  });
+
+  await check("raw filename-suffix search falls back to the stem and preserves the extension", async () => {
+    const result = await tool("onedrive_search", { query: "9037.csv", format: "full" });
+    assert(!result.isError, "suffix fallback search should succeed", result);
+    assert(result.value.items[0]?.id === "suffix-csv", "suffix fallback should return the CSV fixture", result.value);
+    assert(result.value.items[0]?.file?.mimeType === "text/csv", "CSV MIME should normalize consistently", result.value.items[0]);
+    assert(result.value.extensionFallback === "9037", "suffix fallback should report the stem query", result.value);
+    return { id: result.value.items[0].id, extensionFallback: result.value.extensionFallback };
+  });
+
   await check("list_all clears truncation after the final page", async () => {
     const result = await tool("onedrive_list_all", { itemId: "root", pageSize: 2, maxItems: 10 });
     assert(!result.isError, "list_all should succeed across paginated root children", result);
@@ -2924,6 +3050,23 @@ process.exit(2);
       deltaCursorStored: true,
       legacyCursorCleared: true
     };
+  });
+
+  await check("delta rejects ambiguous cursors and target selectors before Graph", async () => {
+    const cursor = `${graphBaseUrl}/me/drive/root/delta?token=one`;
+    const before = requests.length;
+    const cases = [
+      { nextLink: cursor, deltaLink: `${graphBaseUrl}/me/drive/root/delta?token=two` },
+      { nextLink: cursor, itemId: "folder-a" },
+      { itemId: "folder-a", path: "Folder A" },
+      { path: "Folder A", preset: "documents" }
+    ];
+    for (const args of cases) {
+      const result = await tool("onedrive_delta", args);
+      assert(result.isError, "ambiguous delta arguments should be rejected", { args, result });
+    }
+    assert(requests.length === before, "ambiguous delta arguments must not reach Graph", { added: requests.slice(before) });
+    return { rejected: cases.length, graphRequestsAdded: 0 };
   });
 
   await check("account-scoped content indexes fail closed on scope mismatch", async () => {
@@ -3049,6 +3192,13 @@ process.exit(2);
     return { graphRequestsAdded: requests.length - before };
   });
 
+  await check("restore preview resolves the exact destination before issuing approval", async () => {
+    const result = await tool("onedrive_restore_deleted", { itemId: "deleted-item", destinationParentItemId: "missing-destination" });
+    assert(result.isError, "missing restore destination should fail before preview", result);
+    assert(!result.value?.previewToken, "missing restore destination must not receive a preview token", result);
+    return { missingDestinationRejected: true };
+  });
+
   await check("delete requires confirmation before DELETE", async () => {
     const result = await tool("onedrive_delete", { itemId: "delete-target", expectedName: "delete-me.txt", dryRun: false });
     assert(!result.isError, "delete confirmation guard should return a structured result", result);
@@ -3062,6 +3212,44 @@ process.exit(2);
     assert(!result.isError, "confirmed delete should succeed", result);
     assert(counters.get("delete") === 1, "expected exactly one DELETE", { deleteCount: counters.get("delete") });
     return { deleteCount: counters.get("delete") };
+  });
+
+  await check("delete preview token is invalidated by a version change", async () => {
+    const preview = await tool("onedrive_delete", { itemId: "delete-target", expectedId: "delete-target" });
+    assert(!preview.isError && preview.value.previewToken, "delete preview should issue a token", preview);
+    deleteTargetRevision += 1;
+    const beforeDeleteCount = counters.get("delete") || 0;
+    const live = await tool("onedrive_delete", {
+      itemId: "delete-target",
+      expectedId: "delete-target",
+      dryRun: false,
+      confirmed: true,
+      previewToken: preview.value.previewToken
+    });
+    assert(!live.isError && live.value.previewTokenStatus === "mismatch", "stale delete preview should fail closed", live);
+    assert((counters.get("delete") || 0) === beforeDeleteCount, "stale delete preview must not DELETE", { beforeDeleteCount, after: counters.get("delete") || 0 });
+    return { previewTokenStatus: live.value.previewTokenStatus };
+  });
+
+  await check("search suppresses stale Graph hits after an explicit delete", async () => {
+    await tool("onedrive_cache_clear");
+    const info = await tool("onedrive_get_info", { itemId: "stale-delete-item" });
+    assert(!info.isError, "stale search fixture should seed metadata", info);
+    const preview = await tool("onedrive_delete", { itemId: "stale-delete-item", expectedId: "stale-delete-item" });
+    assert(!preview.isError && preview.value.previewToken, "delete preview should issue a token", preview);
+    const deleted = await tool("onedrive_delete", {
+      itemId: "stale-delete-item",
+      expectedId: "stale-delete-item",
+      dryRun: false,
+      confirmed: true,
+      previewToken: preview.value.previewToken
+    });
+    assert(!deleted.isError, "stale search fixture should delete", deleted);
+    const searched = await tool("onedrive_search", { query: "Stale Deleted", format: "full" });
+    assert(!searched.isError, "post-delete search should succeed", searched);
+    assert(searched.value.items.length === 0, "deleted item should be filtered from stale Graph search results", searched.value);
+    assert(searched.value.staleItemsFiltered === 1, "search should report the filtered stale result", searched.value);
+    return { filtered: searched.value.staleItemsFiltered };
   });
 
   await check("batch_delete live action preflights expected identity before any DELETE", async () => {
@@ -3080,6 +3268,21 @@ process.exit(2);
     assert((counters.get("delete") || 0) === beforeDeleteCount, "batch_delete should not delete any item before preflight passes", { beforeDeleteCount, afterDeleteCount: counters.get("delete") || 0 });
     assert(requests.length === beforeRequests, "batch_delete preflight should not touch Graph when an item is missing expected identity", { added: requests.slice(beforeRequests) });
     return { requiredToDelete: result.value.requiredToDelete, deleteCount: counters.get("delete") || 0 };
+  });
+
+  await check("batch_delete rejects duplicate resolved targets before mutation", async () => {
+    const beforeDeleteCount = counters.get("delete") || 0;
+    const result = await tool("onedrive_batch_delete", {
+      items: [
+        { itemId: "delete-target", expectedId: "delete-target" },
+        { itemId: "delete-target", expectedName: "delete-me.txt" }
+      ],
+      dryRun: false,
+      confirmed: true
+    });
+    assert(!result.isError && result.value.preflightFailed === true, "duplicate batch delete should fail preflight", result);
+    assert((counters.get("delete") || 0) === beforeDeleteCount, "duplicate batch delete must not mutate", result.value);
+    return { duplicateRejected: true };
   });
 
   await check("batch_delete reports second-item live failure with partial-state warning", async () => {
@@ -3399,6 +3602,22 @@ process.exit(2);
     return { errors: result.value.errors };
   });
 
+  await check("batch_move rejects duplicate resolved targets before mutation", async () => {
+    const beforeMoveCount = counters.get("move-root-note") || 0;
+    const result = await tool("onedrive_batch_move", {
+      items: [
+        { itemId: "root-note", expectedId: "root-note" },
+        { itemId: "root-note", expectedName: "root-note.txt" }
+      ],
+      destinationParentItemId: "folder-a",
+      dryRun: false,
+      confirmed: true
+    });
+    assert(!result.isError && result.value.preflightFailed === true, "duplicate batch move should fail preflight", result);
+    assert((counters.get("move-root-note") || 0) === beforeMoveCount, "duplicate batch move must not mutate", result.value);
+    return { duplicateRejected: true };
+  });
+
   await check("batch_move reports second-item live failure with partial-state warning", async () => {
     const beforeMoveCount = counters.get("move-root-note") || 0;
     const beforeMoveFailCount = counters.get("move-fail") || 0;
@@ -3481,6 +3700,21 @@ process.exit(2);
     assert(result.value.preflightFailed === true, "batch revoke should report preflight failure", result.value);
     assert((counters.get("revoke-perm-public") || 0) === beforeRevokeCount, "batch revoke should not DELETE after preflight failure", { beforeRevokeCount, afterRevokeCount: counters.get("revoke-perm-public") || 0 });
     return { errors: result.value.errors };
+  });
+
+  await check("batch revoke rejects duplicate item-permission targets before deletion", async () => {
+    const beforeRevokeCount = counters.get("revoke-perm-a") || 0;
+    const result = await tool("onedrive_batch_revoke_permissions", {
+      items: [
+        { itemId: "revoke-a", permissionId: "perm-a", expectedId: "revoke-a" },
+        { itemId: "revoke-a", permissionId: "perm-a", expectedName: "revoke-a.txt" }
+      ],
+      dryRun: false,
+      confirmed: true
+    });
+    assert(!result.isError && result.value.preflightFailed === true, "duplicate batch revoke should fail preflight", result);
+    assert((counters.get("revoke-perm-a") || 0) === beforeRevokeCount, "duplicate batch revoke must not delete", result.value);
+    return { duplicateRejected: true };
   });
 
   await check("batch revoke validates permission existence even when permissions are omitted from output", async () => {
@@ -4478,6 +4712,21 @@ process.exit(2);
     assert(result.value.summary.usedScanFallback === true, "stale cache hit should not suppress scan", result.value.summary);
     assert(!result.value.items.some((item) => item.id === "stale-cache"), "stale cache-only item should not be returned", result.value.items);
     return { summary: result.value.summary, ids: result.value.items.map((item) => item.id) };
+  });
+
+  await check("find treats absent default folders as optional scan hints", async () => {
+    const result = await tool("onedrive_find", {
+      query: "missing optional folder sentinel",
+      maxResults: 3,
+      scanMaxItems: 100,
+      scanMaxFolders: 20,
+      useContentIndex: false
+    });
+    assert(!result.isError, "find should continue when a default folder is absent", result);
+    const missingOptionalRuns = (result.value.scanRuns || []).filter((run) => run.skipped === "missing-optional-folder");
+    assert(missingOptionalRuns.length > 0, "find should label absent default folders as optional skips", result.value.scanRuns);
+    assert(missingOptionalRuns.every((run) => !run.error), "optional missing folders should not be reported as scan errors", missingOptionalRuns);
+    return { skippedFolders: missingOptionalRuns.map((run) => run.folder) };
   });
 
   await check("find confirms cached nested deck with live scan", async () => {
