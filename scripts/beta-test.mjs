@@ -48,6 +48,8 @@ const allowedCliArgs = new Set([
   "cleanup-search-query",
   "read-retry-attempts",
   "read-retry-delay-ms",
+  "fetch-timeout-ms",
+  "report",
   "tenant-matrix",
   "tenant-matrix-live",
   "self-check"
@@ -117,6 +119,18 @@ function parseInviteRecipient(value) {
   return recipient;
 }
 
+function parseReportPath(value, baseDirectory = workspace) {
+  if (value === undefined) return null;
+  if (typeof value === "boolean" || String(value).trim() === "") {
+    throw new Error("--report requires a local JSON file path.");
+  }
+  return resolve(baseDirectory, String(value));
+}
+
+function sameMailbox(left, right) {
+  return Boolean(left && right) && String(left).trim().toLowerCase() === String(right).trim().toLowerCase();
+}
+
 function exportFailureStatus(value) {
   const message = errorText(value);
   const unsupported = /\b(?:notSupported|unsupportedFormat|cannotOpenFile|notAcceptable)\b/i.test(message)
@@ -161,6 +175,10 @@ function betaIsolationRoots(runDirectory) {
 
 function betaSyntheticSyncRoot(runDirectory) {
   return resolve(runDirectory, "synthetic-local-sync-root");
+}
+
+function betaOfficePython(env = process.env) {
+  return env.ONEDRIVE_OFFICE_TEST_PYTHON || env.ONEDRIVE_OFFICE_PYTHON || "python3";
 }
 
 async function pathExists(path) {
@@ -238,8 +256,10 @@ const cleanupMaxItems = parseBoundedIntegerFlag(cliArgs["cleanup-max-items"], "c
 const cleanupMaxResults = parseBoundedIntegerFlag(cliArgs["cleanup-max-results"], "cleanup-max-results", 100, 1, 500);
 const cleanupPageSize = parseBoundedIntegerFlag(cliArgs["cleanup-page-size"], "cleanup-page-size", 100, 1, 200);
 const cleanupVerifyConcurrency = parseBoundedIntegerFlag(cliArgs["cleanup-verify-concurrency"], "cleanup-verify-concurrency", 4, 1, 8);
-const readRetryAttempts = parseBoundedIntegerFlag(cliArgs["read-retry-attempts"], "read-retry-attempts", 3, 1, 5);
+const readRetryAttempts = parseBoundedIntegerFlag(cliArgs["read-retry-attempts"], "read-retry-attempts", 1, 1, 5);
 const readRetryDelayMs = parseBoundedIntegerFlag(cliArgs["read-retry-delay-ms"], "read-retry-delay-ms", 250, 0, 5000);
+const fetchTimeoutMs = parseBoundedIntegerFlag(cliArgs["fetch-timeout-ms"], "fetch-timeout-ms", 10_000, 1_000, 60_000);
+const reportPath = parseReportPath(cliArgs.report);
 const tenantMatrix = cliArgs["tenant-matrix"];
 const tenantMatrixLive = parseBooleanFlag(cliArgs["tenant-matrix-live"], "tenant-matrix-live");
 const selfCheck = parseBooleanFlag(cliArgs["self-check"], "self-check");
@@ -284,6 +304,9 @@ if (selfCheck) {
     validRunIdAccepted: parseRunId("codex-beta-20260713T120000Z") === "codex-beta-20260713T120000Z",
     invalidInviteRecipientRejected: throws(() => parseInviteRecipient("not-an-email")),
     validInviteRecipientAccepted: parseInviteRecipient("beta@example.test") === "beta@example.test",
+    missingReportPathRejected: throws(() => parseReportPath(true)),
+    relativeReportPathResolved: parseReportPath("reports/beta.json", "/tmp/onedrive-beta") === "/tmp/onedrive-beta/reports/beta.json",
+    selfRecipientComparisonIsCaseInsensitive: sameMailbox("Owner@Example.test", "owner@example.test"),
     exactToolContract: compareToolContract(ONEDRIVE_TOOL_CONTRACT).ok,
     preciseUnsupportedExportClassification: exportFailureStatus("Microsoft Graph error notSupported: conversion refused") === "blocked",
     unknownExportFailureIsNotSoftPassed: exportFailureStatus("Microsoft Graph error: UnknownError") === "fail",
@@ -292,6 +315,7 @@ if (selfCheck) {
     overflowingStaleDaysRejected: throws(() => parseNonNegativeNumberFlag("1e308", "stale-days", 1, maxCleanupStaleDays)),
     fractionalIntegerFlagRejected: throws(() => parseBoundedIntegerFlag("1.5", "cleanup-page-size", 100, 1, 200)),
     outOfRangeIntegerFlagRejected: throws(() => parseBoundedIntegerFlag("201", "cleanup-page-size", 100, 1, 200)),
+    invalidFetchTimeoutRejected: throws(() => parseBoundedIntegerFlag("999", "fetch-timeout-ms", 10_000, 1_000, 60_000)),
     staleClassification: betaFolderLooksStale(stale, now - 86_400_000) && !betaFolderLooksStale(fresh, now - 86_400_000),
     unknownTimestampNotStale: !betaFolderLooksStale({ id: "unknown-age", name: `${betaFolderPrefix}unknown`, folder: {} }, now),
     candidateDeduplication: candidates.length === 2 && candidates[0].id === "stale" && candidates[1].id === "fresh",
@@ -300,6 +324,9 @@ if (selfCheck) {
     syntheticSyncRootIsRunScoped: syntheticSyncRootProbe === resolve(workspace, "work", "onedrive-beta", "self-check", "synthetic-local-sync-root"),
     syntheticSyncRootOutsideRealOneDriveHierarchy: !syntheticSyncRootProbe.startsWith(join(homedir(), "Library", "CloudStorage", "OneDrive"))
       && !syntheticSyncRootProbe.startsWith(join(homedir(), "OneDrive")),
+    officeTestPythonOverridesServerPython: betaOfficePython({ ONEDRIVE_OFFICE_TEST_PYTHON: "/test/python", ONEDRIVE_OFFICE_PYTHON: "/server/python" }) === "/test/python",
+    officeServerPythonIsReusedForFixtures: betaOfficePython({ ONEDRIVE_OFFICE_PYTHON: "/server/python" }) === "/server/python",
+    officePythonDefaultsToPathLookup: betaOfficePython({}) === "python3",
     transientFetchFailure: clearlyTransientReadError("fetch failed"),
     classifiedTransportFailure: clearlyTransientReadError("Microsoft Graph transport error after 3 attempts: fetch failed"),
     deterministicErrorNotTransient: !clearlyTransientReadError("Microsoft Graph error: itemNotFound"),
@@ -336,6 +363,7 @@ const updateCheckout = join(outDir, "update-checkout.txt");
 const updateManifest = join(outDir, "update-checkout.json");
 const officeFixtureDir = join(outDir, "office-fixtures");
 const richOfficeFixtureDir = join(outDir, "rich-office-fixtures");
+const fixturePython = betaOfficePython();
 const blockedSyncDownload = join(syntheticSyncRoot, `${unique}-blocked-download.txt`);
 const blockedSyncUpload = join(syntheticSyncRoot, `${unique}-blocked-upload.txt`);
 const blockedSyncUploadSentinel = `Synthetic local sync-path guard fixture: ${unique}\n`;
@@ -368,27 +396,31 @@ async function prepareSyntheticSyncFixture() {
 }
 
 await mkdir(outDir, { recursive: true });
-if (live && !cleanupStale && !tenantMatrix) {
-  const fixturePython = process.env.ONEDRIVE_OFFICE_TEST_PYTHON || "python3";
-  execFileSync(fixturePython, [join(pluginRoot, "scripts", "office-openxml-test.py"), `--emit-fixtures=${officeFixtureDir}`], {
-    env: { ...process.env, PYTHONPYCACHEPREFIX: join(outDir, "pycache") }, stdio: "ignore"
-  });
-  richOfficeFixtures = JSON.parse(execFileSync(fixturePython, [join(pluginRoot, "scripts", "office-fixture-factory.py"), richOfficeFixtureDir], {
-    env: { ...process.env, PYTHONPYCACHEPREFIX: join(outDir, "pycache") }, encoding: "utf8"
-  }));
-  await writeFile(localUpload, `Uploaded through onedrive_upload: ${unique}\n`, "utf8");
-  await writeFile(localSessionUpload, Buffer.alloc(400 * 1024, `session-${unique}\n`));
-  await writeFile(localBinary, Buffer.from([0, 1, 2, 3, 4, 0, 255, 128]));
-  await rm(localDownload, { force: true });
-  await rm(excelDownload, { force: true });
-  await rm(wordDownload, { force: true });
-  await rm(powerpointDownload, { force: true });
-  await rm(exportPdfDownload, { force: true });
-  await rm(exportTextDownload, { force: true });
-  await rm(updateCheckout, { force: true });
-  await rm(updateManifest, { force: true });
+try {
+  if (live && !cleanupStale && !tenantMatrix) {
+    execFileSync(fixturePython, [join(pluginRoot, "scripts", "office-openxml-test.py"), `--emit-fixtures=${officeFixtureDir}`], {
+      env: { ...process.env, PYTHONPYCACHEPREFIX: join(outDir, "pycache") }, stdio: "ignore"
+    });
+    richOfficeFixtures = JSON.parse(execFileSync(fixturePython, [join(pluginRoot, "scripts", "office-fixture-factory.py"), richOfficeFixtureDir], {
+      env: { ...process.env, PYTHONPYCACHEPREFIX: join(outDir, "pycache") }, encoding: "utf8"
+    }));
+    await writeFile(localUpload, `Uploaded through onedrive_upload: ${unique}\n`, "utf8");
+    await writeFile(localSessionUpload, Buffer.alloc(400 * 1024, `session-${unique}\n`));
+    await writeFile(localBinary, Buffer.from([0, 1, 2, 3, 4, 0, 255, 128]));
+    await rm(localDownload, { force: true });
+    await rm(excelDownload, { force: true });
+    await rm(wordDownload, { force: true });
+    await rm(powerpointDownload, { force: true });
+    await rm(exportPdfDownload, { force: true });
+    await rm(exportTextDownload, { force: true });
+    await rm(updateCheckout, { force: true });
+    await rm(updateManifest, { force: true });
+    await prepareSyntheticSyncFixture();
+  }
+} catch (error) {
+  if (!keepWork) await cleanupLocalWorkDir();
+  throw new Error(`Office beta fixture setup failed with ${fixturePython}. Install the pinned dependencies with '${fixturePython} -m pip install -r scripts/requirements-office-test.txt' or set ONEDRIVE_OFFICE_TEST_PYTHON to a compatible Python executable. ${error.message}`);
 }
-if (live && !cleanupStale && !tenantMatrix) await prepareSyntheticSyncFixture();
 
 const child = spawn(process.execPath, [serverPath], {
   cwd: workspace,
@@ -396,6 +428,8 @@ const child = spawn(process.execPath, [serverPath], {
     ...process.env,
     ONEDRIVE_STORAGE_ROOT: betaStorageRoot,
     ONEDRIVE_CACHE_ROOT: betaCacheRoot,
+    ONEDRIVE_OFFICE_PYTHON: fixturePython,
+    ONEDRIVE_FETCH_TIMEOUT_MS: String(fetchTimeoutMs),
     ONEDRIVE_ADDITIONAL_LOCAL_SYNC_ROOTS: JSON.stringify([syntheticSyncRoot])
   },
   stdio: ["pipe", "pipe", "pipe"]
@@ -560,7 +594,7 @@ async function pollIndexedSearch(name, args, matches, options = {}) {
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     lastResult = await tool(name, args);
     if (!lastResult.isError && matches(lastResult.value)) return { ...lastResult, pollAttempts: attempt };
-    if (lastResult.isError && !clearlyTransientReadError(lastResult.value)) return { ...lastResult, pollAttempts: attempt };
+    if (lastResult.isError) return { ...lastResult, pollAttempts: attempt };
     if (attempt < maxAttempts) await wait(delayMs);
   }
   return { ...lastResult, pollAttempts: maxAttempts };
@@ -819,7 +853,7 @@ async function runOneTenantMatrixEntry(tenant) {
   if (keepWork) childArgs.push("--keep-work");
   const entry = spawn(process.execPath, childArgs, {
     cwd: workspace,
-    env: { ...process.env, ONEDRIVE_TENANT: tenant },
+    env: { ...process.env, ONEDRIVE_TENANT: tenant, ONEDRIVE_FETCH_TIMEOUT_MS: String(fetchTimeoutMs) },
     stdio: ["ignore", "pipe", "pipe"]
   });
   let stdout = "";
@@ -878,12 +912,14 @@ const results = {
   checks: [],
   cleanup: null,
   retryEvents: toolRetryEvents,
+  readPolicy: { fetchTimeoutMs, readRetryAttempts, readRetryDelayMs },
   stderr: ""
 };
 
 function record(name, status, details = {}) {
   if (!resultStatuses.has(status)) throw new Error(`Invalid beta result status for ${name}: ${status}`);
   results.checks.push({ name, status, details });
+  process.stderr.write(`${JSON.stringify({ event: "beta-check", name, status, completed: results.checks.length })}\n`);
 }
 
 let folder = null;
@@ -931,7 +967,19 @@ try {
     capabilities: {},
     clientInfo: { name: "onedrive-beta-test", version: "1.0.0" }
   });
-  record("initialize", init.result?.serverInfo?.name === "onedrive" ? "pass" : "fail", init.result);
+  const initializedServerInfo = init.result?.serverInfo;
+  const initializedIcon = initializedServerInfo?.icons?.[0];
+  record(
+    "initialize",
+    initializedServerInfo?.name === "onedrive"
+      && initializedServerInfo?.title === "OneDrive"
+      && initializedIcon?.mimeType === "image/png"
+      && initializedIcon?.sizes?.includes("256x256")
+      && initializedIcon?.src?.startsWith("data:image/png;base64,")
+      ? "pass"
+      : "fail",
+    init.result
+  );
 
   const listed = await request("tools/list");
   const toolNames = listed.result.tools.map((entry) => entry.name).sort();
@@ -986,6 +1034,9 @@ try {
     userPrincipalName: me.userPrincipalName,
     mail: me.mail
   });
+  if (sameMailbox(inviteRecipient, me.userPrincipalName) || sameMailbox(inviteRecipient, me.mail)) {
+    throw new Error("--invite-recipient must differ from the signed-in OneDrive account. Inviting the owner returns the existing non-revocable owner permission instead of creating an isolated sharing grant. Use another account or an explicit user-controlled email alias.");
+  }
 
   const drive = assertOk("onedrive_drive", await tool("onedrive_drive"));
   record("drive metadata read", drive.id && drive.driveType ? "pass" : "fail", {
@@ -2168,41 +2219,59 @@ try {
     requiredToInvite: inviteMissingExpected.requiredToInvite
   });
 
-  const inviteLiveValue = assertOk("invite permission live", await toolWithPreview("onedrive_invite_permission", {
+  const inviteLiveResult = await toolWithPreview("onedrive_invite_permission", {
     itemId: copiedInfo.id,
     recipients: [{ email: inviteRecipient }],
     role: "read",
     expectedName: copyFileName,
     dryRun: false,
     confirmed: true
-  }));
-  const invitePermissionId = inviteLiveValue.permissionDiff?.added?.[0]?.id
-    || inviteLiveValue.permissions?.find((permission) => permission.id)?.id;
+  });
   const permissionsAfterInvite = assertOk("permissions after invite", await tool("onedrive_permissions", { itemId: copiedInfo.id }));
-  record("invite permission silently grants the explicit recipient", inviteLiveValue.confirmed === true
-    && inviteLiveValue.invite?.sendInvitation === false
-    && Boolean(invitePermissionId)
-    && permissionsAfterInvite.permissions?.some((permission) => permission.id === invitePermissionId) ? "pass" : "fail", {
-    recipient: inviteRecipient,
-    permissionId: invitePermissionId,
-    invite: inviteLiveValue.invite,
-    diff: inviteLiveValue.permissionDiff
-  });
+  if (inviteLiveResult.isError) {
+    const beforeIds = new Set((inviteDryRun.beforePermissions || []).map((permission) => permission.id));
+    const unexpectedAdded = (permissionsAfterInvite.permissions || []).filter((permission) => permission.id && !beforeIds.has(permission.id));
+    const rejectedWithoutChange = /\bsharingFailed\b/i.test(errorText(inviteLiveResult.value)) && unexpectedAdded.length === 0;
+    if (!rejectedWithoutChange) {
+      throw new Error(`invite permission live returned error or partial state: ${errorText(inviteLiveResult.value)}${unexpectedAdded.length ? ` Unexpected permissions: ${JSON.stringify(unexpectedAdded)}` : ""}`);
+    }
+    record("invite permission silently grants the explicit recipient", "blocked", {
+      recipient: inviteRecipient,
+      reason: "Microsoft Graph rejected the explicit recipient with sharingFailed and a permission audit verified that no new grant was created.",
+      response: inviteLiveResult.value
+    });
+    record("explicit recipient permission is revoked and absent", "blocked", {
+      reason: "No revocable named-recipient permission was created, so no recipient grant required cleanup."
+    });
+  } else {
+    const inviteLiveValue = inviteLiveResult.value;
+    const inviteAddedPermission = inviteLiveValue.permissionDiff?.added?.find((permission) => permission.id && permission.revocable !== false);
+    const invitePermissionId = inviteAddedPermission?.id;
+    record("invite permission silently grants the explicit recipient", inviteLiveValue.confirmed === true
+      && inviteLiveValue.invite?.sendInvitation === false
+      && Boolean(invitePermissionId)
+      && permissionsAfterInvite.permissions?.some((permission) => permission.id === invitePermissionId && permission.revocable !== false) ? "pass" : "fail", {
+      recipient: inviteRecipient,
+      permissionId: invitePermissionId,
+      invite: inviteLiveValue.invite,
+      diff: inviteLiveValue.permissionDiff
+    });
 
-  if (!invitePermissionId) throw new Error("The live invite did not return a verifiable permission ID.");
-  const inviteRevoked = assertOk("revoke invited recipient", await toolWithPreview("onedrive_revoke_permission", {
-    itemId: copiedInfo.id,
-    permissionId: invitePermissionId,
-    expectedId: copiedInfo.id,
-    dryRun: false,
-    confirmed: true
-  }));
-  const permissionsAfterInviteRevoke = assertOk("permissions after invite revoke", await tool("onedrive_permissions", { itemId: copiedInfo.id }));
-  record("explicit recipient permission is revoked and absent", inviteRevoked.permissionDiff?.removed?.some((permission) => permission.id === invitePermissionId)
-    && !permissionsAfterInviteRevoke.permissions?.some((permission) => permission.id === invitePermissionId) ? "pass" : "fail", {
-    permissionId: invitePermissionId,
-    remainingPermissionIds: permissionsAfterInviteRevoke.permissions?.map((permission) => permission.id)
-  });
+    if (!invitePermissionId) throw new Error("The live invite did not create a new revocable permission. Confirm that --invite-recipient is a non-owner account or explicit user-controlled alias, then retry with a fresh beta run ID.");
+    const inviteRevoked = assertOk("revoke invited recipient", await toolWithPreview("onedrive_revoke_permission", {
+      itemId: copiedInfo.id,
+      permissionId: invitePermissionId,
+      expectedId: copiedInfo.id,
+      dryRun: false,
+      confirmed: true
+    }));
+    const permissionsAfterInviteRevoke = assertOk("permissions after invite revoke", await tool("onedrive_permissions", { itemId: copiedInfo.id }));
+    record("explicit recipient permission is revoked and absent", inviteRevoked.permissionDiff?.removed?.some((permission) => permission.id === invitePermissionId)
+      && !permissionsAfterInviteRevoke.permissions?.some((permission) => permission.id === invitePermissionId) ? "pass" : "fail", {
+      permissionId: invitePermissionId,
+      remainingPermissionIds: permissionsAfterInviteRevoke.permissions?.map((permission) => permission.id)
+    });
+  }
 
   const sharingLive = assertOk("sharing link live", await toolWithPreview("onedrive_create_sharing_link", {
     itemId: copiedInfo.id,
@@ -2494,7 +2563,21 @@ if (!keepWork) {
   results.localWorkDir = outDir;
 }
 
-console.log(JSON.stringify(results, null, 2));
+const serializedResults = `${JSON.stringify(results, null, 2)}\n`;
+if (reportPath) {
+  await mkdir(dirname(reportPath), { recursive: true });
+  await writeFile(reportPath, serializedResults, "utf8");
+  console.log(JSON.stringify({
+    reportPath,
+    summary: results.summary,
+    runtimeMs: results.runtimeMs,
+    cleanup: results.cleanup,
+    localWorkCleaned: results.localWorkCleaned,
+    error: results.error || null
+  }, null, 2));
+} else {
+  process.stdout.write(serializedResults);
+}
 
 if (results.error || failCount > 0) {
   process.exitCode = 1;

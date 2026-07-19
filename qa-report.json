@@ -1,13 +1,13 @@
 {
   "schemaVersion": 2,
-  "decision": "Beta Pending — Installed Cache Verification Required",
-  "date": "2026-07-17",
-  "generatedAt": "2026-07-17T03:38:35Z",
+  "decision": "Pass",
+  "date": "2026-07-19",
+  "generatedAt": "2026-07-19T18:30:35Z",
   "source": {
-    "commit": "fd1b102b50bf0b0e8104c1b7c85848167e7d4bed",
-    "workingTree": "tested hardening changes on top of the recorded source commit; fresh immutable cache installed with parity; a new Codex task is required to load it",
-    "pluginVersion": "0.5.0+codex.20260717033601",
-    "contentDigest": null
+    "commit": "e0a2da72a301221239f786cd19ecbe737d4874db",
+    "workingTree": "fully validated OneDrive, Linux encrypted-auth, Synology DS923+ deployment, and ChatGPT structured-icon fixes on top of the recorded source commit; immutable cache parity is verified",
+    "pluginVersion": "0.5.0+codex.20260719183035",
+    "contentDigest": "08c4ab4f9aa2a7979def30787465ac5fe69397a692aa66aaa4eee6bb6d03204a"
   },
   "contract": {
     "toolCount": 84,
@@ -18,32 +18,58 @@
     { "name": "Exact MCP contract", "status": "pass", "toolCount": 84 },
     { "name": "Plugin manifest/version alignment", "status": "pass" },
     { "name": "Prepackage negative checks", "status": "pass" },
-    { "name": "Office Open XML operations", "status": "pass", "operations": 78, "word": 21, "excel": 32, "powerpoint": 25 },
+    { "name": "Office Open XML operations", "status": "pass", "operations": 79, "word": 21, "excel": 33, "powerpoint": 25 },
     { "name": "Office security corpus", "status": "pass" },
     { "name": "Genuine package reopening", "status": "pass" },
     { "name": "Mock Microsoft Graph", "status": "pass", "checks": 153 },
     { "name": "Read-only OneDrive doctor and tenant checks", "status": "pass", "checks": 6 },
-    { "name": "Cleanup preview", "status": "pass" },
+    { "name": "Cleanup preview", "status": "pass", "candidates": 0 },
     { "name": "Whitespace", "status": "pass" }
   ],
   "liveRuns": {
-    "source": { "status": "pass", "scope": "read-only health harness", "checks": 6, "contractTools": 84, "runId": "codex-beta-20260717t033726496z-35285", "folderName": "Codex OneDrive Plugin Beta Test codex-beta-20260717t033726496z-35285", "runtimeMs": 1926, "cleanupVerified": true },
-    "installed": { "status": "pass", "scope": "read-only health harness", "checks": 6, "contractTools": 84, "runId": "codex-beta-20260717t033833268z-35644", "folderName": "Codex OneDrive Plugin Beta Test codex-beta-20260717t033833268z-35644", "runtimeMs": 1993, "cleanupVerified": true }
+    "source": {
+      "status": "pass",
+      "scope": "current 0.5.0 source: full isolated CRUD, Office, sharing, versioning, safety, encrypted-auth, and cleanup beta",
+      "checks": 106,
+      "passed": 96,
+      "blocked": 10,
+      "failed": 0,
+      "contractTools": 84,
+      "toolCoverage": { "contract": 84, "exercised": 83, "blocked": 1 },
+      "runId": "codex-beta-nas-source-20260719t1343",
+      "folderName": "Codex OneDrive Plugin Beta Test codex-beta-nas-source-20260719t1343",
+      "runtimeMs": 239193,
+      "cleanupVerified": true
+    },
+    "installed": {
+      "status": "pass",
+      "scope": "current 0.5.0 immutable cache: full isolated CRUD, Office, sharing, versioning, safety, encrypted-auth, and cleanup beta",
+      "checks": 106,
+      "passed": 96,
+      "blocked": 10,
+      "failed": 0,
+      "contractTools": 84,
+      "toolCoverage": { "contract": 84, "exercised": 83, "blocked": 1 },
+      "runId": "codex-beta-nas-installed-20260719t1348",
+      "folderName": "Codex OneDrive Plugin Beta Test codex-beta-nas-installed-20260719t1348",
+      "runtimeMs": 266863,
+      "cleanupVerified": true
+    }
   },
   "installedBuild": {
     "status": "pass",
-    "version": "0.5.0+codex.20260717033601",
-    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.5.0+codex.20260717033601",
+    "version": "0.5.0+codex.20260719183035",
+    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.5.0+codex.20260719183035",
     "oldCacheOverwritten": false
   },
   "cleanup": { "status": "pass", "remoteTestRootsRemaining": 0, "permissionsRemaining": 0, "anonymousLinksRemaining": 0, "isolatedLocalResidue": false },
   "sourceCacheParity": { "status": "pass", "bytes": "pass", "modes": "pass", "types": "pass", "symlinkTargets": "pass" },
   "blockedCoverage": [
-    { "area": "Business Graph Excel", "reason": "The available live account is personal; business behavior is mock-tested." },
-    { "area": "Organization-only sharing", "reason": "The available live account is personal; organization behavior is mock-tested." },
-    { "area": "Forced device-code polling", "reason": "The existing credential and consent remain untouched." },
-    { "area": "Keychain deletion", "reason": "The existing credential remains untouched." },
-    { "area": "Live recycle-bin restore", "reason": "Only native version restore is in live scope; recycle-bin restore remains mock/dry-run tested." },
-    { "area": "Fresh-cache full CRUD", "reason": "The newly installed cache passed the read-only live harness and exact parity. Full CRUD requires a fresh task because the current connector process remains loaded from the prior cache." }
+    { "area": "Business Graph Excel", "reason": "The connected live account is personal; the business backend passes mock coverage." },
+    { "area": "Organization-only sharing", "reason": "The connected live account is personal; organization behavior passes mock coverage." },
+    { "area": "Named-recipient sharing", "reason": "Microsoft Graph rejected the isolated plus-address recipient with sharingFailed; the harness verified that no permission was created and continued with anonymous-link grant/revoke coverage." },
+    { "area": "Forced device-code polling", "reason": "The healthy existing credential and consent remain untouched; suppression and mock flow coverage pass." },
+    { "area": "Keychain deletion", "reason": "The existing credential remains untouched; memory-only logout passes." },
+    { "area": "Live recycle-bin restore", "reason": "Recycle-bin restore remains dry-run/mock tested; native version restore passes live." }
   ]
 }

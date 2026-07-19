@@ -8,6 +8,7 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,7 +19,7 @@ OPENXML_TOOL_NAMES = {
     "excel": "onedrive_excel_batch_update",
     "powerpoint": "onedrive_powerpoint_batch_update",
 }
-EXPECTED_OPENXML_OPERATION_COUNTS = {"word": 21, "excel": 32, "powerpoint": 25}
+EXPECTED_OPENXML_OPERATION_COUNTS = {"word": 21, "excel": 33, "powerpoint": 25}
 COVERED_OPENXML_OPERATIONS = {kind: set() for kind in OPENXML_TOOL_NAMES}
 RICH_REAL_FIXTURE_OPERATIONS = {
     "word": {"insertImage", "replaceImage", "createContentControl", "deleteContentControl", "createBookmark", "deleteBookmark", "insertTableRow", "deleteTableRow", "insertTableColumn", "deleteTableColumn", "setHeaderFooterText", "setSectionProperties"},
@@ -363,6 +364,145 @@ def main():
         no_totals_cells = {cell["address"]: cell for cell in no_totals_result["sheets"][0]["cells"]}
         no_totals_table = no_totals_result["sheets"][0]["tables"][0]
         checks["excelDisableTotals"] = no_totals_edit["changeCount"] == 1 and no_totals_table["ref"] == "A1:B4" and no_totals_table["totalsRowCount"] == 0 and "A5" not in no_totals_cells and "B5" not in no_totals_cells
+
+        compatibility_xlsx = root / "compatibility-table.xlsx"
+        write_package(compatibility_xlsx, {
+            "_rels/.rels": root_rels("xl/workbook.xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"),
+            "xl/workbook.xml": """<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Log" sheetId="1" r:id="rId1"/></sheets></workbook>""",
+            "xl/_rels/workbook.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>""",
+            "xl/worksheets/sheet1.xml": """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:x14ac="http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac" xmlns:xr="http://schemas.microsoft.com/office/spreadsheetml/2014/revision" xmlns:xr2="http://schemas.microsoft.com/office/spreadsheetml/2015/revision2" xmlns:xr3="http://schemas.microsoft.com/office/spreadsheetml/2016/revision3" mc:Ignorable="x14ac xr xr2 xr3" xr:uid="{11111111-1111-1111-1111-111111111111}"><dimension ref="A1:B3"/><sheetData><row r="1"><c r="A1" s="1" t="inlineStr"><is><t>Metric</t></is></c><c r="B1" s="1" t="inlineStr"><is><t>Value</t></is></c></row><row r="2" ht="24" customHeight="1"><c r="A2" s="2" t="inlineStr"><is><t>Q1</t></is></c><c r="B2" s="3"><v>10</v></c></row><row r="3" ht="26" customHeight="1"><c r="A3" s="2" t="inlineStr"><is><t>Q2</t></is></c><c r="B3" s="3"><f>B2+1</f><v>11</v></c></row></sheetData><conditionalFormatting sqref="A2:B3"><cfRule type="expression" priority="1"><formula>B2&gt;0</formula></cfRule></conditionalFormatting><dataValidations count="1"><dataValidation type="whole" sqref="B2:B3"><formula1>0</formula1><formula2>100</formula2></dataValidation></dataValidations><hyperlinks><hyperlink ref="A2" r:id="rId2"/><hyperlink ref="A3" r:id="rId3"/></hyperlinks><tableParts count="1"><tablePart r:id="rId1"/></tableParts></worksheet>""",
+            "xl/worksheets/_rels/sheet1.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/q1" TargetMode="External"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/q2" TargetMode="External"/></Relationships>""",
+            "xl/tables/table1.xml": """<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:xr="http://schemas.microsoft.com/office/spreadsheetml/2014/revision" xmlns:xr3="http://schemas.microsoft.com/office/spreadsheetml/2016/revision3" mc:Ignorable="xr xr3" xr:uid="{22222222-2222-2222-2222-222222222222}" id="1" name="CompatibilityTable" displayName="CompatibilityTable" ref="A1:B3"><autoFilter ref="A1:B3"/><tableColumns count="2"><tableColumn id="1" name="Metric"/><tableColumn id="2" name="Value"/></tableColumns><tableStyleInfo name="TableStyleMedium2" showRowStripes="1"/></table>""",
+        })
+        compatibility_output = root / "compatibility-table-edited.xlsx"
+        compatibility_edit = run_helper(compatibility_xlsx, "excel", action="edit", outputPath=str(compatibility_output), operations=[
+            {"type": "addTableRow", "table": "CompatibilityTable", "values": [["Q3", 30]]},
+        ])
+        compatibility_validation = run_helper(compatibility_output, "excel", action="validate")
+        with zipfile.ZipFile(compatibility_output, "r") as package:
+            sheet_root = ET.fromstring(package.read("xl/worksheets/sheet1.xml"))
+            table_xml = package.read("xl/tables/table1.xml").decode("utf-8")
+            sheet_xml = package.read("xl/worksheets/sheet1.xml").decode("utf-8")
+            spreadsheet_ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+            new_row = next(row for row in sheet_root.find(spreadsheet_ns + "sheetData") if row.attrib.get("r") == "4")
+            new_cells = {cell.attrib.get("r"): cell for cell in new_row}
+            conditional = sheet_root.find(spreadsheet_ns + "conditionalFormatting")
+            validation = sheet_root.find(spreadsheet_ns + "dataValidations").find(spreadsheet_ns + "dataValidation")
+        checks["excelCompatibilityNamespacePreservation"] = (
+            compatibility_validation["valid"]
+            and compatibility_validation["package"]["markupCompatibilityErrors"] == []
+            and all(("xmlns:%s=" % prefix) in sheet_xml for prefix in ("x14ac", "xr", "xr2", "xr3"))
+            and all(("xmlns:%s=" % prefix) in table_xml for prefix in ("xr", "xr3"))
+        )
+        checks["excelAppendCopiesRowMetadata"] = (
+            compatibility_edit["changes"][0]["copiedFormatFromRow"] == 3
+            and compatibility_edit["changes"][0]["expandedConditionalFormatting"] == 1
+            and compatibility_edit["changes"][0]["expandedDataValidations"] == 1
+            and new_row.attrib.get("ht") == "26"
+            and new_row.attrib.get("customHeight") == "1"
+            and new_cells["A4"].attrib.get("s") == "2"
+            and new_cells["B4"].attrib.get("s") == "3"
+            and conditional.attrib.get("sqref") == "A2:B4"
+            and validation.attrib.get("sqref") == "B2:B4"
+        )
+
+        compatibility_deleted = root / "compatibility-table-deleted.xlsx"
+        compatibility_delete = run_helper(compatibility_output, "excel", action="edit", outputPath=str(compatibility_deleted), operations=[
+            {"type": "deleteTableRow", "table": "CompatibilityTable", "index": 0},
+        ])
+        compatibility_delete_validation = run_helper(compatibility_deleted, "excel", action="validate")
+        compatibility_delete_result = run_helper(compatibility_deleted, "excel")
+        deleted_cells = {cell["address"]: cell for cell in compatibility_delete_result["sheets"][0]["cells"]}
+        deleted_table = compatibility_delete_result["sheets"][0]["tables"][0]
+        with zipfile.ZipFile(compatibility_deleted, "r") as package:
+            deleted_sheet = ET.fromstring(package.read("xl/worksheets/sheet1.xml"))
+            deleted_relationships = ET.fromstring(package.read("xl/worksheets/_rels/sheet1.xml.rels"))
+            deleted_hyperlinks = deleted_sheet.find(spreadsheet_ns + "hyperlinks")
+            deleted_conditional = deleted_sheet.find(spreadsheet_ns + "conditionalFormatting")
+            deleted_validation = deleted_sheet.find(spreadsheet_ns + "dataValidations").find(spreadsheet_ns + "dataValidation")
+            deleted_dimension = deleted_sheet.find(spreadsheet_ns + "dimension")
+            deleted_row = next(row for row in deleted_sheet.find(spreadsheet_ns + "sheetData") if row.attrib.get("r") == "2")
+            relationship_ids = {entry.attrib.get("Id") for entry in list(deleted_relationships)}
+        delete_change = compatibility_delete["changes"][0]
+        checks["excelDeleteTableRowCompactsSafely"] = (
+            compatibility_delete_validation["valid"]
+            and compatibility_delete_validation["package"]["markupCompatibilityErrors"] == []
+            and deleted_table["ref"] == "A1:B3"
+            and deleted_cells["A2"]["value"] == "Q2"
+            and deleted_cells["B2"]["formula"] == "B1+1"
+            and deleted_cells["A3"]["value"] == "Q3"
+            and "A4" not in deleted_cells and "B4" not in deleted_cells
+            and deleted_row.attrib.get("ht") == "26"
+            and [cell.attrib.get("r") for cell in list(deleted_row)] == ["A2", "B2"]
+            and deleted_conditional.attrib.get("sqref") == "A2:B3"
+            and deleted_validation.attrib.get("sqref") == "B2:B3"
+            and deleted_dimension.attrib.get("ref") == "A1:B3"
+            and len(list(deleted_hyperlinks)) == 1
+            and list(deleted_hyperlinks)[0].attrib.get("ref") == "A2"
+            and "rId2" not in relationship_ids and "rId3" in relationship_ids
+            and delete_change["beforeRef"] == "A1:B4"
+            and delete_change["afterRef"] == "A1:B3"
+            and delete_change["formulasTranslated"] == 1
+            and delete_change["shrunkConditionalFormatting"] == 1
+            and delete_change["shrunkDataValidations"] == 1
+            and delete_change["removedHyperlinks"] == 1
+            and delete_change["shiftedHyperlinks"] == 1
+            and delete_change["removedHyperlinkRelationships"] == 1
+        )
+
+        shared_formula_xlsx = root / "shared-formula-table.xlsx"
+        write_package(shared_formula_xlsx, {
+            "_rels/.rels": root_rels("xl/workbook.xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"),
+            "xl/workbook.xml": """<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Shared" sheetId="1" r:id="rId1"/></sheets></workbook>""",
+            "xl/_rels/workbook.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>""",
+            "xl/worksheets/sheet1.xml": """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><dimension ref="A1:C4"/><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Metric</t></is></c><c r="B1" t="inlineStr"><is><t>Fit</t></is></c></row><row r="2" ht="22" customHeight="1"><c r="A2" t="inlineStr"><is><t>Q1</t></is></c><c r="B2"><f t="shared" ref="B2:B4" si="9">A2&amp;\"-fit\"</f><v>101</v></c><c r="C2" s="5"/></row><row r="3" ht="24" customHeight="1"><c r="A3" t="inlineStr"><is><t>Q2</t></is></c><c r="B3"><f t="shared" si="9"/><v>202</v></c><c r="C3" s="5"/></row><row r="4" ht="26" customHeight="1"><c r="A4" t="inlineStr"><is><t>Q3</t></is></c><c r="B4"><f t="shared" si="9"/><v>303</v></c><c r="C4" s="5"/></row></sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts></worksheet>""",
+            "xl/worksheets/_rels/sheet1.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/></Relationships>""",
+            "xl/tables/table1.xml": """<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="SharedTable" displayName="SharedTable" ref="A1:B4"><autoFilter ref="A1:B4"/><tableColumns count="2"><tableColumn id="1" name="Metric"/><tableColumn id="2" name="Fit"/></tableColumns><tableStyleInfo name="TableStyleMedium2" showRowStripes="1"/></table>""",
+        })
+        shared_formula_deleted = root / "shared-formula-table-deleted.xlsx"
+        shared_formula_edit = run_helper(shared_formula_xlsx, "excel", action="edit", outputPath=str(shared_formula_deleted), operations=[
+            {"type": "deleteTableRow", "table": "SharedTable", "index": 1},
+        ])
+        shared_formula_validation = run_helper(shared_formula_deleted, "excel", action="validate")
+        with zipfile.ZipFile(shared_formula_deleted, "r") as package:
+            shared_sheet = ET.fromstring(package.read("xl/worksheets/sheet1.xml"))
+            shared_rows = {row.attrib["r"]: row for row in shared_sheet.find(spreadsheet_ns + "sheetData")}
+            shared_master = next(cell for cell in shared_rows["2"] if cell.attrib.get("r") == "B2")
+            shared_follower = next(cell for cell in shared_rows["3"] if cell.attrib.get("r") == "B3")
+            shared_master_formula = shared_master.find(spreadsheet_ns + "f")
+            shared_follower_formula = shared_follower.find(spreadsheet_ns + "f")
+            shared_follower_cache = shared_follower.find(spreadsheet_ns + "v")
+        shared_change = shared_formula_edit["changes"][0]
+        checks["excelDeleteTableRowPreservesSharedFormulas"] = (
+            shared_formula_validation["valid"]
+            and shared_master_formula.attrib == {"t": "shared", "ref": "B2:B3", "si": "9"}
+            and shared_master_formula.text == 'A2&"-fit"'
+            and shared_follower_formula.attrib == {"t": "shared", "si": "9"}
+            and shared_follower_formula.text is None
+            and shared_follower_cache.text == "303"
+            and shared_rows["3"].attrib.get("ht") == "26"
+            and [cell.attrib.get("r") for cell in list(shared_rows["3"])] == ["A3", "B3", "C3"]
+            and shared_change["sharedFormulaRefsShrunk"] == 1
+            and shared_change["sharedFormulaCellsMoved"] == 1
+            and shared_change["formulasTranslated"] == 0
+            and shared_change["shiftedRowAttributes"] == 1
+        )
+
+        bad_compatibility = root / "bad-compatibility.xlsx"
+        write_package(bad_compatibility, {
+            "_rels/.rels": root_rels("xl/workbook.xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"),
+            "xl/workbook.xml": """<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>""",
+            "xl/_rels/workbook.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>""",
+            "xl/worksheets/sheet1.xml": """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="xr3"><sheetData/></worksheet>""",
+        })
+        bad_compatibility_result = subprocess.run(
+            [sys.executable, str(HELPER)],
+            input=json.dumps({"action": "validate", "inputPath": str(bad_compatibility), "kind": "excel"}),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        checks["undeclaredIgnorablePrefixRejected"] = bad_compatibility_result.returncode != 0 and "invalid markup-compatibility declarations" in bad_compatibility_result.stdout
 
         pptx = fixtures["powerpoint"]
         powerpoint = run_helper(pptx, "powerpoint", searchText="PowerPoint")

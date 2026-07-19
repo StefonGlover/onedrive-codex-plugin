@@ -1533,7 +1533,7 @@ const graph = createServer(async (req, res) => {
     versionTextRevision += 1;
     return json(res, 200, item("version-text", "versioned.txt", { size: versionTextBuffer.length, eTag: `etag-version-text-${versionTextRevision}`, cTag: `ctag-version-text-${versionTextRevision}` }));
   }
-  if (req.method === "POST" && path === "/v1.0/me/drive/items/version-text/versions/1.0/restore") {
+  if (req.method === "POST" && path === "/v1.0/me/drive/items/version-text/versions/1.0/restoreVersion") {
     if (req.headers["if-match"] !== `etag-version-text-${versionTextRevision}`) return json(res, 412, { error: { code: "preconditionFailed", message: "stale restore" } });
     versionTextBuffer = Buffer.from("alpha\nold\n", "utf8");
     versionTextRevision += 1;
@@ -2003,7 +2003,7 @@ try {
     assert(capabilities.value.runtime.pythonAvailable === true, "Office Python runtime should be available", capabilities.value);
     assert(capabilities.value.runtime.helperAvailable === true, "Office Open XML helper should be available", capabilities.value);
     assert(capabilities.value.backends.openXml.readOnlyToolsReady === true, "Open XML read tools should report ready", capabilities.value);
-    assert(capabilities.value.backends.openXml.operations.excel.includes("addTableRow") && capabilities.value.backends.openXml.operations.excel.includes("setTableTotals"), "Open XML table operations should be advertised", capabilities.value);
+    assert(capabilities.value.backends.openXml.operations.excel.includes("addTableRow") && capabilities.value.backends.openXml.operations.excel.includes("deleteTableRow") && capabilities.value.backends.openXml.operations.excel.includes("setTableTotals"), "Open XML table operations should be advertised", capabilities.value);
     assert(capabilities.value.backends.graphExcel.availableForAccount === false, "mock personal drive should report Graph Excel unavailable", capabilities.value);
     return { checked: expected, runtime: capabilities.value.runtime.pythonVersion };
   });
@@ -2158,6 +2158,17 @@ try {
     assert(excelPreview.value.semanticDiff?.affectedObjects?.some((entry) => entry.sheet === "Data" && entry.address === "B2"), "Excel preview should identify the affected cell", excelPreview);
     const excelLive = await tool("onedrive_excel_batch_update", { itemId: "office-excel", operations: [{ type: "setCell", sheet: "Data", address: "B2", value: "Updated" }], dryRun: false, confirmed: true, expectedId: "office-excel", previewToken: excelPreview.value.previewToken });
     assert(!excelLive.isError && excelLive.value.changeCount === 1, "Excel live edit failed", excelLive);
+    const tableCompactionOperations = [
+      { type: "addTableRow", table: "RevenueTable", values: [["Q2", 20]] },
+      { type: "deleteTableRow", table: "RevenueTable", index: 0 }
+    ];
+    const tableCompactionPreview = await tool("onedrive_excel_batch_update", { itemId: "office-excel", operations: tableCompactionOperations });
+    assert(!tableCompactionPreview.isError && tableCompactionPreview.value.changeCount === 2 && tableCompactionPreview.value.previewToken, "Excel table compaction preview failed", tableCompactionPreview);
+    assert(tableCompactionPreview.value.changes?.[1]?.operation === "deleteTableRow" && tableCompactionPreview.value.changes[1].beforeRef === "A1:B3" && tableCompactionPreview.value.changes[1].afterRef === "A1:B2", "Excel deleteTableRow preview should report bounded table compaction", tableCompactionPreview);
+    const staleCompactionLive = await tool("onedrive_excel_batch_update", { itemId: "office-excel", operations: tableCompactionOperations, dryRun: false, confirmed: true, expectedId: "office-excel", expectedETag: "stale-etag", previewToken: tableCompactionPreview.value.previewToken });
+    assert(!staleCompactionLive.isError && staleCompactionLive.value.revisionConflict === true && staleCompactionLive.value.requiredToUpdate, "Excel live edit should reject an explicit stale expectedETag", staleCompactionLive);
+    const tableCompactionLive = await tool("onedrive_excel_batch_update", { itemId: "office-excel", operations: tableCompactionOperations, dryRun: false, confirmed: true, expectedId: "office-excel", expectedETag: tableCompactionPreview.value.item.eTag, previewToken: tableCompactionPreview.value.previewToken });
+    assert(!tableCompactionLive.isError && tableCompactionLive.value.changeCount === 2, "Excel deleteTableRow should commit with the exact expectedETag", tableCompactionLive);
 
     const pptPreview = await tool("onedrive_powerpoint_batch_update", { itemId: "office-powerpoint", operations: [{ type: "replaceText", slideIndex: 0, shapeId: "2", find: "Hello", replace: "Updated" }] });
     assert(!pptPreview.isError && pptPreview.value.previewToken, "PowerPoint edit preview failed", pptPreview);
@@ -2180,7 +2191,7 @@ try {
     const updatedExcel = await tool("onedrive_excel_get_workbook", { itemId: "office-excel" });
     const updatedPowerpoint = await tool("onedrive_powerpoint_get_presentation", { itemId: "office-powerpoint" });
     assert(updatedWord.value.paragraphs[0].text === "Updated Word", "Word edit did not persist", updatedWord);
-    assert(updatedExcel.value.sheets[0].cells.some((cell) => cell.address === "B2" && cell.value === "Updated"), "Excel edit did not persist", updatedExcel);
+    assert(updatedExcel.value.sheets[0].cells.some((cell) => cell.address === "B2" && cell.value === 20), "Excel table compaction did not persist", updatedExcel);
     assert(updatedPowerpoint.value.slides[0].shapes[0].text === "Updated PowerPoint", "PowerPoint edit did not persist", updatedPowerpoint);
     const pptShapes = new Map(updatedPowerpoint.value.slides[0].shapes.map((shape) => [shape.id, shape]));
     assert(pptShapes.get("5")?.text === "Native text" && !pptShapes.has("6"), "PowerPoint text-box/style/delete edits did not persist", updatedPowerpoint);

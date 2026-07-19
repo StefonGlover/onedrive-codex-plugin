@@ -2,15 +2,17 @@
 
 Local Codex plugin for OneDrive file operations through Microsoft Graph.
 
-Release `0.5.0+codex.20260717033601` exposes an exact 84-tool contract.
+Release `0.5.0+codex.20260719183035` exposes an exact 84-tool contract.
 
 This is an unofficial integration and is not affiliated with, endorsed by, or sponsored by Microsoft.
+
+The primary plugin logo is `assets/onedrive-cloud-logo.png`; `assets/chatgpt-icon.png` is the square ChatGPT/Codex icon derived from the supplied artwork, and the dark-mode logo remains separate so each surface can render without distortion. The MCP initialization metadata embeds that square PNG as a standards-based `serverInfo.icons` data URI so ChatGPT can display it after a developer-mode refresh.
 
 The plugin is remote-first: it uses Microsoft Graph rather than the laptop's local OneDrive sync folder. Upload and download tools refuse local OneDrive sync-folder paths by default unless `allowLocalOneDriveSyncPath: true` is explicitly provided.
 
 ## Setup
 
-This plugin uses Microsoft identity platform device-code login and stores refresh tokens in macOS Keychain. It does not store Microsoft passwords.
+This plugin uses Microsoft identity platform device-code login. On macOS it stores refresh tokens in Keychain. On Linux/NAS deployments it uses an AES-256-GCM encrypted file protected by a separate owner-only key file. It does not store Microsoft passwords.
 
 1. Create or choose a Microsoft Entra app registration.
 2. Enable public client flows for the app.
@@ -25,7 +27,35 @@ scripts/configure.zsh
 5. Start a fresh Codex thread after installing or refreshing the plugin.
 6. Ask Codex to call `onedrive_config` with `checkToken: true`. If no reusable credential exists, call `onedrive_auth_device_start`, open the returned verification URL, enter the returned user code, then call `onedrive_auth_device_poll`.
 
-After the first successful login, the refresh token is reused from macOS Keychain. `onedrive_auth_device_start` now checks that credential before contacting Microsoft's device-code endpoint and returns `alreadyAuthenticated: true` without generating a code when authentication is healthy. Use `forceReauth: true` only for an intentional account switch, consent repair, or explicit sign-in reset. Temporary token-check network failures do not trigger a new login flow.
+After the first successful login, the refresh token is reused from the configured secure authentication store. `onedrive_auth_device_start` checks that credential before contacting Microsoft's device-code endpoint and returns `alreadyAuthenticated: true` without generating a code when authentication is healthy. Use `forceReauth: true` only for an intentional account switch, consent repair, or explicit sign-in reset. Temporary token-check network failures do not trigger a new login flow.
+
+## ChatGPT Developer mode
+
+The MCP server can also run as a private ChatGPT developer-mode app through OpenAI's [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels). Every tool descriptor includes the required read-only, open-world, and destructive impact annotations.
+
+1. Enable **Developer mode** in ChatGPT under **Settings → Security and login**.
+2. Create a tunnel in [OpenAI Platform tunnel settings](https://platform.openai.com/settings/organization/tunnels), and associate both the Platform organization and the target ChatGPT workspace.
+3. Install the latest official `tunnel-client` release and create a runtime API key whose principal has Tunnels **Read + Use**.
+4. Save that key outside the plugin source tree at `~/.config/tunnel-client/onedrive-chatgpt.env` as `OPENAI_API_KEY` or `CONTROL_PLANE_API_KEY`, and restrict the file to owner-only access with `chmod 600`. Keeping the runtime credential outside the plugin prevents it from entering a packaged cache version.
+5. Create the local stdio profile. Quote the server path inside `--mcp-command`; unquoted paths containing spaces are split into invalid Node arguments.
+
+```bash
+onedrive_plugin_root="$(pwd)"
+tunnel-client init \
+  --sample sample_mcp_stdio_local \
+  --profile onedrive-chatgpt \
+  --tunnel-id tunnel_... \
+  --mcp-command "node \"$onedrive_plugin_root/mcp/server.mjs\""
+```
+
+6. Validate the stopped profile with `tunnel-client doctor --profile onedrive-chatgpt --explain`, then run it with `node scripts/run-chatgpt-tunnel.mjs`. The launcher reads the private tunnel-client env file without printing the key. Set `ONEDRIVE_TUNNEL_ENV_FILE` only when you intentionally use a different credential-file path.
+7. In ChatGPT **Settings → Plugins**, create a developer-mode plugin, choose **Tunnel**, select the tunnel, choose **No Auth**, create the plugin, and connect it.
+
+Keep `tunnel-client` running for connector discovery and every OneDrive tool call from ChatGPT.
+
+### Synology NAS
+
+The DS923+ deployment under `deploy/synology/` runs the MCP server and `tunnel-client` in one outbound-only Container Manager project. The service uses persistent storage for cache, audit records, backups, and the encrypted Microsoft refresh token; the tunnel runtime key and vault encryption key remain separate owner-only files. No router port forwarding or public MCP listener is required. See `deploy/synology/README.md` for the project layout.
 
 ## Configuration
 
@@ -42,6 +72,9 @@ export ONEDRIVE_CLIENT_ID="your-public-client-app-id"
 export ONEDRIVE_TENANT="common"
 export ONEDRIVE_SCOPES="offline_access User.Read Files.ReadWrite"
 export ONEDRIVE_KEYCHAIN_SERVICE="Codex OneDrive"
+export ONEDRIVE_TOKEN_STORE="keychain" # encrypted-file on Linux/NAS
+export ONEDRIVE_TOKEN_FILE="$HOME/.codex/onedrive-plugin/auth/tokens.enc"
+export ONEDRIVE_TOKEN_ENCRYPTION_KEY_FILE="/run/onedrive-runtime/auth-vault.key"
 export ONEDRIVE_STORAGE_ROOT="$HOME/.codex/onedrive-plugin"
 export ONEDRIVE_CACHE_ROOT="$HOME/.codex/onedrive-plugin/cache"
 export ONEDRIVE_CACHE_TTL_SECONDS="900"
@@ -56,6 +89,8 @@ export ONEDRIVE_INDEX_OFFICE_EXPORT="false"
 
 `ONEDRIVE_TENANT` can be `common`, `consumers`, `organizations`, or a tenant ID. Use `common` for a plugin that may access either personal Microsoft accounts or work/school accounts.
 If Microsoft reports that the app is Microsoft-account-only and requires `/consumers`, the plugin retries device-code and refresh-token auth on `consumers` automatically when the configured tenant is `common`.
+
+`ONEDRIVE_TOKEN_STORE` defaults to `keychain` on macOS and `encrypted-file` on other platforms. The encrypted-file store requires `ONEDRIVE_TOKEN_ENCRYPTION_KEY_FILE` or `ONEDRIVE_TOKEN_ENCRYPTION_KEY`; the key must decode to exactly 32 bytes, and key files with group/other permissions or symlinks are rejected. Prefer the key-file option so the encryption key is not inherited broadly through process environments.
 
 You can also add friendly path aliases to the config file:
 
@@ -176,6 +211,7 @@ Managed Office backups have opaque IDs and manifests containing the original sta
 
 - Word exposes durable paragraph, table, and content-control anchors and 21 headless operations, including image insertion/replacement, bookmarks, content controls, table row/column changes, headers/footers, and section properties. Documents containing tracked changes are refused instead of silently changing review semantics.
 - Excel exposes worksheet, range, defined-name, and table/row-key anchors and 32 headless operations, including worksheet/table lifecycle, merge/unmerge, sort/filter, hyperlinks, notes, images, chart formatting, passwordless sheet protection, and pivot refresh-on-open. Business `.xlsx` Graph writes use scoped persistent sessions; personal workbooks and unsupported Graph operations use Open XML automatically.
+- Open XML validation now rejects undeclared prefixes referenced by `mc:Ignorable`, and serialization preserves original namespace declarations even when a prefix appears only in compatibility metadata. `addTableRow` copies the nearest row's cell styles and row attributes/height and extends applicable conditional-format/data-validation ranges. `deleteTableRow` compacts one table data row, shifts native hyperlinks, translates ordinary relative A1 formulas, safely shrinks bounded single-column shared-formula groups without changing their formulas or cached values, shrinks applicable ranges, and reports each preservation decision in its preview diff.
 - PowerPoint exposes persistent slide and shape anchors and 25 headless operations, including slides, images/cropping, tables and row/column changes, alternative text, z-order, grouping/ungrouping, and layout application.
 - Positional selectors remain valid. An anchor defaults to `rebasePolicy:"unique"`; moved targets re-resolve only when exactly one match exists. Missing, duplicate, or selector/anchor disagreement returns a structured conflict. Every live commit remains bound to the eTag used by its preview.
 - Encrypted and legacy binary files are refused. Macro-enabled edits require `allowMacros: true`; signed-package edits are always refused because any edit invalidates the signature.
@@ -327,14 +363,14 @@ Preview the exact new versioned cache directory, then install only after reviewi
 
 ```bash
 node scripts/install-versioned-cache.mjs
-node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.0+codex.20260717033601"
+node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.0+codex.20260719183035"
 ```
 
 After both live betas, regenerate the two QA reports, preview their exact sync into that new cache, then apply only those evidence files and re-run parity:
 
 ```bash
-node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.0+codex.20260717033601"
-node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.0+codex.20260717033601"
+node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.0+codex.20260719183035"
+node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.0+codex.20260719183035"
 ```
 
 Office compatibility checks are split by purpose:
@@ -361,8 +397,14 @@ Running the harness without `--live` is read-only. It prints the exact proposed 
 scripts/beta-test.mjs --live --confirmed --run-id=codex-beta-20260713t150000z --invite-recipient=person@example.com
 ```
 
+For a durable machine-readable result, add `--report=work/qa-artifacts/<run-id>.json`. When a report path is provided, the harness writes the complete JSON result there and keeps terminal output compact; the ignored `work/` tree prevents local beta evidence from entering the plugin package.
+
 All four live arguments are required. The test creates the exact named temporary OneDrive folder, exercises CRUD and safety behavior, silently grants then revokes read access for the explicit recipient, creates then revokes an anonymous test link, deletes only that test folder during cleanup, and removes isolated local work on success. Results are recorded as `pass`, `fail`, or `blocked`; a resource limitation is never reported as a pass. Pass `--keep-work` to keep local artifacts for debugging.
+The invite recipient must differ from the signed-in OneDrive owner. The harness rejects a self-recipient before creating the remote test folder because Microsoft returns the existing non-revocable owner grant rather than a new isolated permission; an explicit user-controlled email alias is acceptable when the provider treats it as a distinct recipient.
+If Microsoft Graph rejects a distinct recipient with `sharingFailed`, the harness immediately audits permissions. It continues with that named-recipient round trip marked blocked only when the audit proves no grant was created; any partial or ambiguous permission state remains a hard failure.
+The live harness uses one Python runtime for both Office fixtures and the plugin child process: `ONEDRIVE_OFFICE_TEST_PYTHON`, then `ONEDRIVE_OFFICE_PYTHON`, then `python3` from `PATH`. Set `ONEDRIVE_OFFICE_TEST_PYTHON=/absolute/path/to/python` when the pinned fixture dependencies are installed in another Python environment. Fixture setup failures are reported with the exact remediation command and remove partial local beta work unless `--keep-work` was requested; they occur before any remote mutation.
 Unknown, duplicate, and positional CLI options are rejected before the beta harness starts, so a misspelled safety or mode flag cannot silently fall through to a different test mode.
+The harness emits one compact progress event to stderr after every completed check. Live child Graph requests use a 10-second timeout by default and the harness does not multiply the server's built-in read retries; use `--fetch-timeout-ms=1000..60000` or `--read-retry-attempts=1..5` only when intentionally tuning a degraded connection.
 
 Find old beta-test folders without deleting them. Cleanup discovery uses bounded Graph search followed by item verification, so it does not recursively scan the entire drive. Candidates with missing or invalid timestamps are skipped, and invalid/overflowing cleanup limits are rejected before any delete:
 

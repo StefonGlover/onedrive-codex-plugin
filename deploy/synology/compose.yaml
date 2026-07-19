@@ -1,0 +1,38 @@
+services:
+  onedrive-chatgpt:
+    build:
+      context: ./app
+      dockerfile: deploy/synology/Dockerfile
+      args:
+        TUNNEL_CLIENT_VERSION: "0.0.10"
+        TARGETARCH: "amd64"
+    image: onedrive-chatgpt-nas:0.5.0-nas4
+    container_name: onedrive-chatgpt
+    restart: unless-stopped
+    environment:
+      ONEDRIVE_CLIENT_ID: "6e97d01c-edf8-43fe-bf69-bb494ae22513"
+      ONEDRIVE_TENANT: "consumers"
+      ONEDRIVE_SCOPES: "offline_access User.Read Files.ReadWrite"
+      ONEDRIVE_TUNNEL_ID: "tunnel_6a5cf76803d881918237de43c2db9888"
+      ONEDRIVE_TOKEN_STORE: "encrypted-file"
+      ONEDRIVE_TOKEN_FILE: "/data/auth/tokens.enc"
+      ONEDRIVE_TOKEN_ENCRYPTION_KEY_FILE: "/run/onedrive-runtime/auth-vault.key"
+      ONEDRIVE_CONCURRENCY_LIMIT: "2"
+    volumes:
+      - ./data:/data
+      - ./runtime:/run/onedrive-source
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+      - /run/onedrive-runtime:size=1m,mode=0700
+    pids_limit: 256
+    mem_limit: 2g

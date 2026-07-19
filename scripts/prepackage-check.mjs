@@ -57,7 +57,7 @@ const expectedOfficeOperationKinds = {
   ],
   excel: [
     "setCell", "setFormula", "setRange", "clearRange", "setStyle", "setNumberFormat",
-    "addConditionalFormat", "setDataValidation", "freezePanes", "setColumnWidth", "addTableRow",
+    "addConditionalFormat", "setDataValidation", "freezePanes", "setColumnWidth", "addTableRow", "deleteTableRow",
     "setTableTotals", "createChart", "updateChart", "renameSheet", "setDefinedName", "recalculate",
     "addWorksheet", "deleteWorksheet", "addTable", "deleteTable", "mergeRange", "unmergeRange", "sortRange",
     "setAutoFilter", "setHyperlink", "addNote", "deleteNote", "insertImage", "formatChart",
@@ -95,8 +95,10 @@ const requiredFiles = [
   ".codex-plugin/plugin.json",
   ".mcp.json",
   "mcp/server.mjs",
+  "mcp/auth-vault.mjs",
   "mcp/semantic-anchors.mjs",
   "mcp/text-patch.mjs",
+  "scripts/auth-vault-test.mjs",
   "scripts/benchmark.mjs",
   "scripts/beta-test.mjs",
   "scripts/tool-contract.mjs",
@@ -111,6 +113,10 @@ const requiredFiles = [
   "scripts/office-real-fixture-test.py",
   "scripts/office-security-test.py",
   "scripts/prepackage-check.mjs",
+  "deploy/synology/Dockerfile",
+  "deploy/synology/entrypoint.sh",
+  "deploy/synology/compose.yaml",
+  "deploy/synology/README.md",
   "skills/onedrive/SKILL.md",
   "README.md",
   "qa-report.md",
@@ -527,6 +533,13 @@ function checkToolSchemas() {
     if (seenToolNames.has(tool.name)) fail(`Duplicate MCP tool registered: ${tool.name}`);
     seenToolNames.add(tool.name);
     if (!tool.description || typeof tool.description !== "string") fail(`${tool.name} must have a non-empty description.`);
+    if (!tool.title || typeof tool.title !== "string") fail(`${tool.name} must have a non-empty title.`);
+    for (const hint of ["readOnlyHint", "openWorldHint", "destructiveHint"]) {
+      if (typeof tool.annotations?.[hint] !== "boolean") fail(`${tool.name} must define boolean annotations.${hint}.`);
+    }
+    if (tool.annotations.readOnlyHint && (tool.annotations.openWorldHint || tool.annotations.destructiveHint)) {
+      fail(`${tool.name} is read-only but advertises write-only impact hints.`);
+    }
     for (const issue of schemaConsistencyProblems(tool.name, tool.inputSchema || {})) fail(issue);
   }
   for (const [officeKind, expectedKinds] of Object.entries(expectedOfficeOperationKinds)) {

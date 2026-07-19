@@ -39,6 +39,7 @@ NS = {
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
     "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
     "ct": "http://schemas.openxmlformats.org/package/2006/content-types",
+    "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
     "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
     "pic": "http://schemas.openxmlformats.org/drawingml/2006/picture",
     "pr": "http://schemas.openxmlformats.org/package/2006/relationships",
@@ -47,11 +48,15 @@ NS = {
     "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
     "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
     "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+    "x14ac": "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac",
+    "xr": "http://schemas.microsoft.com/office/spreadsheetml/2014/revision",
+    "xr2": "http://schemas.microsoft.com/office/spreadsheetml/2015/revision2",
+    "xr3": "http://schemas.microsoft.com/office/spreadsheetml/2016/revision3",
 }
 
 for _prefix, _uri in NS.items():
     if _prefix not in {"ct", "pr"}:
-        ET.register_namespace(_prefix, _uri)
+        ET.register_namespace("" if _prefix == "s" else _prefix, _uri)
 
 
 class OfficePackageError(Exception):
@@ -60,6 +65,62 @@ class OfficePackageError(Exception):
 
 def q(prefix: str, local: str) -> str:
     return "{%s}%s" % (NS[prefix], local)
+
+
+def xml_namespace_declarations(payload: bytes) -> Dict[str, str]:
+    """Return every namespace declaration found in an XML part."""
+    declarations: Dict[str, str] = {}
+    try:
+        for _event, declaration in ET.iterparse(io.BytesIO(payload), events=("start-ns",)):
+            prefix, uri = declaration
+            declarations[prefix or ""] = uri
+    except ET.ParseError as error:
+        raise OfficePackageError("Invalid XML while reading namespace declarations: %s" % error) from error
+    return declarations
+
+
+def serialize_xml_preserving_namespaces(root: ET.Element, original_payload: bytes) -> bytes:
+    """Serialize an edited XML part without dropping compatibility declarations.
+
+    ElementTree only emits namespaces used by element or attribute names. OOXML's
+    mc:Ignorable value refers to prefixes as text, so declarations such as x14ac
+    can otherwise disappear even though the XML remains well formed.
+    """
+    original_namespaces = xml_namespace_declarations(original_payload)
+    for prefix, uri in original_namespaces.items():
+        if prefix == "xml" or re.fullmatch(r"ns\d+", prefix or ""):
+            continue
+        try:
+            ET.register_namespace(prefix, uri)
+        except ValueError as error:
+            raise OfficePackageError("OOXML part uses an unsupported namespace prefix: %s" % prefix) from error
+    serialized = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    serialized_namespaces = xml_namespace_declarations(serialized)
+    missing = [(prefix, uri) for prefix, uri in original_namespaces.items() if prefix not in serialized_namespaces and prefix != "xml"]
+    if missing:
+        root_start = re.search(br"<[^!?][^\s/>]*", serialized)
+        if root_start is None:
+            raise OfficePackageError("Serialized OOXML part has no document element.")
+        attributes = b"".join(
+            (b' xmlns="' if not prefix else b' xmlns:' + prefix.encode("utf-8") + b'="')
+            + uri.replace("&", "&amp;").replace('"', "&quot;").encode("utf-8")
+            + b'"'
+            for prefix, uri in missing
+        )
+        serialized = serialized[:root_start.end()] + attributes + serialized[root_start.end():]
+    return serialized
+
+
+def store_modified_xml(
+    package: zipfile.ZipFile,
+    modifications: Dict[str, Optional[bytes]],
+    part: str,
+    root: ET.Element,
+) -> None:
+    original_payload = modifications.get(part)
+    if original_payload is None:
+        original_payload = package.read(part)
+    modifications[part] = serialize_xml_preserving_namespaces(root, original_payload)
 
 
 def read_request() -> Dict[str, Any]:
@@ -199,6 +260,40 @@ def validate_content_types(package: zipfile.ZipFile, names: Iterable[str]) -> Li
         extension = name.rsplit(".", 1)[-1].lower() if "." in name else ""
         if name not in overrides and extension not in defaults:
             errors.append({"part": name, "error": "part has no Default or Override content type"})
+    return errors
+
+
+def validate_markup_compatibility(package: zipfile.ZipFile, names: Iterable[str]) -> List[Dict[str, str]]:
+    """Require every mc:Ignorable token to be declared in its XML scope."""
+    errors: List[Dict[str, str]] = []
+    for name in sorted(entry for entry in names if entry.endswith((".xml", ".rels"))):
+        payload = package.read(name)
+        pending: Dict[str, str] = {}
+        scopes: List[Dict[str, str]] = []
+        try:
+            for event, value in ET.iterparse(io.BytesIO(payload), events=("start", "end", "start-ns")):
+                if event == "start-ns":
+                    prefix, uri = value
+                    pending[prefix or ""] = uri
+                    continue
+                if event == "start":
+                    scope = dict(scopes[-1]) if scopes else {}
+                    scope.update(pending)
+                    pending.clear()
+                    scopes.append(scope)
+                    ignorable = value.attrib.get(q("mc", "Ignorable"))
+                    if ignorable:
+                        for prefix in ignorable.split():
+                            if prefix not in scope:
+                                errors.append({
+                                    "part": name,
+                                    "error": "mc:Ignorable prefix is not declared in scope",
+                                    "prefix": prefix,
+                                })
+                elif scopes:
+                    scopes.pop()
+        except ET.ParseError as error:
+            errors.append({"part": name, "error": "XML is not well formed: %s" % error})
     return errors
 
 
@@ -700,6 +795,18 @@ def inspect_package(path: Path, request: Dict[str, Any]) -> Dict[str, Any]:
             content_type_errors = validate_content_types(package, inventory["names"])
             if content_type_errors and request.get("strictContentTypes", True):
                 raise OfficePackageError("Office package has missing or incomplete content types.")
+            markup_compatibility_errors = validate_markup_compatibility(package, inventory["names"])
+            if markup_compatibility_errors and request.get("strictMarkupCompatibility", True):
+                first = markup_compatibility_errors[0]
+                if str(first.get("error", "")).startswith("XML is not well formed"):
+                    raise OfficePackageError(
+                        "Invalid XML in Office package part %s: %s."
+                        % (first.get("part"), first.get("error"))
+                    )
+                raise OfficePackageError(
+                    "Office package has invalid markup-compatibility declarations in %s: %s."
+                    % (first.get("part"), first.get("error"))
+                )
             if kind == "word":
                 content = inspect_word(package, request)
             elif kind == "excel":
@@ -746,6 +853,7 @@ def inspect_package(path: Path, request: Dict[str, Any]) -> Dict[str, Any]:
                     "hasDigitalSignatures": inventory["hasDigitalSignatures"],
                     "relationshipErrors": relationship_errors,
                     "contentTypeErrors": content_type_errors,
+                    "markupCompatibilityErrors": markup_compatibility_errors,
                     "fingerprint": package_fingerprint(package),
                 }
             })
@@ -1467,6 +1575,353 @@ def excel_remove_cell(root: ET.Element, address: str) -> None:
         sheet_data.remove(row)
 
 
+def excel_row_format_template(
+    root: ET.Element,
+    row_number: int,
+    start_column: int,
+    end_column: int,
+) -> Dict[str, Any]:
+    sheet_data = root.find(q("s", "sheetData"))
+    row = next((entry for entry in list(sheet_data or []) if int(entry.attrib.get("r", "0")) == row_number), None)
+    if row is None:
+        return {"rowAttributes": {}, "cellAttributes": {}}
+    cell_attributes: Dict[int, Dict[str, str]] = {}
+    for cell in row.findall(q("s", "c")):
+        try:
+            column, _row = excel_address_parts(cell.attrib.get("r", ""))
+        except OfficePackageError:
+            continue
+        if start_column <= column <= end_column:
+            cell_attributes[column] = {key: value for key, value in cell.attrib.items() if key not in {"r", "t"}}
+    return {
+        "rowAttributes": {key: value for key, value in row.attrib.items() if key != "r"},
+        "cellAttributes": cell_attributes,
+    }
+
+
+def excel_apply_row_format_template(
+    root: ET.Element,
+    row_number: int,
+    start_column: int,
+    end_column: int,
+    template: Dict[str, Any],
+) -> None:
+    first_cell = find_or_create_excel_cell(root, "%s%d" % (excel_column_name(start_column), row_number))
+    sheet_data = root.find(q("s", "sheetData"))
+    row = next(entry for entry in list(sheet_data or []) if first_cell in list(entry))
+    row.attrib.clear()
+    row.attrib.update(template.get("rowAttributes", {}))
+    row.attrib["r"] = str(row_number)
+    for column in range(start_column, end_column + 1):
+        cell = find_or_create_excel_cell(root, "%s%d" % (excel_column_name(column), row_number))
+        cell.attrib.clear()
+        cell.attrib.update(template.get("cellAttributes", {}).get(column, {}))
+        cell.attrib["r"] = "%s%d" % (excel_column_name(column), row_number)
+
+
+def excel_expand_sqref_end_row(
+    root: ET.Element,
+    old_end_row: int,
+    new_end_row: int,
+    start_column: int,
+    end_column: int,
+) -> Dict[str, int]:
+    """Extend validation and conditional-format ranges that ended at a table edge."""
+    range_pattern = re.compile(r"^(\$?[A-Z]{1,3})(\$?\d+):(\$?[A-Z]{1,3})(\$?\d+)$")
+
+    def expanded(value: str) -> Tuple[str, bool]:
+        changed = False
+        tokens = []
+        for token in value.upper().split():
+            match = range_pattern.fullmatch(token)
+            if match:
+                first_column = excel_address_parts(match.group(1).replace("$", "") + "1")[0]
+                last_column = excel_address_parts(match.group(3).replace("$", "") + "1")[0]
+                last_row = int(match.group(4).replace("$", ""))
+                if last_row == old_end_row and first_column <= end_column and last_column >= start_column:
+                    row_prefix = "$" if match.group(4).startswith("$") else ""
+                    token = "%s%s:%s%s%d" % (match.group(1), match.group(2), match.group(3), row_prefix, new_end_row)
+                    changed = True
+            tokens.append(token)
+        return " ".join(tokens), changed
+
+    counts = {"conditionalFormatting": 0, "dataValidation": 0}
+    for container in root.findall(q("s", "conditionalFormatting")):
+        replacement, changed = expanded(container.attrib.get("sqref", ""))
+        if changed:
+            container.attrib["sqref"] = replacement
+            counts["conditionalFormatting"] += 1
+    validations = root.find(q("s", "dataValidations"))
+    for validation in list(validations or []):
+        replacement, changed = expanded(validation.attrib.get("sqref", ""))
+        if changed:
+            validation.attrib["sqref"] = replacement
+            counts["dataValidation"] += 1
+    return counts
+
+
+def excel_translate_formula_rows(formula: str, delta: int) -> str:
+    """Translate relative A1 row references while preserving strings and absolute rows."""
+    reference_pattern = re.compile(r"(?<![A-Z0-9_.])(?P<column>\$?[A-Z]{1,3})(?P<absolute>\$?)(?P<row>[1-9][0-9]*)(?![A-Z0-9_(])", re.IGNORECASE)
+
+    def translated_segment(segment: str) -> str:
+        def replace(match: re.Match) -> str:
+            if match.group("absolute") == "$":
+                return match.group(0)
+            row = int(match.group("row")) + delta
+            if row < 1 or row > 1_048_576:
+                raise OfficePackageError("Excel formula translation moved a row reference outside the worksheet.")
+            return "%s%d" % (match.group("column"), row)
+        return reference_pattern.sub(replace, segment)
+
+    pieces = re.split(r'("(?:[^"]|"")*")', formula)
+    return "".join(piece if index % 2 else translated_segment(piece) for index, piece in enumerate(pieces))
+
+
+def excel_shrink_sqref_end_row(
+    root: ET.Element,
+    old_end_row: int,
+    new_end_row: int,
+    start_column: int,
+    end_column: int,
+) -> Dict[str, int]:
+    """Shrink validation and conditional-format ranges that ended at a table edge."""
+    return excel_expand_sqref_end_row(root, old_end_row, new_end_row, start_column, end_column)
+
+
+def excel_update_sheet_dimension(root: ET.Element) -> Optional[str]:
+    cells = []
+    for row in list(root.find(q("s", "sheetData")) or []):
+        for cell in row.findall(q("s", "c")):
+            try:
+                cells.append(excel_address_parts(cell.attrib.get("r", "")))
+            except OfficePackageError:
+                continue
+    reference = "A1"
+    if cells:
+        min_column = min(column for column, _row in cells)
+        max_column = max(column for column, _row in cells)
+        min_row = min(row for _column, row in cells)
+        max_row = max(row for _column, row in cells)
+        start = "%s%d" % (excel_column_name(min_column), min_row)
+        end = "%s%d" % (excel_column_name(max_column), max_row)
+        reference = start if start == end else "%s:%s" % (start, end)
+    dimension = root.find(q("s", "dimension"))
+    if dimension is not None:
+        dimension.attrib["ref"] = reference
+    return reference
+
+
+def excel_shift_table_hyperlinks_up(
+    package: zipfile.ZipFile,
+    modifications: Dict[str, Optional[bytes]],
+    sheet_part: str,
+    root: ET.Element,
+    deleted_row: int,
+    old_end_row: int,
+    start_column: int,
+    end_column: int,
+) -> Dict[str, int]:
+    hyperlinks = root.find(q("s", "hyperlinks"))
+    if hyperlinks is None:
+        return {"removed": 0, "shifted": 0, "relationshipsRemoved": 0}
+    removed_ids = []
+    removed = 0
+    shifted = 0
+    for hyperlink in list(hyperlinks):
+        reference = hyperlink.attrib.get("ref", "")
+        if ":" in reference:
+            try:
+                first_reference, last_reference = reference.split(":", 1)
+                first_column, first_row = excel_address_parts(first_reference.replace("$", ""))
+                last_column, last_row = excel_address_parts(last_reference.replace("$", ""))
+            except OfficePackageError:
+                continue
+            intersects_table_rows = (
+                first_column <= end_column
+                and last_column >= start_column
+                and first_row <= old_end_row
+                and last_row >= deleted_row
+            )
+            if intersects_table_rows:
+                raise OfficePackageError("Excel deleteTableRow does not support multi-cell hyperlink references that intersect the affected table rows.")
+            continue
+        try:
+            column, row = excel_address_parts(reference)
+        except OfficePackageError:
+            continue
+        if not (start_column <= column <= end_column and deleted_row <= row <= old_end_row):
+            continue
+        if row == deleted_row:
+            rel_id = hyperlink.attrib.get(q("r", "id"))
+            if rel_id:
+                removed_ids.append(rel_id)
+            hyperlinks.remove(hyperlink)
+            removed += 1
+        else:
+            hyperlink.attrib["ref"] = "%s%d" % (excel_column_name(column), row - 1)
+            shifted += 1
+    if not list(hyperlinks):
+        root.remove(hyperlinks)
+    relationships_removed = 0
+    if removed_ids:
+        relationship_part, relationships = excel_relationship_root(package, modifications, sheet_part)
+        still_used = {
+            node.attrib.get(q("r", "id"))
+            for node in list(root.find(q("s", "hyperlinks")) or [])
+            if node.attrib.get(q("r", "id"))
+        }
+        for relationship in list(relationships):
+            if relationship.attrib.get("Id") in removed_ids and relationship.attrib.get("Id") not in still_used:
+                relationships.remove(relationship)
+                relationships_removed += 1
+        modifications[relationship_part] = ET.tostring(relationships, encoding="utf-8", xml_declaration=True)
+    return {"removed": removed, "shifted": shifted, "relationshipsRemoved": relationships_removed}
+
+
+def excel_prepare_shared_formulas_for_row_delete(
+    root: ET.Element,
+    deleted_row: int,
+    old_end_row: int,
+    start_column: int,
+    end_column: int,
+) -> Dict[str, int]:
+    """Shrink shared-formula ranges without expanding formulas or touching caches."""
+    shared_cells: List[Tuple[ET.Element, ET.Element, int, int, str]] = []
+    masters: Dict[str, Tuple[ET.Element, int, int]] = {}
+    for cell in root.iter(q("s", "c")):
+        formula = cell.find(q("s", "f"))
+        if formula is None or formula.attrib.get("t") != "shared":
+            continue
+        column, row = excel_address_parts(cell.attrib.get("r", ""))
+        shared_index = formula.attrib.get("si")
+        if shared_index is None:
+            raise OfficePackageError("Excel shared formula is missing its shared index.")
+        shared_cells.append((cell, formula, column, row, shared_index))
+        if formula.text or formula.attrib.get("ref"):
+            if shared_index in masters:
+                raise OfficePackageError("Excel shared formula group has more than one master formula.")
+            masters[shared_index] = (formula, column, row)
+
+    moved = 0
+    affected_indexes = set()
+    for _cell, formula, column, row, shared_index in shared_cells:
+        if not (start_column <= column <= end_column and deleted_row <= row <= old_end_row):
+            continue
+        affected_indexes.add(shared_index)
+        master = masters.get(shared_index)
+        if master is None:
+            raise OfficePackageError("Excel shared formula group has no master formula.")
+        if (formula.text or formula.attrib.get("ref")) and row >= deleted_row:
+            raise OfficePackageError("Excel deleteTableRow refuses to move or delete a shared-formula master cell.")
+        if row > deleted_row:
+            moved += 1
+
+    refs_shrunk = 0
+    for shared_index in affected_indexes:
+        formula, master_column, master_row = masters[shared_index]
+        reference = formula.attrib.get("ref", "")
+        if ":" not in reference:
+            raise OfficePackageError("Excel shared formula master has no bounded range reference.")
+        first_reference, last_reference = reference.split(":", 1)
+        first_column, first_row = excel_address_parts(first_reference.replace("$", ""))
+        last_column, last_row = excel_address_parts(last_reference.replace("$", ""))
+        if first_column != last_column or first_column != master_column or first_row != master_row:
+            raise OfficePackageError("Excel deleteTableRow supports only single-column shared-formula groups anchored at their master cell.")
+        if not (first_row <= deleted_row <= last_row):
+            raise OfficePackageError("Excel shared formula cell falls outside its master's declared range.")
+        if last_row > old_end_row:
+            raise OfficePackageError("Excel shared formula range extends beyond the affected table rows.")
+        if deleted_row == first_row or last_row <= first_row:
+            raise OfficePackageError("Excel deleteTableRow refuses to delete the first or final member of a shared-formula group.")
+        formula.attrib["ref"] = "%s%d:%s%d" % (
+            excel_column_name(first_column), first_row, excel_column_name(last_column), last_row - 1
+        )
+        refs_shrunk += 1
+    return {"sharedFormulaRefsShrunk": refs_shrunk, "sharedFormulaCellsMoved": moved}
+
+
+def excel_shift_table_cells_up(
+    root: ET.Element,
+    deleted_row: int,
+    old_end_row: int,
+    start_column: int,
+    end_column: int,
+) -> Dict[str, int]:
+    sheet_data = root.find(q("s", "sheetData"))
+    if sheet_data is None:
+        raise OfficePackageError("Excel table worksheet has no sheet data.")
+    affected_rows = [
+        row for row in list(sheet_data)
+        if deleted_row <= int(row.attrib.get("r", "0")) <= old_end_row
+    ]
+
+    def outside_table_cell_is_blank(cell: ET.Element) -> bool:
+        column, _row = excel_address_parts(cell.attrib.get("r", ""))
+        if start_column <= column <= end_column:
+            return True
+        return all(cell.find(q("s", child)) is None for child in ("f", "v", "is"))
+
+    shift_row_attributes = all(
+        all(outside_table_cell_is_blank(cell) for cell in row.findall(q("s", "c")))
+        for row in affected_rows
+    )
+    shared_formula_changes = excel_prepare_shared_formulas_for_row_delete(
+        root, deleted_row, old_end_row, start_column, end_column
+    )
+    formulas_translated = 0
+    for source_row in range(deleted_row + 1, old_end_row + 1):
+        destination_row = source_row - 1
+        for column in range(start_column, end_column + 1):
+            destination_address = "%s%d" % (excel_column_name(column), destination_row)
+            excel_remove_cell(root, destination_address)
+            source_cells = excel_cells_in_columns(root, source_row, column, column)
+            if not source_cells:
+                continue
+            source = source_cells[0]
+            destination = find_or_create_excel_cell(root, destination_address)
+            destination.attrib.clear()
+            destination.attrib.update(source.attrib)
+            destination.attrib["r"] = destination_address
+            destination[:] = [ET.fromstring(ET.tostring(child)) for child in list(source)]
+            formula = destination.find(q("s", "f"))
+            if formula is not None:
+                formula_type = formula.attrib.get("t")
+                if formula_type not in {None, "normal", "shared"}:
+                    raise OfficePackageError("Excel deleteTableRow refuses array or data-table formulas.")
+                if formula_type != "shared" and formula.text:
+                    formula.text = excel_translate_formula_rows(formula.text, -1)
+                    formulas_translated += 1
+        if shift_row_attributes:
+            source_node = next((row for row in list(sheet_data) if int(row.attrib.get("r", "0")) == source_row), None)
+            destination_node = next((row for row in list(sheet_data) if int(row.attrib.get("r", "0")) == destination_row), None)
+            if source_node is not None and destination_node is not None:
+                destination_node.attrib.clear()
+                destination_node.attrib.update(source_node.attrib)
+                destination_node.attrib["r"] = str(destination_row)
+    for column in range(start_column, end_column + 1):
+        excel_remove_cell(root, "%s%d" % (excel_column_name(column), old_end_row))
+    for row in list(sheet_data):
+        row_number = int(row.attrib.get("r", "0"))
+        if not (deleted_row <= row_number <= old_end_row):
+            continue
+        cells = row.findall(q("s", "c"))
+        if len(cells) < 2:
+            continue
+        sorted_cells = sorted(cells, key=lambda cell: excel_address_parts(cell.attrib.get("r", ""))[0])
+        if cells != sorted_cells:
+            first_cell_index = min(list(row).index(cell) for cell in cells)
+            for cell in cells:
+                row.remove(cell)
+            for offset, cell in enumerate(sorted_cells):
+                row.insert(first_cell_index + offset, cell)
+    return {
+        "formulasTranslated": formulas_translated,
+        "shiftedRowAttributes": int(shift_row_attributes),
+        **shared_formula_changes,
+    }
+
+
 def excel_shift_table_cells_down(root: ET.Element, start_row: int, end_row: int, start_column: int, end_column: int, count: int) -> None:
     if end_row + count > 1_048_576:
         raise OfficePackageError("Excel table expansion exceeds the worksheet row limit.")
@@ -1522,15 +1977,88 @@ def excel_add_table_rows(
     if index < 0 or index > data_count:
         raise OfficePackageError("Excel addTableRow index is outside the table data rows.")
     insertion_row = start_row + header_count + index
+    format_source_row = insertion_row if index < data_count else max(start_row, insertion_row - 1)
+    format_template = excel_row_format_template(sheet, format_source_row, start_column, end_column)
     excel_shift_table_cells_down(sheet, insertion_row, end_row, start_column, end_column, len(values))
     for row_offset, row_values in enumerate(values):
+        excel_apply_row_format_template(
+            sheet,
+            insertion_row + row_offset,
+            start_column,
+            end_column,
+            format_template,
+        )
         for column_offset, value in enumerate(row_values):
             address = "%s%d" % (excel_column_name(start_column + column_offset), insertion_row + row_offset)
             set_excel_cell(find_or_create_excel_cell(sheet, address), value)
+    expanded_ranges = {"conditionalFormatting": 0, "dataValidation": 0}
+    if index == data_count:
+        data_end_row = end_row - totals_count
+        expanded_ranges = excel_expand_sqref_end_row(
+            sheet,
+            data_end_row,
+            data_end_row + len(values),
+            start_column,
+            end_column,
+        )
     excel_update_table_ref(table, start_column, start_row, end_column, end_row + len(values))
-    modifications[sheet_part] = ET.tostring(sheet, encoding="utf-8", xml_declaration=True)
-    modifications[table_part] = ET.tostring(table, encoding="utf-8", xml_declaration=True)
-    return {"table": table_name, "sheetPart": sheet_part, "index": index, "rowCount": len(values), "beforeRef": "%s%d:%s%d" % (excel_column_name(start_column), start_row, excel_column_name(end_column), end_row), "afterRef": table.attrib["ref"], "preservedTotalsRow": totals_count == 1}
+    store_modified_xml(package, modifications, sheet_part, sheet)
+    store_modified_xml(package, modifications, table_part, table)
+    return {"table": table_name, "sheetPart": sheet_part, "index": index, "rowCount": len(values), "beforeRef": "%s%d:%s%d" % (excel_column_name(start_column), start_row, excel_column_name(end_column), end_row), "afterRef": table.attrib["ref"], "preservedTotalsRow": totals_count == 1, "copiedFormatFromRow": format_source_row, "expandedConditionalFormatting": expanded_ranges["conditionalFormatting"], "expandedDataValidations": expanded_ranges["dataValidation"]}
+
+
+def excel_delete_table_row(
+    package: zipfile.ZipFile,
+    modifications: Dict[str, Optional[bytes]],
+    sheet_parts: Dict[str, str],
+    operation: Dict[str, Any],
+) -> Dict[str, Any]:
+    table_name = str(operation.get("table", ""))
+    sheet_part, table_part, sheet, table = excel_table_target(package, modifications, sheet_parts, table_name)
+    start_column, start_row, end_column, end_row = excel_table_bounds(table)
+    header_count = int(table.attrib.get("headerRowCount", "1"))
+    totals_count = int(table.attrib.get("totalsRowCount", "0"))
+    if header_count not in {0, 1} or totals_count not in {0, 1}:
+        raise OfficePackageError("Excel table uses unsupported header or totals row counts.")
+    data_count = end_row - start_row + 1 - header_count - totals_count
+    if data_count <= 1:
+        raise OfficePackageError("Excel deleteTableRow refuses to remove the table's final data row.")
+    index = int(operation.get("index", -1))
+    if index < 0 or index >= data_count:
+        raise OfficePackageError("Excel deleteTableRow index is outside the table data rows.")
+    deleted_row = start_row + header_count + index
+    before_ref = "%s%d:%s%d" % (excel_column_name(start_column), start_row, excel_column_name(end_column), end_row)
+    hyperlink_changes = excel_shift_table_hyperlinks_up(
+        package, modifications, sheet_part, sheet, deleted_row, end_row, start_column, end_column
+    )
+    shifted = excel_shift_table_cells_up(sheet, deleted_row, end_row, start_column, end_column)
+    old_data_end_row = end_row - totals_count
+    shrunk_ranges = excel_shrink_sqref_end_row(
+        sheet, old_data_end_row, old_data_end_row - 1, start_column, end_column
+    )
+    excel_update_table_ref(table, start_column, start_row, end_column, end_row - 1)
+    dimension = excel_update_sheet_dimension(sheet)
+    store_modified_xml(package, modifications, sheet_part, sheet)
+    store_modified_xml(package, modifications, table_part, table)
+    return {
+        "table": table_name,
+        "sheetPart": sheet_part,
+        "index": index,
+        "deletedWorksheetRow": deleted_row,
+        "beforeRef": before_ref,
+        "afterRef": table.attrib["ref"],
+        "preservedTotalsRow": totals_count == 1,
+        "formulasTranslated": shifted["formulasTranslated"],
+        "shiftedRowAttributes": shifted["shiftedRowAttributes"],
+        "sharedFormulaRefsShrunk": shifted["sharedFormulaRefsShrunk"],
+        "sharedFormulaCellsMoved": shifted["sharedFormulaCellsMoved"],
+        "shrunkConditionalFormatting": shrunk_ranges["conditionalFormatting"],
+        "shrunkDataValidations": shrunk_ranges["dataValidation"],
+        "removedHyperlinks": hyperlink_changes["removed"],
+        "shiftedHyperlinks": hyperlink_changes["shifted"],
+        "removedHyperlinkRelationships": hyperlink_changes["relationshipsRemoved"],
+        "worksheetDimension": dimension,
+    }
 
 
 EXCEL_TOTAL_FUNCTIONS = {
@@ -1623,8 +2151,8 @@ def excel_set_table_totals(
                 column.attrib.pop("totalsRowLabel", None)
                 set_excel_cell(find_or_create_excel_cell(sheet, "%s%d" % (excel_column_name(start_column + index), end_row)), None)
     excel_update_table_ref(table, start_column, start_row, end_column, end_row)
-    modifications[sheet_part] = ET.tostring(sheet, encoding="utf-8", xml_declaration=True)
-    modifications[table_part] = ET.tostring(table, encoding="utf-8", xml_declaration=True)
+    store_modified_xml(package, modifications, sheet_part, sheet)
+    store_modified_xml(package, modifications, table_part, table)
     return {"table": table_name, "beforeEnabled": before_enabled, "afterEnabled": enabled, "afterRef": table.attrib["ref"], "columns": configured}
 
 
@@ -2117,6 +2645,9 @@ def edit_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[
         op_type = operation.get("type")
         if op_type == "addTableRow":
             changes.append({"operation": op_type, **excel_add_table_rows(package, modifications, sheet_parts, operation)})
+            continue
+        if op_type == "deleteTableRow":
+            changes.append({"operation": op_type, **excel_delete_table_row(package, modifications, sheet_parts, operation)})
             continue
         if op_type == "setTableTotals":
             changes.append({"operation": op_type, **excel_set_table_totals(package, modifications, sheet_parts, operation)})
@@ -2967,6 +3498,16 @@ def write_modified_package(source: Path, destination: Path, modifications: Dict[
             if info.filename in modifications and modifications[info.filename] is None:
                 continue
             payload = modifications.get(info.filename, input_package.read(info.filename))
+            if (
+                info.filename in modifications
+                and payload is not None
+                and info.filename.endswith((".xml", ".rels"))
+            ):
+                try:
+                    modified_root = ET.fromstring(payload)
+                except ET.ParseError as error:
+                    raise OfficePackageError("Edited XML is not well formed in %s: %s" % (info.filename, error)) from error
+                payload = serialize_xml_preserving_namespaces(modified_root, input_package.read(info.filename))
             output_package.writestr(info, payload)
         existing = set(input_package.namelist())
         for name, payload in modifications.items():
@@ -2989,6 +3530,13 @@ def edit_package(path: Path, request: Dict[str, Any]) -> Dict[str, Any]:
             raise OfficePackageError("Digitally signed Office packages are refused because editing would invalidate the signature. Remove the signature in Office before editing.")
         if inventory["hasMacros"] and not request.get("allowMacros", False):
             raise OfficePackageError("Macro-enabled Office packages require allowMacros=true and explicit confirmation.")
+        markup_compatibility_errors = validate_markup_compatibility(package, inventory["names"])
+        if markup_compatibility_errors:
+            first = markup_compatibility_errors[0]
+            raise OfficePackageError(
+                "Office package has invalid markup-compatibility declarations in %s: %s."
+                % (first.get("part"), first.get("error"))
+            )
         if kind == "word":
             modifications, changes = edit_word(package, request)
             write_modified_package(path, destination, modifications)

@@ -12,10 +12,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { addSemanticAnchors, resolveSemanticOperations } from "./semantic-anchors.mjs";
 import { applyTextPatch, boundedLineDiff, decodeTextBuffer } from "./text-patch.mjs";
+import { createAuthVault } from "./auth-vault.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, "..");
 const pluginManifest = JSON.parse(readFileSync(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"));
+const chatgptIconDataUri = `data:image/png;base64,${readFileSync(join(pluginRoot, "assets", "chatgpt-icon.png")).toString("base64")}`;
 const defaultStorageRoot = join(homedir(), ".codex", "onedrive-plugin");
 const configPath = join(defaultStorageRoot, "config.json");
 let localConfigReadError = null;
@@ -220,6 +222,7 @@ const officeBatchCommonProperties = {
   confirmed: { type: "boolean", default: false },
   expectedName: { type: "string", description: "Safety check for the resolved remote file name." },
   expectedId: { type: "string", description: "Safety check for the resolved remote drive item ID." },
+  expectedETag: { type: "string", description: "Optional explicit revision guard for live Office edits. When provided, it must exactly match the current remote eTag." },
   previewToken: previewTokenSchema,
   createBackup: { type: "boolean", default: true },
   verify: { type: "boolean", default: true },
@@ -296,6 +299,7 @@ const excelOperationsSchema = {
     operationObject(["type", "sheet"], { type: { const: "freezePanes" }, sheet: { type: "string", minLength: 1 }, rows: { type: "integer", minimum: 0, maximum: 1048575 }, columns: { type: "integer", minimum: 0, maximum: 16383 } }),
     operationObject(["type", "sheet", "address", "width"], { type: { const: "setColumnWidth" }, ...excelBaseOperation, width: { type: "number", exclusiveMinimum: 0, maximum: 255 } }),
     operationObject(["type", "table", "values"], { type: { const: "addTableRow" }, table: { type: "string", minLength: 1 }, index: { type: ["integer", "null"], minimum: 0 }, values: { type: "array", minItems: 1, maxItems: 1000, items: { type: "array", minItems: 1, maxItems: 16384 } } }),
+    operationObject(["type", "table", "index"], { type: { const: "deleteTableRow" }, table: { type: "string", minLength: 1 }, index: { type: "integer", minimum: 0 } }),
     operationObject(["type", "table", "enabled"], { type: { const: "setTableTotals" }, table: { type: "string", minLength: 1 }, enabled: { type: "boolean" }, columns: { type: "array", maxItems: 16384, items: operationObject(["column"], { column: { anyOf: [{ type: "string", minLength: 1 }, { type: "integer", minimum: 0 }] }, function: { type: "string", enum: ["average", "count", "countNums", "custom", "max", "min", "none", "stdDev", "sum", "var"] }, label: { type: "string" }, formula: { type: "string", minLength: 1 } }) } }),
     operationObject(["type", "sheet", "chartType", "sourceData"], { type: { const: "createChart" }, sheet: { type: "string", minLength: 1 }, chartType: { type: "string", enum: ["BarClustered", "ColumnClustered", "Line", "Pie"] }, sourceData: { type: "string", minLength: 1 }, seriesBy: { type: "string", enum: ["Auto", "Columns", "Rows"] }, name: { type: "string", minLength: 1 }, titleText: { type: "string" }, height: { type: "number", exclusiveMinimum: 0 }, width: { type: "number", exclusiveMinimum: 0 }, left: { type: "number", minimum: 0 }, top: { type: "number", minimum: 0 } }),
     operationObject(["type", "sheet", "chart"], { type: { const: "updateChart" }, sheet: { type: "string", minLength: 1 }, chart: { type: "string", minLength: 1 }, chartType: { type: "string", enum: ["BarClustered", "ColumnClustered", "Line", "Pie"] }, name: { type: "string", minLength: 1 }, titleText: { type: "string" }, height: { type: "number", exclusiveMinimum: 0 }, width: { type: "number", exclusiveMinimum: 0 }, left: { type: "number", minimum: 0 }, top: { type: "number", minimum: 0 }, sourceData: { type: "string", minLength: 1 }, seriesBy: { type: "string", enum: ["Auto", "Columns", "Rows"] } }),
@@ -405,7 +409,7 @@ const tools = [
         checkToken: {
           type: "boolean",
           default: false,
-          description: "When true, try to get an access token from Keychain or memory."
+          description: "When true, try to get an access token from the configured secure authentication store or memory."
         }
       },
       additionalProperties: false
@@ -413,7 +417,7 @@ const tools = [
   },
   {
     name: "onedrive_auth_device_start",
-    description: "Verify existing Keychain authentication first, and start Microsoft device-code login only when reauthentication is required or explicitly forced.",
+    description: "Verify existing stored authentication first, and start Microsoft device-code login only when reauthentication is required or explicitly forced.",
     inputSchema: {
       type: "object",
       properties: {
@@ -422,7 +426,7 @@ const tools = [
         forceReauth: {
           type: "boolean",
           default: false,
-          description: "Generate a new device code even when existing Keychain authentication is healthy. Use only for explicit account switching or consent repair."
+          description: "Generate a new device code even when existing stored authentication is healthy. Use only for explicit account switching or consent repair."
         }
       },
       additionalProperties: false
@@ -430,7 +434,7 @@ const tools = [
   },
   {
     name: "onedrive_auth_device_poll",
-    description: "Poll Microsoft token endpoint after the user completes device-code login, then store tokens in Keychain.",
+    description: "Poll Microsoft token endpoint after the user completes device-code login, then save tokens in the configured secure authentication store.",
     inputSchema: {
       type: "object",
       properties: {
@@ -441,7 +445,7 @@ const tools = [
   },
   {
     name: "onedrive_logout",
-    description: "Forget cached OneDrive tokens from memory and optionally delete the Keychain token.",
+    description: "Forget cached OneDrive tokens from memory and optionally delete the securely stored token.",
     inputSchema: {
       type: "object",
       properties: {
@@ -449,7 +453,7 @@ const tools = [
         confirmed: {
           type: "boolean",
           default: false,
-          description: "Must be true after explicit user confirmation to delete the Keychain refresh token."
+          description: "Must be true after explicit user confirmation to delete the securely stored refresh token."
         }
       },
       additionalProperties: false
@@ -1924,6 +1928,112 @@ const tools = [
   }
 ];
 
+// ChatGPT developer-mode apps reject MCP tools that omit impact annotations.
+// Keep these classifications centralized so every descriptor carries the three
+// required hints and newly added tools fail closed during packaging.
+const readOnlyToolNames = new Set([
+  "onedrive_config",
+  "onedrive_me",
+  "onedrive_drive",
+  "onedrive_doctor",
+  "onedrive_presets",
+  "onedrive_list",
+  "onedrive_list_all",
+  "onedrive_scan",
+  "onedrive_search",
+  "onedrive_search_all",
+  "onedrive_find",
+  "onedrive_find_all",
+  "onedrive_delta",
+  "onedrive_sync_status",
+  "onedrive_content_search",
+  "onedrive_office_search",
+  "onedrive_office_capabilities",
+  "onedrive_office_validate",
+  "onedrive_word_get_document",
+  "onedrive_excel_get_workbook",
+  "onedrive_powerpoint_get_presentation",
+  "onedrive_office_backups",
+  "onedrive_office_compare_backup",
+  "onedrive_get_info",
+  "onedrive_read_text",
+  "onedrive_preview",
+  "onedrive_versions",
+  "onedrive_compare_version",
+  "onedrive_workspace_list",
+  "onedrive_workspace_status",
+  "onedrive_watch_status",
+  "onedrive_permissions",
+  "onedrive_batch_get_info",
+  "onedrive_batch_permissions",
+  "onedrive_recent",
+  "onedrive_large_files",
+  "onedrive_duplicates",
+  "onedrive_shared_by_me",
+  "onedrive_public_links",
+  "onedrive_audit_recent"
+]);
+
+const destructiveToolNames = new Set([
+  "onedrive_logout",
+  "onedrive_cache_clear",
+  "onedrive_content_index_clear",
+  "onedrive_word_batch_update",
+  "onedrive_excel_batch_update",
+  "onedrive_powerpoint_batch_update",
+  "onedrive_office_batch_transform",
+  "onedrive_office_restore_backup",
+  "onedrive_download",
+  "onedrive_download_excel",
+  "onedrive_download_word",
+  "onedrive_download_powerpoint",
+  "onedrive_export_pdf",
+  "onedrive_export_text",
+  "onedrive_write_text",
+  "onedrive_patch_text",
+  "onedrive_restore_version",
+  "onedrive_workspace_promote",
+  "onedrive_workspace_abandon",
+  "onedrive_revoke_permission",
+  "onedrive_batch_revoke_permissions",
+  "onedrive_batch_download",
+  "onedrive_batch_delete",
+  "onedrive_update_file",
+  "onedrive_audit_export",
+  "onedrive_audit_clear",
+  "onedrive_delete"
+]);
+
+const openWorldToolNames = new Set([
+  "onedrive_download",
+  "onedrive_download_excel",
+  "onedrive_download_word",
+  "onedrive_download_powerpoint",
+  "onedrive_export_pdf",
+  "onedrive_export_text",
+  "onedrive_invite_permission",
+  "onedrive_batch_download",
+  "onedrive_update_file",
+  "onedrive_audit_export"
+]);
+
+function toolTitle(name) {
+  return name
+    .replace(/^onedrive_/, "OneDrive ")
+    .split("_")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+for (const tool of tools) {
+  tool.title = tool.title || toolTitle(tool.name);
+  tool.annotations = {
+    readOnlyHint: readOnlyToolNames.has(tool.name),
+    openWorldHint: openWorldToolNames.has(tool.name),
+    destructiveHint: destructiveToolNames.has(tool.name)
+  };
+}
+
 const toolByName = new Map(tools.map((tool) => [tool.name, tool]));
 
 function schemaTypeMatches(value, type) {
@@ -2409,57 +2519,45 @@ function keychainAccount() {
   return "tokens";
 }
 
+function authVault(cfg = config()) {
+  return createAuthVault({
+    account: keychainAccount(),
+    service: cfg.keychainService,
+    storageRoot
+  });
+}
+
 function getKeychainToken(cfg = config()) {
-  try {
-    const raw = execFileSync("security", [
-      "find-generic-password",
-      "-a", keychainAccount(),
-      "-s", cfg.keychainService,
-      "-w"
-    ], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
+  return authVault(cfg).read();
 }
 
 function setKeychainToken(token, cfg = config()) {
-  const payload = JSON.stringify(token);
-  try {
-    execFileSync("security", [
-      "add-generic-password",
-      "-U",
-      "-a", keychainAccount(),
-      "-s", cfg.keychainService,
-      "-w", payload
-    ], { stdio: "ignore" });
-  } catch (error) {
-    throw new Error(`Could not store OneDrive token in Keychain: ${error.message}`);
-  }
+  authVault(cfg).write(token);
 }
 
 function deleteKeychainToken(cfg = config()) {
-  try {
-    execFileSync("security", [
-      "delete-generic-password",
-      "-a", keychainAccount(),
-      "-s", cfg.keychainService
-    ], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
+  return authVault(cfg).remove();
 }
 
 function publicConfig() {
   const cfg = config();
-  const stored = getKeychainToken(cfg);
+  const vault = authVault(cfg);
+  let stored = null;
+  let authStoreError = null;
+  try {
+    stored = vault.read();
+  } catch (error) {
+    authStoreError = safeToolErrorMessage(error);
+  }
   return {
     clientIdConfigured: Boolean(cfg.clientId),
     tenant: cfg.tenant,
     scopes: cfg.scopes,
+    authenticationStore: vault.mode,
+    storedCredentialConfigured: Boolean(stored?.refresh_token),
+    ...(authStoreError ? { authenticationStoreError: authStoreError } : {}),
     keychainService: cfg.keychainService,
-    keychainTokenConfigured: Boolean(stored?.refresh_token),
+    keychainTokenConfigured: vault.mode === "keychain" && Boolean(stored?.refresh_token),
     configPath,
     ...(localConfigReadError ? { configReadError: localConfigReadError } : {}),
     pathPresets: pathPresets(),
@@ -3738,6 +3836,8 @@ async function doctor(args = {}) {
     clientIdConfigured: cfgStatus.clientIdConfigured,
     tenant: cfgStatus.tenant,
     scopes: cfgStatus.scopes,
+    authenticationStore: cfgStatus.authenticationStore,
+    storedCredentialConfigured: cfgStatus.storedCredentialConfigured,
     keychainTokenConfigured: cfgStatus.keychainTokenConfigured,
     configPath: cfgStatus.configPath,
     ...(cfgStatus.configReadError ? { configReadError: cfgStatus.configReadError } : {})
@@ -3841,11 +3941,15 @@ async function startDeviceLogin(args = {}) {
   if (args.forceReauth !== true) {
     try {
       await getAccessToken(cfg);
+      const vault = authVault(config());
+      const storedCredentialConfigured = Boolean(getKeychainToken(config())?.refresh_token);
       return {
         authenticated: true,
         alreadyAuthenticated: true,
         deviceCodeIssued: false,
-        keychainTokenConfigured: Boolean(getKeychainToken(config())?.refresh_token),
+        authenticationStore: vault.mode,
+        storedCredentialConfigured,
+        keychainTokenConfigured: vault.mode === "keychain" && storedCredentialConfigured,
         message: "Existing OneDrive authentication is healthy. No device code was issued."
       };
     } catch (error) {
@@ -3934,7 +4038,9 @@ async function pollDeviceLogin(args = {}) {
     authTenant: tokenResponse.tenant || cfg.tenant,
     tokenType: tokenCache.token_type,
     expiresAt: tokenCache.expires_at ? new Date(tokenCache.expires_at).toISOString() : null,
-    refreshTokenStoredInKeychain: Boolean(tokenCache.refresh_token)
+    authenticationStore: authVault(cfg).mode,
+    refreshTokenStored: Boolean(tokenCache.refresh_token),
+    refreshTokenStoredInKeychain: authVault(cfg).mode === "keychain" && Boolean(tokenCache.refresh_token)
   };
 }
 
@@ -7036,7 +7142,7 @@ async function officeCapabilities() {
         mutationToolsReady: true,
         operations: {
           word: ["replaceText", "setParagraphText", "setParagraphStyle", "insertParagraph", "insertTable", "setTableCell", "setContentControlText", "addHyperlink", "addComment", "insertImage", "replaceImage", "createContentControl", "deleteContentControl", "createBookmark", "deleteBookmark", "insertTableRow", "deleteTableRow", "insertTableColumn", "deleteTableColumn", "setHeaderFooterText", "setSectionProperties"],
-          excel: ["setCell", "setFormula", "setRange", "clearRange", "setStyle", "setNumberFormat", "addConditionalFormat", "setDataValidation", "freezePanes", "setColumnWidth", "renameSheet", "setDefinedName", "recalculate", "addTableRow", "setTableTotals", "createChart", "updateChart", "addWorksheet", "deleteWorksheet", "addTable", "deleteTable", "mergeRange", "unmergeRange", "sortRange", "setAutoFilter", "setHyperlink", "addNote", "deleteNote", "insertImage", "formatChart", "setSheetProtection", "refreshPivot"],
+          excel: ["setCell", "setFormula", "setRange", "clearRange", "setStyle", "setNumberFormat", "addConditionalFormat", "setDataValidation", "freezePanes", "setColumnWidth", "renameSheet", "setDefinedName", "recalculate", "addTableRow", "deleteTableRow", "setTableTotals", "createChart", "updateChart", "addWorksheet", "deleteWorksheet", "addTable", "deleteTable", "mergeRange", "unmergeRange", "sortRange", "setAutoFilter", "setHyperlink", "addNote", "deleteNote", "insertImage", "formatChart", "setSheetProtection", "refreshPivot"],
           powerpoint: ["replaceText", "setShapeText", "setShapeGeometry", "setTextStyle", "addTextBox", "deleteShape", "replaceImage", "setTableCell", "setNotes", "duplicateSlide", "deleteSlide", "moveSlide", "addSlide", "addImage", "cropImage", "addTable", "insertTableRow", "deleteTableRow", "insertTableColumn", "deleteTableColumn", "setShapeAltText", "setZOrder", "groupShapes", "ungroupShape", "applySlideLayout"]
         },
         notes: [
@@ -7792,6 +7898,15 @@ async function officeBatchUpdate(args = {}, kind, toolName) {
   }
   if (args.dryRun === false && !hasExpectedIdentity(args)) {
     return { dryRun: false, confirmed: true, requiredToUpdate: "Provide expectedName or expectedId for live Office edits." };
+  }
+  if (args.dryRun === false && args.expectedETag && args.expectedETag !== rawItem.eTag) {
+    return {
+      dryRun: false,
+      confirmed: true,
+      item: simplifyItem(rawItem),
+      revisionConflict: true,
+      requiredToUpdate: "The explicit expectedETag does not match the current remote item. Re-read the item and run a new preview from the latest revision."
+    };
   }
 
   const transactionRoot = join(officeEditingRoot, `edit-${randomUUID()}`);
@@ -8918,7 +9033,7 @@ async function restoreVersion(args = {}) {
   const tokenRequired = previewTokenRequiredResult(preview, "onedrive_restore_version", proof, args.previewToken, "requiredToRestore");
   if (tokenRequired) return tokenRequired;
   try {
-    await graph(driveItemVersionPath(rawItem.id, target.id, "/restore"), { method: "POST", body: "{}", headers: { "If-Match": rawItem.eTag }, maxRetries: 0 });
+    await graph(driveItemVersionPath(rawItem.id, target.id, "/restoreVersion"), { method: "POST", headers: { "If-Match": rawItem.eTag }, maxRetries: 0 });
     const after = await getRawInfo({ itemId: rawItem.id, cacheResults: false });
     if (after.eTag === rawItem.eTag) throw new Error("Graph accepted the restore but the current eTag did not change; restore verification failed.");
     await writeMutationAudit("onedrive_restore_version", { status: "success", target: itemAuditSummary(rawItem), before: itemAuditSummary(rawItem), after: itemAuditSummary(after), versionId: String(target.id) });
@@ -10555,12 +10670,18 @@ async function callTool(name, args = {}) {
       if (args.deleteKeychainToken === true && args.confirmed !== true) {
         return textResult({
           memoryCleared: true,
+          storedCredentialDeleted: false,
           keychainTokenDeleted: false,
           confirmed: false,
-          requiredToDelete: "Set confirmed: true after explicit user confirmation to delete the OneDrive Keychain refresh token."
+          requiredToDelete: "Set confirmed: true after explicit user confirmation to delete the securely stored OneDrive refresh token."
         });
       }
-      return textResult({ memoryCleared: true, keychainTokenDeleted: args.deleteKeychainToken ? deleteKeychainToken() : false });
+      const storedCredentialDeleted = args.deleteKeychainToken ? deleteKeychainToken() : false;
+      return textResult({
+        memoryCleared: true,
+        storedCredentialDeleted,
+        keychainTokenDeleted: authVault(config()).mode === "keychain" && storedCredentialDeleted
+      });
     }
     case "onedrive_me":
       return textResult(await graph("/me"));
@@ -10731,10 +10852,22 @@ async function handleRequest(message) {
   const { id, method, params = {} } = message;
   try {
     if (method === "initialize") {
+      const requestedProtocolVersion = params.protocolVersion;
+      const supportedProtocolVersions = new Set(["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]);
       sendResult(id, {
-        protocolVersion: "2024-11-05",
+        protocolVersion: supportedProtocolVersions.has(requestedProtocolVersion) ? requestedProtocolVersion : "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "onedrive", version: pluginManifest.version || "0.1.0" }
+        serverInfo: {
+          name: "onedrive",
+          title: "OneDrive",
+          version: pluginManifest.version || "0.1.0",
+          description: "Search, read, organize, share, and safely edit files in your personal OneDrive.",
+          icons: [{
+            src: chatgptIconDataUri,
+            mimeType: "image/png",
+            sizes: ["256x256"]
+          }]
+        }
       });
       return;
     }

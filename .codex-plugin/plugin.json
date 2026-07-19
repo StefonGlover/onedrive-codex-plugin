@@ -1,6 +1,6 @@
 {
   "name": "onedrive",
-  "version": "0.5.0+codex.20260717033601",
+  "version": "0.5.0+codex.20260719183035",
   "description": "Manage OneDrive files and natively inspect or edit Word, Excel, and PowerPoint content from Codex.",
   "author": {
     "name": "Stefon Glover"
@@ -27,6 +27,7 @@
       "Sharing",
       "Permission management",
       "Keychain auth",
+      "Encrypted Linux auth vault",
       "Microsoft Graph",
       "Native Office editing",
       "Version history",
@@ -39,8 +40,8 @@
       "Inspect and safely edit a Word, Excel, or PowerPoint file in OneDrive."
     ],
     "brandColor": "#2563EB",
-    "composerIcon": "./assets/icon.png",
-    "logo": "./assets/logo.png",
+    "composerIcon": "./assets/chatgpt-icon.png",
+    "logo": "./assets/onedrive-cloud-logo.png",
     "logoDark": "./assets/logo-dark.png",
     "screenshots": [
       "./assets/screenshot-file-manager.png"

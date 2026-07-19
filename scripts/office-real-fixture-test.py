@@ -137,6 +137,7 @@ def main():
         edited_xlsx = root / "edited-excel.xlsx"
         excel = edit(source_xlsx, edited_xlsx, "excel", [
             {"type": "addTableRow", "table": "RevenueTable", "values": [["West", 40]]},
+            {"type": "deleteTableRow", "table": "RevenueTable", "index": 0},
             {"type": "setTableTotals", "table": "RevenueTable", "enabled": True, "columns": [{"column": "Region", "label": "Total"}, {"column": "Revenue", "function": "sum"}]},
             {"type": "createChart", "sheet": "Data", "sourceData": "A1:B4", "chartType": "ColumnClustered", "name": "Revenue chart", "titleText": "Revenue by region", "left": 20, "top": 30, "width": 420, "height": 240},
             {"type": "updateChart", "sheet": "Data", "chart": "Revenue chart", "chartType": "Line", "sourceData": "A1:B4", "name": "Revenue trend", "titleText": "Revenue trend", "left": 40, "top": 50, "width": 400, "height": 220},
@@ -231,10 +232,12 @@ def main():
         checks["wordRealPackage"] = word["changeCount"] == 2 and rendered["edited-word"]["bytes"] > 0 and rendered["edited-word"]["cleanOpen"]
         reopened_sheet = reopened_excel["Data"]
         checks["excelRealPackage"] = (
-            excel["changeCount"] == 4
-            and reopened_sheet.tables["RevenueTable"].ref == "A1:B5"
+            excel["changeCount"] == 5
+            and reopened_sheet.tables["RevenueTable"].ref == "A1:B4"
             and len(reopened_sheet._charts) == 2
-            and reopened_sheet["B5"].value == "=SUBTOTAL(109,[Revenue])"
+            and reopened_sheet["A2"].value == "South"
+            and reopened_sheet["A3"].value == "West"
+            and reopened_sheet["B4"].value == "=SUBTOTAL(109,[Revenue])"
             and rendered["edited-excel"]["bytes"] > 0
             and rendered["edited-excel"]["cleanOpen"]
         )
