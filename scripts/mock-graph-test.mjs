@@ -38,6 +38,7 @@ let officeWordBuffer = readFileSync(join(officeFixtureDir, "sample.docx"));
 let officeExcelBuffer = readFileSync(join(officeFixtureDir, "sample.xlsx"));
 let officeBusinessBuffer = Buffer.from(officeExcelBuffer);
 let officePowerPointBuffer = readFileSync(join(officeFixtureDir, "sample.pptx"));
+const commonRtfBuffer = Buffer.from("{\\rtf1\\ansi Common file extraction\\par Budget total: \\b $1,234\\b0\\par}", "utf8");
 let officeWordPostMetadataFailuresRemaining = 0;
 let failNextOfficeExcelPut = false;
 let officeMetadataRace = null;
@@ -509,6 +510,17 @@ const graph = createServer(async (req, res) => {
     count("root-note-content-read");
     if (delayedRootNoteContentMs) await new Promise((resolve) => setTimeout(resolve, delayedRootNoteContentMs));
     return text(res, 200, "root note mock content\n");
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/common-rtf") {
+    return json(res, 200, item("common-rtf", "Common Notes.rtf", {
+      size: commonRtfBuffer.length,
+      file: { mimeType: "application/rtf" }
+    }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/common-rtf/content") {
+    return binary(res, 200, commonRtfBuffer, { "Content-Type": "application/rtf" });
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/recent") {
@@ -1040,6 +1052,11 @@ const graph = createServer(async (req, res) => {
   if (req.method === "DELETE" && path === "/v1.0/me/drive/items/delete-target") {
     count("delete");
     return empty(res, 204, { "request-id": "mock-delete-request" });
+  }
+
+  if (req.method === "POST" && path === "/v1.0/drives/drive/items/delete-target/permanentDelete") {
+    count("permanent-delete");
+    return empty(res, 204, { "request-id": "mock-permanent-delete-request" });
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/copy-src") {
@@ -3327,6 +3344,32 @@ process.exit(2);
     return { previewTokenStatus: live.value.previewTokenStatus };
   });
 
+  await check("permanent delete requires irreversible acknowledgement and scoped preview", async () => {
+    const before = counters.get("permanent-delete") || 0;
+    const preview = await tool("onedrive_permanent_delete", { itemId: "delete-target", expectedId: "delete-target" });
+    assert(!preview.isError && preview.value.previewToken && preview.value.warning?.includes("cannot be undone"), "permanent delete should return an irreversible preview", preview);
+    const missingAcknowledgement = await tool("onedrive_permanent_delete", {
+      itemId: "delete-target",
+      expectedId: "delete-target",
+      dryRun: false,
+      confirmed: true,
+      previewToken: preview.value.previewToken
+    });
+    assert(!missingAcknowledgement.isError && missingAcknowledgement.value.requiredToPermanentlyDelete?.includes("acknowledgeIrreversible"), "permanent delete should require explicit irreversible acknowledgement", missingAcknowledgement);
+    assert((counters.get("permanent-delete") || 0) === before, "permanent delete must not POST without acknowledgement", { before, after: counters.get("permanent-delete") || 0 });
+    const live = await tool("onedrive_permanent_delete", {
+      itemId: "delete-target",
+      expectedId: "delete-target",
+      dryRun: false,
+      confirmed: true,
+      acknowledgeIrreversible: true,
+      previewToken: preview.value.previewToken
+    });
+    assert(!live.isError && live.value.permanentlyDeleted?.id === "delete-target" && live.value.irreversible === true, "reviewed permanent delete should succeed", live);
+    assert((counters.get("permanent-delete") || 0) === before + 1, "reviewed permanent delete should POST exactly once", { before, after: counters.get("permanent-delete") || 0 });
+    return { permanentDeleteCount: counters.get("permanent-delete") || 0, irreversible: live.value.irreversible };
+  });
+
   await check("search suppresses stale Graph hits after an explicit delete", async () => {
     await tool("onedrive_cache_clear");
     const info = await tool("onedrive_get_info", { itemId: "stale-delete-item" });
@@ -3871,6 +3914,32 @@ process.exit(2);
     assert(String(result.value).includes("local OneDrive sync folder"), "unexpected sync-path guard message", result);
     assert(requests.length === before, "upload guard should not reach mock Graph", { before, after: requests.length });
     return { graphRequestsAdded: requests.length - before };
+  });
+
+  await check("ChatGPT file upload requires preview and rejects untrusted download URLs", async () => {
+    const args = {
+      sourceFile: {
+        download_url: "https://evil.example.test/private-file",
+        file_id: "file-untrusted",
+        file_name: "untrusted.txt",
+        mime_type: "text/plain"
+      },
+      remotePath: "Uploads/untrusted.txt",
+      conflictBehavior: "fail"
+    };
+    const preview = await tool("onedrive_upload_file", args);
+    assert(!preview.isError && preview.value.previewToken && preview.value.dryRun === true, "ChatGPT upload should require a scoped preview", preview);
+    const beforePuts = requests.filter((entry) => entry.method === "PUT").length;
+    const live = await tool("onedrive_upload_file", {
+      ...args,
+      dryRun: false,
+      confirmed: true,
+      previewToken: preview.value.previewToken
+    });
+    assert(live.isError && String(live.value).includes("untrusted URL"), "ChatGPT upload should reject an untrusted file URL", live);
+    const afterPuts = requests.filter((entry) => entry.method === "PUT").length;
+    assert(afterPuts === beforePuts, "untrusted ChatGPT upload must not send file bytes to Graph", { beforePuts, afterPuts });
+    return { previewRequired: true, untrustedUrlRejected: true };
   });
 
   await check("public upload and write_text replacements require scoped previews and identity", async () => {
@@ -4575,6 +4644,54 @@ process.exit(2);
     const added = requests.slice(before);
     assert(!added.some((request) => request.path.endsWith("/content")), "find should not fetch content bodies", { added });
     return { summary: result.value.summary, found: result.value.items[0], graphRequestsAdded: added.length };
+  });
+
+  await check("ChatGPT search and fetch use fresh local indexes without Graph round trips", async () => {
+    const before = requests.length;
+    const searched = await tool("search", { query: "root note" });
+    assert(!searched.isError && searched.value.results?.some((entry) => entry.id === "root-note"), "ChatGPT search should return the fresh cached item", searched);
+    const fetched = await tool("fetch", { id: "root-note" });
+    assert(!fetched.isError && fetched.value.text.includes("root note mock content"), "ChatGPT fetch should return indexed text", fetched);
+    assert(fetched.value.metadata?.previewSource === "content-index", "ChatGPT fetch should report its local content-index source", fetched.value);
+    const added = requests.slice(before);
+    assert(!added.some((request) => decodeURIComponent(request.url).includes("/search(q='")), "fresh ChatGPT search should not call Graph search", { added });
+    assert(!added.some((request) => request.path.endsWith("/content")), "fresh ChatGPT fetch should not call Graph content", { added });
+    return { searchResults: searched.value.results.length, fetchSource: fetched.value.metadata.previewSource, graphRequestsAdded: added.length };
+  });
+
+  await check("ChatGPT fetch extracts structured Excel content instead of relying on Graph text export", async () => {
+    await tool("onedrive_cache_clear");
+    const before = requests.length;
+    const fetched = await tool("fetch", { id: "office-excel" });
+    assert(!fetched.isError, "ChatGPT Excel fetch should succeed", fetched);
+    assert(fetched.value.metadata?.previewSource === "office-openxml", "Excel fetch should use the local Open XML extractor", fetched.value);
+    assert(fetched.value.text.includes("## Worksheet: Data"), "Excel fetch should preserve worksheet names", fetched.value.text);
+    assert(fetched.value.text.includes("A1\t3\tformula=SUM(1,2)"), "Excel fetch should preserve cell values and formulas", fetched.value.text);
+    assert(/(?:^|\n)B2\t\d+(?:\.\d+)?(?:\n|$)/u.test(fetched.value.text), "Excel fetch should expose numeric workbook figures", fetched.value.text);
+    const added = requests.slice(before);
+    assert(added.some((request) => request.path.endsWith("/items/office-excel/content")), "Excel fetch should download the workbook package", { added });
+    assert(!added.some((request) => request.url.includes("format=text")), "Excel fetch must not rely on unreliable Graph text export", { added });
+    const refreshed = await tool("onedrive_content_index_refresh", { itemId: "office-excel", maxFiles: 1, maxBytesPerFile: 4096 });
+    assert(!refreshed.isError && refreshed.value.indexed === 1, "Excel workbook should be reusable from the structured content index", refreshed);
+    const beforeWarm = requests.length;
+    const warm = await tool("fetch", { id: "office-excel" });
+    assert(!warm.isError && warm.value.metadata?.previewSource === "content-index", "warm Excel fetch should use the content index", warm);
+    assert(warm.value.text.includes("## Worksheet: Data") && warm.value.text.includes("A1\t3\tformula=SUM(1,2)"), "warm Excel fetch should preserve worksheet, cell, and formula context", warm.value.text);
+    const warmAdded = requests.slice(beforeWarm);
+    assert(!warmAdded.some((request) => request.path.endsWith("/content")), "warm Excel fetch should not redownload the workbook", { warmAdded });
+    return { source: fetched.value.metadata.previewSource, warmSource: warm.value.metadata.previewSource, textBytes: Buffer.byteLength(fetched.value.text, "utf8"), graphRequestsAdded: added.length };
+  });
+
+  await check("ChatGPT fetch locally extracts a common non-Office format", async () => {
+    const before = requests.length;
+    const fetched = await tool("fetch", { id: "common-rtf" });
+    assert(!fetched.isError, "ChatGPT RTF fetch should succeed", fetched);
+    assert(fetched.value.metadata?.previewSource === "local-rtf", "RTF fetch should use the bounded local extractor", fetched.value);
+    assert(fetched.value.text.includes("Common file extraction"), "RTF text should be readable", fetched.value.text);
+    assert(fetched.value.text.includes("Budget total: $1,234"), "RTF extractor should preserve figures", fetched.value.text);
+    const added = requests.slice(before);
+    assert(!added.some((request) => request.url.includes("format=text")), "supported local formats should not call Graph text export", { added });
+    return { source: fetched.value.metadata.previewSource, text: fetched.value.text };
   });
 
   await check("rename dry-run previews without PATCH", async () => {

@@ -36,12 +36,15 @@ const auditRoot = join(storageRoot, "audit");
 const auditPath = join(auditRoot, "mutations.jsonl");
 const auditLockPath = join(auditRoot, "mutations.lock");
 const officeEditingRoot = join(storageRoot, "office-editing");
+const chatgptUploadRoot = join(storageRoot, "chatgpt-uploads");
 const workspaceStateRoot = join(storageRoot, "workspaces");
 const managedWorkspaceRootName = "Codex Editing Drafts";
 const watchStateRoot = join(storageRoot, "watches");
 const officeHelperPath = join(pluginRoot, "scripts", "office-openxml.py");
+const commonTextHelperPath = join(pluginRoot, "scripts", "common-text.py");
 const officePythonPath = process.env.ONEDRIVE_OFFICE_PYTHON || localConfig.officeEditing?.pythonPath || "/usr/bin/python3";
 const maxOfficePackageBytes = 250 * 1024 * 1024;
+const maxCommonExtractionBytes = 100 * 1024 * 1024;
 const localOneDriveSyncRoots = [
   { path: join(homedir(), "Library", "CloudStorage", "OneDrive"), prefix: false },
   { path: join(homedir(), "Library", "CloudStorage", "OneDrive-"), prefix: true },
@@ -56,11 +59,14 @@ const simpleUploadLimit = 250 * 1024 * 1024;
 const uploadChunkUnit = 320 * 1024;
 const defaultUploadChunkSize = 10 * 1024 * 1024;
 const maxUploadChunkSize = 60 * 1024 * 1024;
+const chatgptToolResponseByteLimit = 1024 * 1024;
+const chatgptFetchTextByteLimit = 192 * 1024;
 const defaultSelect = "id,name,size,folder,file,webUrl,createdDateTime,lastModifiedDateTime,parentReference,eTag,cTag,deleted";
 const textExtensions = new Set([
   ".bat", ".c", ".cfg", ".conf", ".cpp", ".cs", ".css", ".csv", ".env", ".go", ".h", ".hpp", ".htm",
-  ".html", ".ini", ".java", ".js", ".json", ".jsx", ".log", ".md", ".mjs", ".php", ".properties",
-  ".py", ".rb", ".rs", ".sh", ".sql", ".svg", ".toml", ".ts", ".tsx", ".txt", ".xml", ".yaml", ".yml"
+  ".html", ".ics", ".ini", ".ipynb", ".java", ".js", ".json", ".jsonl", ".jsx", ".log", ".md", ".mjs",
+  ".ndjson", ".php", ".properties", ".py", ".rb", ".rs", ".rst", ".sh", ".sql", ".svelte", ".svg", ".tex",
+  ".toml", ".ts", ".tsv", ".tsx", ".txt", ".vcf", ".vue", ".xml", ".yaml", ".yml"
 ]);
 const textMimePrefixes = ["text/"];
 const textMimeTypes = new Set([
@@ -69,9 +75,12 @@ const textMimeTypes = new Set([
   "application/javascript",
   "application/json",
   "application/sql",
-  "application/x-javascript",
   "application/x-ndjson",
+  "application/x-javascript",
   "application/xml",
+  "text/calendar",
+  "text/tab-separated-values",
+  "text/vcard",
   "image/svg+xml"
 ]);
 const canonicalTextMimeTypes = new Map([
@@ -88,6 +97,7 @@ const canonicalTextMimeTypes = new Map([
   [".ts", "text/plain"],
   [".tsx", "text/plain"],
   [".txt", "text/plain"],
+  [".tsv", "text/tab-separated-values"],
   [".xml", "application/xml"],
   [".yaml", "application/yaml"],
   [".yml", "application/yaml"]
@@ -159,7 +169,7 @@ const excelSessionPool = new Map();
 let watchesLoaded = false;
 const previewTokenTtlMs = 15 * 60 * 1000;
 const previewScopedTools = new Set([
-  "onedrive_upload", "onedrive_write_text", "onedrive_batch_delete", "onedrive_delete",
+  "onedrive_upload", "onedrive_upload_file", "onedrive_write_text", "onedrive_batch_delete", "onedrive_delete", "onedrive_permanent_delete",
   "onedrive_create_sharing_link", "onedrive_invite_permission", "onedrive_revoke_permission",
   "onedrive_batch_revoke_permissions", "onedrive_restore_deleted", "onedrive_word_batch_update",
   "onedrive_excel_batch_update", "onedrive_powerpoint_batch_update", "onedrive_office_batch_transform",
@@ -1944,6 +1954,128 @@ const tools = [
   }
 ];
 
+// ChatGPT and company-knowledge surfaces give special treatment to the
+// standard search/fetch contract and can pass uploaded-file references through
+// file parameters. Keep these ChatGPT-specific tools out of the immutable
+// 84-tool local/Codex contract, but advertise and execute them in the focused
+// profile so ordinary retrieval avoids the exhaustive finder path.
+const chatgptCompatibilityTools = [
+  {
+    name: "search",
+    title: "Search OneDrive",
+    description: "Use this when the user wants to find files or folders in OneDrive by name, keywords, or content. Returns a small ranked result set without recursive drive scanning.",
+    inputSchema: {
+      type: "object",
+      required: ["query"],
+      properties: {
+        query: { type: "string", minLength: 1 }
+      },
+      additionalProperties: false
+    },
+    outputSchema: {
+      type: "object",
+      required: ["results"],
+      properties: {
+        results: {
+          type: "array",
+          maxItems: 10,
+          items: {
+            type: "object",
+            required: ["id", "title", "url"],
+            properties: {
+              id: { type: "string" },
+              title: { type: "string" },
+              url: { type: "string" }
+            },
+            additionalProperties: false
+          }
+        }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "fetch",
+    title: "Fetch OneDrive item",
+    description: "Use this once after search to read the item. It directly extracts bounded content from Excel, Word, PowerPoint, PDF, RTF, OpenDocument, EPUB, common text/code files, and supported images; do not make a second read call for the same item.",
+    inputSchema: {
+      type: "object",
+      required: ["id"],
+      properties: {
+        id: { type: "string", minLength: 1 }
+      },
+      additionalProperties: false
+    },
+    outputSchema: {
+      type: "object",
+      required: ["id", "title", "text", "url"],
+      properties: {
+        id: { type: "string" },
+        title: { type: "string" },
+        text: { type: "string" },
+        url: { type: "string" },
+        metadata: {
+          type: "object",
+          additionalProperties: { type: "string" }
+        }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_upload_file",
+    title: "Upload File to OneDrive",
+    description: "Preview, then upload a ChatGPT-provided file to OneDrive. Every upload requires confirmation and a scoped preview token; replacement also requires the existing item's expected identity.",
+    inputSchema: {
+      type: "object",
+      required: ["sourceFile", "remotePath"],
+      properties: {
+        sourceFile: {
+          type: "object",
+          required: ["download_url", "file_id"],
+          properties: {
+            download_url: { type: "string", minLength: 1 },
+            file_id: { type: "string", minLength: 1 },
+            mime_type: { type: "string" },
+            file_name: { type: "string" }
+          },
+          additionalProperties: false
+        },
+        remotePath: { type: "string", minLength: 1, description: "Destination path relative to the OneDrive root, including filename." },
+        conflictBehavior: { type: "string", enum: ["fail", "replace", "rename"], default: "fail" },
+        dryRun: { type: "boolean", default: true },
+        confirmed: { type: "boolean", default: false },
+        expectedName: { type: "string", description: "Required when replacing an existing file unless expectedId is provided." },
+        expectedId: { type: "string", description: "Required when replacing an existing file unless expectedName is provided." },
+        previewToken: previewTokenSchema
+      },
+      additionalProperties: false
+    },
+    _meta: {
+      "openai/fileParams": ["sourceFile"]
+    }
+  },
+  {
+    name: "onedrive_permanent_delete",
+    title: "Permanently Delete OneDrive Item",
+    description: "Permanently delete a OneDrive item without using the recycle bin. Irreversible; defaults to preview and requires confirmation, expected identity, an acknowledgement, and a scoped preview token.",
+    inputSchema: {
+      type: "object",
+      required: ["itemId"],
+      properties: {
+        itemId: { type: "string", minLength: 1 },
+        dryRun: { type: "boolean", default: true },
+        confirmed: { type: "boolean", default: false },
+        acknowledgeIrreversible: { type: "boolean", default: false },
+        expectedName: { type: "string" },
+        expectedId: { type: "string" },
+        previewToken: previewTokenSchema
+      },
+      additionalProperties: false
+    }
+  }
+];
+
 // ChatGPT developer-mode apps reject MCP tools that omit impact annotations.
 // Keep these classifications centralized so every descriptor carries the three
 // required hints and newly added tools fail closed during packaging.
@@ -1954,6 +2086,8 @@ const tools = [
 // Entra API scope and Graph calls use the request's on-behalf-of token.
 const configuredSecuritySchemes = Object.freeze(toolSecuritySchemes());
 const readOnlyToolNames = new Set([
+  "search",
+  "fetch",
   "onedrive_config",
   "onedrive_me",
   "onedrive_drive",
@@ -2023,7 +2157,9 @@ const destructiveToolNames = new Set([
   "onedrive_update_file",
   "onedrive_audit_export",
   "onedrive_audit_clear",
-  "onedrive_delete"
+  "onedrive_delete",
+  "onedrive_permanent_delete",
+  "onedrive_upload_file"
 ]);
 
 const openWorldToolNames = new Set([
@@ -2036,7 +2172,8 @@ const openWorldToolNames = new Set([
   "onedrive_invite_permission",
   "onedrive_batch_download",
   "onedrive_update_file",
-  "onedrive_audit_export"
+  "onedrive_audit_export",
+  "onedrive_upload_file"
 ]);
 
 function toolTitle(name) {
@@ -2047,7 +2184,9 @@ function toolTitle(name) {
     .join(" ");
 }
 
-for (const tool of tools) {
+const executableTools = [...tools, ...chatgptCompatibilityTools];
+
+for (const tool of executableTools) {
   tool.title = tool.title || toolTitle(tool.name);
   tool.securitySchemes = configuredSecuritySchemes;
   tool._meta = {
@@ -2068,22 +2207,14 @@ for (const tool of tools) {
 // contract for Codex and local automation while offering a focused ChatGPT
 // profile for tunnel deployments.
 const chatgptToolNames = new Set([
+  "search",
+  "fetch",
   "onedrive_list",
-  "onedrive_find",
   "onedrive_office_capabilities",
-  "onedrive_office_search",
-  "onedrive_word_get_document",
-  "onedrive_excel_get_workbook",
-  "onedrive_powerpoint_get_presentation",
   "onedrive_office_batch_transform",
-  "onedrive_get_info",
-  "onedrive_read_text",
-  "onedrive_preview",
-  "onedrive_upload",
+  "onedrive_upload_file",
   "onedrive_write_text",
   "onedrive_patch_text",
-  "onedrive_versions",
-  "onedrive_restore_version",
   "onedrive_create_folder",
   "onedrive_rename",
   "onedrive_move",
@@ -2092,8 +2223,9 @@ const chatgptToolNames = new Set([
   "onedrive_invite_permission",
   "onedrive_revoke_permission",
   "onedrive_permissions",
-  "onedrive_recent",
-  "onedrive_delete"
+  "onedrive_delete",
+  "onedrive_restore_deleted",
+  "onedrive_permanent_delete"
 ]);
 
 const compactOfficeOperationSchema = {
@@ -2108,7 +2240,7 @@ const compactOfficeOperationSchema = {
     },
     additionalProperties: true
   },
-  description: "Typed Office operations. Call onedrive_office_capabilities and the matching Office read tool first; the server validates every operation against the full schema."
+  description: "Typed Office operations. Use fetch to read the document first; the server validates every operation against the full schema."
 };
 
 function compactChatgptToolDescriptor(tool) {
@@ -2136,7 +2268,7 @@ function selectedToolProfile(env = process.env) {
 
 const toolProfile = selectedToolProfile();
 const advertisedTools = toolProfile === "chatgpt"
-  ? tools.filter((tool) => chatgptToolNames.has(tool.name)).map(compactChatgptToolDescriptor)
+  ? executableTools.filter((tool) => chatgptToolNames.has(tool.name)).map(compactChatgptToolDescriptor)
   : tools;
 const advertisedContractHash = createHash("sha256").update(JSON.stringify(advertisedTools)).digest("hex").slice(0, 12);
 const manifestServerVersion = pluginManifest.version || "0.1.0";
@@ -2144,7 +2276,7 @@ const advertisedServerVersion = toolProfile === "chatgpt"
   ? `${manifestServerVersion}${manifestServerVersion.includes("+") ? "." : "+"}chatgpt.${advertisedContractHash}`
   : manifestServerVersion;
 
-const toolByName = new Map(tools.map((tool) => [tool.name, tool]));
+const toolByName = new Map(executableTools.map((tool) => [tool.name, tool]));
 
 function schemaTypeMatches(value, type) {
   if (Array.isArray(type)) return type.some((candidate) => candidate === "null" ? value === null : schemaTypeMatches(value, candidate));
@@ -3513,11 +3645,12 @@ function contentIndexableReason(item = {}, args = {}) {
   const settings = pluginSettings();
   const maxBytes = clampInteger(args.maxBytesPerFile, settings.maxIndexedFileSize, 1024, textFileLimit);
   const isOffice = officeExportIndexable(item);
+  const openXmlKind = officePackageKindFromName(item.name);
   if (args.officeOnly === true && !isOffice) return { ok: false, reason: "not-office" };
-  if (isOffice && args.includeOfficeStructured !== false) {
+  if (isOffice && openXmlKind && args.includeOfficeStructured !== false) {
     const officeIndexLimit = clampInteger(args.maxOfficePackageBytes, 50 * 1024 * 1024, 1024, maxOfficePackageBytes);
     if (item.size && item.size > officeIndexLimit) return { ok: false, reason: "office-package-too-large" };
-    return { ok: true, source: "office-openxml", kind: officePackageKindFromName(item.name) };
+    return { ok: true, source: "office-openxml", kind: openXmlKind };
   }
   if (item.size && item.size > maxBytes) return { ok: false, reason: "too-large" };
   const allowedExtensions = normalizeExtensions(args.extensions?.length ? args.extensions : settings.supportedIndexedFileTypes);
@@ -3885,6 +4018,14 @@ async function cacheMovedOrRenamedItem(previous, current) {
   await bestEffortLocalWrite("metadata cache update", async () => await cacheItems([current]));
 }
 
+function metadataCacheFresh(cache, settings = pluginSettings()) {
+  if (!cache?.updatedAt) return false;
+  const updatedAt = Date.parse(cache.updatedAt);
+  if (!Number.isFinite(updatedAt)) return false;
+  const ageSeconds = Math.max(0, (Date.now() - updatedAt) / 1000);
+  return settings.cacheTtlSeconds === 0 || ageSeconds <= settings.cacheTtlSeconds;
+}
+
 function unresolvedPathItems(cache) {
   return Object.values(cache.itemsById || {}).filter((item) => item?.id && !item.deleted && item.remotePath === undefined);
 }
@@ -3907,7 +4048,7 @@ async function syncStatus(args = {}) {
     itemCount: items.length,
     updatedAt: cache.updatedAt,
     cacheAgeSeconds,
-    cacheFresh: cacheAgeSeconds === null ? false : settings.cacheTtlSeconds === 0 || cacheAgeSeconds <= settings.cacheTtlSeconds,
+    cacheFresh: metadataCacheFresh(cache, settings),
     deltaLinkAvailable: Boolean(cache.deltaLink),
     deltaNextLinkAvailable: Boolean(cache.deltaNextLink),
     deltaTarget: cache.deltaTarget || null,
@@ -6120,10 +6261,14 @@ async function find(args = {}) {
   let liveSearchDurationMs = 0;
   let scanDurationMs = 0;
   let cacheConfirmDurationMs = 0;
+  let cacheFresh = false;
+  let usedFreshLocalFastPath = false;
   let cacheConfirmations = { attempted: 0, confirmed: 0, errors: 0 };
 
   if (args.useCache !== false) {
-    const cacheList = await cachedItems();
+    const cache = await loadMetadataCache();
+    const cacheList = Object.values(cache.itemsById || {});
+    cacheFresh = metadataCacheFresh(cache);
     for (const item of cacheList) {
       addFindCandidate(candidates, item, {
         args,
@@ -6175,6 +6320,15 @@ async function find(args = {}) {
       });
     } catch (error) {
       searchRuns.push({ strategy: "exactPath", path: query, error: safeToolErrorMessage(error) });
+    }
+  }
+
+  if (args.preferFreshLocalResults === true && cacheFresh) {
+    const bestLocal = rankedFindCandidates(candidates)[0];
+    const localConfidenceThreshold = clampInteger(args.freshLocalMinConfidence, 60, 0, 200);
+    if (bestLocal && bestLocal.score >= localConfidenceThreshold) {
+      usedFreshLocalFastPath = true;
+      searchStopReason = "fresh-local-cache";
     }
   }
 
@@ -6232,9 +6386,13 @@ async function find(args = {}) {
     searchRuns.push(...runs);
   };
 
-  if (searchTerms.length) {
-    await executeSearchWave([{ term: searchTerms[0], index: 0, stage: "canonical" }]);
-    let nextSearchTermIndex = 1;
+  if (searchTerms.length && !usedFreshLocalFastPath) {
+    const initialSearchTermCount = clampInteger(args.initialSearchTermCount, 1, 1, searchConcurrency);
+    const initialWave = searchTerms
+      .slice(0, initialSearchTermCount)
+      .map((term, index) => ({ term, index, stage: index === 0 ? "canonical" : "initial-expansion" }));
+    await executeSearchWave(initialWave);
+    let nextSearchTermIndex = initialWave.length;
     let bestLiveSearchScore = rankedFindCandidates(candidates).find(candidateHasLiveSource)?.score || 0;
     if (args.executeAllSearchTerms !== true && bestLiveSearchScore >= searchConfidenceThreshold && nextSearchTermIndex < searchTerms.length) {
       searchStopReason = "high-confidence-canonical";
@@ -6253,15 +6411,15 @@ async function find(args = {}) {
       }
     }
 
-    for (const term of searchTerms.slice(executedSearchTerms.length)) {
+  }
+  for (const [index, term] of searchTerms.slice(executedSearchTerms.length).entries()) {
       skippedSearchTerms.push(term);
       searchRuns.push({
         term,
-        stage: "expansion",
+        stage: executedSearchTerms.length + index === 0 ? "canonical" : "expansion",
         executed: false,
         skipped: searchStopReason || "adaptive-stop"
       });
-    }
   }
   if (!searchStopReason) searchStopReason = "all-terms-executed";
 
@@ -6447,6 +6605,8 @@ async function find(args = {}) {
       localIndexUsed: contentIndexCandidateCount > 0,
       contentIndexCandidates: contentIndexCandidateCount,
       persistentCacheUsed: cacheCandidateCount > 0,
+      cacheFresh,
+      usedFreshLocalFastPath,
       cacheCandidates: cacheCandidateCount,
       durationMs: elapsedMs(startedAt),
       contentIndexDurationMs,
@@ -7329,6 +7489,53 @@ function officePackageKindFromName(name = "") {
   return null;
 }
 
+function commonExtractionKind(info = {}) {
+  const extension = extname(info.name || "").toLowerCase();
+  const mimeType = String(info.file?.mimeType || "").toLowerCase();
+  if (extension === ".pdf" || mimeType === "application/pdf") return "pdf";
+  if (extension === ".rtf" || ["application/rtf", "text/rtf"].includes(mimeType)) return "rtf";
+  if ([".odt", ".ods", ".odp"].includes(extension) || mimeType.startsWith("application/vnd.oasis.opendocument.")) return "opendocument";
+  if (extension === ".epub" || mimeType === "application/epub+zip") return "epub";
+  if (extension === ".doc" || mimeType === "application/msword") return "legacy-word";
+  if (extension === ".xls" || mimeType === "application/vnd.ms-excel") return "legacy-excel";
+  if (extension === ".ppt" || mimeType === "application/vnd.ms-powerpoint") return "legacy-powerpoint";
+  if ([".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"].includes(extension) || (mimeType.startsWith("image/") && mimeType !== "image/svg+xml")) return "image-ocr";
+  return null;
+}
+
+async function extractCommonDocumentText(info, args = {}) {
+  if (info.folder) throw new Error(`Item is a folder, not an extractable document: ${info.name}`);
+  const kind = commonExtractionKind(info);
+  if (!kind) throw new Error(`No local text extractor is available for ${info.name || "this file"}.`);
+  if (Number(info.size || 0) > maxCommonExtractionBytes) {
+    throw new Error(`File is ${info.size} bytes, above the ${maxCommonExtractionBytes}-byte common-document extraction limit.`);
+  }
+  const transactionRoot = join(officeEditingRoot, `extract-${randomUUID()}`);
+  await ensurePrivateDirectory(transactionRoot);
+  const localPath = join(transactionRoot, basename(info.name || `document${extname(info.name || "")}`));
+  try {
+    await downloadResolvedItem(info, { localPath, overwrite: false });
+    const extracted = await runCommonTextHelper({
+      action: "extract",
+      inputPath: localPath,
+      kind,
+      maxBytes: clampInteger(args.maxBytes, chatgptFetchTextByteLimit, 1, chatgptFetchTextByteLimit)
+    }, { timeoutMs: 60_000, maxOutputBytes: 2 * 1024 * 1024 });
+    const limited = truncateUtf8(extracted.text || "", chatgptFetchTextByteLimit);
+    return {
+      item: info,
+      preview: limited.text,
+      bytes: Buffer.byteLength(limited.text, "utf8"),
+      bytesRead: Number(info.size || 0),
+      truncated: limited.truncated || Boolean(extracted.truncated),
+      source: `local-${kind}`,
+      extractor: extracted.extractor || null
+    };
+  } finally {
+    await rm(transactionRoot, { recursive: true, force: true });
+  }
+}
+
 function officeRuntimeStatus() {
   let pythonAvailable = false;
   let pythonVersion = null;
@@ -7400,10 +7607,16 @@ async function officeCapabilities() {
   };
 }
 
-export async function runOfficeHelper(request, options = {}) {
+async function runPythonJsonHelper(helperPath, request, options = {}) {
   const runtime = officeRuntimeStatus();
-  if (!runtime.pythonAvailable || !runtime.helperAvailable) {
-    throw new Error(`Office Open XML runtime is unavailable: ${runtime.error || "Python/helper not found"}`);
+  let helperAvailable = false;
+  try {
+    helperAvailable = readFileSync(helperPath).length > 0;
+  } catch {
+    helperAvailable = false;
+  }
+  if (!runtime.pythonAvailable || !helperAvailable) {
+    throw new Error(`Document extraction runtime is unavailable: ${runtime.error || "Python/helper not found"}`);
   }
   const timeoutMs = clampInteger(options.timeoutMs, 60_000, 1000, 5 * 60_000);
   const maxOutputBytes = clampInteger(options.maxOutputBytes, 20 * 1024 * 1024, 1024, 50 * 1024 * 1024);
@@ -7414,7 +7627,7 @@ export async function runOfficeHelper(request, options = {}) {
   );
   await ensurePrivateDirectory(pythonCacheRoot);
   return await new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(officePythonPath, [officeHelperPath], {
+    const child = spawn(officePythonPath, [helperPath], {
       cwd: pluginRoot,
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, PYTHONPYCACHEPREFIX: pythonCacheRoot }
@@ -7464,8 +7677,16 @@ export async function runOfficeHelper(request, options = {}) {
   });
 }
 
+export async function runOfficeHelper(request, options = {}) {
+  return await runPythonJsonHelper(officeHelperPath, request, options);
+}
+
+async function runCommonTextHelper(request, options = {}) {
+  return await runPythonJsonHelper(commonTextHelperPath, request, options);
+}
+
 async function inspectRemoteOfficePackage(args = {}, expectedKind = null, action = "inspect") {
-  const info = await getInfo(args);
+  const info = args._resolvedInfo || await getInfo(args);
   if (info.folder) throw new Error(`Item is a folder, not an Office document: ${info.name}`);
   const detectedKind = officePackageKindFromName(info.name);
   if (!detectedKind) {
@@ -8568,7 +8789,7 @@ function truncateUtf8(text, maxBytes) {
 }
 
 async function preview(args = {}) {
-  const info = await getInfo(args);
+  const info = args._resolvedInfo || await getInfo(args);
   const maxBytes = clampInteger(args.maxBytes, 65536, 1, 1048576);
   if (info.folder) return { item: info, preview: null, note: "Item is a folder; preview is only available for files." };
 
@@ -8589,6 +8810,253 @@ async function preview(args = {}) {
   if (args.force !== true) assertNoBinaryNulls(limited.buffer);
   const previewText = limited.buffer.toString("utf8").replace(/\uFFFD$/u, "");
   return { item: info, preview: previewText, bytes: Buffer.byteLength(previewText, "utf8"), bytesRead: limited.bytesRead, truncated: limited.truncated, source: "text-read" };
+}
+
+function absoluteWebUrl(value) {
+  const url = String(value || "").trim();
+  return /^https?:\/\//iu.test(url) ? url : "";
+}
+
+async function chatgptSearch(args = {}) {
+  const startedAt = Date.now();
+  const found = await find({
+    query: String(args.query || "").trim(),
+    maxResults: 10,
+    maxResultsLimit: 10,
+    maxSearchTerms: 2,
+    searchConcurrency: 2,
+    initialSearchTermCount: 2,
+    searchPageSize: 10,
+    searchMaxItemsPerTerm: 10,
+    minConfidenceForSearchOnly: 60,
+    preferFreshLocalResults: true,
+    freshLocalMinConfidence: 60,
+    scanFallback: false,
+    confirmCacheCandidates: false,
+    useCache: true,
+    useContentIndex: true,
+    contentMaxResults: 10,
+    format: "compact"
+  });
+  const results = (found.items || []).slice(0, 10).map((item) => ({
+    id: String(item.id || ""),
+    title: String(item.name || item.remotePath || item.id || "OneDrive item"),
+    url: absoluteWebUrl(item.webUrl)
+  })).filter((item) => item.id);
+  if (toolProfile === "chatgpt" || process.env.ONEDRIVE_PERFORMANCE_LOG === "1") {
+    console.error(JSON.stringify({
+      event: "onedrive-chatgpt-search",
+      durationMs: elapsedMs(startedAt),
+      results: results.length,
+      graphSearchCalls: found.summary?.graphSearchCalls || 0,
+      searchTermsExecuted: found.summary?.searchTermsExecuted || 0,
+      bestScore: found.summary?.bestScore || 0,
+      cacheFresh: Boolean(found.summary?.cacheFresh),
+      cacheCandidates: found.summary?.cacheCandidates || 0,
+      metadataCacheWrites: found.summary?.metadataCacheWrites || 0,
+      usedFreshLocalFastPath: Boolean(found.summary?.usedFreshLocalFastPath),
+      usedScanFallback: Boolean(found.summary?.usedScanFallback)
+    }));
+  }
+  return { results };
+}
+
+function chatgptOfficeText(document, fileName = "Office document") {
+  const lines = [`Document: ${fileName}`, `Format: ${document.kind || "office"}`];
+  const addTableRows = (rows = [], prefix = "") => {
+    for (const [rowIndex, row] of rows.entries()) {
+      lines.push(`${prefix}row ${rowIndex + 1}\t${row.map((value) => String(value ?? "").replace(/[\r\n\t]+/gu, " ")).join("\t")}`);
+    }
+  };
+  if (document.kind === "excel") {
+    lines.push(`Worksheets: ${(document.sheets || []).map((sheet) => sheet.name).join(", ") || "none"}`);
+    lines.push(`Extracted cells: ${document.cellCount || 0}`);
+    for (const sheet of document.sheets || []) {
+      lines.push("", `## Worksheet: ${sheet.name}${sheet.state && sheet.state !== "visible" ? ` (${sheet.state})` : ""}`);
+      for (const cell of sheet.cells || []) {
+        const value = cell.value === null || cell.value === undefined ? "" : String(cell.value).replace(/[\r\n\t]+/gu, " ");
+        const formula = cell.formula ? `\tformula=${String(cell.formula).replace(/[\r\n\t]+/gu, " ")}` : "";
+        lines.push(`${cell.address || "?"}\t${value}${formula}`);
+      }
+      for (const table of sheet.tables || []) {
+        lines.push(`Table: ${table.name || table.displayName || "unnamed"}${table.ref ? ` (${table.ref})` : ""}`);
+      }
+      for (const chart of sheet.charts || []) {
+        lines.push(`Chart: ${chart.title || chart.name || chart.type || "unnamed"}${chart.type ? ` [${chart.type}]` : ""}`);
+      }
+      for (const pivot of sheet.pivots || []) {
+        lines.push(`Pivot table: ${pivot.name || "unnamed"}${pivot.location?.ref ? ` (${pivot.location.ref})` : ""}`);
+      }
+    }
+    if ((document.definedNames || []).length) {
+      lines.push("", "## Defined names");
+      for (const entry of document.definedNames) lines.push(`${entry.name || "unnamed"}\t${entry.value || ""}`);
+    }
+  } else if (document.kind === "word") {
+    lines.push(`Paragraphs: ${document.paragraphCount || 0}; tables: ${document.tableCount || 0}`);
+    for (const paragraph of document.paragraphs || []) {
+      const value = String(paragraph.text || "").trim();
+      if (value) lines.push(`${paragraph.style ? `[${paragraph.style}] ` : ""}${value}`);
+    }
+    for (const table of document.tables || []) {
+      lines.push("", `## Table ${Number(table.index || 0) + 1}`);
+      addTableRows(table.rows || []);
+    }
+    for (const comment of document.comments || []) {
+      lines.push(`Comment${comment.author ? ` by ${comment.author}` : ""}: ${comment.text || ""}`);
+    }
+  } else if (document.kind === "powerpoint") {
+    lines.push(`Slides: ${document.slideCount || 0}`);
+    const addShape = (shape, indent = "") => {
+      const value = String(shape.text || "").trim();
+      if (value) lines.push(`${indent}${shape.name ? `${shape.name}: ` : ""}${value}`);
+      if (shape.table?.rows?.length) addTableRows(shape.table.rows, indent);
+      for (const child of shape.children || []) addShape(child, `${indent}  `);
+    };
+    for (const slide of document.slides || []) {
+      lines.push("", `## Slide ${Number(slide.index || 0) + 1}`);
+      for (const shape of slide.shapes || []) addShape(shape);
+      if (slide.notes) lines.push(`Speaker notes: ${slide.notes}`);
+    }
+  }
+  const limited = truncateUtf8(lines.join("\n"), chatgptFetchTextByteLimit);
+  return { ...limited, truncated: limited.truncated || Boolean(document.truncated) };
+}
+
+function chatgptIndexedText(indexed, fileName = "OneDrive item") {
+  if (!indexed?.structuredKind || !Array.isArray(indexed.segments) || !indexed.segments.length) {
+    return String(indexed?.text || "");
+  }
+  const lines = [`Document: ${fileName}`, `Format: ${indexed.structuredKind}`];
+  let section = null;
+  for (const segment of indexed.segments) {
+    const anchor = segment.anchor || {};
+    const value = String(segment.text ?? "").replace(/[\r\n\t]+/gu, " ").trim();
+    if (!value) continue;
+    if (indexed.structuredKind === "excel") {
+      const sheet = anchor.sheet || "Unknown";
+      if (sheet !== section) {
+        section = sheet;
+        lines.push("", `## Worksheet: ${sheet}`);
+      }
+      if (anchor.type === "formula") continue;
+      lines.push(`${anchor.address || "?"}\t${value}${anchor.formula ? `\tformula=${String(anchor.formula).replace(/[\r\n\t]+/gu, " ")}` : ""}`);
+    } else if (indexed.structuredKind === "powerpoint") {
+      const slide = Number(anchor.slideIndex || 0) + 1;
+      if (slide !== section) {
+        section = slide;
+        lines.push("", `## Slide ${slide}`);
+      }
+      lines.push(value);
+    } else if (indexed.structuredKind === "word") {
+      if (anchor.type === "tableCell") {
+        lines.push(`Table ${Number(anchor.tableIndex || 0) + 1}, row ${Number(anchor.rowIndex || 0) + 1}, column ${Number(anchor.columnIndex || 0) + 1}: ${value}`);
+      } else {
+        lines.push(value);
+      }
+    }
+  }
+  return lines.join("\n");
+}
+
+async function chatgptFetch(args = {}) {
+  const startedAt = Date.now();
+  const id = String(args.id || "").trim();
+  const [cache, contentIndex] = await Promise.all([loadMetadataCache(), loadContentIndex()]);
+  const cached = cache.itemsById?.[id] || null;
+  const cacheFresh = metadataCacheFresh(cache);
+  const indexed = cached && contentIndex.entriesById?.[id];
+  let snapshot;
+  let usedContentIndex = false;
+  if (cacheFresh && cached?.folder) {
+    snapshot = { item: cached, preview: null, note: "This OneDrive item is a folder.", source: "metadata-cache", truncated: false };
+  } else if (cacheFresh && cached && indexed && contentIndexEntryFresh(indexed, cached)) {
+    const indexedText = chatgptIndexedText(indexed, cached.name || id);
+    const limited = truncateUtf8(indexedText, chatgptFetchTextByteLimit);
+    snapshot = {
+      item: cached,
+      preview: limited.text,
+      bytes: Buffer.byteLength(limited.text, "utf8"),
+      bytesRead: indexed.bytes ?? Buffer.byteLength(indexed.text || "", "utf8"),
+      truncated: limited.truncated || Boolean(indexed.truncated),
+      source: "content-index"
+    };
+    usedContentIndex = true;
+  } else {
+    const info = cacheFresh && cached ? cached : await getInfo({ itemId: id });
+    const officeKind = officePackageKindFromName(info.name);
+    const commonKind = commonExtractionKind(info);
+    if (officeKind) {
+      try {
+        const document = await inspectRemoteOfficePackage({
+          itemId: id,
+          _resolvedInfo: info,
+          maxParagraphs: 4000,
+          maxCells: 15_000,
+          maxSlides: 500,
+          includeCells: true,
+          includeTables: true,
+          includeCharts: true,
+          includePivots: true,
+          strictRelationships: true
+        }, officeKind, "inspect");
+        const rendered = chatgptOfficeText(document, info.name);
+        snapshot = {
+          item: info,
+          preview: rendered.text,
+          bytes: Buffer.byteLength(rendered.text, "utf8"),
+          bytesRead: Number(info.size || 0),
+          truncated: rendered.truncated,
+          source: "office-openxml",
+          officeKind
+        };
+      } catch (error) {
+        snapshot = await preview({ itemId: id, _resolvedInfo: info, maxBytes: chatgptFetchTextByteLimit, preferExportText: true });
+        if (!snapshot.preview) snapshot.exportError = `Open XML extraction failed: ${safeToolErrorMessage(error)}; ${snapshot.exportError || "Graph text export was unavailable."}`;
+      }
+    } else if (commonKind) {
+      try {
+        snapshot = await extractCommonDocumentText(info, { maxBytes: chatgptFetchTextByteLimit });
+      } catch (error) {
+        snapshot = await preview({ itemId: id, _resolvedInfo: info, maxBytes: chatgptFetchTextByteLimit, preferExportText: true });
+        if (!snapshot.preview) snapshot.exportError = `Local ${commonKind} extraction failed: ${safeToolErrorMessage(error)}; ${snapshot.exportError || "Graph text export was unavailable."}`;
+      }
+    } else {
+      snapshot = await preview({ itemId: id, _resolvedInfo: info, maxBytes: chatgptFetchTextByteLimit, preferExportText: true });
+    }
+  }
+  const item = snapshot.item || {};
+  const metadata = {
+    type: item.folder ? "folder" : "file",
+    size: String(item.size ?? ""),
+    modified: String(item.lastModifiedDateTime || ""),
+    mimeType: String(item.file?.mimeType || ""),
+    previewSource: String(snapshot.source || "metadata"),
+    truncated: String(Boolean(snapshot.truncated))
+  };
+  if (snapshot.exportError) metadata.previewError = String(snapshot.exportError);
+  const result = {
+    id: String(item.id || id || ""),
+    title: String(item.name || id || "OneDrive item"),
+    text: item.folder
+      ? String(snapshot.note || "This OneDrive item is a folder.")
+      : String(snapshot.preview ?? snapshot.note ?? ""),
+    url: absoluteWebUrl(item.webUrl),
+    metadata
+  };
+  if (toolProfile === "chatgpt" || process.env.ONEDRIVE_PERFORMANCE_LOG === "1") {
+    console.error(JSON.stringify({
+      event: "onedrive-chatgpt-fetch",
+      durationMs: elapsedMs(startedAt),
+      cacheFresh,
+      usedCachedMetadata: Boolean(cacheFresh && cached),
+      usedContentIndex,
+      previewSource: snapshot.source || "metadata",
+      bytes: Buffer.byteLength(result.text || "", "utf8"),
+      truncated: Boolean(snapshot.truncated)
+    }));
+  }
+  return result;
 }
 
 function updateManifestPath(localPath, manifestPath) {
@@ -8886,6 +9354,127 @@ async function existingReplacementTarget(remotePathValue) {
   }
 }
 
+function trustedChatgptFileUrl(value) {
+  let target;
+  try {
+    target = new URL(String(value || ""));
+  } catch {
+    throw new Error("sourceFile.download_url must be a valid HTTPS URL.");
+  }
+  const host = target.hostname.toLowerCase();
+  const trustedHost = host === "files.openai.com"
+    || host.endsWith(".files.openai.com")
+    || host === "files.oaiusercontent.com"
+    || host.endsWith(".oaiusercontent.com")
+    || host.endsWith(".openaiusercontent.com");
+  if (target.protocol !== "https:" || target.username || target.password || !trustedHost) {
+    throw new Error("Refusing to download a ChatGPT file from an untrusted URL.");
+  }
+  return target;
+}
+
+async function downloadChatgptFile(sourceFile = {}) {
+  await ensurePrivateDirectory(chatgptUploadRoot);
+  const targetPath = join(chatgptUploadRoot, `${randomUUID()}.upload`);
+  let current = trustedChatgptFileUrl(sourceFile.download_url);
+  let response;
+  for (let redirects = 0; redirects <= 3; redirects += 1) {
+    response = await fetchWithRetry(current.toString(), { method: "GET", redirect: "manual" }, { maxRetries: 2 });
+    if (![301, 302, 303, 307, 308].includes(response.status)) break;
+    const location = response.headers.get("location");
+    if (!location) throw new Error("ChatGPT file download redirected without a Location header.");
+    if (redirects === 3) throw new Error("ChatGPT file download exceeded the redirect limit.");
+    current = trustedChatgptFileUrl(new URL(location, current).toString());
+  }
+  if (!response?.ok) {
+    await parseResponseBody(response).catch(() => null);
+    throw new Error(`ChatGPT file download failed with HTTP ${response?.status || "unknown"}.`);
+  }
+  const declaredBytes = contentLength(response);
+  if (declaredBytes !== null && declaredBytes > simpleUploadLimit) {
+    throw new Error(`ChatGPT file is larger than the ${simpleUploadLimit}-byte safe upload limit.`);
+  }
+  let bytesWritten = 0;
+  try {
+    if (response.body) {
+      const counter = new TransformStream({
+        transform(chunk, controller) {
+          bytesWritten += chunk.byteLength;
+          if (bytesWritten > simpleUploadLimit) {
+            controller.error(new Error(`ChatGPT file exceeded the ${simpleUploadLimit}-byte safe upload limit.`));
+            return;
+          }
+          controller.enqueue(chunk);
+        }
+      });
+      await pipeline(Readable.fromWeb(response.body.pipeThrough(counter)), createWriteStream(targetPath, { flags: "wx", mode: 0o600 }));
+    } else {
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (buffer.length > simpleUploadLimit) throw new Error(`ChatGPT file exceeded the ${simpleUploadLimit}-byte safe upload limit.`);
+      bytesWritten = buffer.length;
+      await writePrivateFile(targetPath, buffer);
+    }
+    await hardenPrivateFile(targetPath);
+    return { localPath: targetPath, bytes: bytesWritten };
+  } catch (error) {
+    await rm(targetPath, { force: true }).catch(() => null);
+    throw error;
+  }
+}
+
+async function uploadChatgptFile(args = {}) {
+  const destinationPath = assertSafeRemotePath(args.remotePath, "remotePath");
+  if (!destinationPath) throw new Error("remotePath must include a filename.");
+  const conflictBehavior = args.conflictBehavior || "fail";
+  const source = {
+    fileId: String(args.sourceFile?.file_id || ""),
+    fileName: String(args.sourceFile?.file_name || basename(destinationPath)),
+    mimeType: String(args.sourceFile?.mime_type || "")
+  };
+  const current = conflictBehavior === "replace" ? await existingReplacementTarget(destinationPath) : null;
+  if (current?.folder) throw new Error(`Refusing to replace a folder with file content: ${current.name}`);
+  const proof = {
+    destinationPath,
+    conflictBehavior,
+    source,
+    existing: current ? itemVersionProof(current) : null
+  };
+  const preview = {
+    dryRun: args.dryRun !== false,
+    confirmed: args.confirmed === true,
+    wouldUpload: { source, destinationPath, conflictBehavior },
+    wouldReplace: current ? simplifyItem(current) : null
+  };
+  if (args.dryRun !== false) return previewWithToken(preview, "onedrive_upload_file", proof);
+  if (args.confirmed !== true) {
+    return { ...preview, dryRun: false, requiredToUpload: "Set dryRun: false and confirmed: true after reviewing the upload preview." };
+  }
+  if (current && !hasExpectedIdentity(args)) {
+    return { ...preview, dryRun: false, confirmed: true, requiredToUpload: "Provide expectedName or expectedId matching the existing remote file." };
+  }
+  if (current) assertExpectedItem(current, args, "Upload replacement");
+  const previewTokenRequired = previewTokenRequiredResult(preview, "onedrive_upload_file", proof, args.previewToken, "requiredToUpload");
+  if (previewTokenRequired) return previewTokenRequired;
+
+  const downloaded = await downloadChatgptFile(args.sourceFile);
+  try {
+    const uploaded = await upload({
+      localPath: downloaded.localPath,
+      remotePath: destinationPath,
+      conflictBehavior: current ? "replace" : conflictBehavior === "replace" ? "fail" : conflictBehavior,
+      guardedInternalReplace: true,
+      ifMatch: current?.eTag,
+      uploadMode: "simple",
+      auditTool: "onedrive_upload_file",
+      auditSource: source
+    });
+    const { localPath: omittedLocalPath, ...safeUploaded } = uploaded;
+    return { ...safeUploaded, sourceFile: source };
+  } finally {
+    await rm(downloaded.localPath, { force: true }).catch(() => null);
+  }
+}
+
 async function guardPublicReplacement(args, destinationPath, replacement, toolName) {
   if (args.conflictBehavior !== "replace" || args.itemId || args.guardedInternalReplace === true) return null;
   const current = await existingReplacementTarget(destinationPath);
@@ -8965,7 +9554,7 @@ async function upload(args = {}) {
         status: "success",
         target: { remotePath: destinationPath },
         after: itemAuditSummary(response.item),
-        localPath,
+        ...(args.auditSource ? { source: args.auditSource } : { localPath }),
         bytes: fileStat.size
       });
     }
@@ -8975,7 +9564,7 @@ async function upload(args = {}) {
       await writeMutationAudit(auditTool, {
         status: "failed",
         target: { remotePath: destinationPath },
-        localPath,
+        ...(args.auditSource ? { source: args.auditSource } : { localPath }),
         bytes: fileStat.size,
         error: safeErrorInfo(error)
       });
@@ -10772,6 +11361,71 @@ async function deleteItem(args = {}) {
   }
 }
 
+async function permanentDeleteItem(args = {}) {
+  const rawItem = await getRawInfo({ itemId: args.itemId });
+  if (rawItem.root) throw new Error("Permanent delete refuses to operate on the OneDrive root.");
+  assertExpectedItem(rawItem, args, "Permanent delete");
+  const item = simplifyItem(rawItem);
+  const previewProof = { items: [itemVersionProof(rawItem)], operation: "permanentDelete" };
+  const preview = {
+    dryRun: args.dryRun !== false,
+    confirmed: args.confirmed === true,
+    acknowledgeIrreversible: args.acknowledgeIrreversible === true,
+    wouldPermanentlyDelete: item,
+    warning: "This bypasses the recycle bin and cannot be undone."
+  };
+  if (args.dryRun !== false) return previewWithToken(preview, "onedrive_permanent_delete", previewProof);
+  if (args.confirmed !== true || args.acknowledgeIrreversible !== true) {
+    return {
+      ...preview,
+      dryRun: false,
+      requiredToPermanentlyDelete: "Set dryRun: false, confirmed: true, and acknowledgeIrreversible: true after explicit user confirmation."
+    };
+  }
+  if (!hasExpectedIdentity(args)) {
+    return {
+      ...preview,
+      dryRun: false,
+      confirmed: true,
+      requiredToPermanentlyDelete: "Provide expectedName or expectedId for permanent deletion."
+    };
+  }
+  const previewTokenRequired = previewTokenRequiredResult(
+    preview,
+    "onedrive_permanent_delete",
+    previewProof,
+    args.previewToken,
+    "requiredToPermanentlyDelete"
+  );
+  if (previewTokenRequired) return previewTokenRequired;
+  const driveId = rawItem.parentReference?.driveId || (await graph("/me/drive?$select=id")).id;
+  if (!driveId) throw new Error("Could not resolve the OneDrive drive ID for permanent deletion.");
+  try {
+    await graph(`/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(rawItem.id)}/permanentDelete`, {
+      method: "POST",
+      headers: mutationMatchHeaders(rawItem),
+      maxRetries: 0
+    });
+    await bestEffortLocalWrite("metadata cache update", async () => await cacheItems([{ ...rawItem, deleted: { state: "permanentlyDeleted" } }]));
+    await writeMutationAudit("onedrive_permanent_delete", {
+      status: "success",
+      target: itemAuditSummary(rawItem),
+      before: itemAuditSummary(rawItem),
+      irreversible: true
+    });
+    return { dryRun: false, confirmed: true, permanentlyDeleted: item, irreversible: true };
+  } catch (error) {
+    await writeMutationAudit("onedrive_permanent_delete", {
+      status: "failed",
+      target: itemAuditSummary(rawItem),
+      before: itemAuditSummary(rawItem),
+      irreversible: true,
+      error: safeErrorInfo(error)
+    });
+    throw error;
+  }
+}
+
 function validateRestoreArgs(args = {}) {
   if (args.newName) assertSafeItemName(args.newName, "newName");
   if (args.destinationParentPath) assertSafeRemotePath(args.destinationParentPath, "destinationParentPath");
@@ -10856,17 +11510,67 @@ async function restoreDeleted(args = {}) {
   }
 }
 
+export function boundChatgptToolPayload(value, maxBytes = chatgptToolResponseByteLimit) {
+  let serialized;
+  try {
+    serialized = JSON.stringify(value);
+  } catch (error) {
+    const replacement = {
+      responseTruncated: true,
+      originalBytes: null,
+      maxBytes,
+      retryHint: "Retry with a smaller result limit or a more specific item ID.",
+      preview: safeToolErrorMessage(error)
+    };
+    return { value: replacement, truncated: true, originalBytes: null, boundedBytes: Buffer.byteLength(JSON.stringify(replacement), "utf8") };
+  }
+  if (serialized === undefined) serialized = "null";
+  const originalBytes = Buffer.byteLength(serialized, "utf8");
+  if (originalBytes <= maxBytes) {
+    return { value, truncated: false, originalBytes, boundedBytes: originalBytes };
+  }
+  const previewLimit = Math.max(1024, Math.min(256 * 1024, Math.floor(maxBytes / 2)));
+  const replacement = {
+    responseTruncated: true,
+    originalBytes,
+    maxBytes,
+    retryHint: "Retry with a smaller result limit, a narrower range, or a more specific item ID.",
+    preview: truncateUtf8(serialized, previewLimit).text
+  };
+  const boundedBytes = Buffer.byteLength(JSON.stringify(replacement), "utf8");
+  return { value: replacement, truncated: true, originalBytes, boundedBytes };
+}
+
 function textResult(value, isError = false, structuredContent = undefined) {
   const localWarnings = toolCallContext.getStore()?.localWarnings || [];
-  const payload = localWarnings.length
+  let payload = localWarnings.length
     ? (value && typeof value === "object" && !Array.isArray(value)
         ? { ...value, localWarnings }
         : { message: value, localWarnings })
     : value;
-  const text = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
+  let boundedStructuredContent = structuredContent;
+  if (toolProfile === "chatgpt") {
+    const boundedPayload = boundChatgptToolPayload(payload);
+    payload = boundedPayload.value;
+    if (structuredContent !== undefined) {
+      boundedStructuredContent = structuredContent === value && !localWarnings.length
+        ? boundedPayload.value
+        : boundChatgptToolPayload(structuredContent).value;
+    }
+    if (boundedPayload.truncated) {
+      console.error(JSON.stringify({
+        event: "onedrive-response-truncated",
+        tool: toolCallContext.getStore()?.toolName || null,
+        originalBytes: boundedPayload.originalBytes,
+        boundedBytes: boundedPayload.boundedBytes,
+        maxBytes: chatgptToolResponseByteLimit
+      }));
+    }
+  }
+  const text = typeof payload === "string" ? payload : JSON.stringify(payload, null, toolProfile === "chatgpt" ? 0 : 2);
   return {
     content: [{ type: "text", text }],
-    ...(structuredContent === undefined ? {} : { structuredContent }),
+    ...(boundedStructuredContent === undefined ? {} : { structuredContent: boundedStructuredContent }),
     isError
   };
 }
@@ -10946,6 +11650,14 @@ async function callTool(name, args = {}) {
     if (store) store.storageScope = await activeStorageScope();
   }
   switch (name) {
+    case "search": {
+      const value = await chatgptSearch(args);
+      return textResult(value, false, value);
+    }
+    case "fetch": {
+      const value = await chatgptFetch(args);
+      return textResult(value, false, value);
+    }
     case "onedrive_config": {
       const status = publicConfig();
       if (args.checkToken) {
@@ -11071,6 +11783,8 @@ async function callTool(name, args = {}) {
       return textResult(await downloadExport(args, "text"));
     case "onedrive_upload":
       return textResult(await upload(args));
+    case "onedrive_upload_file":
+      return textResult(await uploadChatgptFile(args));
     case "onedrive_write_text":
       return textResult(await writeText(args));
     case "onedrive_patch_text":
@@ -11139,6 +11853,8 @@ async function callTool(name, args = {}) {
       return textResult(await sharingAudit(args, true));
     case "onedrive_restore_deleted":
       return textResult(await restoreDeleted(args));
+    case "onedrive_permanent_delete":
+      return textResult(await permanentDeleteItem(args));
     case "onedrive_audit_recent":
       return textResult(await auditRecent(args));
     case "onedrive_audit_export":
@@ -11164,7 +11880,7 @@ export async function processMcpMessage(message, requestAuth = null) {
       return resultMessage(id, {
         protocolVersion: supportedProtocolVersions.has(requestedProtocolVersion) ? requestedProtocolVersion : "2024-11-05",
         capabilities: { tools: {} },
-        instructions: "Use onedrive_list for direct folder listings and onedrive_find for normal filename or fuzzy lookup. Prefer compact responses and small limits. Locate an item before reading or changing it. For Office edits, call onedrive_office_capabilities and the matching read tool before onedrive_office_batch_transform. Mutations default to preview and require confirmation.",
+        instructions: "Use search for normal OneDrive file or content lookup, then fetch with the returned ID when text or metadata is needed. Use onedrive_list only for direct folder listings. Keep results small. Locate an item before changing it. For Office edits, call onedrive_office_capabilities and the matching structured read tool before onedrive_office_batch_transform. Mutations default to preview and require confirmation.",
         serverInfo: {
           name: "onedrive",
           title: "OneDrive",
@@ -11201,6 +11917,7 @@ export async function processMcpMessage(message, requestAuth = null) {
         }));
       }
       const result = await toolCallContext.run({
+        toolName: params.name,
         localWarnings: [],
         lastGraphRequestId: null,
         lastMutationGraphRequestId: null,

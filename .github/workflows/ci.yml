@@ -53,6 +53,8 @@ jobs:
           node --check scripts/tool-contract.mjs
           node --check scripts/tool-profile-test.mjs
           node --check scripts/install-versioned-cache.mjs
+          python3 -m py_compile scripts/common-text.py
+          python3 -m py_compile scripts/common-text-test.py
           python3 -m py_compile scripts/office-fixture-factory.py
           zsh -n scripts/configure.zsh
 
@@ -81,6 +83,7 @@ jobs:
 
       - name: Run mocked Microsoft Graph tests
         run: |
+          python3 scripts/common-text-test.py
           python3 scripts/office-openxml-test.py
           python3 scripts/office-security-test.py
           SOFFICE="$(command -v soffice)" python3 scripts/office-real-fixture-test.py

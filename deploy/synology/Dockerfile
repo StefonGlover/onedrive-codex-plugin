@@ -22,7 +22,7 @@ RUN set -eu; \
 FROM node:20-bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates gosu python3 tini \
+    && apt-get install -y --no-install-recommends ca-certificates catdoc gosu poppler-utils python3 tesseract-ocr tini \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=tunnel-client /usr/local/bin/tunnel-client /usr/local/bin/tunnel-client

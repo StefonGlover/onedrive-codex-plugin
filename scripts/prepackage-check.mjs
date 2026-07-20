@@ -113,6 +113,8 @@ const requiredFiles = [
   "scripts/semantic-anchors-test.mjs",
   "scripts/text-patch-test.mjs",
   "scripts/tool-profile-test.mjs",
+  "scripts/common-text.py",
+  "scripts/common-text-test.py",
   "scripts/office-openxml.py",
   "scripts/office-fixture-factory.py",
   "scripts/office-openxml-test.py",
