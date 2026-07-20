@@ -2254,7 +2254,7 @@ const compactOfficeOperationSchema = {
 
 const chatgptToolMetadata = Object.freeze({
   search: {
-    description: "Use this when the user wants to find OneDrive files or folders by name, keywords, or indexed content. Every result includes an opaque id; select the best match and pass that id unchanged to fetch.",
+    description: "Use this when the user wants to find OneDrive files or folders by name, keywords, or indexed content. For multiple requested targets, call search separately for each distinct filename or topic. Every result includes an opaque id; pass the chosen id unchanged to fetch.",
     invoking: "Searching OneDrive…",
     invoked: "OneDrive results ready"
   },
@@ -2299,22 +2299,22 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "Folder creation result ready"
   },
   onedrive_rename: {
-    description: "Use this when the user wants to change the name of one existing OneDrive file or folder without changing its parent location. Locate the item and preview first.",
+    description: "Use this when the user wants to change the name of one existing OneDrive file or folder without changing its parent location. Inputs: itemId or path plus newName. Preview with dryRun true; then use dryRun false, confirmed true, and expectedId or expectedName.",
     invoking: "Preparing OneDrive rename…",
     invoked: "Rename result ready"
   },
   onedrive_move: {
-    description: "Use this when the user wants to move one existing OneDrive file or folder to a different parent folder. Locate the source and destination and preview first.",
+    description: "Use this when the user wants to move one existing OneDrive item to a different parent folder. Inputs: source itemId or path plus destinationParentItemId or destinationParentPath; newName is optional. Preview with dryRun true; then use dryRun false, confirmed true, and expectedId or expectedName.",
     invoking: "Preparing OneDrive move…",
     invoked: "Move result ready"
   },
   onedrive_copy: {
-    description: "Use this when the user wants to copy one existing OneDrive file or folder while leaving the source in place. Locate the source and destination and preview first.",
+    description: "Use this when the user wants to copy one existing OneDrive item while leaving the source in place. Inputs: source itemId or path plus destinationParentItemId or destinationParentPath; newName and waitForCompletion are optional. Preview with dryRun true; then use dryRun false, confirmed true, and expectedId or expectedName.",
     invoking: "Preparing OneDrive copy…",
     invoked: "Copy result ready"
   },
   onedrive_create_sharing_link: {
-    description: "Use this when the user wants a shareable OneDrive link with a selected link type and scope. Use invite permission instead for named recipients, and preview before creating the link.",
+    description: "Use this when the user wants a shareable OneDrive link with a selected type and scope; use invite permission for named recipients. Inputs: itemId or path, type, and scope. Preview with dryRun true; then use dryRun false, confirmed true, expectedId or expectedName, and the returned previewToken.",
     invoking: "Preparing sharing link…",
     invoked: "Sharing link result ready"
   },
@@ -2324,7 +2324,7 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "Invitation result ready"
   },
   onedrive_revoke_permission: {
-    description: "Use this when the user wants to revoke one existing OneDrive permission or sharing link by permission ID. Inspect permissions and preview the exact removal first.",
+    description: "Use this when the user wants to revoke one existing OneDrive permission or sharing link. Inspect permissions first. Inputs: itemId or path plus permissionId. Preview with dryRun true; then use dryRun false, confirmed true, expectedId or expectedName, and the returned previewToken.",
     invoking: "Preparing permission removal…",
     invoked: "Permission removal result ready"
   },
@@ -2392,7 +2392,7 @@ const advertisedServerVersion = toolProfile === "chatgpt"
   ? `${manifestServerVersion}${manifestServerVersion.includes("+") ? "." : "+"}chatgpt.${advertisedContractHash}`
   : manifestServerVersion;
 const serverInstructions = toolProfile === "chatgpt"
-  ? "Search for OneDrive lookup. Every result includes an opaque id: choose the best match and pass its id unchanged to fetch; never claim it is missing or derive it from the URL. If fetch returns nextChunkId, fetch that only when more detail is needed. Use onedrive_list only for a known folder. Locate items before changing them. For Office edits, fetch each file, call onedrive_office_capabilities, then onedrive_office_batch_transform. Mutations require preview and confirmation."
+  ? "Search OneDrive. For multiple targets, call search separately for each filename or topic. Every result has an opaque id; pass it unchanged to fetch—never claim it is missing or derive it from a URL. Fetch nextChunkId only if needed. Use onedrive_list only for a known folder. Locate items before changes. For Office edits, fetch each file, call onedrive_office_capabilities, then onedrive_office_batch_transform. Mutations require preview, confirmation, and exact expected identity."
   : "Use onedrive_find for normal OneDrive lookup and the matching structured read tool before an Office edit. Use onedrive_list only for direct folder listings. Keep results bounded. Locate an item before changing it. Mutations default to preview and require confirmation.";
 
 const toolByName = new Map(executableTools.map((tool) => [tool.name, tool]));

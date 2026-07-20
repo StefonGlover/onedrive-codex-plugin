@@ -6,7 +6,7 @@ services:
       args:
         TUNNEL_CLIENT_VERSION: "0.0.10"
         TARGETARCH: "amd64"
-    image: onedrive-chatgpt-nas:0.5.1-nas11
+    image: onedrive-chatgpt-nas:0.5.1-nas12
     container_name: onedrive-chatgpt
     restart: unless-stopped
     environment:

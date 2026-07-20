@@ -92,10 +92,15 @@ try {
   assert(chatgpt.officeTransformBytes <= 4096, "ChatGPT Office transform descriptor must remain compact.", chatgpt);
   assert(chatgpt.instructions.length > 0 && chatgpt.instructions.length <= 512, "Server instructions must be present and concise.", chatgpt.instructions);
   assert(chatgpt.instructions.includes("fetch each file") && !chatgpt.instructions.includes("matching structured read tool"), "ChatGPT server instructions must use the focused fetch-first Office sequence.", chatgpt.instructions);
+  assert(chatgpt.instructions.includes("call search separately"), "ChatGPT server instructions must prevent multi-target queries from hiding distinct result IDs.", chatgpt.instructions);
   assert(chatgpt.metadata.every((tool) => /^Use this when\b/u.test(tool.description || "")), "Every focused ChatGPT tool description must begin with a discriminative 'Use this when' cue.", chatgpt.metadata);
   assert(new Set(chatgpt.metadata.map((tool) => tool.description)).size === chatgpt.metadata.length, "Focused ChatGPT tool descriptions must be unique.", chatgpt.metadata);
   assert(chatgpt.metadata.every((tool) => tool.invoking && tool.invoked && tool.invoking.length <= 64 && tool.invoked.length <= 64), "Every focused ChatGPT tool must advertise bounded invocation status text.", chatgpt.metadata);
   assert(chatgpt.metadata.find((tool) => tool.name === "fetch")?.description.includes("continuation ID"), "Fetch metadata must explain progressive continuation behavior.", chatgpt.metadata);
+  for (const name of ["onedrive_rename", "onedrive_move", "onedrive_copy", "onedrive_create_sharing_link", "onedrive_revoke_permission"]) {
+    const description = chatgpt.metadata.find((tool) => tool.name === name)?.description || "";
+    assert(description.includes("Inputs:") && description.includes("expectedId or expectedName"), `${name} must expose compact live-call input guidance for deferred ChatGPT schema loading.`, description);
+  }
   assert(chatgpt.serverVersion !== full.serverVersion && chatgpt.serverVersion.includes(".chatgpt."), "ChatGPT metadata must use a contract-specific server version to invalidate stale app caches.", { full: full.serverVersion, chatgpt: chatgpt.serverVersion });
 
   const invalid = spawnSync(process.execPath, [scriptPath, "--probe"], {
