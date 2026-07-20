@@ -2,10 +2,10 @@
   "schemaVersion": 2,
   "decision": "Pending — Entra registration, NAS OAuth rollout, and ChatGPT Work validation",
   "date": "2026-07-20",
-  "generatedAt": "2026-07-20T11:52:32Z",
+  "generatedAt": "2026-07-20T12:28:43Z",
   "source": {
-    "commit": "5cec4030176ac44d49dd1a2b79a26ee6a7e1fa53",
-    "workingTree": "Pending extraction/performance and OAuth compatibility build. The exact 2026 Family Budgeting.xlsx ChatGPT failure is repaired and live-tested, the optimized developer-mode app logo matches the local OneDrive asset, the 19-tool ChatGPT contract and 84-tool full contract pass, and all 162 mock Graph tests pass. Immutable-cache parity, NAS rollout of this commit, Entra registration, and the ChatGPT Work host loop remain outstanding.",
+    "commit": "9a83b2df1f9ee20c1126df34d0df60f0d467916a",
+    "workingTree": "Pending performance-hardening and OAuth rollout build. The exact 2026 Family Budgeting.xlsx failure remains repaired, and the developer-mode app logo still matches the local OneDrive asset. Current source adds corrected focused instructions and status metadata, progressive fetch, stale-while-revalidate search, ETag/cTag index reuse, and a 19-case metadata golden-prompt gate. The 19-tool ChatGPT contract, 84-tool full contract, and all 164 mock Graph checks pass. Immutable-cache parity, NAS rollout, ChatGPT metadata refresh/retest, Entra registration, and the ChatGPT Work host loop remain outstanding.",
     "pluginVersion": "0.5.1+codex.20260719224717",
     "contentDigest": null
   },
@@ -22,7 +22,7 @@
     { "name": "Office security corpus", "status": "pass" },
     { "name": "Genuine package reopening", "status": "pass" },
     { "name": "Common document extraction", "status": "pass", "formats": ["rtf", "opendocument", "epub"] },
-    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 162 },
+    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 164 },
     { "name": "Read-only OneDrive doctor and tenant checks", "status": "pass", "checks": 6 },
     { "name": "Cleanup preview", "status": "pass", "candidates": 0 },
     { "name": "Whitespace", "status": "pass" }
@@ -98,7 +98,7 @@
       "fix": "Do not chmod the storage mount root; keep Python bytecode in a private temporary directory outside /data and retain 0700 hardening for managed writable state.",
       "focusedFixtureTest": "pass",
       "rootOwnedMountTest": "pass_as_unprivileged_node_user_with_mode_0555",
-      "mockGraphChecks": 162,
+      "mockGraphChecks": 164,
       "mockGraphFailures": 0,
       "liveWorkbookRetest": "pass",
       "liveWorkbookPath": "Personal/Documents/Career Development/QSE Job Tracker.xlsx",
@@ -148,10 +148,31 @@
       "summaryVerified": true,
       "sampleFigures": { "monthlyIncome": 12325, "monthlyOutflows": 13993, "monthlyNetCashFlow": -1668, "ytdIncomeThroughJune": 73950, "ytdNetCashFlowThroughJune": -10008 }
     },
+    "chatgptPerformanceHardening": {
+      "status": "offline_pass_pending_host_refresh",
+      "profileToolCount": 19,
+      "profileBytes": 32409,
+      "fullToolCount": 84,
+      "fullProfileBytes": 335403,
+      "contractReductionPercent": 90.3,
+      "serverVersion": "0.5.1+codex.20260719224717.chatgpt.a6ed3e1f07c7",
+      "serverInstructionBytes": 430,
+      "goldenPromptCases": 19,
+      "ambiguityPairs": 6,
+      "initialFetchTextBytes": 32768,
+      "continuationChunkBytes": 65536,
+      "fetchSnapshotTtlSeconds": 600,
+      "staleCacheMaxAgeSeconds": 86400,
+      "mockGraphChecks": 164,
+      "mockGraphFailures": 0,
+      "node26Local": "pass",
+      "node20Ci": "pending_push",
+      "liveChatgptRetest": false
+    },
     "currentSourceRollout": {
       "immutableCache": "pending",
       "synologyImage": "pending",
-      "chatgptDeveloperAppMetadata": "refreshed"
+      "chatgptDeveloperAppMetadata": "pending_refresh_for_a6ed3e1f07c7"
     }
   },
   "blockedCoverage": [
@@ -161,6 +182,6 @@
     { "area": "Forced device-code polling", "reason": "The healthy existing credential and consent remain untouched; suppression and mock flow coverage pass." },
     { "area": "Keychain deletion", "reason": "The existing credential remains untouched; memory-only logout passes." },
     { "area": "Live recycle-bin restore", "reason": "Recycle-bin restore remains dry-run/mock tested; native version restore passes live." },
-    { "area": "Current source cache/NAS parity", "reason": "The extraction/performance source commit is locally and live-ChatGPT tested but has not yet replaced the immutable cache or NAS image." }
+    { "area": "Current source rollout and host validation", "reason": "The performance-hardening source commit passes local offline gates but has not yet replaced the immutable cache or NAS image, refreshed the ChatGPT app metadata, or completed a new live ChatGPT timing run." }
   ]
 }
