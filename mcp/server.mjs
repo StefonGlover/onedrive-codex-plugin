@@ -179,6 +179,7 @@ let watchesLoaded = false;
 const previewTokenTtlMs = 15 * 60 * 1000;
 const previewScopedTools = new Set([
   "onedrive_upload", "onedrive_upload_file", "onedrive_write_text", "onedrive_batch_delete", "onedrive_delete", "onedrive_permanent_delete",
+  "onedrive_rename", "onedrive_move", "onedrive_copy",
   "onedrive_create_sharing_link", "onedrive_invite_permission", "onedrive_revoke_permission",
   "onedrive_batch_revoke_permissions", "onedrive_restore_deleted", "onedrive_word_batch_update",
   "onedrive_excel_batch_update", "onedrive_powerpoint_batch_update", "onedrive_office_batch_transform",
@@ -1417,7 +1418,8 @@ const tools = [
           description: "Must be true after explicit user confirmation because this renames a file or folder."
         },
         expectedName: { type: "string", description: "Required for a live rename unless expectedId is provided; item name must match. Optional for dry-run." },
-        expectedId: { type: "string", description: "Required for a live rename unless expectedName is provided; item ID must match. Optional for dry-run." }
+        expectedId: { type: "string", description: "Required for a live rename unless expectedName is provided; item ID must match. Optional for dry-run." },
+        previewToken: previewTokenSchema
       },
       additionalProperties: false
     }
@@ -1444,7 +1446,8 @@ const tools = [
           description: "Must be true after explicit user confirmation because this moves a file or folder."
         },
         expectedName: { type: "string", description: "Required for a live move unless expectedId is provided; source item name must match. Optional for dry-run." },
-        expectedId: { type: "string", description: "Required for a live move unless expectedName is provided; source item ID must match. Optional for dry-run." }
+        expectedId: { type: "string", description: "Required for a live move unless expectedName is provided; source item ID must match. Optional for dry-run." },
+        previewToken: previewTokenSchema
       },
       additionalProperties: false
     }
@@ -1473,7 +1476,8 @@ const tools = [
         waitForCompletion: { type: "boolean", default: false },
         timeoutSeconds: { type: "integer", minimum: 1, maximum: 300, default: 60 },
         expectedName: { type: "string", description: "Required for a live copy unless expectedId is provided; source item name must match. Optional for dry-run." },
-        expectedId: { type: "string", description: "Required for a live copy unless expectedName is provided; source item ID must match. Optional for dry-run." }
+        expectedId: { type: "string", description: "Required for a live copy unless expectedName is provided; source item ID must match. Optional for dry-run." },
+        previewToken: previewTokenSchema
       },
       additionalProperties: false
     }
@@ -2299,17 +2303,17 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "Folder creation result ready"
   },
   onedrive_rename: {
-    description: "Use this when the user wants to change the name of one existing OneDrive file or folder without changing its parent location. Inputs: itemId or path plus newName. Preview with dryRun true; then use dryRun false, confirmed true, and expectedId or expectedName.",
+    description: "Use this when the user wants to change the name of one existing OneDrive file or folder without changing its parent location. Inputs: itemId or path plus newName. Preview with dryRun true; then use dryRun false, confirmed true, expectedId or expectedName, and the returned previewToken.",
     invoking: "Preparing OneDrive rename…",
     invoked: "Rename result ready"
   },
   onedrive_move: {
-    description: "Use this when the user wants to move one existing OneDrive item to a different parent folder. Inputs: source itemId or path plus destinationParentItemId or destinationParentPath; newName is optional. Preview with dryRun true; then use dryRun false, confirmed true, and expectedId or expectedName.",
+    description: "Use this when the user wants to move one existing OneDrive item to a different parent folder. Inputs: source itemId or path plus destinationParentItemId or destinationParentPath; newName is optional. Preview with dryRun true; then use dryRun false, confirmed true, expectedId or expectedName, and the returned previewToken.",
     invoking: "Preparing OneDrive move…",
     invoked: "Move result ready"
   },
   onedrive_copy: {
-    description: "Use this when the user wants to copy one existing OneDrive item while leaving the source in place. Inputs: source itemId or path plus destinationParentItemId or destinationParentPath; newName and waitForCompletion are optional. Preview with dryRun true; then use dryRun false, confirmed true, and expectedId or expectedName.",
+    description: "Use this when the user wants to copy one existing OneDrive item while leaving the source in place. Inputs: source itemId or path plus destinationParentItemId or destinationParentPath; newName and waitForCompletion are optional. Preview with dryRun true; then use dryRun false, confirmed true, expectedId or expectedName, and the returned previewToken.",
     invoking: "Preparing OneDrive copy…",
     invoked: "Copy result ready"
   },
@@ -10852,15 +10856,14 @@ async function rename(args = {}) {
   if (current.root) throw new Error("Rename refuses to operate on the OneDrive root.");
   assertExpectedItem(current, args, "Rename");
   const item = simplifyItem(current);
+  const preview = { dryRun: args.dryRun !== false, confirmed: args.confirmed === true, wouldRename: item, newName };
+  const previewProof = { items: [itemVersionProof(current)], operation: "rename", newName };
   if (args.dryRun !== false) {
-    return { dryRun: true, wouldRename: item, newName };
+    return previewWithToken(preview, "onedrive_rename", previewProof);
   }
   if (args.confirmed !== true) {
     return {
-      dryRun: false,
-      confirmed: false,
-      wouldRename: item,
-      newName,
+      ...preview,
       requiredToRename: "Set dryRun: false and confirmed: true after explicit user confirmation."
     };
   }
@@ -10873,6 +10876,8 @@ async function rename(args = {}) {
       requiredToRename: "Provide expectedName or expectedId for live renames."
     };
   }
+  const previewTokenRequired = previewTokenRequiredResult(preview, "onedrive_rename", previewProof, args.previewToken, "requiredToRename");
+  if (previewTokenRequired) return previewTokenRequired;
   try {
     const result = await graph(itemMutationBase(current), {
       method: "PATCH",
@@ -10910,16 +10915,14 @@ async function moveItem(args = {}) {
   const body = { parentReference: { id: parentReference.id } };
   if (args.newName) body.name = args.newName;
   const item = simplifyItem(current);
+  const preview = { dryRun: args.dryRun !== false, confirmed: args.confirmed === true, wouldMove: item, destination: parentReference, newName: args.newName || null };
+  const previewProof = { items: [itemVersionProof(current)], operation: "move", destinationParentId: parentReference.id, newName: args.newName || null };
   if (args.dryRun !== false) {
-    return { dryRun: true, wouldMove: item, destination: parentReference, newName: args.newName || null };
+    return previewWithToken(preview, "onedrive_move", previewProof);
   }
   if (args.confirmed !== true) {
     return {
-      dryRun: false,
-      confirmed: false,
-      wouldMove: item,
-      destination: parentReference,
-      newName: args.newName || null,
+      ...preview,
       requiredToMove: "Set dryRun: false and confirmed: true after explicit user confirmation."
     };
   }
@@ -10933,6 +10936,8 @@ async function moveItem(args = {}) {
       requiredToMove: "Provide expectedName or expectedId for live moves."
     };
   }
+  const previewTokenRequired = previewTokenRequiredResult(preview, "onedrive_move", previewProof, args.previewToken, "requiredToMove");
+  if (previewTokenRequired) return previewTokenRequired;
   try {
     const result = await graph(itemMutationBase(current), {
       method: "PATCH",
@@ -11019,16 +11024,14 @@ async function copyItem(args = {}) {
   assertExpectedItem(current, args, "Copy");
   const parentReference = await resolveDestinationParent(args);
   const item = simplifyItem(current);
+  const preview = { dryRun: args.dryRun !== false, confirmed: args.confirmed === true, wouldCopy: item, destination: parentReference, newName: args.newName || null };
+  const previewProof = { items: [itemVersionProof(current)], operation: "copy", destinationParentId: parentReference.id, newName: args.newName || null };
   if (args.dryRun !== false) {
-    return { dryRun: true, wouldCopy: item, destination: parentReference, newName: args.newName || null };
+    return previewWithToken(preview, "onedrive_copy", previewProof);
   }
   if (args.confirmed !== true) {
     return {
-      dryRun: false,
-      confirmed: false,
-      wouldCopy: item,
-      destination: parentReference,
-      newName: args.newName || null,
+      ...preview,
       requiredToCopy: "Set dryRun: false and confirmed: true after explicit user confirmation."
     };
   }
@@ -11042,6 +11045,8 @@ async function copyItem(args = {}) {
       requiredToCopy: "Provide expectedName or expectedId for live copies."
     };
   }
+  const previewTokenRequired = previewTokenRequiredResult(preview, "onedrive_copy", previewProof, args.previewToken, "requiredToCopy");
+  if (previewTokenRequired) return previewTokenRequired;
   try {
     const response = await graph(`${itemMutationBase(current)}/copy`, {
       method: "POST",

@@ -3510,8 +3510,21 @@ process.exit(2);
     return { graphRequestsAdded: added.length };
   });
 
+  await check("rename, move, and copy live actions require matching preview tokens", async () => {
+    const before = requests.length;
+    const rename = await tool("onedrive_rename", { itemId: "delete-target", newName: "renamed.txt", dryRun: false, confirmed: true, expectedId: "delete-target" });
+    const move = await tool("onedrive_move", { itemId: "root-note", destinationParentItemId: "folder-a", dryRun: false, confirmed: true, expectedId: "root-note" });
+    const copy = await tool("onedrive_copy", { itemId: "copy-src", destinationParentItemId: "folder-a", dryRun: false, confirmed: true, expectedId: "copy-src" });
+    assert(rename.value.previewTokenRequired === true, "rename should require its dry-run preview token", rename.value);
+    assert(move.value.previewTokenRequired === true, "move should require its dry-run preview token", move.value);
+    assert(copy.value.previewTokenRequired === true, "copy should require its dry-run preview token", copy.value);
+    const added = requests.slice(before);
+    assert(!added.some((request) => request.method === "PATCH" || request.method === "POST"), "missing preview tokens must not mutate", { added });
+    return { graphRequestsAdded: added.length };
+  });
+
   await check("confirmed copy sends one copy POST and preserves manual 303 monitor", async () => {
-    const result = await tool("onedrive_copy", {
+    const result = await toolWithPreview("onedrive_copy", {
       itemId: "copy-src",
       destinationParentItemId: "folder-a",
       dryRun: false,
@@ -3531,15 +3544,15 @@ process.exit(2);
   });
 
   await check("copy monitor explicitly distinguishes failed and unknown terminal states", async () => {
-    const failed = await tool("onedrive_copy", { itemId: "copy-failed", destinationParentItemId: "folder-a", dryRun: false, confirmed: true, expectedId: "copy-failed", waitForCompletion: true, timeoutSeconds: 5 });
+    const failed = await toolWithPreview("onedrive_copy", { itemId: "copy-failed", destinationParentItemId: "folder-a", dryRun: false, confirmed: true, expectedId: "copy-failed", waitForCompletion: true, timeoutSeconds: 5 });
     assert(!failed.isError && failed.value.monitor?.terminal === true && failed.value.monitor?.succeeded === false && failed.value.monitor?.terminalState === "failed", "failed copy monitor state was ambiguous", failed);
-    const unknown = await tool("onedrive_copy", { itemId: "copy-unknown", destinationParentItemId: "folder-a", dryRun: false, confirmed: true, expectedId: "copy-unknown", waitForCompletion: true, timeoutSeconds: 5 });
+    const unknown = await toolWithPreview("onedrive_copy", { itemId: "copy-unknown", destinationParentItemId: "folder-a", dryRun: false, confirmed: true, expectedId: "copy-unknown", waitForCompletion: true, timeoutSeconds: 5 });
     assert(!unknown.isError && unknown.value.monitor?.terminal === true && unknown.value.monitor?.succeeded === false && unknown.value.monitor?.terminalState === "unknown", "unknown copy monitor state must not resemble success", unknown);
     return { failed: failed.value.monitor.terminalState, unknown: unknown.value.monitor.terminalState };
   });
 
   await check("copy monitor rejects untrusted and insecure external URLs", async () => {
-    const result = await tool("onedrive_copy", {
+    const result = await toolWithPreview("onedrive_copy", {
       itemId: "copy-evil",
       dryRun: false,
       confirmed: true,
@@ -3551,7 +3564,7 @@ process.exit(2);
     assert(result.value.accepted === true, "copy should still report accepted mutation", result.value);
     assert(result.value.monitorError?.includes("untrusted copy monitor URL"), "unexpected monitor rejection", result.value);
     assert(result.value.monitor?.terminal === false && result.value.monitor?.succeeded === false && result.value.monitor?.terminalState === "monitor_error", "monitor errors need an explicit non-success state", result.value);
-    const insecure = await tool("onedrive_copy", {
+    const insecure = await toolWithPreview("onedrive_copy", {
       itemId: "copy-http-sharepoint",
       dryRun: false,
       confirmed: true,
@@ -3567,7 +3580,7 @@ process.exit(2);
   });
 
   await check("copy wait reports an explicit non-success state when Graph omits the monitor URL", async () => {
-    const result = await tool("onedrive_copy", {
+    const result = await toolWithPreview("onedrive_copy", {
       itemId: "copy-no-location",
       destinationParentItemId: "folder-a",
       dryRun: false,
@@ -4786,7 +4799,7 @@ process.exit(2);
     await tool("onedrive_cache_clear");
     const info = await tool("onedrive_get_info", { itemId: "delete-target" });
     assert(!info.isError, "get_info should seed cache", info);
-    const result = await tool("onedrive_rename", {
+    const result = await toolWithPreview("onedrive_rename", {
       itemId: "delete-target",
       newName: "renamed-cache.txt",
       expectedName: "delete-me.txt",
@@ -4807,7 +4820,7 @@ process.exit(2);
     let cache = JSON.parse(readFileSync(join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json"), "utf8"));
     assert(cache.pathsByLower["folder a/deep summary deck.pptx"] === "deep-deck", "expected descendant cache path before rename", cache.pathsByLower);
 
-    const renamed = await tool("onedrive_rename", {
+    const renamed = await toolWithPreview("onedrive_rename", {
       itemId: "folder-a",
       newName: "Folder Renamed",
       expectedName: "Folder A",

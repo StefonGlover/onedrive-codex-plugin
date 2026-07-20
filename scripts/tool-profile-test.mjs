@@ -99,7 +99,7 @@ try {
   assert(chatgpt.metadata.find((tool) => tool.name === "fetch")?.description.includes("continuation ID"), "Fetch metadata must explain progressive continuation behavior.", chatgpt.metadata);
   for (const name of ["onedrive_rename", "onedrive_move", "onedrive_copy", "onedrive_create_sharing_link", "onedrive_revoke_permission"]) {
     const description = chatgpt.metadata.find((tool) => tool.name === name)?.description || "";
-    assert(description.includes("Inputs:") && description.includes("expectedId or expectedName"), `${name} must expose compact live-call input guidance for deferred ChatGPT schema loading.`, description);
+    assert(description.includes("Inputs:") && description.includes("expectedId or expectedName") && description.includes("previewToken"), `${name} must expose compact live-call input guidance for deferred ChatGPT schema loading.`, description);
   }
   assert(chatgpt.serverVersion !== full.serverVersion && chatgpt.serverVersion.includes(".chatgpt."), "ChatGPT metadata must use a contract-specific server version to invalidate stale app caches.", { full: full.serverVersion, chatgpt: chatgpt.serverVersion });
 
