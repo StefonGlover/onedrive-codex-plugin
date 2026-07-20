@@ -1,11 +1,11 @@
 {
   "schemaVersion": 2,
-  "decision": "Pending — Entra registration, NAS OAuth rollout, ChatGPT Work validation, and correct hosted logo",
-  "date": "2026-07-19",
-  "generatedAt": "2026-07-19T22:47:17Z",
+  "decision": "Pending — Entra registration, NAS OAuth rollout, and ChatGPT Work validation",
+  "date": "2026-07-20",
+  "generatedAt": "2026-07-20T11:52:32Z",
   "source": {
-    "commit": "87d94eb3df28c5c7a79409cbae238633ed992094",
-    "workingTree": "Pending OAuth compatibility build on top of the validated No Auth release. The immutable 0.5.1 cache, Synology nas8 workbook repair, live QSE workbook read, local JWT, protected-resource discovery, OBO exchange, Streamable HTTP, 84-tool oauth2 metadata, runtime challenge, and authenticated-call tests pass. Entra registration, NAS OAuth deployment, the ChatGPT Work host loop, and the correct hosted listing logo remain outstanding.",
+    "commit": "5cec4030176ac44d49dd1a2b79a26ee6a7e1fa53",
+    "workingTree": "Pending extraction/performance and OAuth compatibility build. The exact 2026 Family Budgeting.xlsx ChatGPT failure is repaired and live-tested, the optimized developer-mode app logo matches the local OneDrive asset, the 19-tool ChatGPT contract and 84-tool full contract pass, and all 162 mock Graph tests pass. Immutable-cache parity, NAS rollout of this commit, Entra registration, and the ChatGPT Work host loop remain outstanding.",
     "pluginVersion": "0.5.1+codex.20260719224717",
     "contentDigest": null
   },
@@ -14,14 +14,15 @@
     "exact": true
   },
   "offlineGates": [
-    { "name": "Node 20 and Node 26 syntax/self-checks", "status": "pass" },
+    { "name": "Node 20 and Node 26 syntax/self-checks", "status": "pending" },
     { "name": "Exact MCP contract", "status": "pass", "toolCount": 84 },
     { "name": "Plugin manifest/version alignment", "status": "pass" },
     { "name": "Prepackage negative checks", "status": "pass" },
     { "name": "Office Open XML operations", "status": "pass", "operations": 79, "word": 21, "excel": 33, "powerpoint": 25 },
     { "name": "Office security corpus", "status": "pass" },
     { "name": "Genuine package reopening", "status": "pass" },
-    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 157 },
+    { "name": "Common document extraction", "status": "pass", "formats": ["rtf", "opendocument", "epub"] },
+    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 162 },
     { "name": "Read-only OneDrive doctor and tenant checks", "status": "pass", "checks": 6 },
     { "name": "Cleanup preview", "status": "pass", "candidates": 0 },
     { "name": "Whitespace", "status": "pass" }
@@ -57,13 +58,13 @@
     }
   },
   "installedBuild": {
-    "status": "pass",
+    "status": "pending_source_update",
     "version": "0.5.1+codex.20260719224717",
     "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.5.1+codex.20260719224717",
     "oldCacheOverwritten": false
   },
   "cleanup": { "status": "pass", "remoteTestRootsRemaining": 0, "permissionsRemaining": 0, "anonymousLinksRemaining": 0, "isolatedLocalResidue": false },
-  "sourceCacheParity": { "status": "pass", "bytes": "pass", "modes": "pass", "types": "pass", "symlinkTargets": "pass" },
+  "sourceCacheParity": { "status": "pending", "bytes": "pending", "modes": "pending", "types": "pending", "symlinkTargets": "pending" },
   "deployment": {
     "status": "pass",
     "platform": "Synology DS923+ Container Manager",
@@ -97,7 +98,7 @@
       "fix": "Do not chmod the storage mount root; keep Python bytecode in a private temporary directory outside /data and retain 0700 hardening for managed writable state.",
       "focusedFixtureTest": "pass",
       "rootOwnedMountTest": "pass_as_unprivileged_node_user_with_mode_0555",
-      "mockGraphChecks": 157,
+      "mockGraphChecks": 162,
       "mockGraphFailures": 0,
       "liveWorkbookRetest": "pass",
       "liveWorkbookPath": "Personal/Documents/Career Development/QSE Job Tracker.xlsx",
@@ -111,17 +112,16 @@
     "chatgptHostLoop": {
       "status": "pass_with_host_limitation",
       "appName": "OneDrive",
-      "appId": "asdk_app_6a5d3b6c8b9c8191a0cb7d281bf6bc1d",
+      "appId": "asdk_app_6a5d95ab7c8881918fe4b3ce03457716",
       "authentication": "No Auth",
       "toolSecuritySchemes": "84/84 noauth",
       "listingLogo": {
-        "status": "fail_generic_plug_confirmed",
-        "checkedAt": "2026-07-19T21:34:46Z",
+        "status": "pass_developer_app_matches_local_asset",
+        "checkedAt": "2026-07-20T11:40:00Z",
         "expectedAsset": "assets/chatgpt-icon.png",
         "expectedAppearance": "square blue OneDrive cloud",
-        "observedAppearance": "generic plug",
-        "replacementFlow": "The ChatGPT New Plugin form exposes a PNG icon field and OAuth/Mixed authentication choices; the existing app manager exposes no logo edit control.",
-        "automationBlock": "Chrome refused fileChooser.setFiles because the ChatGPT Chrome Extension does not have access to file URLs.",
+        "observedAppearance": "square blue OneDrive cloud matching the local asset",
+        "storageBehavior": "Developer-mode app logos are stored at app creation and are not changed by MCP metadata refresh.",
         "genericPlugAccepted": false
       },
       "chatSurface": { "status": "pass", "healthChecksPassed": 5, "warnings": 1, "failed": 0, "filesModified": false },
@@ -130,9 +130,29 @@
     "warnings": [
       "The account does not currently contain the default Desktop or Pictures/Screenshots preset targets; doctor reports these as warnings.",
       "ChatGPT Work shows an incorrect expired-connection card for the custom No Auth app before dispatching a tool call; the identical fresh app passes in Chat.",
-      "The packaged square OneDrive icon is validated locally, but a live ChatGPT directory check at 2026-07-19T21:34:46Z still showed the generic plug. The existing app manager has no logo control; the replacement-app form has the required PNG icon field, but Chrome file upload remains blocked until its ChatGPT extension can access file URLs.",
+      "The active optimized developer-mode app now shows the correct OneDrive logo; future logo changes still require recreating the app because MCP metadata refresh does not update stored artwork.",
       "Synology administrative verification used HTTPS over the LAN fallback with insecure TLS certificate validation enabled after the Tailscale endpoint failed; install a trusted DSM certificate or certificate pinning to remove this operational warning."
-    ]
+    ],
+    "chatgptExtraction": {
+      "status": "live_pass",
+      "appId": "asdk_app_6a5d95ab7c8881918fe4b3ce03457716",
+      "profileToolCount": 19,
+      "profileBytes": 29189,
+      "fullToolCount": 84,
+      "fullProfileBytes": 335403,
+      "contractReductionPercent": 91.3,
+      "workbook": "2026 Family Budgeting.xlsx",
+      "coldFetch": { "source": "office-openxml", "durationMs": 3534, "textBytes": 40679 },
+      "warmRun": { "searchDurationMs": 1052, "graphSearchCalls": 0, "fetchDurationMs": 1.6, "fetchSource": "content-index", "hostEndToEndMs": 79742 },
+      "redundantOfficeReadCallsAfterContractRefresh": 0,
+      "summaryVerified": true,
+      "sampleFigures": { "monthlyIncome": 12325, "monthlyOutflows": 13993, "monthlyNetCashFlow": -1668, "ytdIncomeThroughJune": 73950, "ytdNetCashFlowThroughJune": -10008 }
+    },
+    "currentSourceRollout": {
+      "immutableCache": "pending",
+      "synologyImage": "pending",
+      "chatgptDeveloperAppMetadata": "refreshed"
+    }
   },
   "blockedCoverage": [
     { "area": "Business Graph Excel", "reason": "The connected live account is personal; the business backend passes mock coverage." },
@@ -140,6 +160,7 @@
     { "area": "Named-recipient sharing", "reason": "Microsoft Graph rejected the isolated plus-address recipient with sharingFailed; the harness verified that no permission was created and continued with anonymous-link grant/revoke coverage." },
     { "area": "Forced device-code polling", "reason": "The healthy existing credential and consent remain untouched; suppression and mock flow coverage pass." },
     { "area": "Keychain deletion", "reason": "The existing credential remains untouched; memory-only logout passes." },
-    { "area": "Live recycle-bin restore", "reason": "Recycle-bin restore remains dry-run/mock tested; native version restore passes live." }
+    { "area": "Live recycle-bin restore", "reason": "Recycle-bin restore remains dry-run/mock tested; native version restore passes live." },
+    { "area": "Current source cache/NAS parity", "reason": "The extraction/performance source commit is locally and live-ChatGPT tested but has not yet replaced the immutable cache or NAS image." }
   ]
 }
