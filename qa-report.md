@@ -2,12 +2,18 @@
 
 Decision: Pending — Entra registration, NAS OAuth rollout, and ChatGPT Work validation
 Date: 2026-07-20
-Generated: 2026-07-20T14:17:05Z
-Tested source base commit: `16d5e0272a6a5bac4796b85a0bef9b6f95c5df24`
+Generated: 2026-07-20T15:16:15Z
+Tested source base commit: `8f5ae49c61e0beb79226cd2a038b88b456235876`
 Plugin version: `0.5.1+codex.20260719224717`
 Tool contract: 84 exact tool names
 
 ## Current outcome
+
+The final ChatGPT/NAS pass is deployed as `onedrive-chatgpt-nas:0.5.1-nas13`. The focused contract remains 19 tools and is now 33,669 bytes (90% smaller than the full 84-tool/335,838-byte contract), with 484 bytes of routing instructions. All 165 mocked Graph checks and all 19 golden prompt cases pass. Rename, move, and copy now require an account-scoped, operation-bound, single-use preview token in addition to confirmation and exact identity for live calls. DSM built image `ea810e8b9f6c`, started it with exit code 0, and reports all services healthy.
+
+The canonical ChatGPT app remains **OneDrive** (`asdk_app_6a5e2416985481918d0f6c68785da2c4`); metadata refresh succeeded without recreating the app, and the stored local OneDrive image is still displayed. In the same ChatGPT conversation, the post-deploy beta returned `$12,325 — excel`, read one permission with no sharing-link permission, and an exact-ID `onedrive_rename` dry-run returned `dryRun`, `confirmed`, `wouldRename`, `newName`, `previewToken`, and `previewTokenExpiresAt` with no error. No file or permission was changed in this final pass. Host orchestration still took about 39 seconds for the multi-step read/permissions/preview prompt even though the plugin contract and warm read paths are compact.
+
+One ChatGPT host-safety defect remains outside the plugin: during the earlier isolated CRUD fixture, clicking **Deny** on the host permission dialog did not prevent the folder/file mutation, and the consent UI displayed unrelated PII categories. The plugin's own scoped preview, identity, confirmation, audit, and cleanup protections remain enabled; this host behavior should be reported to OpenAI. The isolated fixture was subsequently moved to the recycle bin and its exact folder ID was verified.
 
 The ChatGPT workbook-content failure is fixed in the tested source. Standard `fetch` now downloads modern Office packages once and renders bounded Word paragraphs/tables, Excel worksheet names/cells/formulas, and PowerPoint slides/shapes instead of relying on Microsoft Graph `format=text`. The exact `2026 Family Budgeting.xlsx` failure was reproduced in Chrome, the refreshed developer-mode app then returned a real worksheet-by-worksheet summary with exact figures, and the plugin logged `previewSource: office-openxml` with 40,679 bytes returned in 3.534 seconds on the cold read. A final warm run used only one `search` (1.052 seconds, zero Graph search calls) and one `fetch` (1.6 milliseconds from the content index); the ChatGPT host completed the detailed answer in 79.742 seconds.
 
