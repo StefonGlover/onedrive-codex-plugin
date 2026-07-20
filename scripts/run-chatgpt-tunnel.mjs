@@ -9,6 +9,12 @@ const envFile = process.env.ONEDRIVE_TUNNEL_ENV_FILE || join(homedir(), ".config
 const profileDir = process.env.ONEDRIVE_TUNNEL_PROFILE_DIR || join(homedir(), ".config", "tunnel-client");
 const profile = process.env.ONEDRIVE_TUNNEL_PROFILE || "onedrive-chatgpt";
 const tunnelClient = process.env.ONEDRIVE_TUNNEL_CLIENT || "/opt/homebrew/bin/tunnel-client";
+const toolProfile = process.env.ONEDRIVE_TOOL_PROFILE || "chatgpt";
+
+if (!["full", "chatgpt"].includes(toolProfile)) {
+  console.error("ONEDRIVE_TOOL_PROFILE must be full or chatgpt.");
+  process.exit(1);
+}
 
 function envValue(text, name) {
   const match = text.match(new RegExp(`^\\s*${name}\\s*=\\s*(.*?)\\s*$`, "m"));
@@ -40,7 +46,7 @@ if (!runtimeKey) {
 }
 
 const child = spawn(tunnelClient, ["run", "--profile-dir", profileDir, "--profile", profile], {
-  env: { ...process.env, CONTROL_PLANE_API_KEY: runtimeKey },
+  env: { ...process.env, CONTROL_PLANE_API_KEY: runtimeKey, ONEDRIVE_TOOL_PROFILE: toolProfile },
   stdio: "inherit"
 });
 

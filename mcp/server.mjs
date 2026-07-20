@@ -4,7 +4,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createReadStream, createWriteStream, readFileSync } from "node:fs";
 import { appendFile, chmod, copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename as renameFile, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, parse, relative, resolve } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -13,6 +13,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { addSemanticAnchors, resolveSemanticOperations } from "./semantic-anchors.mjs";
 import { applyTextPatch, boundedLineDiff, decodeTextBuffer } from "./text-patch.mjs";
 import { createAuthVault } from "./auth-vault.mjs";
+import { oauthChallenge, oauthSettings, toolSecuritySchemes } from "./oauth.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, "..");
@@ -485,6 +486,11 @@ const tools = [
           minimum: 1,
           maximum: 20,
           default: 5
+        },
+        checkPresets: {
+          type: "boolean",
+          default: true,
+          description: "When true, resolve every configured path preset and warn when a target does not exist."
         }
       },
       additionalProperties: false
@@ -551,6 +557,12 @@ const tools = [
           default: 1000,
           description: "Maximum folders to visit during recursive traversal."
         },
+        scanConcurrency: {
+          type: "integer",
+          minimum: 1,
+          maximum: 4,
+          description: "Bounded number of folders scanned concurrently. Defaults to the configured concurrency limit, capped at 4."
+        },
         nameContains: { type: "string", description: "Optional case-insensitive filename/folder-name substring filter." },
         extensions: {
           type: "array",
@@ -571,7 +583,8 @@ const tools = [
   },
   {
     name: "onedrive_search",
-    description: "Search the signed-in user's OneDrive.",
+    title: "Raw Graph search (advanced)",
+    description: "Run one direct Microsoft Graph search query against the signed-in user's OneDrive. Use only when the user explicitly requests raw Graph search behavior; for normal file lookup by exact name, partial name, or fuzzy wording, use onedrive_find instead because it adds adaptive queries, ranking, cache evidence, and bounded scan fallback.",
     inputSchema: {
       type: "object",
       required: ["query"],
@@ -585,7 +598,8 @@ const tools = [
   },
   {
     name: "onedrive_search_all",
-    description: "Search OneDrive and follow Microsoft Graph pagination up to a safe item cap.",
+    title: "Paginated raw Graph search (advanced)",
+    description: "Run one direct Microsoft Graph search query and follow its pagination up to a safe item cap. Use only for explicitly requested paginated raw Graph results; for broad or exhaustive user-facing file lookup, use onedrive_find_all instead.",
     inputSchema: {
       type: "object",
       required: ["query"],
@@ -600,7 +614,8 @@ const tools = [
   },
   {
     name: "onedrive_find",
-    description: "Cache-assisted remote-first file finder. Runs the canonical Graph query first, expands terms adaptively with bounded concurrency, ranks matches in memory, and optionally falls back to bounded recursive scans.",
+    title: "Find OneDrive files",
+    description: "Default tool for normal OneDrive file lookup by exact name, partial name, or fuzzy user wording. This cache-assisted remote-first finder runs the canonical Graph query first, expands terms adaptively with bounded concurrency, ranks matches in memory, and optionally falls back to bounded recursive scans.",
     inputSchema: {
       type: "object",
       required: ["query"],
@@ -670,6 +685,7 @@ const tools = [
   },
   {
     name: "onedrive_find_all",
+    title: "Find files across OneDrive",
     description: "Broader cache-assisted remote-first file locator. Uses adaptive bounded-concurrency Graph term expansion, common-folder hints, and bounded scan fallback when needed.",
     inputSchema: {
       type: "object",
@@ -1931,6 +1947,12 @@ const tools = [
 // ChatGPT developer-mode apps reject MCP tools that omit impact annotations.
 // Keep these classifications centralized so every descriptor carries the three
 // required hints and newly added tools fail closed during packaging.
+//
+// Auth is selected at process start. Local/Codex and legacy ChatGPT deployments
+// default to noauth and use the encrypted device-code credential. Work-compatible
+// HTTP deployments set ONEDRIVE_MCP_AUTH_MODE=oauth; each tool then advertises the
+// Entra API scope and Graph calls use the request's on-behalf-of token.
+const configuredSecuritySchemes = Object.freeze(toolSecuritySchemes());
 const readOnlyToolNames = new Set([
   "onedrive_config",
   "onedrive_me",
@@ -2027,12 +2049,100 @@ function toolTitle(name) {
 
 for (const tool of tools) {
   tool.title = tool.title || toolTitle(tool.name);
+  tool.securitySchemes = configuredSecuritySchemes;
+  tool._meta = {
+    ...(tool._meta || {}),
+    securitySchemes: configuredSecuritySchemes
+  };
   tool.annotations = {
     readOnlyHint: readOnlyToolNames.has(tool.name),
     openWorldHint: openWorldToolNames.has(tool.name),
     destructiveHint: destructiveToolNames.has(tool.name)
   };
 }
+
+// ChatGPT sends the advertised tool contract through the model's selection
+// path on every turn. The full OneDrive surface is intentionally broad, but
+// exposing every maintenance, batch, watch, and workspace helper makes simple
+// requests pay for 300+ KB of schemas before Graph is called. Keep the full
+// contract for Codex and local automation while offering a focused ChatGPT
+// profile for tunnel deployments.
+const chatgptToolNames = new Set([
+  "onedrive_list",
+  "onedrive_find",
+  "onedrive_office_capabilities",
+  "onedrive_office_search",
+  "onedrive_word_get_document",
+  "onedrive_excel_get_workbook",
+  "onedrive_powerpoint_get_presentation",
+  "onedrive_office_batch_transform",
+  "onedrive_get_info",
+  "onedrive_read_text",
+  "onedrive_preview",
+  "onedrive_upload",
+  "onedrive_write_text",
+  "onedrive_patch_text",
+  "onedrive_versions",
+  "onedrive_restore_version",
+  "onedrive_create_folder",
+  "onedrive_rename",
+  "onedrive_move",
+  "onedrive_copy",
+  "onedrive_create_sharing_link",
+  "onedrive_invite_permission",
+  "onedrive_revoke_permission",
+  "onedrive_permissions",
+  "onedrive_recent",
+  "onedrive_delete"
+]);
+
+const compactOfficeOperationSchema = {
+  type: "array",
+  minItems: 1,
+  maxItems: 100,
+  items: {
+    type: "object",
+    required: ["type"],
+    properties: {
+      type: { type: "string", minLength: 1 }
+    },
+    additionalProperties: true
+  },
+  description: "Typed Office operations. Call onedrive_office_capabilities and the matching Office read tool first; the server validates every operation against the full schema."
+};
+
+function compactChatgptToolDescriptor(tool) {
+  const compact = JSON.parse(JSON.stringify(tool));
+  if (compact.name === "onedrive_office_batch_transform") {
+    const item = compact.inputSchema?.properties?.items?.items;
+    if (item?.properties) item.properties.operations = compactOfficeOperationSchema;
+  } else if ([
+    "onedrive_word_batch_update",
+    "onedrive_excel_batch_update",
+    "onedrive_powerpoint_batch_update"
+  ].includes(compact.name) && compact.inputSchema?.properties) {
+    compact.inputSchema.properties.operations = compactOfficeOperationSchema;
+  }
+  return compact;
+}
+
+function selectedToolProfile(env = process.env) {
+  const profile = String(env.ONEDRIVE_TOOL_PROFILE || "full").trim().toLowerCase();
+  if (!["full", "chatgpt"].includes(profile)) {
+    throw new Error("ONEDRIVE_TOOL_PROFILE must be full or chatgpt.");
+  }
+  return profile;
+}
+
+const toolProfile = selectedToolProfile();
+const advertisedTools = toolProfile === "chatgpt"
+  ? tools.filter((tool) => chatgptToolNames.has(tool.name)).map(compactChatgptToolDescriptor)
+  : tools;
+const advertisedContractHash = createHash("sha256").update(JSON.stringify(advertisedTools)).digest("hex").slice(0, 12);
+const manifestServerVersion = pluginManifest.version || "0.1.0";
+const advertisedServerVersion = toolProfile === "chatgpt"
+  ? `${manifestServerVersion}${manifestServerVersion.includes("+") ? "." : "+"}chatgpt.${advertisedContractHash}`
+  : manifestServerVersion;
 
 const toolByName = new Map(tools.map((tool) => [tool.name, tool]));
 
@@ -2201,6 +2311,7 @@ function validateToolArguments(name, args = {}) {
   const result = validateSchemaValue(args || {}, tool.inputSchema || { type: "object" }, "$");
   if (result.ok) {
     const pairedFields = [
+      ["relativePath", "preset"],
       ["destinationParentRelativePath", "destinationParentPreset"],
       ["parentRelativePath", "parentPreset"],
       ["remoteRelativePath", "remotePreset"]
@@ -2322,6 +2433,8 @@ function adoptCurrentToolAccountGeneration() {
 }
 
 function currentAuthContextId() {
+  const requestContextId = toolCallContext.getStore()?.authContextId;
+  if (requestContextId) return requestContextId;
   if (process.env.ONEDRIVE_TEST_ACCESS_TOKEN) return testAuthContextId;
   const cfg = config();
   const current = tokenCache || getKeychainToken(cfg);
@@ -2353,8 +2466,13 @@ function scopedStatePath(root, scope) {
 function assertStorageScopeGuard(guard, operation = "OneDrive local-state operation") {
   assertToolAccountGeneration(operation);
   if (!guard?.scope || guard.generation !== storageScopeGeneration) throw accountContextChangedError(operation);
+  const store = toolCallContext.getStore();
   const authContextId = currentAuthContextId();
   if (!authContextId || authContextId !== guard.scope.authContextId) throw accountContextChangedError(operation);
+  if (store?.authMode === "oauth") {
+    if (!storageScopesEqual(store.storageScope, guard.scope)) throw accountContextChangedError(operation);
+    return guard;
+  }
   if (activeStorageScopeGeneration !== guard.generation || activeStorageScopeKey !== storageScopeKey(guard.scope)) {
     throw accountContextChangedError(operation);
   }
@@ -2370,6 +2488,17 @@ async function captureStorageScopeGuard(operation = "OneDrive local-state operat
 
 async function activeStorageScope() {
   assertToolAccountGeneration("OneDrive storage-scope resolution");
+  const store = toolCallContext.getStore();
+  if (store?.authMode === "oauth") {
+    await getAccessToken();
+    if (store.storageScope?.authContextId === store.authContextId && store.storageScope?.driveId) {
+      return store.storageScope;
+    }
+    const drive = await graph("/me/drive?$select=id");
+    if (!drive?.id) throw new Error("Microsoft Graph did not return the current OneDrive drive ID. Refusing to use account-scoped local state.");
+    store.storageScope = { authContextId: store.authContextId, driveId: drive.id };
+    return store.storageScope;
+  }
   const generation = storageScopeGeneration;
   await getAccessToken();
   if (generation !== storageScopeGeneration) throw accountContextChangedError("OneDrive storage-scope resolution");
@@ -2541,6 +2670,7 @@ function deleteKeychainToken(cfg = config()) {
 
 function publicConfig() {
   const cfg = config();
+  const mcpAuth = oauthSettings();
   const vault = authVault(cfg);
   let stored = null;
   let authStoreError = null;
@@ -2558,6 +2688,15 @@ function publicConfig() {
     ...(authStoreError ? { authenticationStoreError: authStoreError } : {}),
     keychainService: cfg.keychainService,
     keychainTokenConfigured: vault.mode === "keychain" && Boolean(stored?.refresh_token),
+    mcpAuthentication: {
+      mode: mcpAuth.mode,
+      delegatedRequest: toolCallContext.getStore()?.authMode === "oauth",
+      ...(mcpAuth.mode === "oauth" ? {
+        resource: mcpAuth.resource,
+        scope: mcpAuth.apiScope,
+        authority: mcpAuth.authority
+      } : {})
+    },
     configPath,
     ...(localConfigReadError ? { configReadError: localConfigReadError } : {}),
     pathPresets: pathPresets(),
@@ -3049,8 +3188,9 @@ function resolveUnresolvedCachedPaths(cache) {
   return changes;
 }
 
-async function cacheItems(items = [], metadata = {}) {
+async function cacheItems(items = [], metadata = {}, options = {}) {
   const guard = await captureStorageScopeGuard("metadata cache update");
+  const lockTimeoutMs = options.lockTimeoutMs ?? (toolProfile === "chatgpt" ? 0 : 10_000);
   const hasMetadata = metadata.deltaLink !== undefined
     || metadata.deltaNextLink !== undefined
     || metadata.deltaTarget !== undefined
@@ -3089,7 +3229,7 @@ async function cacheItems(items = [], metadata = {}) {
     }
     changes.push(...resolveUnresolvedCachedPaths(cache));
     assertStorageScopeGuard(guard, "metadata/content index reconciliation");
-    await reconcileContentIndexWithMetadata(changes, guard);
+    await reconcileContentIndexWithMetadata(changes, guard, { lockTimeoutMs });
     if (metadata.deltaLink !== undefined) {
       cache.deltaLink = metadata.deltaLink || null;
       if (metadata.deltaLink) cache.deltaNextLink = null;
@@ -3098,7 +3238,7 @@ async function cacheItems(items = [], metadata = {}) {
     if (metadata.deltaTarget !== undefined) cache.deltaTarget = metadata.deltaTarget || null;
     assertStorageScopeGuard(guard, "metadata cache update");
     return await saveMetadataCache(cache, guard);
-  }));
+  }, { timeoutMs: lockTimeoutMs }));
 }
 
 async function clearMetadataCache() {
@@ -3304,9 +3444,10 @@ function indexedItemMetadataChanged(left = {}, right = {}) {
     || Boolean(left.deleted) !== Boolean(right.deleted);
 }
 
-async function reconcileContentIndexWithMetadata(changes = [], existingGuard = null) {
+async function reconcileContentIndexWithMetadata(changes = [], existingGuard = null, options = {}) {
   if (!changes.length) return;
   const guard = existingGuard || await captureStorageScopeGuard("metadata/content index reconciliation");
+  const lockTimeoutMs = options.lockTimeoutMs ?? (toolProfile === "chatgpt" ? 0 : 10_000);
   await runSerialized("content", async () => await withFileLock(contentIndexLockPath, async () => {
     assertStorageScopeGuard(guard, "metadata/content index reconciliation");
     let index;
@@ -3350,7 +3491,7 @@ async function reconcileContentIndexWithMetadata(changes = [], existingGuard = n
       contentIndexMemory = index;
       contentIndexMemoryGeneration = guard.generation;
     }
-  }));
+  }, { timeoutMs: lockTimeoutMs }));
 }
 
 function contentIndexEntryFresh(entry, item) {
@@ -3864,7 +4005,55 @@ async function doctor(args = {}) {
       quotaState: drive.quota?.state
     };
   });
-  addCheck("presets", "pass", { pathPresets: cfgStatus.pathPresets });
+  if (args.checkPresets === false) {
+    addCheck("presets", "pass", {
+      pathPresets: cfgStatus.pathPresets,
+      validated: false,
+      note: "Preset resolution checks were explicitly skipped."
+    });
+  } else {
+    const presetEntries = Object.entries(cfgStatus.pathPresets || {});
+    const presetChecks = await mapWithConcurrency(
+      presetEntries,
+      Math.min(pluginSettings().concurrencyLimit, 4),
+      async ([name, path]) => {
+        try {
+          const item = await getRawInfo({ path, cacheResults: false });
+          return {
+            name,
+            path,
+            available: true,
+            item: {
+              id: item.id,
+              name: item.name,
+              type: item.folder ? "folder" : item.file ? "file" : "item"
+            }
+          };
+        } catch (error) {
+          return {
+            name,
+            path,
+            available: false,
+            graphStatus: error?.graphStatus,
+            error: safeToolErrorMessage(error)
+          };
+        }
+      }
+    );
+    const missing = presetChecks.filter((entry) => entry.graphStatus === 404);
+    const failed = presetChecks.filter((entry) => !entry.available && entry.graphStatus !== 404);
+    addCheck("presets", failed.length ? "fail" : missing.length ? "warn" : "pass", {
+      pathPresets: cfgStatus.pathPresets,
+      validated: true,
+      availableCount: presetChecks.filter((entry) => entry.available).length,
+      missingCount: missing.length,
+      failedCount: failed.length,
+      presets: presetChecks,
+      ...(missing.length ? {
+        recommendation: "Update pathPresets in config.json so every preset points to an existing root-relative OneDrive folder."
+      } : {})
+    });
+  }
 
   if (args.checkRootList !== false) {
     await runCheck("root list", async () => {
@@ -3886,7 +4075,9 @@ async function doctor(args = {}) {
     checks,
     note: failCount
       ? "At least one OneDrive health check failed. Fix the failed check before relying on file tools."
-      : "OneDrive plugin health checks passed."
+      : warnCount
+        ? "OneDrive plugin health checks completed with warnings. Review the warning checks before relying on affected workflows."
+        : "OneDrive plugin health checks passed."
   };
 }
 
@@ -4068,6 +4259,8 @@ async function refreshAccessToken(refreshToken, cfg = config(), generation = aut
 }
 
 async function getAccessToken(cfg = config()) {
+  const requestToken = toolCallContext.getStore()?.graphAccessToken;
+  if (requestToken) return requestToken;
   if (process.env.ONEDRIVE_TEST_ACCESS_TOKEN) return process.env.ONEDRIVE_TEST_ACCESS_TOKEN;
   requireClientId(cfg);
   let current = tokenCache || getKeychainToken(cfg);
@@ -5201,7 +5394,7 @@ function scanItemMatches(item, args = {}, extensionFilter = new Set()) {
   const isFile = Boolean(item.file);
   if (isFile && args.includeFiles === false) return false;
   if (isFolder && args.includeFolders === false) return false;
-  if (!isFile && !isFolder && args.includeFiles === false && args.includeFolders === false) return false;
+  if (!isFile && !isFolder && (args.includeFiles === false || args.includeFolders === false)) return false;
 
   if (args.nameContains) {
     const needle = String(args.nameContains).toLowerCase();
@@ -5242,6 +5435,7 @@ async function scan(args = {}) {
     const maxResults = clampInteger(args.maxResults, 500, 1, 5000);
     const maxDepth = clampInteger(args.maxDepth, 25, 0, 50);
     const maxFolders = clampInteger(args.maxFolders, 1000, 1, 10000);
+    const scanConcurrency = clampInteger(args.scanConcurrency, Math.min(pluginSettings().concurrencyLimit, 4), 1, 4);
     const extensionFilter = normalizeExtensions(args.extensions || []);
     const skipFolderIds = new Set((args._skipFolderIds || []).filter(Boolean));
     const root = args._resolvedRoot || await resolveScanRoot(args);
@@ -5249,7 +5443,17 @@ async function scan(args = {}) {
     params.set("$top", String(pageSize));
     params.set("$select", args.select || defaultSelect);
 
-    const queue = [{ id: root.id, name: root.name, remotePath: root.remotePath, depth: 0 }];
+    const queue = [{
+      id: root.id,
+      name: root.name,
+      remotePath: root.remotePath,
+      depth: 0,
+      nextPath: null,
+      counted: false,
+      pagesFetched: 0,
+      seenPages: new Set(),
+      discoveredFolders: []
+    }];
     const results = [];
     const pendingCacheItems = [];
     const counters = {
@@ -5262,38 +5466,49 @@ async function scan(args = {}) {
     };
     let truncatedReason = null;
 
+    const scanFolderPage = async (folder) => {
+      const nextPath = folder.nextPath || `/me/drive/items/${encodeURIComponent(folder.id)}/children?${params.toString()}`;
+      const maxPagesPerFolder = Math.max(1, maxItems + 100);
+      if (folder.seenPages.has(nextPath)) {
+        throw new Error(`Microsoft Graph pagination cycle detected while scanning ${folder.remotePath || folder.name || folder.id}.`);
+      }
+      if (folder.pagesFetched >= maxPagesPerFolder) {
+        throw new Error(`Microsoft Graph pagination exceeded ${maxPagesPerFolder} pages while scanning ${folder.remotePath || folder.name || folder.id}.`);
+      }
+      return { folder, requestedPath: nextPath, page: await graph(nextPath) };
+    };
+
     while (queue.length) {
       if (counters.itemsScanned >= maxItems) {
         truncatedReason = "maxItems";
         break;
       }
-      if (counters.foldersVisited >= maxFolders) {
+      if (counters.foldersVisited >= maxFolders && !queue[0]?.counted) {
         truncatedReason = "maxFolders";
         break;
       }
 
-      const folder = queue.shift();
-      counters.foldersVisited += 1;
-      let nextPath = `/me/drive/items/${encodeURIComponent(folder.id)}/children?${params.toString()}`;
-      const seenPages = new Set();
-      let pagesFetched = 0;
-      const maxPagesPerFolder = Math.max(1, maxItems + 100);
+      const batch = [];
+      let newFoldersInBatch = 0;
+      while (queue.length && batch.length < scanConcurrency) {
+        const candidate = queue[0];
+        if (!candidate.counted && counters.foldersVisited + newFoldersInBatch >= maxFolders) break;
+        queue.shift();
+        if (!candidate.counted) newFoldersInBatch += 1;
+        batch.push(candidate);
+      }
+      if (!batch.length) {
+        truncatedReason = "maxFolders";
+        break;
+      }
+      counters.foldersVisited += newFoldersInBatch;
+      const scannedPages = await Promise.all(batch.map(scanFolderPage));
+      const continuations = [];
+      const discoveredFolders = [];
 
-      while (nextPath) {
-        if (counters.itemsScanned >= maxItems) {
-          truncatedReason = "maxItems";
-          break;
-        }
-        if (seenPages.has(nextPath)) {
-          throw new Error(`Microsoft Graph pagination cycle detected while scanning ${folder.remotePath || folder.name || folder.id}.`);
-        }
-        if (pagesFetched >= maxPagesPerFolder) {
-          throw new Error(`Microsoft Graph pagination exceeded ${maxPagesPerFolder} pages while scanning ${folder.remotePath || folder.name || folder.id}.`);
-        }
-        seenPages.add(nextPath);
-        pagesFetched += 1;
-        const page = await graph(nextPath);
+      for (const { folder, requestedPath, page } of scannedPages) {
         const cacheableItems = [];
+        const pageDiscoveredFolders = [];
         for (const item of page.value || []) {
           if (counters.itemsScanned >= maxItems) {
             truncatedReason = "maxItems";
@@ -5320,21 +5535,41 @@ async function scan(args = {}) {
             if (skipFolderIds.has(item.id)) {
               counters.foldersSkipped += 1;
             } else {
-              queue.push({
+              pageDiscoveredFolders.push({
                 id: item.id,
                 name: item.name,
                 remotePath: itemRemotePath(item),
-                depth: folder.depth + 1
+                depth: folder.depth + 1,
+                nextPath: null,
+                counted: false,
+                pagesFetched: 0,
+                seenPages: new Set(),
+                discoveredFolders: []
               });
             }
           }
         }
         if (args.cacheResults !== false) pendingCacheItems.push(...cacheableItems);
         if (truncatedReason) break;
-        nextPath = page["@odata.nextLink"] || null;
+        const nextPath = page["@odata.nextLink"] || null;
+        const accumulatedDiscoveredFolders = [...(folder.discoveredFolders || []), ...pageDiscoveredFolders];
+        if (nextPath) {
+          continuations.push({
+            ...folder,
+            nextPath,
+            counted: true,
+            pagesFetched: folder.pagesFetched + 1,
+            seenPages: new Set([...folder.seenPages, requestedPath]),
+            discoveredFolders: accumulatedDiscoveredFolders
+          });
+        } else {
+          discoveredFolders.push(...accumulatedDiscoveredFolders);
+        }
       }
 
       if (truncatedReason) break;
+      if (continuations.length) queue.unshift(...continuations);
+      if (discoveredFolders.length) queue.push(...discoveredFolders);
     }
 
     if (!truncatedReason && queue.length) truncatedReason = "queueRemaining";
@@ -5352,7 +5587,8 @@ async function scan(args = {}) {
         maxDepth,
         maxItems,
         maxFolders,
-        maxResults
+        maxResults,
+        scanConcurrency
       },
       summary: {
         ...counters,
@@ -5360,7 +5596,7 @@ async function scan(args = {}) {
         resultTruncated: counters.matched > results.length,
         traversalTruncated: Boolean(truncatedReason),
         truncatedReason,
-        foldersQueued: queue.length
+        foldersQueued: new Set(queue.map((entry) => entry.id)).size
       },
       items: results,
       note: truncatedReason
@@ -7164,15 +7400,18 @@ async function officeCapabilities() {
   };
 }
 
-async function runOfficeHelper(request, options = {}) {
+export async function runOfficeHelper(request, options = {}) {
   const runtime = officeRuntimeStatus();
   if (!runtime.pythonAvailable || !runtime.helperAvailable) {
     throw new Error(`Office Open XML runtime is unavailable: ${runtime.error || "Python/helper not found"}`);
   }
   const timeoutMs = clampInteger(options.timeoutMs, 60_000, 1000, 5 * 60_000);
   const maxOutputBytes = clampInteger(options.maxOutputBytes, 20 * 1024 * 1024, 1024, 50 * 1024 * 1024);
-  await ensurePrivateDirectory(storageRoot);
-  const pythonCacheRoot = join(storageRoot, "pycache");
+  // Python bytecode is disposable runtime state. Keep it off storageRoot,
+  // which can be a pre-existing read-only NAS/container mount such as /data.
+  const pythonCacheRoot = resolve(
+    process.env.ONEDRIVE_OFFICE_PYCACHE_ROOT || join(tmpdir(), "onedrive-python-cache")
+  );
   await ensurePrivateDirectory(pythonCacheRoot);
   return await new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(officePythonPath, [officeHelperPath], {
@@ -10617,7 +10856,7 @@ async function restoreDeleted(args = {}) {
   }
 }
 
-function textResult(value, isError = false) {
+function textResult(value, isError = false, structuredContent = undefined) {
   const localWarnings = toolCallContext.getStore()?.localWarnings || [];
   const payload = localWarnings.length
     ? (value && typeof value === "object" && !Array.isArray(value)
@@ -10625,18 +10864,83 @@ function textResult(value, isError = false) {
         : { message: value, localWarnings })
     : value;
   const text = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
-  return { content: [{ type: "text", text }], isError };
+  return {
+    content: [{ type: "text", text }],
+    ...(structuredContent === undefined ? {} : { structuredContent }),
+    isError
+  };
 }
 
-function sendResult(id, result) {
-  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n");
+function structuredToolError(error, tool = undefined) {
+  const message = safeToolErrorMessage(error);
+  const graphStatus = Number.isInteger(error?.graphStatus) ? error.graphStatus : undefined;
+  let code = "internal_error";
+  if (graphStatus === 400) code = "invalid_argument";
+  else if (graphStatus === 401) code = "unauthenticated";
+  else if (graphStatus === 403) code = "permission_denied";
+  else if (graphStatus === 404) code = "not_found";
+  else if (graphStatus === 409 || graphStatus === 412) code = "conflict";
+  else if (graphStatus === 429) code = "rate_limited";
+  else if (graphStatus >= 500) code = "service_unavailable";
+  else if (/\b(?:timed out|timeout|AbortError|TimeoutError)\b/i.test(message)) code = "deadline_exceeded";
+  else if (/\b(?:refus|requires|invalid|must include|must provide|unsupported|not a folder|not a file)\b/i.test(message)) code = "failed_precondition";
+  return {
+    error: {
+      code,
+      message,
+      ...(tool ? { tool } : {}),
+      ...(graphStatus === undefined ? {} : { graphStatus }),
+      ...(error?.graphRequestId ? { graphRequestId: redactAuditText(error.graphRequestId) } : {})
+    }
+  };
 }
 
-function sendError(id, code, message) {
-  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }) + "\n");
+function toolErrorResult(error, tool = undefined) {
+  const structuredContent = structuredToolError(error, tool);
+  return textResult(structuredContent.error.message, true, structuredContent);
+}
+
+function resultMessage(id, result) {
+  return { jsonrpc: "2.0", id, result };
+}
+
+function errorMessage(id, code, message) {
+  return { jsonrpc: "2.0", id, error: { code, message } };
+}
+
+function oauthRequiredResult(error = null) {
+  const description = error?.message || "Connect OneDrive to continue.";
+  return {
+    ...textResult(description, true, {
+      error: {
+        code: error?.code === "insufficient_scope" ? "permission_denied" : "unauthenticated",
+        message: description
+      }
+    }),
+    _meta: {
+      "mcp/www_authenticate": [oauthChallenge({
+        error: error?.code || "invalid_token",
+        description
+      })]
+    }
+  };
 }
 
 async function callTool(name, args = {}) {
+  if (toolCallContext.getStore()?.authMode === "oauth"
+    && new Set(["onedrive_auth_device_start", "onedrive_auth_device_poll", "onedrive_logout"]).has(name)) {
+    return textResult(
+      "Device-code credential tools are disabled for delegated OAuth requests. Connect or disconnect OneDrive from ChatGPT app settings.",
+      true,
+      {
+        error: {
+          code: "failed_precondition",
+          message: "Manage the delegated OneDrive connection from ChatGPT app settings.",
+          tool: name
+        }
+      }
+    );
+  }
   if (previewScopedTools.has(name)) {
     const store = toolCallContext.getStore();
     if (store) store.storageScope = await activeStorageScope();
@@ -10848,19 +11152,23 @@ async function callTool(name, args = {}) {
   }
 }
 
-async function handleRequest(message) {
+export async function processMcpMessage(message, requestAuth = null) {
   const { id, method, params = {} } = message;
   try {
     if (method === "initialize") {
       const requestedProtocolVersion = params.protocolVersion;
       const supportedProtocolVersions = new Set(["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]);
-      sendResult(id, {
+      if (toolProfile === "chatgpt" || process.env.ONEDRIVE_PERFORMANCE_LOG === "1") {
+        console.error(JSON.stringify({ event: "onedrive-initialize", profile: toolProfile, serverVersion: advertisedServerVersion, toolCount: advertisedTools.length }));
+      }
+      return resultMessage(id, {
         protocolVersion: supportedProtocolVersions.has(requestedProtocolVersion) ? requestedProtocolVersion : "2024-11-05",
         capabilities: { tools: {} },
+        instructions: "Use onedrive_list for direct folder listings and onedrive_find for normal filename or fuzzy lookup. Prefer compact responses and small limits. Locate an item before reading or changing it. For Office edits, call onedrive_office_capabilities and the matching read tool before onedrive_office_batch_transform. Mutations default to preview and require confirmation.",
         serverInfo: {
           name: "onedrive",
           title: "OneDrive",
-          version: pluginManifest.version || "0.1.0",
+          version: advertisedServerVersion,
           description: "Search, read, organize, share, and safely edit files in your personal OneDrive.",
           icons: [{
             src: chatgptIconDataUri,
@@ -10869,17 +11177,28 @@ async function handleRequest(message) {
           }]
         }
       });
-      return;
     }
     if (method === "tools/list") {
-      sendResult(id, { tools });
-      return;
+      if (toolProfile === "chatgpt" || process.env.ONEDRIVE_PERFORMANCE_LOG === "1") {
+        console.error(JSON.stringify({ event: "onedrive-tools-list", profile: toolProfile, serverVersion: advertisedServerVersion, toolCount: advertisedTools.length }));
+      }
+      return resultMessage(id, { tools: advertisedTools });
     }
     if (method === "tools/call") {
+      const toolStartedAt = performance.now();
+      if (oauthSettings().mode === "oauth" && requestAuth?.authMode !== "oauth") {
+        return resultMessage(id, oauthRequiredResult(requestAuth?.error));
+      }
       const validation = validateToolArguments(params.name, params.arguments || {});
       if (!validation.ok) {
-        sendResult(id, textResult(validation.error, true));
-        return;
+        return resultMessage(id, textResult(validation.error, true, {
+          error: {
+            code: "invalid_argument",
+            message: `Invalid arguments for ${params.name}.`,
+            tool: params.name,
+            details: validation.error.details || []
+          }
+        }));
       }
       const result = await toolCallContext.run({
         localWarnings: [],
@@ -10887,49 +11206,72 @@ async function handleRequest(message) {
         lastMutationGraphRequestId: null,
         metadataCacheWrites: 0,
         authGeneration,
-        storageScopeGeneration
+        storageScopeGeneration,
+        ...(requestAuth || {})
       }, async () => {
         try {
           const value = await callTool(params.name, validation.args || {});
           assertToolAccountGeneration(`${params.name} completion`);
           return value;
         } catch (error) {
-          return textResult(safeToolErrorMessage(error), true);
+          return toolErrorResult(error, params.name);
         }
       });
-      sendResult(id, result);
-      return;
+      if (toolProfile === "chatgpt" || process.env.ONEDRIVE_PERFORMANCE_LOG === "1") {
+        console.error(JSON.stringify({
+          event: "onedrive-tool-complete",
+          tool: params.name,
+          durationMs: Number((performance.now() - toolStartedAt).toFixed(1)),
+          isError: Boolean(result?.isError)
+        }));
+      }
+      return resultMessage(id, result);
     }
-    if (method?.startsWith("notifications/")) return;
-    if (id !== undefined) sendError(id, -32601, `Method not found: ${method}`);
+    if (method?.startsWith("notifications/")) return null;
+    if (id !== undefined) return errorMessage(id, -32601, `Method not found: ${method}`);
+    return null;
   } catch (error) {
-    if (id !== undefined) sendResult(id, textResult(safeToolErrorMessage(error), true));
-    else console.error(error);
+    if (id !== undefined) return resultMessage(id, toolErrorResult(error, params?.name));
+    console.error(error);
+    return null;
   }
 }
 
-let buffer = "";
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk) => {
-  buffer += chunk;
-  for (;;) {
-    const newline = buffer.indexOf("\n");
-    if (newline === -1) break;
-    const line = buffer.slice(0, newline).trim();
-    buffer = buffer.slice(newline + 1);
-    if (!line) continue;
-    try {
-      void handleRequest(JSON.parse(line));
-    } catch (error) {
-      sendError(null, -32700, `Parse error: ${error.message}`);
+export async function shutdownOneDriveServer() {
+  for (const timer of watchTimers.values()) clearTimeout(timer);
+  await closeAllExcelSessions().catch(() => null);
+}
+
+function startStdioServer() {
+  let buffer = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk) => {
+    buffer += chunk;
+    for (;;) {
+      const newline = buffer.indexOf("\n");
+      if (newline === -1) break;
+      const line = buffer.slice(0, newline).trim();
+      buffer = buffer.slice(newline + 1);
+      if (!line) continue;
+      try {
+        void processMcpMessage(JSON.parse(line)).then((response) => {
+          if (response) process.stdout.write(`${JSON.stringify(response)}\n`);
+        });
+      } catch (error) {
+        process.stdout.write(`${JSON.stringify(errorMessage(null, -32700, `Parse error: ${error.message}`))}\n`);
+      }
     }
-  }
-});
-process.stdin.on("end", () => { closeAllExcelSessions().catch(() => null); });
-for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.on(signal, async () => {
-    for (const timer of watchTimers.values()) clearTimeout(timer);
-    await closeAllExcelSessions().catch(() => null);
-    process.exit(0);
   });
+  process.stdin.on("end", () => { shutdownOneDriveServer().catch(() => null); });
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.on(signal, async () => {
+      await shutdownOneDriveServer();
+      process.exit(0);
+    });
+  }
+}
+
+const isMainModule = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMainModule) {
+  startStdioServer();
 }

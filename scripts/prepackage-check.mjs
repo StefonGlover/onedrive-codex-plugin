@@ -47,7 +47,7 @@ const forbiddenResidueDirs = new Set([".codex", ".pytest_cache", "__pycache__"])
 const sensitivePackageFileNames = new Set([".env", ".env.local", ".env.development", ".env.production", "credentials.json", "token.json"]);
 const sensitivePackageFileExtensions = new Set([".key", ".pem", ".p12", ".pfx"]);
 const sensitivePackageNamePattern = /(token|secret|credential)/i;
-const expectedPluginVersion = /^0\.5\.0\+codex\.\d{14}$/;
+const expectedPluginVersion = /^0\.5\.1\+codex\.\d{14}$/;
 const expectedOfficeOperationKinds = {
   word: [
     "replaceText", "setParagraphText", "setParagraphStyle", "insertParagraph", "setTableCell",
@@ -95,6 +95,8 @@ const requiredFiles = [
   ".codex-plugin/plugin.json",
   ".mcp.json",
   "mcp/server.mjs",
+  "mcp/http-server.mjs",
+  "mcp/oauth.mjs",
   "mcp/auth-vault.mjs",
   "mcp/semantic-anchors.mjs",
   "mcp/text-patch.mjs",
@@ -105,8 +107,12 @@ const requiredFiles = [
   "scripts/install-versioned-cache.mjs",
   "scripts/requirements-office-test.txt",
   "scripts/mock-graph-test.mjs",
+  "scripts/oauth-http-test.mjs",
+  "scripts/storage-root-permissions-test.mjs",
+  "scripts/run-chatgpt-oauth-tunnel.mjs",
   "scripts/semantic-anchors-test.mjs",
   "scripts/text-patch-test.mjs",
+  "scripts/tool-profile-test.mjs",
   "scripts/office-openxml.py",
   "scripts/office-fixture-factory.py",
   "scripts/office-openxml-test.py",
@@ -116,6 +122,7 @@ const requiredFiles = [
   "deploy/synology/Dockerfile",
   "deploy/synology/entrypoint.sh",
   "deploy/synology/compose.yaml",
+  "deploy/synology/compose.oauth.example.yaml",
   "deploy/synology/README.md",
   "skills/onedrive/SKILL.md",
   "README.md",
@@ -196,7 +203,7 @@ function checkManifest() {
   if (!manifest) return;
   if (manifest.name !== "onedrive") fail(`Unexpected plugin name: ${manifest.name}`);
   if (!expectedPluginVersion.test(manifest.version || "")) {
-    fail(`Plugin version must match 0.5.0+codex.<14-digit timestamp>: ${manifest.version}`);
+    fail(`Plugin version must match 0.5.1+codex.<14-digit timestamp>: ${manifest.version}`);
   }
   const readme = readFileSync(join(pluginRoot, "README.md"), "utf8");
   if (!readme.includes(`Release \`${manifest.version}\``)) {
@@ -537,6 +544,13 @@ function checkToolSchemas() {
     for (const hint of ["readOnlyHint", "openWorldHint", "destructiveHint"]) {
       if (typeof tool.annotations?.[hint] !== "boolean") fail(`${tool.name} must define boolean annotations.${hint}.`);
     }
+    const expectedSecuritySchemes = [{ type: "noauth" }];
+    if (JSON.stringify(tool.securitySchemes) !== JSON.stringify(expectedSecuritySchemes)) {
+      fail(`${tool.name} must advertise the standard noauth security scheme.`);
+    }
+    if (JSON.stringify(tool._meta?.securitySchemes) !== JSON.stringify(expectedSecuritySchemes)) {
+      fail(`${tool.name} must mirror the noauth security scheme in _meta for ChatGPT compatibility.`);
+    }
     if (tool.annotations.readOnlyHint && (tool.annotations.openWorldHint || tool.annotations.destructiveHint)) {
       fail(`${tool.name} is read-only but advertises write-only impact hints.`);
     }
@@ -612,7 +626,7 @@ if (selfCheck) {
     missingToolRejected: !missingContract.ok && missingContract.missing.length === 1,
     extraToolRejected: !extraContract.ok && extraContract.extra.includes("onedrive_unexpected"),
     duplicateToolRejected: !duplicateContract.ok && duplicateContract.duplicates.length === 1,
-    currentVersionAccepted: expectedPluginVersion.test("0.5.0+codex.20260714034051"),
+    currentVersionAccepted: expectedPluginVersion.test("0.5.1+codex.20260719224717"),
     staleVersionRejected: !expectedPluginVersion.test("0.4.0+codex.20260713105951"),
     sensitiveFileNamesRecognized: isSensitivePackageEntryName(".env.local")
       && isSensitivePackageEntryName("signing.pem")

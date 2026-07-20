@@ -27,7 +27,7 @@ When the configured tenant is `common`, the plugin can retry Microsoft-account-o
 ## Tool Guidance
 
 - Start with `onedrive_config({ checkToken: true })` when authentication state is relevant. A healthy stored refresh token must be reused silently.
-- Use `onedrive_doctor` when setup, auth, or Graph access seems questionable, or before a larger workflow where a single health check would save time.
+- Use `onedrive_doctor` when setup, auth, Graph access, or friendly path presets seem questionable, or before a larger workflow where a single health check would save time. By default it resolves every configured preset; treat missing-preset warnings as a configuration problem before using the affected alias. Pass `checkPresets: false` only for a deliberately faster auth-only diagnostic.
 - Use `onedrive_auth_device_start` only after the token check reports no stored credential or a genuine Microsoft reauthentication error. The tool verifies existing authentication itself and returns `alreadyAuthenticated: true` without issuing a code when stored authentication is healthy. Never turn a timeout, network failure, throttling response, or other temporary verification problem into a device-login prompt. Pass `forceReauth: true` only when the user explicitly asks to switch accounts, repair consent, or sign in again.
 - Use `onedrive_auth_device_poll` after the user finishes browser sign-in.
 - Use `onedrive_logout` only when the user asks to disconnect or reset OneDrive auth. Do not delete the securely stored token unless the user explicitly asks.
@@ -48,7 +48,7 @@ When the configured tenant is `common`, the plugin can retry Microsoft-account-o
 - Use `onedrive_find_all` for broader “look everywhere” or “scan my OneDrive” file-location requests. It executes every planned Graph search term instead of stopping after a confident canonical hit. Keep caps bounded and prefer folder hints when the user gives them; duplicate/nested hints are pruned before fallback scanning.
 - Use `onedrive_search` for direct Graph search when the user specifically wants raw Graph search behavior.
 - Use `onedrive_search_all` only when the user needs paginated search results; set a bounded `maxItems`.
-- Use `onedrive_scan` when the user wants to scan the whole OneDrive or recursively inspect subfolders. Set bounded `maxItems`, `maxFolders`, and `maxResults`; use filters like `nameContains`, `extensions`, and `includeFolders: false` when searching for files.
+- Use `onedrive_scan` when the user wants to scan the whole OneDrive or recursively inspect subfolders. Set bounded `maxItems`, `maxFolders`, and `maxResults`; use filters like `nameContains`, `extensions`, and `includeFolders: false` when searching for files. Folder traversal is bounded and concurrent; set `scanConcurrency` from 1–4 only when an explicit latency/throttling tradeoff is useful.
 - Use `onedrive_delta` to answer what changed since a previous scan. Save `deltaLink` when present; use `nextLink` to continue an incomplete delta scan. Set bounded `maxItems`, and use `maxPages` when one call must stop after a known number of Graph pages while preserving the advanced `nextLink` or terminal `deltaLink`.
 - Use `onedrive_get_info` with `includeDeletedItems: true` and an `itemId` when inspecting a deleted item ID on OneDrive Personal.
 - Use `onedrive_read_text` only for bounded text files.

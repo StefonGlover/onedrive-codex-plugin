@@ -39,13 +39,19 @@ jobs:
       - name: Syntax check scripts
         run: |
           node --check mcp/server.mjs
+          node --check mcp/http-server.mjs
+          node --check mcp/oauth.mjs
           node --check scripts/mock-graph-test.mjs
+          node --check scripts/oauth-http-test.mjs
+          node --check scripts/storage-root-permissions-test.mjs
+          node --check scripts/run-chatgpt-oauth-tunnel.mjs
           node --check scripts/semantic-anchors-test.mjs
           node --check scripts/text-patch-test.mjs
           node --check scripts/prepackage-check.mjs
           node --check scripts/beta-test.mjs
           node --check scripts/benchmark.mjs
           node --check scripts/tool-contract.mjs
+          node --check scripts/tool-profile-test.mjs
           node --check scripts/install-versioned-cache.mjs
           python3 -m py_compile scripts/office-fixture-factory.py
           zsh -n scripts/configure.zsh
@@ -54,6 +60,7 @@ jobs:
         run: |
           node scripts/beta-test.mjs --self-check
           node scripts/benchmark.mjs --self-check
+          node scripts/tool-profile-test.mjs
           node scripts/install-versioned-cache.mjs --self-check
           if node scripts/beta-test.mjs --self-check --stale-days=-1; then
             echo "beta-test should reject negative --stale-days" >&2
@@ -79,6 +86,8 @@ jobs:
           SOFFICE="$(command -v soffice)" python3 scripts/office-real-fixture-test.py
           node scripts/semantic-anchors-test.mjs
           node scripts/text-patch-test.mjs
+          node scripts/oauth-http-test.mjs
+          node scripts/storage-root-permissions-test.mjs
           node scripts/mock-graph-test.mjs
 
       - name: Run prepackage guard

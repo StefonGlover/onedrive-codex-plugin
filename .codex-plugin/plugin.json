@@ -1,6 +1,6 @@
 {
   "name": "onedrive",
-  "version": "0.5.0+codex.20260719183035",
+  "version": "0.5.1+codex.20260719224717",
   "description": "Manage OneDrive files and natively inspect or edit Word, Excel, and PowerPoint content from Codex.",
   "author": {
     "name": "Stefon Glover"
@@ -41,8 +41,8 @@
     ],
     "brandColor": "#2563EB",
     "composerIcon": "./assets/chatgpt-icon.png",
-    "logo": "./assets/onedrive-cloud-logo.png",
-    "logoDark": "./assets/logo-dark.png",
+    "logo": "./assets/chatgpt-icon.png",
+    "logoDark": "./assets/chatgpt-icon.png",
     "screenshots": [
       "./assets/screenshot-file-manager.png"
     ]

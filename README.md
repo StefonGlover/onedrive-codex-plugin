@@ -2,17 +2,19 @@
 
 Local Codex plugin for OneDrive file operations through Microsoft Graph.
 
-Release `0.5.0+codex.20260719183035` exposes an exact 84-tool contract.
+Release `0.5.1+codex.20260719224717` fixes structured Office reads on NAS/container storage roots that reject both mount-root `chmod` and creation of disposable Python cache files under `/data`. It also carries the pending ChatGPT Work OAuth compatibility build: local and legacy Chat deployments advertise `noauth`, while ChatGPT Work deployments advertise the configured Entra `oauth2` API scope. Offline OAuth and regression tests pass; Entra registration, NAS OAuth rollout, and the final Work host loop remain required before this build can be promoted from Pending.
+
+ChatGPT surface note (verified 2026-07-19): the regular Chat surface passes the full health check with the No Auth tunnel app. Work requires the delegated OAuth deployment described below; its no-auth host path can display an incorrect expired-connection card before dispatching a tool call.
 
 This is an unofficial integration and is not affiliated with, endorsed by, or sponsored by Microsoft.
 
-The primary plugin logo is `assets/onedrive-cloud-logo.png`; `assets/chatgpt-icon.png` is the square ChatGPT/Codex icon derived from the supplied artwork, and the dark-mode logo remains separate so each surface can render without distortion. The MCP initialization metadata embeds that square PNG as a standards-based `serverInfo.icons` data URI so ChatGPT can display it after a developer-mode refresh.
+All plugin icon surfaces use `assets/chatgpt-icon.png`, the square 256×256 OneDrive image derived from the supplied artwork. The MCP initialization metadata also embeds that PNG as a standards-based `serverInfo.icons` data URI. ChatGPT stores the directory-listing logo separately: while the app is in developer mode, update it from the app's **Manage** menu in ChatGPT settings.
 
 The plugin is remote-first: it uses Microsoft Graph rather than the laptop's local OneDrive sync folder. Upload and download tools refuse local OneDrive sync-folder paths by default unless `allowLocalOneDriveSyncPath: true` is explicitly provided.
 
 ## Setup
 
-This plugin uses Microsoft identity platform device-code login. On macOS it stores refresh tokens in Keychain. On Linux/NAS deployments it uses an AES-256-GCM encrypted file protected by a separate owner-only key file. It does not store Microsoft passwords.
+Local/Codex and legacy No Auth deployments use Microsoft identity platform device-code login. On macOS they store refresh tokens in Keychain. On Linux/NAS they use an AES-256-GCM encrypted file protected by a separate owner-only key file. ChatGPT Work OAuth requests instead carry a short-lived Entra token for the MCP API; the server validates it and exchanges it for a short-lived Graph token with the on-behalf-of flow. It does not store Microsoft passwords or Work refresh tokens.
 
 1. Create or choose a Microsoft Entra app registration.
 2. Enable public client flows for the app.
@@ -48,10 +50,35 @@ tunnel-client init \
   --mcp-command "node \"$onedrive_plugin_root/mcp/server.mjs\""
 ```
 
-6. Validate the stopped profile with `tunnel-client doctor --profile onedrive-chatgpt --explain`, then run it with `node scripts/run-chatgpt-tunnel.mjs`. The launcher reads the private tunnel-client env file without printing the key. Set `ONEDRIVE_TUNNEL_ENV_FILE` only when you intentionally use a different credential-file path.
+6. Validate the stopped profile with `tunnel-client doctor --profile onedrive-chatgpt --explain`, then run it with `node scripts/run-chatgpt-tunnel.mjs`. The launcher reads the private tunnel-client env file without printing the key and defaults to `ONEDRIVE_TOOL_PROFILE=chatgpt`, a focused 26-tool contract with compact Office schemas for lower ChatGPT selection latency. Setup, diagnostics, cache/index maintenance, specialized reporting, and bulk automation remain available with `ONEDRIVE_TOOL_PROFILE=full`; refresh the app metadata in ChatGPT after switching profiles. Set `ONEDRIVE_TUNNEL_ENV_FILE` only when you intentionally use a different credential-file path.
 7. In ChatGPT **Settings → Plugins**, create a developer-mode plugin, choose **Tunnel**, select the tunnel, choose **No Auth**, create the plugin, and connect it.
 
 Keep `tunnel-client` running for connector discovery and every OneDrive tool call from ChatGPT.
+
+### ChatGPT Work OAuth
+
+Work uses an Entra-protected MCP API and Microsoft Graph on-behalf-of (OBO) exchange. This requires two Entra app registrations:
+
+1. **OneDrive MCP API** — the existing OneDrive client registration can be reused.
+   - Keep its delegated Graph permissions: `User.Read` and `Files.ReadWrite` (plus any optional permission you already use).
+   - Under **Expose an API**, set the Application ID URI to `api://<MCP_API_CLIENT_ID>` and add a delegated `access_as_user` scope that users and admins can consent to.
+   - Add a confidential-client secret or certificate. The current implementation accepts the secret through `ONEDRIVE_MCP_OAUTH_API_CLIENT_SECRET_FILE`; never commit it.
+   - Grant the existing user/admin consent for the Graph delegated permissions so OBO does not fail with `interaction_required`.
+2. **ChatGPT OneDrive Client** — create a separate confidential web-client registration.
+   - Support the same account population as the API registration (`consumers` for this personal OneDrive, or the appropriate tenant for work/school accounts).
+   - Add delegated permission to `api://<MCP_API_CLIENT_ID>/access_as_user`.
+   - In the API registration's **Authorized client applications**, pre-authorize this client ID for `access_as_user` when your tenant policy permits it.
+   - Add the exact callback URL shown by ChatGPT, `https://chatgpt.com/connector/oauth/<callback_id>`, as a Web redirect URI.
+
+Configure the NAS with `deploy/synology/compose.oauth.example.yaml`, put the MCP API secret in `deploy/synology/runtime/oauth-api-client.secret`, and keep that file mode `0600`. The OAuth process exposes Streamable HTTP on loopback only; Secure MCP Tunnel forwards `/mcp`, `/.well-known/oauth-protected-resource`, and `/.well-known/oauth-protected-resource/mcp` without publishing a NAS port.
+
+In ChatGPT developer mode, recreate the app with **OAuth** authentication and use the ChatGPT client registration's client ID/secret. Use the Entra authorization and token endpoints for the chosen tenant, and request:
+
+```text
+api://<MCP_API_CLIENT_ID>/access_as_user openid profile offline_access
+```
+
+The server verifies RS256 signature, issuer, audience, expiry/not-before, and `access_as_user`; it then exchanges the assertion for `https://graph.microsoft.com/.default`. Missing or invalid auth returns both the MCP OAuth challenge metadata and the advertised per-tool `oauth2` scheme. Device-code start/poll/logout tools are disabled inside delegated OAuth requests so a Work user cannot mutate the NAS's legacy shared credential.
 
 ### Synology NAS
 
@@ -85,12 +112,26 @@ export ONEDRIVE_CONCURRENCY_LIMIT="2"
 export ONEDRIVE_DELTA_SYNC_ENABLED="true"
 export ONEDRIVE_CONTENT_INDEX_ENABLED="true"
 export ONEDRIVE_INDEX_OFFICE_EXPORT="false"
+
+# Optional ChatGPT Work OAuth transport
+export ONEDRIVE_MCP_AUTH_MODE="oauth"
+export ONEDRIVE_MCP_OAUTH_TENANT="consumers"
+export ONEDRIVE_MCP_OAUTH_API_CLIENT_ID="your-mcp-api-app-id"
+export ONEDRIVE_MCP_OAUTH_API_CLIENT_SECRET_FILE="/run/onedrive-runtime/oauth-api-client.secret"
+export ONEDRIVE_MCP_RESOURCE="api://your-mcp-api-app-id"
+export ONEDRIVE_MCP_OAUTH_API_SCOPE="api://your-mcp-api-app-id/access_as_user"
+export ONEDRIVE_MCP_OAUTH_SCOPE_CLAIM="access_as_user"
+export ONEDRIVE_MCP_OAUTH_AUDIENCE="your-mcp-api-app-id"
+export ONEDRIVE_MCP_OAUTH_AUTHORITY="https://login.microsoftonline.com/consumers/v2.0"
+export ONEDRIVE_MCP_OAUTH_GRAPH_SCOPES="https://graph.microsoft.com/.default"
 ```
 
 `ONEDRIVE_TENANT` can be `common`, `consumers`, `organizations`, or a tenant ID. Use `common` for a plugin that may access either personal Microsoft accounts or work/school accounts.
 If Microsoft reports that the app is Microsoft-account-only and requires `/consumers`, the plugin retries device-code and refresh-token auth on `consumers` automatically when the configured tenant is `common`.
 
 `ONEDRIVE_TOKEN_STORE` defaults to `keychain` on macOS and `encrypted-file` on other platforms. The encrypted-file store requires `ONEDRIVE_TOKEN_ENCRYPTION_KEY_FILE` or `ONEDRIVE_TOKEN_ENCRYPTION_KEY`; the key must decode to exactly 32 bytes, and key files with group/other permissions or symlinks are rejected. Prefer the key-file option so the encryption key is not inherited broadly through process environments.
+
+`ONEDRIVE_MCP_AUTH_MODE` defaults to `noauth`. Set it to `oauth` only after the Entra API registration, OBO secret, API scope, ChatGPT client registration, and ChatGPT callback are configured. In OAuth mode the process fails closed at startup if required settings or the secret file are missing. The API client secret is used only for the OBO token exchange and is never returned by MCP tools or written to audit logs.
 
 You can also add friendly path aliases to the config file:
 
@@ -177,6 +218,18 @@ Use absolute paths in `storageRoot` and `cacheRoot` if you override them. Config
 - `onedrive_export_text`
 - `onedrive_upload`
 - `onedrive_write_text`
+- `onedrive_patch_text`
+- `onedrive_versions`
+- `onedrive_compare_version`
+- `onedrive_restore_version`
+- `onedrive_workspace_list`
+- `onedrive_workspace_create`
+- `onedrive_workspace_status`
+- `onedrive_workspace_promote`
+- `onedrive_workspace_abandon`
+- `onedrive_watch_start`
+- `onedrive_watch_status`
+- `onedrive_watch_stop`
 - `onedrive_create_folder`
 - `onedrive_rename`
 - `onedrive_move`
@@ -264,8 +317,9 @@ For cross-drive research, `onedrive_office_index_refresh` stores structured para
 - `onedrive_batch_get_info` and `onedrive_batch_permissions` use Microsoft Graph batching for up to 20 items. Batch download/delete/move tools provide one result per item with dry-run support where destructive.
 - `onedrive_rename`, `onedrive_move`, and `onedrive_copy` support `dryRun: true` previews. Live `onedrive_batch_move` requires `dryRun: false`, `confirmed: true`, and `expectedName` or `expectedId` for every item.
 - `onedrive_recent`, `onedrive_large_files`, `onedrive_duplicates`, `onedrive_shared_by_me`, and `onedrive_public_links` provide cleanup and sharing-audit workflows.
-- `onedrive_list_all` follows pagination within one folder. Use `onedrive_scan` when you need recursive traversal across subfolders or the whole OneDrive.
-- `onedrive_doctor` checks config, auth, profile, drive metadata, presets, and optional root listing in one call.
+- `onedrive_list_all` follows pagination within one folder. Use `onedrive_scan` when you need recursive traversal across subfolders or the whole OneDrive. Direct scans use bounded folder concurrency; set `scanConcurrency` from 1–4 when latency or Graph throttling requires an explicit tradeoff.
+- `onedrive_doctor` checks config, auth, profile, drive metadata, every configured preset target, and optional root listing in one call. Missing preset folders produce a warning with the exact aliases that need a `pathPresets` override.
+- Tool failures retain a short text message for compatibility and also return machine-readable `structuredContent.error` metadata with a stable code such as `not_found`, `permission_denied`, `conflict`, `rate_limited`, or `service_unavailable`.
 - `onedrive_export_pdf` and `onedrive_export_text` ask Microsoft Graph to convert supported Office files before saving locally. Microsoft Graph may reject conversions for unsupported file types.
 - `onedrive_permissions` audits current sharing/permission grants before changing access.
 - `onedrive_delta` can return deleted item changes. Set `maxPages` from 1 to 100 to cap Graph pages in one call while retaining the advanced `nextLink` or terminal `deltaLink`. Microsoft Graph does not expose a normal OneDrive recycle-bin listing endpoint through the driveItem file APIs.
@@ -327,6 +381,14 @@ The bundled benchmark script runs those steps through the MCP server with bounde
 scripts/benchmark.mjs --query="project plan" --maxItems=1500 --maxFolders=250 --maxFiles=50 --searchConcurrency=2
 ```
 
+Validate the ChatGPT-specific metadata budget separately from Microsoft Graph latency:
+
+```bash
+node scripts/tool-profile-test.mjs
+```
+
+The guard preserves the full 84-tool contract for Codex, limits the ChatGPT profile to the reviewed 26-tool subset, keeps its `tools/list` response under 40 KiB, and verifies that the compact Office transform descriptor is still backed by the server's full validation schema. The ChatGPT server version includes a deterministic contract hash so ChatGPT invalidates stale tool metadata whenever the advertised surface changes.
+
 Add `--clear` when you intentionally want to clear local metadata/content caches before the cold run. The script performs read-only Microsoft Graph operations, writes local cache/index files, and emits progress events to stderr while keeping the final summary JSON on stdout.
 
 Expected improvement: confident canonical matches use one Graph search instead of running every generated term; lower-confidence queries expand terms with bounded concurrency. Warm metadata searches avoid most repeated recursive scans, delta refreshes fetch only changes after the initial scan, and content searches avoid live file reads after the index is built. Benchmark summaries report planned, executed, and skipped terms. Actual speed depends on Microsoft Graph latency, OneDrive size, throttling, and configured caps.
@@ -363,14 +425,14 @@ Preview the exact new versioned cache directory, then install only after reviewi
 
 ```bash
 node scripts/install-versioned-cache.mjs
-node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.0+codex.20260719183035"
+node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.1+codex.20260719224717"
 ```
 
 After both live betas, regenerate the two QA reports, preview their exact sync into that new cache, then apply only those evidence files and re-run parity:
 
 ```bash
-node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.0+codex.20260719183035"
-node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.0+codex.20260719183035"
+node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.1+codex.20260719224717"
+node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.5.1+codex.20260719224717"
 ```
 
 Office compatibility checks are split by purpose:
@@ -455,4 +517,7 @@ The GitHub Actions workflow in `.github/workflows/ci.yml` runs syntax checks, pi
 - Restore deleted item: https://learn.microsoft.com/en-us/graph/api/driveitem-restore
 - Microsoft Graph throttling guidance: https://learn.microsoft.com/en-us/graph/throttling
 - Delegated Microsoft Graph auth: https://learn.microsoft.com/en-us/graph/auth-v2-user
+- Microsoft identity on-behalf-of flow: https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-on-behalf-of-flow
+- Expose an Entra-protected web API: https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-configure-app-expose-web-apis
+- OpenAI Apps SDK authentication: https://developers.openai.com/apps-sdk/build/auth
 - Microsoft identity scopes: https://learn.microsoft.com/en-us/entra/identity-platform/scopes-oidc

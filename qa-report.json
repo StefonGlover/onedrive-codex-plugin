@@ -1,13 +1,13 @@
 {
   "schemaVersion": 2,
-  "decision": "Pass",
+  "decision": "Pending — Entra registration, NAS OAuth rollout, ChatGPT Work validation, and correct hosted logo",
   "date": "2026-07-19",
-  "generatedAt": "2026-07-19T18:30:35Z",
+  "generatedAt": "2026-07-19T22:47:17Z",
   "source": {
-    "commit": "e0a2da72a301221239f786cd19ecbe737d4874db",
-    "workingTree": "fully validated OneDrive, Linux encrypted-auth, Synology DS923+ deployment, and ChatGPT structured-icon fixes on top of the recorded source commit; immutable cache parity is verified",
-    "pluginVersion": "0.5.0+codex.20260719183035",
-    "contentDigest": "08c4ab4f9aa2a7979def30787465ac5fe69397a692aa66aaa4eee6bb6d03204a"
+    "commit": "87d94eb3df28c5c7a79409cbae238633ed992094",
+    "workingTree": "Pending OAuth compatibility build on top of the validated No Auth release. The immutable 0.5.1 cache, Synology nas8 workbook repair, live QSE workbook read, local JWT, protected-resource discovery, OBO exchange, Streamable HTTP, 84-tool oauth2 metadata, runtime challenge, and authenticated-call tests pass. Entra registration, NAS OAuth deployment, the ChatGPT Work host loop, and the correct hosted listing logo remain outstanding.",
+    "pluginVersion": "0.5.1+codex.20260719224717",
+    "contentDigest": null
   },
   "contract": {
     "toolCount": 84,
@@ -21,7 +21,7 @@
     { "name": "Office Open XML operations", "status": "pass", "operations": 79, "word": 21, "excel": 33, "powerpoint": 25 },
     { "name": "Office security corpus", "status": "pass" },
     { "name": "Genuine package reopening", "status": "pass" },
-    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 153 },
+    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 157 },
     { "name": "Read-only OneDrive doctor and tenant checks", "status": "pass", "checks": 6 },
     { "name": "Cleanup preview", "status": "pass", "candidates": 0 },
     { "name": "Whitespace", "status": "pass" }
@@ -29,41 +29,111 @@
   "liveRuns": {
     "source": {
       "status": "pass",
-      "scope": "current 0.5.0 source: full isolated CRUD, Office, sharing, versioning, safety, encrypted-auth, and cleanup beta",
+      "scope": "No Auth descriptor repair source: full isolated CRUD, Office, sharing, versioning, safety, encrypted-auth, and cleanup beta",
       "checks": 106,
       "passed": 96,
       "blocked": 10,
       "failed": 0,
       "contractTools": 84,
       "toolCoverage": { "contract": 84, "exercised": 83, "blocked": 1 },
-      "runId": "codex-beta-nas-source-20260719t1343",
-      "folderName": "Codex OneDrive Plugin Beta Test codex-beta-nas-source-20260719t1343",
-      "runtimeMs": 239193,
+      "runId": "codex-beta-source-noauth-20260719t2034z",
+      "folderName": "Codex OneDrive Plugin Beta Test codex-beta-source-noauth-20260719t2034z",
+      "runtimeMs": 199635,
       "cleanupVerified": true
     },
     "installed": {
       "status": "pass",
-      "scope": "current 0.5.0 immutable cache: full isolated CRUD, Office, sharing, versioning, safety, encrypted-auth, and cleanup beta",
+      "scope": "No Auth descriptor repair immutable cache: full isolated CRUD, Office, sharing, versioning, safety, encrypted-auth, and cleanup beta",
       "checks": 106,
       "passed": 96,
       "blocked": 10,
       "failed": 0,
       "contractTools": 84,
       "toolCoverage": { "contract": 84, "exercised": 83, "blocked": 1 },
-      "runId": "codex-beta-nas-installed-20260719t1348",
-      "folderName": "Codex OneDrive Plugin Beta Test codex-beta-nas-installed-20260719t1348",
-      "runtimeMs": 266863,
+      "runId": "codex-beta-installed-noauth2-20260719t2048z",
+      "folderName": "Codex OneDrive Plugin Beta Test codex-beta-installed-noauth2-20260719t2048z",
+      "runtimeMs": 245881,
       "cleanupVerified": true
     }
   },
   "installedBuild": {
     "status": "pass",
-    "version": "0.5.0+codex.20260719183035",
-    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.5.0+codex.20260719183035",
+    "version": "0.5.1+codex.20260719224717",
+    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.5.1+codex.20260719224717",
     "oldCacheOverwritten": false
   },
   "cleanup": { "status": "pass", "remoteTestRootsRemaining": 0, "permissionsRemaining": 0, "anonymousLinksRemaining": 0, "isolatedLocalResidue": false },
   "sourceCacheParity": { "status": "pass", "bytes": "pass", "modes": "pass", "types": "pass", "symlinkTargets": "pass" },
+  "deployment": {
+    "status": "pass",
+    "platform": "Synology DS923+ Container Manager",
+    "project": "onedrive-chatgpt",
+    "image": "onedrive-chatgpt-nas:0.5.0-nas8",
+    "stagedFiles": 46,
+    "containerHealth": "healthy",
+    "restartCount": 0,
+    "nodeVersion": "20.20.2",
+    "connectorSmoke": "Fresh No Auth app registration exposed 84/84 noauth action descriptors and completed authenticated config, profile, drive, root listing, and preset validation in Chat with five passes, one warning, and zero failures.",
+    "oauthCandidate": {
+      "status": "local_image_pass",
+      "image": "onedrive-chatgpt-nas:0.5.1-nas9",
+      "builtAt": "2026-07-19T22:12:29Z",
+      "containerOAuthIntegration": "pass",
+      "checks": {
+        "protectedResourceMetadata": true,
+        "jwtValidation": true,
+        "onBehalfOfExchangeAndCache": true,
+        "streamableHttpInitialize": true,
+        "oauthToolDescriptors": 84,
+        "runtimeChallenge": true,
+        "authenticatedToolCall": true
+      },
+      "nasDeployed": false
+    },
+    "workbookReadRepair": {
+      "status": "live_workbook_pass",
+      "observedFailure": "EPERM: operation not permitted, chmod '/data', followed by EACCES: permission denied, mkdir '/data/pycache' after the first repair.",
+      "cause": "The Office helper first hardened the pre-existing NAS mount root and then placed disposable Python bytecode under that non-writable mount.",
+      "fix": "Do not chmod the storage mount root; keep Python bytecode in a private temporary directory outside /data and retain 0700 hardening for managed writable state.",
+      "focusedFixtureTest": "pass",
+      "rootOwnedMountTest": "pass_as_unprivileged_node_user_with_mode_0555",
+      "mockGraphChecks": 157,
+      "mockGraphFailures": 0,
+      "liveWorkbookRetest": "pass",
+      "liveWorkbookPath": "Personal/Documents/Career Development/QSE Job Tracker.xlsx",
+      "liveWorkbookBackend": "openxml",
+      "liveWorkbookSheets": 3,
+      "liveWorkbookCellsReturned": 5000,
+      "liveWorkbookTables": 2,
+      "liveWorkbookCharts": 3,
+      "liveWorkbookCheckedAt": "2026-07-19T22:47:17Z"
+    },
+    "chatgptHostLoop": {
+      "status": "pass_with_host_limitation",
+      "appName": "OneDrive",
+      "appId": "asdk_app_6a5d3b6c8b9c8191a0cb7d281bf6bc1d",
+      "authentication": "No Auth",
+      "toolSecuritySchemes": "84/84 noauth",
+      "listingLogo": {
+        "status": "fail_generic_plug_confirmed",
+        "checkedAt": "2026-07-19T21:34:46Z",
+        "expectedAsset": "assets/chatgpt-icon.png",
+        "expectedAppearance": "square blue OneDrive cloud",
+        "observedAppearance": "generic plug",
+        "replacementFlow": "The ChatGPT New Plugin form exposes a PNG icon field and OAuth/Mixed authentication choices; the existing app manager exposes no logo edit control.",
+        "automationBlock": "Chrome refused fileChooser.setFiles because the ChatGPT Chrome Extension does not have access to file URLs.",
+        "genericPlugAccepted": false
+      },
+      "chatSurface": { "status": "pass", "healthChecksPassed": 5, "warnings": 1, "failed": 0, "filesModified": false },
+      "workSurface": { "status": "blocked_by_host", "serverToolCallReceived": false, "workaround": "Select Chat rather than Work." }
+    },
+    "warnings": [
+      "The account does not currently contain the default Desktop or Pictures/Screenshots preset targets; doctor reports these as warnings.",
+      "ChatGPT Work shows an incorrect expired-connection card for the custom No Auth app before dispatching a tool call; the identical fresh app passes in Chat.",
+      "The packaged square OneDrive icon is validated locally, but a live ChatGPT directory check at 2026-07-19T21:34:46Z still showed the generic plug. The existing app manager has no logo control; the replacement-app form has the required PNG icon field, but Chrome file upload remains blocked until its ChatGPT extension can access file URLs.",
+      "Synology administrative verification used HTTPS over the LAN fallback with insecure TLS certificate validation enabled after the Tailscale endpoint failed; install a trusted DSM certificate or certificate pinning to remove this operational warning."
+    ]
+  },
   "blockedCoverage": [
     { "area": "Business Graph Excel", "reason": "The connected live account is personal; the business backend passes mock coverage." },
     { "area": "Organization-only sharing", "reason": "The connected live account is personal; organization behavior passes mock coverage." },

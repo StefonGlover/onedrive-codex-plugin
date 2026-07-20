@@ -62,6 +62,10 @@ let devicePollShouldSucceed = false;
 let driveResponseDelayMs = 0;
 let delayedAccountItemResponseMs = 0;
 let delayedRootNoteContentMs = 0;
+let missingPresetPath = null;
+let scanFolderDelayMs = 0;
+let scanFoldersInFlight = 0;
+let maxScanFoldersInFlight = 0;
 let rootDeltaScenario = "empty";
 let deleteTargetRevision = 1;
 const replacementRaceState = new Map();
@@ -1240,6 +1244,19 @@ const graph = createServer(async (req, res) => {
     return json(res, 200, { id: "root", name: "root", root: {}, folder: {} });
   }
 
+  const presetPaths = new Map([
+    ["/v1.0/me/drive/root:/Documents:", folder("preset-documents", "Documents")],
+    ["/v1.0/me/drive/root:/Desktop:", folder("preset-desktop", "Desktop")],
+    ["/v1.0/me/drive/root:/Pictures:", folder("preset-pictures", "Pictures")],
+    ["/v1.0/me/drive/root:/Pictures/Screenshots:", folder("preset-screenshots", "Screenshots")]
+  ]);
+  if (req.method === "GET" && presetPaths.has(path)) {
+    if (missingPresetPath === path) {
+      return json(res, 404, { error: { code: "itemNotFound", message: "Configured preset path is missing." } });
+    }
+    return json(res, 200, presetPaths.get(path));
+  }
+
   if (req.method === "POST" && path === "/v1.0/me/drive/items/root:/trusted-session.txt:/createUploadSession") {
     count("trusted-upload-session");
     return json(res, 200, { uploadUrl: `http://127.0.0.1:${graph.address().port}/v1.0/mock/upload-session/trusted` });
@@ -1391,6 +1408,12 @@ const graph = createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/folder-a/children") {
+    if (scanFolderDelayMs) {
+      scanFoldersInFlight += 1;
+      maxScanFoldersInFlight = Math.max(maxScanFoldersInFlight, scanFoldersInFlight);
+      await new Promise((resolve) => setTimeout(resolve, scanFolderDelayMs));
+      scanFoldersInFlight -= 1;
+    }
     return json(res, 200, {
       value: [
         item("deep-deck", "Deep Summary Deck.pptx", {
@@ -1425,6 +1448,12 @@ const graph = createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/folder-b/children") {
+    if (scanFolderDelayMs) {
+      scanFoldersInFlight += 1;
+      maxScanFoldersInFlight = Math.max(maxScanFoldersInFlight, scanFoldersInFlight);
+      await new Promise((resolve) => setTimeout(resolve, scanFolderDelayMs));
+      scanFoldersInFlight -= 1;
+    }
     return json(res, 200, {
       value: [
         item("deep-pdf", "Nested Eval.pdf", {
@@ -1441,6 +1470,20 @@ const graph = createServer(async (req, res) => {
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/folder-b") {
     return json(res, 200, folder("folder-b", "Folder B"));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/special-root") {
+    return json(res, 200, folder("special-root", "Special Root"));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/special-root/children") {
+    return json(res, 200, {
+      value: [
+        item("special-vault", "Personal Vault", { file: undefined }),
+        item("special-file", "normal.txt"),
+        folder("special-folder", "Normal Folder")
+      ]
+    });
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/bulk-large") {
@@ -1729,7 +1772,11 @@ async function tool(name, args = {}) {
   } catch {
     // Keep plain text.
   }
-  return { isError: Boolean(response.result?.isError), value };
+  return {
+    isError: Boolean(response.result?.isError),
+    value,
+    structuredContent: response.result?.structuredContent
+  };
 }
 
 async function previewTokenFor(name, args = {}) {
@@ -1801,7 +1848,16 @@ try {
     const authStart = utilities.find((entry) => entry.name === "onedrive_auth_device_start");
     assert(authStart.inputSchema?.properties?.forceReauth?.default === false, "device login should expose an explicit false-by-default forceReauth guard", authStart.inputSchema);
     assert(toolList.length === 84 && new Set(toolList.map((entry) => entry.name)).size === 84, "server must expose exactly 84 unique tools", { count: toolList.length });
-    return { checked: utilities.map((entry) => entry.name).sort(), exactToolCount: toolList.length };
+    const expectedSecuritySchemes = JSON.stringify([{ type: "noauth" }]);
+    for (const entry of toolList) {
+      assert(JSON.stringify(entry.securitySchemes) === expectedSecuritySchemes, `${entry.name} must advertise standard noauth security`, entry.securitySchemes);
+      assert(JSON.stringify(entry._meta?.securitySchemes) === expectedSecuritySchemes, `${entry.name} must mirror noauth security for ChatGPT compatibility`, entry._meta);
+    }
+    return {
+      checked: utilities.map((entry) => entry.name).sort(),
+      exactToolCount: toolList.length,
+      noAuthSecurityDescriptors: toolList.length
+    };
   });
 
   await check("server configuration honors environment then config then defaults", async () => {
@@ -2822,6 +2878,31 @@ process.exit(2);
     return result.value.summary;
   });
 
+  await check("doctor warns when configured preset targets are missing", async () => {
+    missingPresetPath = "/v1.0/me/drive/root:/Desktop:";
+    try {
+      const result = await tool("onedrive_doctor", { checkRootList: false });
+      assert(!result.isError, "doctor warning should remain a successful tool response", result);
+      assert(result.value.ok === true && result.value.status === "warn", "missing presets should produce a warning health state", result.value);
+      const presetCheck = result.value.checks.find((check) => check.name === "presets");
+      assert(presetCheck?.status === "warn", "preset health check should warn", presetCheck);
+      assert(presetCheck.details.missingCount === 1, "doctor should count the missing preset", presetCheck.details);
+      assert(presetCheck.details.presets.some((entry) => entry.name === "desktop" && entry.available === false), "doctor should identify the missing preset", presetCheck.details);
+      return { status: result.value.status, missingCount: presetCheck.details.missingCount };
+    } finally {
+      missingPresetPath = null;
+    }
+  });
+
+  await check("tool errors include stable structured error metadata", async () => {
+    const result = await tool("onedrive_get_info", { itemId: "definitely-missing" });
+    assert(result.isError, "missing item should return a tool error", result);
+    assert(result.structuredContent?.error?.code === "not_found", "404 should map to not_found", result.structuredContent);
+    assert(result.structuredContent?.error?.graphStatus === 404, "structured error should retain Graph status", result.structuredContent);
+    assert(result.structuredContent?.error?.tool === "onedrive_get_info", "structured error should identify the tool", result.structuredContent);
+    return result.structuredContent.error;
+  });
+
   await check("read-only Graph batches retry outer and transient inner failures in order", async () => {
     const result = await tool("onedrive_batch_get_info", {
       items: [{ itemId: "root-note" }, { itemId: "batch-flaky" }],
@@ -3144,6 +3225,8 @@ process.exit(2);
       { name: "onedrive_move", args: { itemId: "root-note", destinationParentRelativePath: "Archive" }, label: "orphan destination relative path" },
       { name: "onedrive_create_folder", args: { name: "Child", parentRelativePath: "Archive" }, label: "orphan parent relative path" },
       { name: "onedrive_write_text", args: { remotePath: "root-target.txt", remoteRelativePath: "orphan.txt", content: "x" }, label: "orphan remote relative path" },
+      { name: "onedrive_scan", args: { relativePath: "Personal" }, label: "orphan scan relative path" },
+      { name: "onedrive_delta", args: { relativePath: "Personal" }, label: "orphan delta relative path" },
       { name: "onedrive_office_batch_transform", args: { items: [{ kind: "word", itemId: "office-word", operations: [{ type: "mysteryOfficeEdit", payload: true }] }] }, label: "unknown nested Office operation" },
       { name: "onedrive_office_batch_transform", args: { items: [{ kind: "word", itemId: "office-word", operations: [{ type: "setCell", sheet: "Data", address: "A1", value: "wrong kind" }] }] }, label: "kind-mismatched Office operation" }
     ];
@@ -3153,6 +3236,8 @@ process.exit(2);
       const result = await tool(entry.name, entry.args);
       assert(result.isError, `${entry.label} should be rejected`, result);
       assert(result.value.error === "invalid_arguments", `${entry.label} should return structured validation error`, result.value);
+      assert(result.structuredContent?.error?.code === "invalid_argument", `${entry.label} should expose a stable structured error code`, result.structuredContent);
+      assert(result.structuredContent?.error?.tool === entry.name, `${entry.label} should identify the rejected tool`, result.structuredContent);
       outputs.push({ label: entry.label, details: result.value.details });
     }
     assert(requests.length === before, "validation failures should not reach Graph", { added: requests.slice(before) });
@@ -4166,6 +4251,42 @@ process.exit(2);
       summary: result.value.summary,
       found: result.value.items[0]
     };
+  });
+
+  await check("scan uses bounded folder concurrency", async () => {
+    scanFolderDelayMs = 50;
+    scanFoldersInFlight = 0;
+    maxScanFoldersInFlight = 0;
+    try {
+      const result = await tool("onedrive_scan", {
+        scanConcurrency: 2,
+        maxDepth: 1,
+        maxItems: 20,
+        maxFolders: 3,
+        maxResults: 20
+      });
+      assert(!result.isError, "concurrent scan should succeed", result);
+      assert(result.value.filters.scanConcurrency === 2, "scan should report effective concurrency", result.value.filters);
+      assert(maxScanFoldersInFlight === 2, "scan should visit sibling folders concurrently", { maxScanFoldersInFlight });
+      return { scanConcurrency: result.value.filters.scanConcurrency, maxScanFoldersInFlight };
+    } finally {
+      scanFolderDelayMs = 0;
+      scanFoldersInFlight = 0;
+    }
+  });
+
+  await check("scan excludes special non-file items when folders are excluded", async () => {
+    const result = await tool("onedrive_scan", {
+      itemId: "special-root",
+      includeFiles: true,
+      includeFolders: false,
+      maxDepth: 0,
+      maxItems: 10,
+      maxResults: 10
+    });
+    assert(!result.isError, "special-item scan should succeed", result);
+    assert(result.value.items.map((entry) => entry.id).join(",") === "special-file", "file-only scan should exclude folders and unknown special items", result.value.items);
+    return { ids: result.value.items.map((entry) => entry.id) };
   });
 
   await check("scan maxItems cap limits metadata cache writes", async () => {

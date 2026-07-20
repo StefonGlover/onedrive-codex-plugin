@@ -1,0 +1,19 @@
+services:
+  onedrive-chatgpt:
+    environment:
+      # Reuse the existing OneDrive app registration after adding an exposed
+      # access_as_user API scope and a confidential-client credential.
+      ONEDRIVE_MCP_AUTH_MODE: "oauth"
+      ONEDRIVE_MCP_OAUTH_TENANT: "consumers"
+      ONEDRIVE_MCP_OAUTH_API_CLIENT_ID: "REPLACE_WITH_MCP_API_CLIENT_ID"
+      ONEDRIVE_MCP_RESOURCE: "api://REPLACE_WITH_MCP_API_CLIENT_ID"
+      ONEDRIVE_MCP_OAUTH_API_SCOPE: "api://REPLACE_WITH_MCP_API_CLIENT_ID/access_as_user"
+      ONEDRIVE_MCP_OAUTH_SCOPE_CLAIM: "access_as_user"
+      ONEDRIVE_MCP_OAUTH_AUDIENCE: "REPLACE_WITH_MCP_API_CLIENT_ID"
+      ONEDRIVE_MCP_OAUTH_AUTHORITY: "https://login.microsoftonline.com/consumers/v2.0"
+      ONEDRIVE_MCP_OAUTH_GRAPH_SCOPES: "https://graph.microsoft.com/.default"
+      # Use the HTTPS MCP resource-metadata URL shown for the secure tunnel.
+      ONEDRIVE_MCP_PUBLIC_BASE_URL: "https://REPLACE_WITH_PUBLIC_MCP_ORIGIN"
+
+    # Put the API registration's secret in runtime/oauth-api-client.secret.
+    # entrypoint.sh copies it into the private in-memory runtime mount at 0600.
