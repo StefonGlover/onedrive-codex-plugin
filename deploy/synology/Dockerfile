@@ -39,6 +39,7 @@ ENV HOME=/home/node \
     ONEDRIVE_TUNNEL_ENV_FILE=/run/onedrive-runtime/tunnel.env \
     ONEDRIVE_TUNNEL_PROFILE_DIR=/data/tunnel \
     ONEDRIVE_TUNNEL_PROFILE=onedrive-chatgpt \
+    ONEDRIVE_TOOL_PROFILE=chatgpt \
     ONEDRIVE_MCP_HTTP_HOST=127.0.0.1 \
     ONEDRIVE_MCP_HTTP_PORT=3001 \
     ONEDRIVE_MCP_OAUTH_API_CLIENT_SECRET_FILE=/run/onedrive-runtime/oauth-api-client.secret

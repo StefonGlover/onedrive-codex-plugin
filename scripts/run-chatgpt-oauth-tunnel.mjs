@@ -8,13 +8,18 @@ const scriptsRoot = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = join(scriptsRoot, "..");
 const httpHost = process.env.ONEDRIVE_MCP_HTTP_HOST || "127.0.0.1";
 const httpPort = process.env.ONEDRIVE_MCP_HTTP_PORT || "3001";
+const toolProfile = process.env.ONEDRIVE_TOOL_PROFILE || "chatgpt";
 const healthUrl = `http://${httpHost}:${httpPort}/healthz`;
 let stopping = false;
 
-function child(script) {
+if (!["full", "chatgpt"].includes(toolProfile)) {
+  throw new Error("ONEDRIVE_TOOL_PROFILE must be full or chatgpt.");
+}
+
+function child(script, env = process.env) {
   return spawn(process.execPath, [script], {
     cwd: pluginRoot,
-    env: process.env,
+    env,
     stdio: "inherit"
   });
 }
@@ -36,7 +41,13 @@ async function waitForHttpServer(processHandle) {
   throw new Error(`The OneDrive MCP HTTP server did not become healthy at ${healthUrl} within 20 seconds.`);
 }
 
-const httpServer = child(join(pluginRoot, "mcp", "http-server.mjs"));
+// The HTTP server owns MCP initialize/tools/list handling, so it must receive
+// the focused ChatGPT profile directly. Passing the profile only to the tunnel
+// client leaves the server on its much larger default `full` contract.
+const httpServer = child(join(pluginRoot, "mcp", "http-server.mjs"), {
+  ...process.env,
+  ONEDRIVE_TOOL_PROFILE: toolProfile
+});
 let tunnel = null;
 
 async function stop(signal = "SIGTERM") {

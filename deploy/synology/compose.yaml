@@ -6,7 +6,7 @@ services:
       args:
         TUNNEL_CLIENT_VERSION: "0.0.10"
         TARGETARCH: "amd64"
-    image: onedrive-chatgpt-nas:0.5.1-nas9
+    image: onedrive-chatgpt-nas:0.5.1-nas10
     container_name: onedrive-chatgpt
     restart: unless-stopped
     environment:
@@ -14,6 +14,7 @@ services:
       ONEDRIVE_TENANT: "consumers"
       ONEDRIVE_SCOPES: "offline_access User.Read Files.ReadWrite"
       ONEDRIVE_TUNNEL_ID: "tunnel_6a5cf76803d881918237de43c2db9888"
+      ONEDRIVE_TOOL_PROFILE: "chatgpt"
       ONEDRIVE_TOKEN_STORE: "encrypted-file"
       ONEDRIVE_TOKEN_FILE: "/data/auth/tokens.enc"
       ONEDRIVE_TOKEN_ENCRYPTION_KEY_FILE: "/run/onedrive-runtime/auth-vault.key"
