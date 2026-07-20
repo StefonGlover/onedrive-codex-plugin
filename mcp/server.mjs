@@ -1972,7 +1972,7 @@ const chatgptCompatibilityTools = [
   {
     name: "search",
     title: "Search OneDrive",
-    description: "Use this when the user wants to find files or folders in OneDrive by name, keywords, or content. Returns a small ranked result set without recursive drive scanning.",
+    description: "Use this when the user wants to find files or folders in OneDrive by name, keywords, or content. Every result includes the opaque ID required by fetch.",
     inputSchema: {
       type: "object",
       required: ["query"],
@@ -2006,7 +2006,7 @@ const chatgptCompatibilityTools = [
   {
     name: "fetch",
     title: "Fetch OneDrive item",
-    description: "Use this when the user wants to read an item returned by search. It extracts bounded content directly and returns a continuation ID only when a large file needs another fetch for full detail.",
+    description: "Use this when the user wants to read an item returned by search. Pass the returned ID unchanged; a continuation ID appears only when a large file needs another fetch.",
     inputSchema: {
       type: "object",
       required: ["id"],
@@ -2254,12 +2254,12 @@ const compactOfficeOperationSchema = {
 
 const chatgptToolMetadata = Object.freeze({
   search: {
-    description: "Use this when the user wants to find OneDrive files or folders by name, keywords, or indexed content. Do not use it to list the children of a known folder.",
+    description: "Use this when the user wants to find OneDrive files or folders by name, keywords, or indexed content. Every result includes an opaque id; select the best match and pass that id unchanged to fetch.",
     invoking: "Searching OneDrive…",
     invoked: "OneDrive results ready"
   },
   fetch: {
-    description: "Use this when the user wants to read an item returned by search. It extracts bounded content directly and returns a continuation ID only when a large file needs another fetch for full detail.",
+    description: "Use this when the user wants to read an item returned by search. Pass the returned id unchanged; it extracts bounded content and returns a continuation ID only when more detail is needed.",
     invoking: "Reading OneDrive item…",
     invoked: "OneDrive item ready"
   },
@@ -2392,7 +2392,7 @@ const advertisedServerVersion = toolProfile === "chatgpt"
   ? `${manifestServerVersion}${manifestServerVersion.includes("+") ? "." : "+"}chatgpt.${advertisedContractHash}`
   : manifestServerVersion;
 const serverInstructions = toolProfile === "chatgpt"
-  ? "Use search for normal OneDrive file or content lookup, then fetch with the returned ID to read it. If fetch metadata includes nextChunkId, fetch that ID only when more detail is needed. Use onedrive_list only for a known folder. Locate an item before changing it. For Office edits, fetch each file, call onedrive_office_capabilities, then use onedrive_office_batch_transform. Mutations default to preview and require confirmation."
+  ? "Search for OneDrive lookup. Every result includes an opaque id: choose the best match and pass its id unchanged to fetch; never claim it is missing or derive it from the URL. If fetch returns nextChunkId, fetch that only when more detail is needed. Use onedrive_list only for a known folder. Locate items before changing them. For Office edits, fetch each file, call onedrive_office_capabilities, then onedrive_office_batch_transform. Mutations require preview and confirmation."
   : "Use onedrive_find for normal OneDrive lookup and the matching structured read tool before an Office edit. Use onedrive_list only for direct folder listings. Keep results bounded. Locate an item before changing it. Mutations default to preview and require confirmation.";
 
 const toolByName = new Map(executableTools.map((tool) => [tool.name, tool]));
