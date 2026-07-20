@@ -25,6 +25,13 @@ if (process.argv.includes("--probe")) {
     count: tools.length,
     bytes: Buffer.byteLength(JSON.stringify(listed)),
     names: tools.map((tool) => tool.name),
+    metadata: tools.map((tool) => ({
+      name: tool.name,
+      title: tool.title,
+      description: tool.description,
+      invoking: tool._meta?.["openai/toolInvocation/invoking"] || null,
+      invoked: tool._meta?.["openai/toolInvocation/invoked"] || null
+    })),
     compatibility,
     oversized: {
       truncated: oversized.truncated,
@@ -84,6 +91,11 @@ try {
   assert(chatgpt.bytes < full.bytes * 0.15, "ChatGPT tools/list payload must remain at least 85% smaller than full.", { full, chatgpt });
   assert(chatgpt.officeTransformBytes <= 4096, "ChatGPT Office transform descriptor must remain compact.", chatgpt);
   assert(chatgpt.instructions.length > 0 && chatgpt.instructions.length <= 512, "Server instructions must be present and concise.", chatgpt.instructions);
+  assert(chatgpt.instructions.includes("fetch each file") && !chatgpt.instructions.includes("matching structured read tool"), "ChatGPT server instructions must use the focused fetch-first Office sequence.", chatgpt.instructions);
+  assert(chatgpt.metadata.every((tool) => /^Use this when\b/u.test(tool.description || "")), "Every focused ChatGPT tool description must begin with a discriminative 'Use this when' cue.", chatgpt.metadata);
+  assert(new Set(chatgpt.metadata.map((tool) => tool.description)).size === chatgpt.metadata.length, "Focused ChatGPT tool descriptions must be unique.", chatgpt.metadata);
+  assert(chatgpt.metadata.every((tool) => tool.invoking && tool.invoked && tool.invoking.length <= 64 && tool.invoked.length <= 64), "Every focused ChatGPT tool must advertise bounded invocation status text.", chatgpt.metadata);
+  assert(chatgpt.metadata.find((tool) => tool.name === "fetch")?.description.includes("continuation ID"), "Fetch metadata must explain progressive continuation behavior.", chatgpt.metadata);
   assert(chatgpt.serverVersion !== full.serverVersion && chatgpt.serverVersion.includes(".chatgpt."), "ChatGPT metadata must use a contract-specific server version to invalidate stale app caches.", { full: full.serverVersion, chatgpt: chatgpt.serverVersion });
 
   const invalid = spawnSync(process.execPath, [scriptPath, "--probe"], {

@@ -52,6 +52,7 @@ jobs:
           node --check scripts/benchmark.mjs
           node --check scripts/tool-contract.mjs
           node --check scripts/tool-profile-test.mjs
+          node --check scripts/chatgpt-golden-test.mjs
           node --check scripts/install-versioned-cache.mjs
           python3 -m py_compile scripts/common-text.py
           python3 -m py_compile scripts/common-text-test.py
@@ -63,6 +64,7 @@ jobs:
           node scripts/beta-test.mjs --self-check
           node scripts/benchmark.mjs --self-check
           node scripts/tool-profile-test.mjs
+          node scripts/chatgpt-golden-test.mjs
           node scripts/install-versioned-cache.mjs --self-check
           if node scripts/beta-test.mjs --self-check --stale-days=-1; then
             echo "beta-test should reject negative --stale-days" >&2

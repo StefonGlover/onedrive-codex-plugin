@@ -39,6 +39,13 @@ let officeExcelBuffer = readFileSync(join(officeFixtureDir, "sample.xlsx"));
 let officeBusinessBuffer = Buffer.from(officeExcelBuffer);
 let officePowerPointBuffer = readFileSync(join(officeFixtureDir, "sample.pptx"));
 const commonRtfBuffer = Buffer.from("{\\rtf1\\ansi Common file extraction\\par Budget total: \\b $1,234\\b0\\par}", "utf8");
+const largeChatgptTextBuffer = Buffer.from([
+  "Large ChatGPT document",
+  ...Array.from({ length: 18 }, (_, sectionIndex) => [
+    `## Section ${sectionIndex + 1}`,
+    ...Array.from({ length: 90 }, (_, lineIndex) => `Section ${sectionIndex + 1} detail ${lineIndex + 1}: ${"bounded progressive content ".repeat(3)}marker-${sectionIndex + 1}-${lineIndex + 1}`)
+  ]).flat()
+].join("\n"), "utf8");
 let officeWordPostMetadataFailuresRemaining = 0;
 let failNextOfficeExcelPut = false;
 let officeMetadataRace = null;
@@ -521,6 +528,21 @@ const graph = createServer(async (req, res) => {
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/common-rtf/content") {
     return binary(res, 200, commonRtfBuffer, { "Content-Type": "application/rtf" });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/large-chatgpt-text") {
+    return json(res, 200, item("large-chatgpt-text", "Large ChatGPT Notes.txt", {
+      size: largeChatgptTextBuffer.length
+    }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/large-chatgpt-text/content") {
+    count("large-chatgpt-text-content-read");
+    return binary(res, 200, largeChatgptTextBuffer, { "Content-Type": "text/plain" });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/chatgpt-stale-cache") {
+    return json(res, 200, item("chatgpt-stale-cache", "ChatGPT Stale Cache.txt"));
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/recent") {
@@ -1371,6 +1393,11 @@ const graph = createServer(async (req, res) => {
 
   if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='No Cache Live')")) {
     return json(res, 200, { value: [item("no-cache-live", "No Cache Live.txt")] });
+  }
+
+  if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='ChatGPT Stale Cache')")) {
+    count("chatgpt-stale-revalidate-search");
+    return json(res, 200, { value: [item("chatgpt-stale-cache", "ChatGPT Stale Cache.txt")] });
   }
 
   if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='Batch Cache Research')")) {
@@ -4659,6 +4686,22 @@ process.exit(2);
     return { searchResults: searched.value.results.length, fetchSource: fetched.value.metadata.previewSource, graphRequestsAdded: added.length };
   });
 
+  await check("ChatGPT stale search returns a high-confidence cache hit and revalidates in the background", async () => {
+    await tool("onedrive_cache_clear");
+    const seeded = await tool("onedrive_get_info", { itemId: "chatgpt-stale-cache" });
+    assert(!seeded.isError, "stale ChatGPT cache fixture should seed metadata", seeded);
+    const cachePath = join(mainCacheRoot, "metadata-cache.json");
+    const staleCache = JSON.parse(readFileSync(cachePath, "utf8"));
+    staleCache.updatedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    staleCache.testStalePadding = "stale-while-revalidate";
+    writeFileSync(cachePath, JSON.stringify(staleCache), "utf8");
+    const target = (counters.get("chatgpt-stale-revalidate-search") || 0) + 1;
+    const searched = await tool("search", { query: "ChatGPT Stale Cache" });
+    assert(!searched.isError && searched.value.results?.[0]?.id === "chatgpt-stale-cache", "stale ChatGPT search should return the strong cached match", searched);
+    await waitForCounter("chatgpt-stale-revalidate-search", target, 3000);
+    return { resultId: searched.value.results[0].id, backgroundRevalidated: true };
+  });
+
   await check("ChatGPT fetch extracts structured Excel content instead of relying on Graph text export", async () => {
     await tool("onedrive_cache_clear");
     const before = requests.length;
@@ -4679,7 +4722,18 @@ process.exit(2);
     assert(warm.value.text.includes("## Worksheet: Data") && warm.value.text.includes("A1\t3\tformula=SUM(1,2)"), "warm Excel fetch should preserve worksheet, cell, and formula context", warm.value.text);
     const warmAdded = requests.slice(beforeWarm);
     assert(!warmAdded.some((request) => request.path.endsWith("/content")), "warm Excel fetch should not redownload the workbook", { warmAdded });
-    return { source: fetched.value.metadata.previewSource, warmSource: warm.value.metadata.previewSource, textBytes: Buffer.byteLength(fetched.value.text, "utf8"), graphRequestsAdded: added.length };
+    const cachePath = join(mainCacheRoot, "metadata-cache.json");
+    const staleCache = JSON.parse(readFileSync(cachePath, "utf8"));
+    staleCache.updatedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    staleCache.testStalePadding = "etag-revalidation";
+    writeFileSync(cachePath, JSON.stringify(staleCache), "utf8");
+    const beforeValidated = requests.length;
+    const validated = await tool("fetch", { id: "office-excel" });
+    assert(!validated.isError && validated.value.metadata?.previewSource === "content-index-validated", "stale indexed Excel fetch should reuse content after an ETag validation", validated);
+    const validatedAdded = requests.slice(beforeValidated);
+    assert(validatedAdded.some((request) => request.path === "/v1.0/me/drive/items/office-excel"), "stale indexed fetch should validate current metadata", { validatedAdded });
+    assert(!validatedAdded.some((request) => request.path.endsWith("/content")), "ETag-validated indexed fetch should not redownload the workbook", { validatedAdded });
+    return { source: fetched.value.metadata.previewSource, warmSource: warm.value.metadata.previewSource, validatedSource: validated.value.metadata.previewSource, textBytes: Buffer.byteLength(fetched.value.text, "utf8"), graphRequestsAdded: added.length };
   });
 
   await check("ChatGPT fetch locally extracts a common non-Office format", async () => {
@@ -4692,6 +4746,30 @@ process.exit(2);
     const added = requests.slice(before);
     assert(!added.some((request) => request.url.includes("format=text")), "supported local formats should not call Graph text export", { added });
     return { source: fetched.value.metadata.previewSource, text: fetched.value.text };
+  });
+
+  await check("ChatGPT fetch returns compact progressive previews and memory-backed continuation chunks", async () => {
+    await tool("onedrive_cache_clear");
+    const beforeReads = counters.get("large-chatgpt-text-content-read") || 0;
+    const first = await tool("fetch", { id: "large-chatgpt-text" });
+    assert(!first.isError, "large ChatGPT text fetch should succeed", first);
+    assert(first.value.metadata?.progressive === "true" && first.value.metadata?.nextChunkId, "large fetch should advertise a continuation ID", first.value.metadata);
+    assert(Buffer.byteLength(first.value.text, "utf8") <= 32 * 1024, "initial progressive preview should stay within the compact budget", { bytes: Buffer.byteLength(first.value.text, "utf8") });
+    assert(first.value.text.includes("## Section 1") && first.value.text.includes("## Section 18"), "compact preview should represent the first and last structured sections", first.value.text);
+    assert((counters.get("large-chatgpt-text-content-read") || 0) === beforeReads + 1, "initial progressive fetch should read the remote body once");
+    const second = await tool("fetch", { id: first.value.metadata.nextChunkId });
+    assert(!second.isError && second.value.metadata?.chunkIndex === "1", "first continuation chunk should be readable through the standard fetch tool", second);
+    assert(second.value.text.includes("Large ChatGPT document") && second.value.text.includes("marker-1-1"), "first continuation should start with the full extracted text", second.value.text.slice(0, 1000));
+    assert(second.value.metadata?.nextChunkId, "large full text should require more than one bounded continuation chunk", second.value.metadata);
+    const third = await tool("fetch", { id: second.value.metadata.nextChunkId });
+    assert(!third.isError && third.value.metadata?.chunkIndex === "2", "second continuation chunk should advance monotonically", third);
+    assert((counters.get("large-chatgpt-text-content-read") || 0) === beforeReads + 1, "continuation chunks should reuse the in-memory snapshot without redownloading", { reads: counters.get("large-chatgpt-text-content-read") || 0 });
+    return {
+      initialBytes: Buffer.byteLength(first.value.text, "utf8"),
+      fullTextBytes: Number(first.value.metadata.fullTextBytes),
+      chunkCount: Number(first.value.metadata.fullTextChunkCount),
+      remoteContentReads: (counters.get("large-chatgpt-text-content-read") || 0) - beforeReads
+    };
   });
 
   await check("rename dry-run previews without PATCH", async () => {
