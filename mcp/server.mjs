@@ -178,6 +178,7 @@ const chatgptRevalidationLastStartedAt = new Map();
 let watchesLoaded = false;
 const previewTokenTtlMs = 15 * 60 * 1000;
 const previewScopedTools = new Set([
+  "onedrive_preview_actions",
   "onedrive_upload", "onedrive_upload_file", "onedrive_write_text", "onedrive_batch_delete", "onedrive_delete", "onedrive_permanent_delete",
   "onedrive_rename", "onedrive_move", "onedrive_copy",
   "onedrive_create_sharing_link", "onedrive_invite_permission", "onedrive_revoke_permission",
@@ -2036,6 +2037,140 @@ const chatgptCompatibilityTools = [
     }
   },
   {
+    name: "onedrive_open_files",
+    title: "Open exact OneDrive files",
+    description: "Read one or more specifically named OneDrive files in one bounded call.",
+    inputSchema: {
+      type: "object",
+      required: ["names"],
+      properties: {
+        names: {
+          type: "array",
+          minItems: 1,
+          maxItems: 5,
+          uniqueItems: true,
+          items: { type: "string", minLength: 1 },
+          description: "Exact filenames, including extensions, to locate and read."
+        }
+      },
+      additionalProperties: false
+    },
+    outputSchema: {
+      type: "object",
+      required: ["files", "durationMs"],
+      properties: {
+        files: {
+          type: "array",
+          maxItems: 5,
+          items: {
+            type: "object",
+            required: ["name", "status", "durationMs"],
+            properties: {
+              name: { type: "string" },
+              status: { type: "string", enum: ["found", "not_found", "ambiguous", "error"] },
+              id: { type: "string" },
+              title: { type: "string" },
+              text: { type: "string" },
+              url: { type: "string" },
+              metadata: { type: "object", additionalProperties: { type: "string" } },
+              error: { type: "string" },
+              candidates: {
+                type: "array",
+                maxItems: 3,
+                items: {
+                  type: "object",
+                  required: ["id", "title", "url"],
+                  properties: { id: { type: "string" }, title: { type: "string" }, url: { type: "string" } },
+                  additionalProperties: false
+                }
+              },
+              durationMs: { type: "integer", minimum: 0 }
+            },
+            additionalProperties: false
+          }
+        },
+        durationMs: { type: "integer", minimum: 0 }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_preview_actions",
+    title: "Preview OneDrive actions",
+    description: "Preview one or more OneDrive item or sharing changes without modifying data or access.",
+    inputSchema: {
+      type: "object",
+      required: ["actions"],
+      properties: {
+        actions: {
+          type: "array",
+          minItems: 1,
+          maxItems: 10,
+          items: {
+            type: "object",
+            required: ["operation", "itemId"],
+            properties: {
+              operation: { type: "string", enum: ["rename", "move", "copy", "createSharingLink", "revokePermission"] },
+              itemId: { type: "string", minLength: 1 },
+              newName: { type: "string", minLength: 1 },
+              destinationParentPath: { type: "string" },
+              destinationParentItemId: { type: "string", minLength: 1 },
+              linkType: { type: "string", enum: ["view", "edit", "embed"], default: "view" },
+              scope: { type: "string", enum: ["anonymous", "organization", "users"], default: "anonymous" },
+              permissionId: { type: "string", minLength: 1 }
+            },
+            additionalProperties: false
+          }
+        }
+      },
+      additionalProperties: false
+    },
+    outputSchema: {
+      type: "object",
+      required: ["dryRun", "results", "durationMs"],
+      properties: {
+        dryRun: { type: "boolean" },
+        results: {
+          type: "array",
+          maxItems: 10,
+          items: {
+            type: "object",
+            required: ["index", "operation", "itemId", "isError", "dryRun", "previewTokenPresent", "durationMs"],
+            properties: {
+              index: { type: "integer", minimum: 0 },
+              operation: { type: "string" },
+              itemId: { type: "string" },
+              expectedId: { type: "string" },
+              isError: { type: "boolean" },
+              dryRun: { type: "boolean" },
+              previewTokenPresent: { type: "boolean" },
+              previewToken: { type: "string" },
+              previewTokenExpiresAt: { type: "string" },
+              summary: { type: "string" },
+              error: { type: "string" },
+              accessSummary: {
+                type: "object",
+                required: ["permissionCount", "sharingLinkCount", "anonymousLinkCount", "roles"],
+                properties: {
+                  permissionCount: { type: "integer", minimum: 0 },
+                  sharingLinkCount: { type: "integer", minimum: 0 },
+                  anonymousLinkCount: { type: "integer", minimum: 0 },
+                  roles: { type: "array", items: { type: "string" } }
+                },
+                additionalProperties: false
+              },
+              accessSummaryError: { type: "string" },
+              durationMs: { type: "integer", minimum: 0 }
+            },
+            additionalProperties: false
+          }
+        },
+        durationMs: { type: "integer", minimum: 0 }
+      },
+      additionalProperties: false
+    }
+  },
+  {
     name: "onedrive_upload_file",
     title: "Upload File to OneDrive",
     description: "Preview, then upload a ChatGPT-provided file to OneDrive. Every upload requires confirmation and a scoped preview token; replacement also requires the existing item's expected identity.",
@@ -2101,6 +2236,8 @@ const configuredSecuritySchemes = Object.freeze(toolSecuritySchemes());
 const readOnlyToolNames = new Set([
   "search",
   "fetch",
+  "onedrive_open_files",
+  "onedrive_preview_actions",
   "onedrive_config",
   "onedrive_me",
   "onedrive_drive",
@@ -2183,6 +2320,7 @@ const openWorldToolNames = new Set([
   "onedrive_export_pdf",
   "onedrive_export_text",
   "onedrive_invite_permission",
+  "onedrive_create_sharing_link",
   "onedrive_batch_download",
   "onedrive_update_file",
   "onedrive_audit_export",
@@ -2222,6 +2360,8 @@ for (const tool of executableTools) {
 const chatgptToolNames = new Set([
   "search",
   "fetch",
+  "onedrive_open_files",
+  "onedrive_preview_actions",
   "onedrive_list",
   "onedrive_office_capabilities",
   "onedrive_office_batch_transform",
@@ -2258,7 +2398,7 @@ const compactOfficeOperationSchema = {
 
 const chatgptToolMetadata = Object.freeze({
   search: {
-    description: "Use this when the user wants to find OneDrive files or folders by name, keywords, or indexed content. For multiple requested targets, call search separately for each distinct filename or topic. Every result includes an opaque id; pass the chosen id unchanged to fetch.",
+    description: "Use this when the user wants OneDrive discovery by topic, partial name, keywords, indexed content, or an ambiguous target. For exact filenames plus content use onedrive_open_files; otherwise pass the chosen opaque id unchanged to fetch.",
     invoking: "Searching OneDrive…",
     invoked: "OneDrive results ready"
   },
@@ -2266,6 +2406,16 @@ const chatgptToolMetadata = Object.freeze({
     description: "Use this when the user wants to read an item returned by search. Pass the returned id unchanged; it extracts bounded content and returns a continuation ID only when more detail is needed.",
     invoking: "Reading OneDrive item…",
     invoked: "OneDrive item ready"
+  },
+  onedrive_open_files: {
+    description: "Use this when the user provides one or more exact filenames and wants their contents. It locates and extracts up to five files in one read-only call; use search then fetch for discovery, partial names, or ambiguous results.",
+    invoking: "Opening OneDrive files…",
+    invoked: "OneDrive files ready"
+  },
+  onedrive_preview_actions: {
+    description: "Use this when the user wants to preview one or more rename, move, copy, sharing-link, or permission-revocation actions. This read-only batch makes no changes, returns scoped preview tokens for later live calls, and returns sharing counts without identities.",
+    invoking: "Previewing OneDrive actions…",
+    invoked: "OneDrive previews ready"
   },
   onedrive_list: {
     description: "Use this when the user wants the direct children of a known OneDrive folder or path. Use search instead when the folder location is not already known.",
@@ -2303,22 +2453,22 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "Folder creation result ready"
   },
   onedrive_rename: {
-    description: "Use this when the user wants to change the name of one existing OneDrive file or folder without changing its parent location. Inputs: itemId or path plus newName. Preview with dryRun true; then use dryRun false, confirmed true, expectedId or expectedName, and the returned previewToken.",
+    description: "Use this when the user has approved a live rename already previewed by onedrive_preview_actions. Inputs: itemId or path, newName, dryRun false, confirmed true, expectedId or expectedName, and the returned previewToken.",
     invoking: "Preparing OneDrive rename…",
     invoked: "Rename result ready"
   },
   onedrive_move: {
-    description: "Use this when the user wants to move one existing OneDrive item to a different parent folder. Inputs: source itemId or path plus destinationParentItemId or destinationParentPath; newName is optional. Preview with dryRun true; then use dryRun false, confirmed true, expectedId or expectedName, and the returned previewToken.",
+    description: "Use this when the user has approved a live move already previewed by onedrive_preview_actions. Inputs: source itemId or path, destination parent, dryRun false, confirmed true, expectedId or expectedName, and the returned previewToken.",
     invoking: "Preparing OneDrive move…",
     invoked: "Move result ready"
   },
   onedrive_copy: {
-    description: "Use this when the user wants to copy one existing OneDrive item while leaving the source in place. Inputs: source itemId or path plus destinationParentItemId or destinationParentPath; newName and waitForCompletion are optional. Preview with dryRun true; then use dryRun false, confirmed true, expectedId or expectedName, and the returned previewToken.",
+    description: "Use this when the user has approved a live copy already previewed by onedrive_preview_actions. Inputs: source itemId or path, destination parent, dryRun false, confirmed true, expectedId or expectedName, previewToken, and optional newName or waitForCompletion.",
     invoking: "Preparing OneDrive copy…",
     invoked: "Copy result ready"
   },
   onedrive_create_sharing_link: {
-    description: "Use this when the user wants a shareable OneDrive link with a selected type and scope; use invite permission for named recipients. Inputs: itemId or path, type, and scope. Preview with dryRun true; then use dryRun false, confirmed true, expectedId or expectedName, and the returned previewToken.",
+    description: "Use this when the user has approved a live sharing link already previewed by onedrive_preview_actions. Inputs: itemId or path, type, scope, dryRun false, confirmed true, expectedId or expectedName, and previewToken; use invite permission for named recipients.",
     invoking: "Preparing sharing link…",
     invoked: "Sharing link result ready"
   },
@@ -2328,12 +2478,12 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "Invitation result ready"
   },
   onedrive_revoke_permission: {
-    description: "Use this when the user wants to revoke one existing OneDrive permission or sharing link. Inspect permissions first. Inputs: itemId or path plus permissionId. Preview with dryRun true; then use dryRun false, confirmed true, expectedId or expectedName, and the returned previewToken.",
+    description: "Use this when the user has approved a live permission removal already previewed by onedrive_preview_actions. Inputs: itemId or path, permissionId, dryRun false, confirmed true, expectedId or expectedName, and previewToken.",
     invoking: "Preparing permission removal…",
     invoked: "Permission removal result ready"
   },
   onedrive_permissions: {
-    description: "Use this when the user wants to inspect who can access one OneDrive file or folder and which sharing links or roles are active. This does not change access.",
+    description: "Use this when the user explicitly wants the identities that can access a OneDrive file or folder. For permission counts or a sharing-link preview, use onedrive_preview_actions so identity details are not returned.",
     invoking: "Checking OneDrive permissions…",
     invoked: "Permissions ready"
   },
@@ -2396,7 +2546,7 @@ const advertisedServerVersion = toolProfile === "chatgpt"
   ? `${manifestServerVersion}${manifestServerVersion.includes("+") ? "." : "+"}chatgpt.${advertisedContractHash}`
   : manifestServerVersion;
 const serverInstructions = toolProfile === "chatgpt"
-  ? "Search OneDrive. For multiple targets, call search separately for each filename or topic. Every result has an opaque id; pass it unchanged to fetch—never claim it is missing or derive it from a URL. Fetch nextChunkId only if needed. Use onedrive_list only for a known folder. Locate items before changes. For Office edits, fetch each file, call onedrive_office_capabilities, then onedrive_office_batch_transform. Mutations require preview, confirmation, and exact expected identity."
+  ? "Use onedrive_open_files once for exact filenames and content; use search then fetch for discovery. Pass search ids unchanged. Use onedrive_preview_actions to batch read-only rename, move, copy, sharing-link, or revoke previews; its sharing preview includes identity-free access counts. Call live mutation tools only after approval with the preview token and expected id. Use onedrive_list only for a known folder. For Office edits, open or fetch each file, check capabilities, then transform."
   : "Use onedrive_find for normal OneDrive lookup and the matching structured read tool before an Office edit. Use onedrive_list only for direct folder listings. Keep results bounded. Locate an item before changing it. Mutations default to preview and require confirmation.";
 
 const toolByName = new Map(executableTools.map((tool) => [tool.name, tool]));
@@ -9532,6 +9682,217 @@ async function chatgptFetch(args = {}) {
   return result;
 }
 
+function exactFilenameKey(value) {
+  return String(value || "").trim().normalize("NFKC").toLowerCase();
+}
+
+async function chatgptOpenFiles(args = {}) {
+  const startedAt = Date.now();
+  const names = args.names || [];
+  const files = await mapWithConcurrency(names, 2, async (name) => {
+    const fileStartedAt = Date.now();
+    const requestedName = String(name || "").trim();
+    try {
+      const searched = await chatgptSearch({ query: requestedName });
+      const exact = (searched.results || []).filter((candidate) => exactFilenameKey(candidate.title) === exactFilenameKey(requestedName));
+      if (exact.length === 0) {
+        return {
+          name: requestedName,
+          status: "not_found",
+          candidates: (searched.results || []).slice(0, 3),
+          durationMs: elapsedMs(fileStartedAt)
+        };
+      }
+      if (exact.length > 1) {
+        return {
+          name: requestedName,
+          status: "ambiguous",
+          candidates: exact.slice(0, 3),
+          durationMs: elapsedMs(fileStartedAt)
+        };
+      }
+      const fetched = await chatgptFetch({ id: exact[0].id });
+      return {
+        name: requestedName,
+        status: "found",
+        id: fetched.id,
+        title: fetched.title,
+        text: fetched.text,
+        url: fetched.url,
+        metadata: fetched.metadata,
+        durationMs: elapsedMs(fileStartedAt)
+      };
+    } catch (error) {
+      return {
+        name: requestedName,
+        status: "error",
+        error: safeToolErrorMessage(error),
+        durationMs: elapsedMs(fileStartedAt)
+      };
+    }
+  });
+  const result = { files, durationMs: elapsedMs(startedAt) };
+  if (toolProfile === "chatgpt" || process.env.ONEDRIVE_PERFORMANCE_LOG === "1") {
+    console.error(JSON.stringify({
+      event: "onedrive-chatgpt-open-files",
+      durationMs: result.durationMs,
+      requested: names.length,
+      found: files.filter((file) => file.status === "found").length,
+      ambiguous: files.filter((file) => file.status === "ambiguous").length,
+      notFound: files.filter((file) => file.status === "not_found").length,
+      errors: files.filter((file) => file.status === "error").length
+    }));
+  }
+  return result;
+}
+
+async function chatgptPermissionSummary(itemId) {
+  const current = await permissionList({ itemId }, "compact");
+  const linkPermissions = current.filter((permission) => Boolean(permission.link));
+  return {
+    permissionCount: current.length,
+    sharingLinkCount: linkPermissions.length,
+    anonymousLinkCount: linkPermissions.filter((permission) => permission.link?.scope === "anonymous").length,
+    roles: [...new Set(current.flatMap((permission) => permission.roles || []).map(String))].sort()
+  };
+}
+
+function chatgptPreviewActionSummary(action) {
+  switch (action.operation) {
+    case "rename":
+      return `Rename item ${action.itemId} to ${action.newName}.`;
+    case "move":
+      return `Move item ${action.itemId} to ${action.destinationParentItemId || action.destinationParentPath || "/"}${action.newName ? ` as ${action.newName}` : ""}.`;
+    case "copy":
+      return `Copy item ${action.itemId} to ${action.destinationParentItemId || action.destinationParentPath || "/"}${action.newName ? ` as ${action.newName}` : ""}.`;
+    case "createSharingLink":
+      return `Create a ${action.scope || "anonymous"} ${action.linkType || "view"} sharing link for item ${action.itemId}.`;
+    case "revokePermission":
+      return `Revoke permission ${action.permissionId} from item ${action.itemId}.`;
+    default:
+      return `Preview ${action.operation} for item ${action.itemId}.`;
+  }
+}
+
+function validateChatgptPreviewAction(action, index) {
+  if (action.operation === "rename" && !action.newName) {
+    throw new Error(`Preview action ${index} rename requires newName.`);
+  }
+  if (["move", "copy"].includes(action.operation)
+    && action.destinationParentPath !== undefined
+    && action.destinationParentItemId !== undefined) {
+    throw new Error(`Preview action ${index} must use only one destination parent selector.`);
+  }
+  if (action.operation === "revokePermission" && !action.permissionId) {
+    throw new Error(`Preview action ${index} revokePermission requires permissionId.`);
+  }
+}
+
+async function chatgptPreviewAction(action, index) {
+  const startedAt = Date.now();
+  try {
+    validateChatgptPreviewAction(action, index);
+    let preview;
+    let accessSummary;
+    let accessSummaryError;
+    if (action.operation === "rename") {
+      preview = await rename({ itemId: action.itemId, newName: action.newName, dryRun: true, confirmed: false });
+    } else if (action.operation === "move") {
+      preview = await moveItem({
+        itemId: action.itemId,
+        destinationParentPath: action.destinationParentPath,
+        destinationParentItemId: action.destinationParentItemId,
+        newName: action.newName,
+        dryRun: true,
+        confirmed: false
+      });
+    } else if (action.operation === "copy") {
+      preview = await copyItem({
+        itemId: action.itemId,
+        destinationParentPath: action.destinationParentPath,
+        destinationParentItemId: action.destinationParentItemId,
+        newName: action.newName,
+        waitForCompletion: false,
+        dryRun: true,
+        confirmed: false
+      });
+    } else if (action.operation === "createSharingLink") {
+      const [linkPreview, summaryResult] = await Promise.all([
+        createSharingLink({
+          itemId: action.itemId,
+          type: action.linkType || "view",
+          scope: action.scope || "anonymous",
+          includePermissionDiff: false,
+          dryRun: true,
+          confirmed: false
+        }),
+        chatgptPermissionSummary(action.itemId)
+          .then((value) => ({ value }))
+          .catch((error) => ({ error: safeToolErrorMessage(error) }))
+      ]);
+      preview = linkPreview;
+      accessSummary = summaryResult.value;
+      accessSummaryError = summaryResult.error;
+    } else if (action.operation === "revokePermission") {
+      preview = await revokePermission({
+        itemId: action.itemId,
+        permissionId: action.permissionId,
+        includePermissions: false,
+        dryRun: true,
+        confirmed: false
+      });
+    } else {
+      throw new Error(`Unsupported preview operation: ${action.operation}.`);
+    }
+    const previewToken = String(preview?.previewToken || "");
+    return {
+      index,
+      operation: action.operation,
+      itemId: action.itemId,
+      expectedId: action.itemId,
+      isError: false,
+      dryRun: true,
+      previewTokenPresent: Boolean(previewToken),
+      ...(previewToken ? { previewToken } : {}),
+      ...(preview?.previewTokenExpiresAt ? { previewTokenExpiresAt: String(preview.previewTokenExpiresAt) } : {}),
+      summary: chatgptPreviewActionSummary(action),
+      ...(accessSummary ? { accessSummary } : {}),
+      ...(accessSummaryError ? { accessSummaryError } : {}),
+      durationMs: elapsedMs(startedAt)
+    };
+  } catch (error) {
+    return {
+      index,
+      operation: action.operation,
+      itemId: action.itemId,
+      isError: true,
+      dryRun: true,
+      previewTokenPresent: false,
+      error: safeToolErrorMessage(error),
+      durationMs: elapsedMs(startedAt)
+    };
+  }
+}
+
+async function chatgptPreviewActions(args = {}) {
+  const startedAt = Date.now();
+  const actions = args.actions || [];
+  const results = await mapWithConcurrency(actions.map((action, index) => ({ action, index })), 3, async ({ action, index }) => (
+    await chatgptPreviewAction(action, index)
+  ));
+  const result = { dryRun: true, results, durationMs: elapsedMs(startedAt) };
+  if (toolProfile === "chatgpt" || process.env.ONEDRIVE_PERFORMANCE_LOG === "1") {
+    console.error(JSON.stringify({
+      event: "onedrive-chatgpt-preview-actions",
+      durationMs: result.durationMs,
+      actions: actions.length,
+      errors: results.filter((entry) => entry.isError).length,
+      sharingPreviews: actions.filter((entry) => entry.operation === "createSharingLink").length
+    }));
+  }
+  return result;
+}
+
 function updateManifestPath(localPath, manifestPath) {
   return manifestPath ? resolve(manifestPath) : `${resolve(localPath)}.onedrive-update.json`;
 }
@@ -12130,6 +12491,14 @@ async function callTool(name, args = {}) {
     }
     case "fetch": {
       const value = await chatgptFetch(args);
+      return textResult(value, false, value);
+    }
+    case "onedrive_open_files": {
+      const value = await chatgptOpenFiles(args);
+      return textResult(value, false, value);
+    }
+    case "onedrive_preview_actions": {
+      const value = await chatgptPreviewActions(args);
       return textResult(value, false, value);
     }
     case "onedrive_config": {

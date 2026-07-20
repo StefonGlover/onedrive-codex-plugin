@@ -12,8 +12,10 @@ function assert(condition, message, details = undefined) {
 }
 
 const goldenPrompts = [
-  { prompt: "Find my 2026 family budget workbook", tool: "search", cues: ["find", "keywords", "call search separately"] },
+  { prompt: "Find documents about the 2026 family budget", tool: "search", cues: ["keywords", "discovery"] },
   { prompt: "Read the budget workbook you found", tool: "fetch", cues: ["read", "returned by search"] },
+  { prompt: "Open 2026 Family Budgeting.xlsx and Annual Report.pdf", tool: "onedrive_open_files", cues: ["exact filenames", "one read-only call"] },
+  { prompt: "Preview renaming this workbook, copying it, and creating a view link", tool: "onedrive_preview_actions", cues: ["preview", "read-only batch", "sharing counts without identities"] },
   { prompt: "Show the files directly inside Documents/Taxes", tool: "onedrive_list", cues: ["direct children", "known"] },
   { prompt: "What structured Excel edits are supported?", tool: "onedrive_office_capabilities", cues: ["supported structured operations"] },
   { prompt: "Update cells in these two Excel workbooks", tool: "onedrive_office_batch_transform", cues: ["structured edits", "preview"] },
@@ -21,19 +23,21 @@ const goldenPrompts = [
   { prompt: "Create a new markdown file with this full content", tool: "onedrive_write_text", cues: ["create or fully replace", "text"] },
   { prompt: "Change only one line in this existing text file", tool: "onedrive_patch_text", cues: ["targeted", "preserving"] },
   { prompt: "Create a folder named Receipts under Documents", tool: "onedrive_create_folder", cues: ["create a new folder"] },
-  { prompt: "Rename this file without moving it", tool: "onedrive_rename", cues: ["change the name", "without changing", "newname", "expectedid or expectedname", "previewtoken"] },
-  { prompt: "Move this workbook into Archive", tool: "onedrive_move", cues: ["different parent folder", "destinationparentitemid", "expectedid or expectedname", "previewtoken"] },
-  { prompt: "Copy this document and keep the original", tool: "onedrive_copy", cues: ["leaving the source in place", "waitforcompletion", "expectedid or expectedname", "previewtoken"] },
-  { prompt: "Create a view-only sharing link", tool: "onedrive_create_sharing_link", cues: ["shareable", "type and scope", "previewtoken"] },
+  { prompt: "I approve the previewed rename; apply it", tool: "onedrive_rename", cues: ["approved a live rename", "newname", "expectedid or expectedname", "previewtoken"] },
+  { prompt: "I approve the previewed move into Archive; apply it", tool: "onedrive_move", cues: ["approved a live move", "destination parent", "expectedid or expectedname", "previewtoken"] },
+  { prompt: "I approve the previewed copy; apply it and keep the original", tool: "onedrive_copy", cues: ["approved a live copy", "waitforcompletion", "expectedid or expectedname", "previewtoken"] },
+  { prompt: "I approve the previewed view-only sharing link; create it", tool: "onedrive_create_sharing_link", cues: ["approved a live sharing link", "type", "scope", "previewtoken"] },
   { prompt: "Give these named people edit access", tool: "onedrive_invite_permission", cues: ["specific named recipients"] },
-  { prompt: "Remove this sharing permission", tool: "onedrive_revoke_permission", cues: ["revoke", "permissionid", "previewtoken"] },
-  { prompt: "Who currently has access to this folder?", tool: "onedrive_permissions", cues: ["inspect who can access"] },
+  { prompt: "I approve the previewed sharing permission removal", tool: "onedrive_revoke_permission", cues: ["approved a live permission removal", "permissionid", "previewtoken"] },
+  { prompt: "Which named people currently have access to this folder?", tool: "onedrive_permissions", cues: ["explicitly wants the identities"] },
   { prompt: "Move this file to the recycle bin", tool: "onedrive_delete", cues: ["recycle bin", "permanent deletion"] },
   { prompt: "Restore this item from the recycle bin", tool: "onedrive_restore_deleted", cues: ["restore", "recycle-bin"] },
   { prompt: "Permanently delete this item and skip the recycle bin", tool: "onedrive_permanent_delete", cues: ["irreversibly", "without the recycle bin"] }
 ];
 
 const ambiguityPairs = [
+  ["search", "onedrive_open_files"],
+  ["onedrive_preview_actions", "onedrive_rename"],
   ["search", "onedrive_list"],
   ["onedrive_write_text", "onedrive_patch_text"],
   ["onedrive_move", "onedrive_copy"],
@@ -53,7 +57,8 @@ try {
   const tools = listed.result.tools || [];
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
   assert(tools.length === goldenPrompts.length, "Golden prompt coverage must match the complete focused ChatGPT tool surface.", { tools: tools.map((tool) => tool.name), prompts: goldenPrompts.map((entry) => entry.tool) });
-  assert(initialized.result.instructions.includes("fetch each file"), "ChatGPT instructions must describe the fetch-first Office edit sequence.", initialized.result.instructions);
+  assert(initialized.result.instructions.includes("onedrive_open_files once"), "ChatGPT instructions must describe the combined exact-file read sequence.", initialized.result.instructions);
+  assert(initialized.result.instructions.includes("onedrive_preview_actions"), "ChatGPT instructions must describe the read-only batch preview sequence.", initialized.result.instructions);
   assert(!initialized.result.instructions.includes("matching structured read tool"), "ChatGPT instructions must not reference tools absent from the focused profile.", initialized.result.instructions);
 
   for (const entry of goldenPrompts) {

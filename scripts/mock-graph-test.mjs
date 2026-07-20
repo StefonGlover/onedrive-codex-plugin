@@ -4699,6 +4699,44 @@ process.exit(2);
     return { searchResults: searched.value.results.length, fetchSource: fetched.value.metadata.previewSource, graphRequestsAdded: added.length };
   });
 
+  await check("ChatGPT exact-file opener combines multi-file search and extraction", async () => {
+    const seeded = await tool("onedrive_get_info", { itemId: "common-rtf" });
+    assert(!seeded.isError, "common file fixture should seed metadata", seeded);
+    const opened = await tool("onedrive_open_files", { names: ["root-note.txt", "Common Notes.rtf"] });
+    assert(!opened.isError, "combined exact-file opener should succeed", opened);
+    assert(opened.value.files?.length === 2, "combined exact-file opener should preserve requested file count", opened.value);
+    const rootNote = opened.value.files.find((entry) => entry.name === "root-note.txt");
+    const commonNotes = opened.value.files.find((entry) => entry.name === "Common Notes.rtf");
+    assert(rootNote?.status === "found" && rootNote.id === "root-note", "combined opener should resolve the exact root note ID", rootNote);
+    assert(rootNote?.text.includes("root note mock content"), "combined opener should return root note content", rootNote);
+    assert(commonNotes?.status === "found" && commonNotes.id === "common-rtf", "combined opener should resolve the exact common-file ID", commonNotes);
+    assert(commonNotes?.metadata?.previewSource === "local-rtf" && commonNotes.text.includes("Budget total: $1,234"), "combined opener should use local common-file extraction", commonNotes);
+    assert(Number.isInteger(opened.value.durationMs) && opened.value.durationMs >= 0, "combined opener should report server-side duration", opened.value);
+    return { files: opened.value.files.map((entry) => ({ name: entry.name, status: entry.status, source: entry.metadata?.previewSource })), durationMs: opened.value.durationMs };
+  });
+
+  await check("ChatGPT action previews batch safely without identity disclosure", async () => {
+    const before = requests.length;
+    const previewed = await tool("onedrive_preview_actions", {
+      actions: [
+        { operation: "rename", itemId: "root-note", newName: "root-note-preview.txt" },
+        { operation: "move", itemId: "root-note", destinationParentItemId: "folder-a" },
+        { operation: "copy", itemId: "root-note", destinationParentItemId: "folder-a", newName: "root-note-copy.txt" },
+        { operation: "createSharingLink", itemId: "root-note", linkType: "view", scope: "anonymous" }
+      ]
+    });
+    assert(!previewed.isError && previewed.value.dryRun === true, "batched action preview should succeed as a dry-run", previewed);
+    assert(previewed.value.results?.length === 4, "batched action preview should return one result per action", previewed.value);
+    assert(previewed.value.results.every((entry) => entry.isError === false && entry.previewTokenPresent === true && entry.previewToken), "every mutation preview should return a scoped token", previewed.value.results);
+    const sharing = previewed.value.results.find((entry) => entry.operation === "createSharingLink");
+    assert(sharing?.accessSummary?.permissionCount === 1 && sharing.accessSummary.sharingLinkCount === 0, "sharing preview should include identity-free access counts", sharing);
+    const serialized = JSON.stringify(previewed.value);
+    assert(!serialized.includes("mock@example.test") && !serialized.includes("Mock User"), "sharing preview must not return permission identities", serialized);
+    const added = requests.slice(before);
+    assert(!added.some((request) => ["PATCH", "POST", "DELETE", "PUT"].includes(request.method)), "batched action preview must not mutate Graph state", { added });
+    return { actionCount: previewed.value.results.length, sharing: sharing.accessSummary, durationMs: previewed.value.durationMs };
+  });
+
   await check("ChatGPT stale search returns a high-confidence cache hit and revalidates in the background", async () => {
     await tool("onedrive_cache_clear");
     const seeded = await tool("onedrive_get_info", { itemId: "chatgpt-stale-cache" });
