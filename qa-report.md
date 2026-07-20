@@ -2,7 +2,7 @@
 
 Decision: Pending — Entra registration, NAS OAuth rollout, and ChatGPT Work validation
 Date: 2026-07-20
-Generated: 2026-07-20T13:57:07Z
+Generated: 2026-07-20T14:17:05Z
 Tested source base commit: `16d5e0272a6a5bac4796b85a0bef9b6f95c5df24`
 Plugin version: `0.5.1+codex.20260719224717`
 Tool contract: 84 exact tool names
@@ -23,7 +23,7 @@ The `0.5.1` patch fixes both live Synology failures that prevented structured wo
 
 The pending OAuth build adds Entra protected-resource discovery, strict bearer-token validation, Graph on-behalf-of exchange, Streamable HTTP transport, per-tool `oauth2` scopes, runtime reauthorization challenges, and an HTTP-target Secure MCP Tunnel profile. The isolated OAuth integration test passes discovery, JWT signature/issuer/audience/time/scope checks, OBO exchange/cache behavior, all 84 OAuth descriptors, an unauthenticated challenge, and an authenticated call. This build is not yet a release Pass: it still needs the two Entra registrations, NAS OAuth deployment, and a fresh ChatGPT Work host-loop result.
 
-A fresh canonical developer-mode app, **OneDrive Fast** (`asdk_app_6a5e2416985481918d0f6c68785da2c4`), was created with the exact local `assets/chatgpt-icon.png` before any metadata refresh. The uploaded asset is a 256×256 PNG, 2,276 bytes, SHA-256 `b9db1f911c59c34ce12cdfdfbae1a6b9933b140e3b024068a8df6ddac43fe5e1`. The app still displayed the OneDrive Fast image after the nas11 metadata refresh. The two stale duplicate OneDrive registrations were uninstalled so the creation-time logo cannot be confused with an older app.
+The canonical developer-mode app, **OneDrive** (`asdk_app_6a5e2416985481918d0f6c68785da2c4`), was created with the exact local `assets/chatgpt-icon.png` before any metadata refresh and later renamed from its temporary `OneDrive Fast` label after the stale name conflicts were removed. The uploaded asset is a 256×256 PNG, 2,276 bytes, SHA-256 `b9db1f911c59c34ce12cdfdfbae1a6b9933b140e3b024068a8df6ddac43fe5e1`. The app still displays the same image after the nas11 metadata refresh and rename. Both obsolete OneDrive developer registrations were permanently deleted, and their former plugin URLs now fail to load, leaving one installed OneDrive entry in the catalog.
 
 The No Auth descriptor repair previously passed both full 106-check source and immutable-cache betas with 96 passes, zero failures, ten explicit environment or safety blocks, exact coverage of all 84 tools, verified remote cleanup, and no isolated local residue. The current source passes all 164 mock Graph checks. The Synology and ChatGPT rollouts now match this source; immutable Codex-cache parity remains a separate pending distribution step.
 

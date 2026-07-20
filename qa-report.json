@@ -2,7 +2,7 @@
   "schemaVersion": 2,
   "decision": "Pending — Entra registration, NAS OAuth rollout, and ChatGPT Work validation",
   "date": "2026-07-20",
-  "generatedAt": "2026-07-20T13:57:07Z",
+  "generatedAt": "2026-07-20T14:17:05Z",
   "source": {
     "commit": "16d5e0272a6a5bac4796b85a0bef9b6f95c5df24",
     "workingTree": "NAS nas11 and the canonical ChatGPT developer app now run this exact focused-profile source. The workbook extraction, opaque search-result ID handoff, progressive fetch, stale-while-revalidate search, ETag/cTag reuse, common-format extraction, and 19-case metadata gate are live-validated. The 19-tool ChatGPT contract, 84-tool full contract, and all 164 mock Graph checks pass. Immutable Codex-cache parity, Entra registration, and the ChatGPT Work host issue remain outstanding.",
@@ -116,7 +116,7 @@
     },
     "chatgptHostLoop": {
       "status": "pass_with_host_limitation",
-      "appName": "OneDrive Fast",
+      "appName": "OneDrive",
       "appId": "asdk_app_6a5e2416985481918d0f6c68785da2c4",
       "authentication": "No Auth",
       "toolSecuritySchemes": "19/19 noauth",
@@ -129,10 +129,12 @@
         "bytes": 2276,
         "sha256": "b9db1f911c59c34ce12cdfdfbae1a6b9933b140e3b024068a8df6ddac43fe5e1",
         "expectedAppearance": "square blue OneDrive cloud",
-        "observedAppearance": "OneDrive Fast image present before and after metadata refresh",
+        "observedAppearance": "OneDrive image present before and after metadata refresh and retained when the canonical app was renamed from OneDrive Fast to OneDrive",
         "storageBehavior": "Developer-mode app logos are stored at app creation and are not changed by MCP metadata refresh.",
         "genericPlugAccepted": false,
-        "staleDuplicateAppIdsUninstalled": ["asdk_app_6a5d95ab7c8881918fe4b3ce03457716", "asdk_app_6a5d5978ae1c819198a59b675941bf63"]
+        "staleDuplicateAppIdsDeleted": ["asdk_app_6a5d95ab7c8881918fe4b3ce03457716", "asdk_app_6a5d5978ae1c819198a59b675941bf63"],
+        "duplicateDeletionVerified": "Both former plugin URLs return We couldn't load this plugin right now; the catalog contains one installed OneDrive entry.",
+        "canonicalRenamedAt": "2026-07-20T14:16:00Z"
       },
       "chatSurface": { "status": "pass", "healthChecksPassed": 5, "warnings": 1, "failed": 0, "filesModified": false },
       "workSurface": { "status": "blocked_by_host", "serverToolCallReceived": false, "workaround": "Select Chat rather than Work." }
