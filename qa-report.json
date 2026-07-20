@@ -2,10 +2,10 @@
   "schemaVersion": 2,
   "decision": "Pending — Entra registration, NAS OAuth rollout, and ChatGPT Work validation",
   "date": "2026-07-20",
-  "generatedAt": "2026-07-20T12:28:43Z",
+  "generatedAt": "2026-07-20T13:57:07Z",
   "source": {
-    "commit": "9a83b2df1f9ee20c1126df34d0df60f0d467916a",
-    "workingTree": "Pending performance-hardening and OAuth rollout build. The exact 2026 Family Budgeting.xlsx failure remains repaired, and the developer-mode app logo still matches the local OneDrive asset. Current source adds corrected focused instructions and status metadata, progressive fetch, stale-while-revalidate search, ETag/cTag index reuse, and a 19-case metadata golden-prompt gate. The 19-tool ChatGPT contract, 84-tool full contract, and all 164 mock Graph checks pass. Immutable-cache parity, NAS rollout, ChatGPT metadata refresh/retest, Entra registration, and the ChatGPT Work host loop remain outstanding.",
+    "commit": "16d5e0272a6a5bac4796b85a0bef9b6f95c5df24",
+    "workingTree": "NAS nas11 and the canonical ChatGPT developer app now run this exact focused-profile source. The workbook extraction, opaque search-result ID handoff, progressive fetch, stale-while-revalidate search, ETag/cTag reuse, common-format extraction, and 19-case metadata gate are live-validated. The 19-tool ChatGPT contract, 84-tool full contract, and all 164 mock Graph checks pass. Immutable Codex-cache parity, Entra registration, and the ChatGPT Work host issue remain outstanding.",
     "pluginVersion": "0.5.1+codex.20260719224717",
     "contentDigest": null
   },
@@ -14,7 +14,7 @@
     "exact": true
   },
   "offlineGates": [
-    { "name": "Node 20 and Node 26 syntax/self-checks", "status": "pending" },
+    { "name": "Node 20 and Node 26 syntax/self-checks", "status": "pass" },
     { "name": "Exact MCP contract", "status": "pass", "toolCount": 84 },
     { "name": "Plugin manifest/version alignment", "status": "pass" },
     { "name": "Prepackage negative checks", "status": "pass" },
@@ -69,12 +69,17 @@
     "status": "pass",
     "platform": "Synology DS923+ Container Manager",
     "project": "onedrive-chatgpt",
-    "image": "onedrive-chatgpt-nas:0.5.0-nas8",
-    "stagedFiles": 46,
+    "image": "onedrive-chatgpt-nas:0.5.1-nas11",
+    "stagedFiles": 66,
     "containerHealth": "healthy",
     "restartCount": 0,
     "nodeVersion": "20.20.2",
-    "connectorSmoke": "Fresh No Auth app registration exposed 84/84 noauth action descriptors and completed authenticated config, profile, drive, root listing, and preset validation in Chat with five passes, one warning, and zero failures.",
+    "connectorSmoke": "Canonical No Auth app exposes the focused 19/19 noauth descriptors; live workbook and PDF search/fetch prompts both completed successfully in regular Chat.",
+    "rollbackArtifact": {
+      "path": "/volume1/docker/onedrive-chatgpt/app-0.5.1-nas11.zip",
+      "files": 66,
+      "sha256": "4343d3cb15342389cca9b72ccd2210e28ded0504a4f097751dcbdbd8cd18b756"
+    },
     "oauthCandidate": {
       "status": "local_image_pass",
       "image": "onedrive-chatgpt-nas:0.5.1-nas9",
@@ -111,18 +116,23 @@
     },
     "chatgptHostLoop": {
       "status": "pass_with_host_limitation",
-      "appName": "OneDrive",
-      "appId": "asdk_app_6a5d95ab7c8881918fe4b3ce03457716",
+      "appName": "OneDrive Fast",
+      "appId": "asdk_app_6a5e2416985481918d0f6c68785da2c4",
       "authentication": "No Auth",
-      "toolSecuritySchemes": "84/84 noauth",
+      "toolSecuritySchemes": "19/19 noauth",
       "listingLogo": {
-        "status": "pass_developer_app_matches_local_asset",
-        "checkedAt": "2026-07-20T11:40:00Z",
+        "status": "pass_exact_local_asset_uploaded_at_creation_and_retained_after_refresh",
+        "checkedAt": "2026-07-20T13:52:00Z",
         "expectedAsset": "assets/chatgpt-icon.png",
+        "width": 256,
+        "height": 256,
+        "bytes": 2276,
+        "sha256": "b9db1f911c59c34ce12cdfdfbae1a6b9933b140e3b024068a8df6ddac43fe5e1",
         "expectedAppearance": "square blue OneDrive cloud",
-        "observedAppearance": "square blue OneDrive cloud matching the local asset",
+        "observedAppearance": "OneDrive Fast image present before and after metadata refresh",
         "storageBehavior": "Developer-mode app logos are stored at app creation and are not changed by MCP metadata refresh.",
-        "genericPlugAccepted": false
+        "genericPlugAccepted": false,
+        "staleDuplicateAppIdsUninstalled": ["asdk_app_6a5d95ab7c8881918fe4b3ce03457716", "asdk_app_6a5d5978ae1c819198a59b675941bf63"]
       },
       "chatSurface": { "status": "pass", "healthChecksPassed": 5, "warnings": 1, "failed": 0, "filesModified": false },
       "workSurface": { "status": "blocked_by_host", "serverToolCallReceived": false, "workaround": "Select Chat rather than Work." }
@@ -135,28 +145,28 @@
     ],
     "chatgptExtraction": {
       "status": "live_pass",
-      "appId": "asdk_app_6a5d95ab7c8881918fe4b3ce03457716",
+      "appId": "asdk_app_6a5e2416985481918d0f6c68785da2c4",
       "profileToolCount": 19,
-      "profileBytes": 29189,
+      "profileBytes": 32446,
       "fullToolCount": 84,
       "fullProfileBytes": 335403,
       "contractReductionPercent": 91.3,
       "workbook": "2026 Family Budgeting.xlsx",
       "coldFetch": { "source": "office-openxml", "durationMs": 3534, "textBytes": 40679 },
-      "warmRun": { "searchDurationMs": 1052, "graphSearchCalls": 0, "fetchDurationMs": 1.6, "fetchSource": "content-index", "hostEndToEndMs": 79742 },
+      "warmRun": { "searchDurationMs": 491.9, "graphSearchCalls": 0, "fetchDurationMs": 4.8, "fetchSource": "content-index", "hostEndToEndMs": 23000 },
       "redundantOfficeReadCallsAfterContractRefresh": 0,
       "summaryVerified": true,
       "sampleFigures": { "monthlyIncome": 12325, "monthlyOutflows": 13993, "monthlyNetCashFlow": -1668, "ytdIncomeThroughJune": 73950, "ytdNetCashFlowThroughJune": -10008 }
     },
     "chatgptPerformanceHardening": {
-      "status": "offline_pass_pending_host_refresh",
+      "status": "live_pass",
       "profileToolCount": 19,
-      "profileBytes": 32409,
+      "profileBytes": 32446,
       "fullToolCount": 84,
       "fullProfileBytes": 335403,
       "contractReductionPercent": 90.3,
-      "serverVersion": "0.5.1+codex.20260719224717.chatgpt.a6ed3e1f07c7",
-      "serverInstructionBytes": 430,
+      "serverVersion": "0.5.1+codex.20260719224717.chatgpt.5972c6de2076",
+      "serverInstructionBytes": 478,
       "goldenPromptCases": 19,
       "ambiguityPairs": 6,
       "initialFetchTextBytes": 32768,
@@ -167,12 +177,29 @@
       "mockGraphFailures": 0,
       "node26Local": "pass",
       "node20Ci": "pending_push",
-      "liveChatgptRetest": false
+      "liveChatgptRetest": true,
+      "metadataRefresh": {
+        "status": "pass",
+        "appId": "asdk_app_6a5e2416985481918d0f6c68785da2c4",
+        "versionId": "asdk_app_v_6a5e24194bf881919606675abf5acd43",
+        "securitySchemes": 19,
+        "noauthEntries": 19,
+        "opaqueIdHandoffInstructionPresent": true
+      },
+      "pdfSearchFetch": {
+        "status": "pass",
+        "file": "#2-200-OSLLenderChangeAmendment (2022_03_25 23_08_06 UTC).pdf",
+        "previewSource": "local-pdf",
+        "firstHeading": "Amendment to Agreement",
+        "cold": { "searchDurationMs": 1323, "fetchDurationMs": 2609, "graphSearchCalls": 0, "searchPath": "stale-local" },
+        "warm": { "searchDurationMs": 802, "fetchDurationMs": 1604, "graphSearchCalls": 0, "searchPath": "fresh-local", "usedCachedMetadata": true },
+        "coldHostApproximateMs": 35000
+      }
     },
     "currentSourceRollout": {
       "immutableCache": "pending",
-      "synologyImage": "pending",
-      "chatgptDeveloperAppMetadata": "pending_refresh_for_a6ed3e1f07c7"
+      "synologyImage": "pass_onedrive-chatgpt-nas_0.5.1-nas11_healthy",
+      "chatgptDeveloperAppMetadata": "pass_refreshed_for_5972c6de2076"
     }
   },
   "blockedCoverage": [
@@ -182,6 +209,6 @@
     { "area": "Forced device-code polling", "reason": "The healthy existing credential and consent remain untouched; suppression and mock flow coverage pass." },
     { "area": "Keychain deletion", "reason": "The existing credential remains untouched; memory-only logout passes." },
     { "area": "Live recycle-bin restore", "reason": "Recycle-bin restore remains dry-run/mock tested; native version restore passes live." },
-    { "area": "Current source rollout and host validation", "reason": "The performance-hardening source commit passes local offline gates but has not yet replaced the immutable cache or NAS image, refreshed the ChatGPT app metadata, or completed a new live ChatGPT timing run." }
+    { "area": "Immutable Codex cache rollout", "reason": "The source, NAS nas11 image, and ChatGPT metadata/live host tests pass; only installation into the separate immutable Codex plugin cache remains pending." }
   ]
 }
