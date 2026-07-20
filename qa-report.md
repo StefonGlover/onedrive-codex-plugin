@@ -2,18 +2,22 @@
 
 Decision: Pending — Entra registration, NAS OAuth rollout, and ChatGPT Work validation
 Date: 2026-07-20
-Generated: 2026-07-20T15:16:15Z
-Tested source base commit: `8f5ae49c61e0beb79226cd2a038b88b456235876`
-Plugin version: `0.5.1+codex.20260719224717`
+Generated: 2026-07-20T16:10:01Z
+Tested source base commit: `78ecce9b79ecc931f2fc5bdee85aed71762474d6`
+Plugin version: `0.5.1+codex.20260720114207`
 Tool contract: 84 exact tool names
 
 ## Current outcome
 
-The final ChatGPT/NAS pass is deployed as `onedrive-chatgpt-nas:0.5.1-nas13`. The focused contract remains 19 tools and is now 33,669 bytes (90% smaller than the full 84-tool/335,838-byte contract), with 484 bytes of routing instructions. All 165 mocked Graph checks and all 19 golden prompt cases pass. Rename, move, and copy now require an account-scoped, operation-bound, single-use preview token in addition to confirmation and exact identity for live calls. DSM built image `ea810e8b9f6c`, started it with exit code 0, and reports all services healthy.
+The current ChatGPT/NAS pass is deployed as `onedrive-chatgpt-nas:0.5.1-nas14`. The focused contract is 21 tools and 37,676 bytes (88.8% smaller than the unchanged full 84-tool/335,837-byte contract), with 492 bytes of routing instructions. All 167 mocked Graph checks and all 21 golden prompt cases pass. DSM built image `9913b12d6f60`, recreated and started the existing project with exit code 0, and reports `onedrive-chatgpt` Healthy. The previous `nas13` app folder and archive remain available for rollback; the exact 66-entry `nas14` source archive is SHA-256 `c3f8fdbfc9c21d5f8f2795f63702789a2d5642bbef8f64d9513fee7af553b9a0`.
 
-The canonical ChatGPT app remains **OneDrive** (`asdk_app_6a5e2416985481918d0f6c68785da2c4`); metadata refresh succeeded without recreating the app, and the stored local OneDrive image is still displayed. In the same ChatGPT conversation, the post-deploy beta returned `$12,325 — excel`, read one permission with no sharing-link permission, and an exact-ID `onedrive_rename` dry-run returned `dryRun`, `confirmed`, `wouldRename`, `newName`, `previewToken`, and `previewTokenExpiresAt` with no error. No file or permission was changed in this final pass. Host orchestration still took about 39 seconds for the multi-step read/permissions/preview prompt even though the plugin contract and warm read paths are compact.
+The canonical ChatGPT app remains **OneDrive** (`asdk_app_6a5e2416985481918d0f6c68785da2c4`). Its metadata was refreshed in place without recreating or renaming the app, so the stored local OneDrive logo remains unchanged. The refreshed inspector exposes `onedrive_open_files` and `onedrive_preview_actions`, retains standard `search` and `fetch`, and shows all 21 focused tools as No Auth.
 
-One ChatGPT host-safety defect remains outside the plugin: during the earlier isolated CRUD fixture, clicking **Deny** on the host permission dialog did not prevent the folder/file mutation, and the consent UI displayed unrelated PII categories. The plugin's own scoped preview, identity, confirmation, audit, and cleanup protections remain enabled; this host behavior should be reported to OpenAI. The isolated fixture was subsequently moved to the recycle bin and its exact folder ID was verified.
+The exact-file beta stayed in the existing conversation and used one `onedrive_open_files` call for `2026 Family Budgeting.xlsx` plus the amendment PDF. It returned `$12,325` from `content-index-validated`, `Amendment to Agreement` from `local-pdf`, and `found` for both files. Server duration was 8,834 ms; observed Chrome end-to-end time was about 40 seconds versus the prior 58-second two-search/two-fetch path. No write tool ran.
+
+The CRUD/permissions beta used one read-only `onedrive_preview_actions` call for rename, copy, move, and anonymous-view sharing preview. All four operations returned scoped preview tokens with no error, and the identity-free access summary returned one permission, zero sharing links, zero anonymous links, and role `owner`. Server duration was 3,527 ms and ChatGPT displayed `Worked for 11s`, replacing the prior 33-second three-preview path and 109-second permissions/sharing path. No consent dialog appeared, so the earlier unrelated sensitive-data categories were not exposed on this read-only flow; no file, permission, or sharing link was changed.
+
+One separate ChatGPT host-safety defect remains outside the plugin: during an earlier isolated live CRUD fixture, clicking **Deny** on the host permission dialog did not prevent the folder/file mutation. The plugin's scoped preview, identity, confirmation, audit, and cleanup protections remain enabled; the isolated fixture was moved to the recycle bin and its exact folder ID was verified.
 
 The ChatGPT workbook-content failure is fixed in the tested source. Standard `fetch` now downloads modern Office packages once and renders bounded Word paragraphs/tables, Excel worksheet names/cells/formulas, and PowerPoint slides/shapes instead of relying on Microsoft Graph `format=text`. The exact `2026 Family Budgeting.xlsx` failure was reproduced in Chrome, the refreshed developer-mode app then returned a real worksheet-by-worksheet summary with exact figures, and the plugin logged `previewSource: office-openxml` with 40,679 bytes returned in 3.534 seconds on the cold read. A final warm run used only one `search` (1.052 seconds, zero Graph search calls) and one `fetch` (1.6 milliseconds from the content index); the ChatGPT host completed the detailed answer in 79.742 seconds.
 
@@ -61,8 +65,10 @@ The first installed-build attempt hit the harness's default 10-second Graph time
 - The DS923+ image pins the classic DSM builder to `amd64`, verifies the OpenAI tunnel-client checksum, runs without published inbound ports, drops all capabilities before adding only the startup minimum, and auto-restarts.
 - The supplied square 256×256 OneDrive artwork is now used for the composer, primary, and dark-mode plugin icons; this removes the wide-banner aspect-ratio mismatch on plugin icon surfaces.
 - ChatGPT `fetch` now reads real `.xlsx` cells and formulas through the local Open XML helper, preserves worksheet context on both cold and indexed reads, and never depends on Graph text export for modern Office packages.
-- The ChatGPT profile exposes 19 focused tools; standard `search` and `fetch` replace overlapping lookup and Office-read tools, preventing the redundant 12.9 MB workbook calls observed in the live host.
-- The focused contract now has corrected fetch-first server instructions, per-tool selection cues and status text, plus an offline golden-prompt gate covering all 19 tools and six commonly confused tool pairs.
+- The ChatGPT profile exposes 21 focused tools; standard `search` and `fetch` remain available while `onedrive_open_files` combines exact-name discovery and bounded extraction for up to five requested files.
+- `onedrive_preview_actions` batches up to ten read-only rename, move, copy, create-link, or revoke previews with bounded concurrency, scoped single-use preview tokens, and identity-free permission/link counts.
+- The focused contract now has exact-file and preview-batch routing instructions, per-tool selection cues and status text, plus an offline golden-prompt gate covering all 21 tools and eight commonly confused tool pairs.
+- Read-only preview batching is annotated as non-destructive and closed-world; live sharing-link creation is correctly annotated open-world. The refreshed ChatGPT host completed the batch without a consent dialog or unrelated sensitive-data categories.
 - ChatGPT search now supports a high-confidence stale-while-revalidate path with bounded background delta/query refresh; fetch validates unchanged indexed content by ETag/cTag and uses progressive 32 KiB previews with memory-backed 64 KiB continuation chunks.
 - Bounded extraction covers common text/code formats, PDF, RTF, OpenDocument, EPUB, legacy Office, and common image OCR, with private temporary files, size limits, fixed extractor paths, timeouts, and cleanup.
 - Upload, folder creation, rename, move, copy, file replacement/update, sharing-link create/revoke, recycle-bin delete/restore, and guarded permanent delete remain available on the focused ChatGPT surface with preview tokens and identity checks for risky mutations.

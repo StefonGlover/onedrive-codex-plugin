@@ -2,11 +2,11 @@
   "schemaVersion": 2,
   "decision": "Pending — Entra registration, NAS OAuth rollout, and ChatGPT Work validation",
   "date": "2026-07-20",
-  "generatedAt": "2026-07-20T15:16:15Z",
+  "generatedAt": "2026-07-20T16:10:01Z",
   "source": {
-    "commit": "8f5ae49c61e0beb79226cd2a038b88b456235876",
-    "workingTree": "NAS nas13 and the canonical ChatGPT developer app run this exact focused-profile source. The 19-tool ChatGPT contract, 84-tool full contract, all 19 golden prompts, and all 165 mock Graph checks pass. Rename, move, and copy now require account-scoped preview tokens for live calls. Immutable Codex-cache parity, Entra registration, and the ChatGPT Work host issue remain outstanding.",
-    "pluginVersion": "0.5.1+codex.20260719224717",
+    "commit": "78ecce9b79ecc931f2fc5bdee85aed71762474d6",
+    "workingTree": "NAS nas14 and the canonical ChatGPT developer app run this exact focused-profile source. The 21-tool ChatGPT contract, unchanged 84-tool full contract, all 21 golden prompts, and all 167 mock Graph checks pass. Exact multi-file reads and CRUD/sharing previews now use one bounded read-only tool call each. Immutable Codex-cache parity, Entra registration, and the separate ChatGPT Work host issue remain outstanding.",
+    "pluginVersion": "0.5.1+codex.20260720114207",
     "contentDigest": null
   },
   "contract": {
@@ -22,7 +22,7 @@
     { "name": "Office security corpus", "status": "pass" },
     { "name": "Genuine package reopening", "status": "pass" },
     { "name": "Common document extraction", "status": "pass", "formats": ["rtf", "opendocument", "epub"] },
-    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 165 },
+    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 167 },
     { "name": "Read-only OneDrive doctor and tenant checks", "status": "pass", "checks": 6 },
     { "name": "Cleanup preview", "status": "pass", "candidates": 0 },
     { "name": "Whitespace", "status": "pass" }
@@ -59,8 +59,8 @@
   },
   "installedBuild": {
     "status": "pending_source_update",
-    "version": "0.5.1+codex.20260719224717",
-    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.5.1+codex.20260719224717",
+    "version": "0.5.1+codex.20260720114207",
+    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.5.1+codex.20260720114207",
     "oldCacheOverwritten": false
   },
   "cleanup": { "status": "pass", "remoteTestRootsRemaining": 0, "permissionsRemaining": 0, "anonymousLinksRemaining": 0, "isolatedLocalResidue": false },
@@ -69,12 +69,17 @@
     "status": "pass",
     "platform": "Synology DS923+ Container Manager",
     "project": "onedrive-chatgpt",
-    "image": "onedrive-chatgpt-nas:0.5.1-nas13",
+    "image": "onedrive-chatgpt-nas:0.5.1-nas14",
     "stagedFiles": 66,
     "containerHealth": "healthy",
     "restartCount": 0,
     "nodeVersion": "20.20.2",
-    "connectorSmoke": "Canonical No Auth app exposes the focused 19/19 noauth descriptors; live workbook and PDF search/fetch prompts both completed successfully in regular Chat.",
+    "connectorSmoke": "Canonical No Auth app exposes the focused 21/21 noauth descriptors; one-call exact-file open and one-call CRUD/sharing preview prompts both completed successfully in the same regular Chat conversation.",
+    "deploymentArtifact": {
+      "path": "/volume1/docker/onedrive-chatgpt/app-0.5.1-nas14.zip",
+      "files": 66,
+      "sha256": "c3f8fdbfc9c21d5f8f2795f63702789a2d5642bbef8f64d9513fee7af553b9a0"
+    },
     "rollbackArtifact": {
       "path": "/volume1/docker/onedrive-chatgpt/app-0.5.1-nas13.zip",
       "files": 66,
@@ -119,7 +124,7 @@
       "appName": "OneDrive",
       "appId": "asdk_app_6a5e2416985481918d0f6c68785da2c4",
       "authentication": "No Auth",
-      "toolSecuritySchemes": "19/19 noauth",
+      "toolSecuritySchemes": "21/21 noauth",
       "listingLogo": {
         "status": "pass_exact_local_asset_uploaded_at_creation_and_retained_after_refresh",
         "checkedAt": "2026-07-20T15:08:00Z",
@@ -142,18 +147,18 @@
     "warnings": [
       "The account does not currently contain the default Desktop or Pictures/Screenshots preset targets; doctor reports these as warnings.",
       "ChatGPT Work shows an incorrect expired-connection card for the custom No Auth app before dispatching a tool call; the identical fresh app passes in Chat.",
-      "The active optimized developer-mode app now shows the correct OneDrive logo; future logo changes still require recreating the app because MCP metadata refresh does not update stored artwork.",
+      "The active optimized developer-mode app still shows the correct stored OneDrive logo after the nas14 metadata refresh; future logo changes still require recreating the app because MCP metadata refresh does not update stored artwork.",
       "Synology administrative verification used HTTPS over the LAN fallback with insecure TLS certificate validation enabled after the Tailscale endpoint failed; install a trusted DSM certificate or certificate pinning to remove this operational warning.",
-      "ChatGPT's host permission dialog allowed an isolated folder/file mutation after Deny was clicked and displayed unrelated PII categories; the fixture was cleaned up, and this requires a ChatGPT host fix."
+      "ChatGPT's host permission dialog allowed an earlier isolated live folder/file mutation after Deny was clicked; the fixture was cleaned up, and this separate host behavior requires a ChatGPT fix. The nas14 read-only preview batch showed no consent dialog or unrelated sensitive-data categories."
     ],
     "chatgptExtraction": {
       "status": "live_pass",
       "appId": "asdk_app_6a5e2416985481918d0f6c68785da2c4",
-      "profileToolCount": 19,
-      "profileBytes": 33669,
+      "profileToolCount": 21,
+      "profileBytes": 37676,
       "fullToolCount": 84,
-      "fullProfileBytes": 335838,
-      "contractReductionPercent": 90,
+      "fullProfileBytes": 335837,
+      "contractReductionPercent": 88.8,
       "workbook": "2026 Family Budgeting.xlsx",
       "coldFetch": { "source": "office-openxml", "durationMs": 3534, "textBytes": 40679 },
       "warmRun": { "searchDurationMs": 491.9, "graphSearchCalls": 0, "fetchDurationMs": 4.8, "fetchSource": "content-index", "hostEndToEndMs": 23000 },
@@ -163,20 +168,20 @@
     },
     "chatgptPerformanceHardening": {
       "status": "live_pass",
-      "profileToolCount": 19,
-      "profileBytes": 33669,
+      "profileToolCount": 21,
+      "profileBytes": 37676,
       "fullToolCount": 84,
-      "fullProfileBytes": 335838,
-      "contractReductionPercent": 90,
-      "serverVersion": "0.5.1+codex.20260719224717.chatgpt.77fd7325f2b2",
-      "serverInstructionBytes": 484,
-      "goldenPromptCases": 19,
-      "ambiguityPairs": 6,
+      "fullProfileBytes": 335837,
+      "contractReductionPercent": 88.8,
+      "serverVersion": "0.5.1+codex.20260720114207.chatgpt.2133911c994b",
+      "serverInstructionBytes": 492,
+      "goldenPromptCases": 21,
+      "ambiguityPairs": 8,
       "initialFetchTextBytes": 32768,
       "continuationChunkBytes": 65536,
       "fetchSnapshotTtlSeconds": 600,
       "staleCacheMaxAgeSeconds": 86400,
-      "mockGraphChecks": 165,
+      "mockGraphChecks": 167,
       "mockGraphFailures": 0,
       "node26Local": "pass",
       "node20Ci": "pending_push",
@@ -185,25 +190,51 @@
         "status": "pass",
         "appId": "asdk_app_6a5e2416985481918d0f6c68785da2c4",
         "versionId": "asdk_app_v_6a5e24194bf881919606675abf5acd43",
-        "securitySchemes": 19,
-        "noauthEntries": 19,
-        "opaqueIdHandoffInstructionPresent": true
+        "securitySchemes": 21,
+        "noauthEntries": 21,
+        "opaqueIdHandoffInstructionPresent": true,
+        "exactFileOpenerPresent": true,
+        "batchedPreviewToolPresent": true,
+        "storedLogoRetained": true
       },
       "finalCrudPermissionsBeta": {
-        "status": "pass_with_host_warning",
+        "status": "pass_with_separate_host_warning",
         "sameConversation": "https://chatgpt.com/c/6a5e2fd7-1508-83ea-a90c-c199cb2ec361",
-        "workbookSummary": "$12,325 — excel",
+        "exactFileOpen": {
+          "tool": "onedrive_open_files",
+          "callCount": 1,
+          "workbookSummary": "$12,325",
+          "workbookPreviewSource": "content-index-validated",
+          "workbookStatus": "found",
+          "pdfFirstHeading": "Amendment to Agreement",
+          "pdfPreviewSource": "local-pdf",
+          "pdfStatus": "found",
+          "serverDurationMs": 8834,
+          "observedChromeEndToEndMs": 40333,
+          "priorHostApproximateMs": 58000
+        },
+        "previewBatch": {
+          "tool": "onedrive_preview_actions",
+          "callCount": 1,
+          "operations": ["rename", "copy", "move", "createSharingLink"],
+          "allSucceeded": true,
+          "allDryRun": true,
+          "allPreviewTokensPresent": true,
+          "permissionCount": 1,
+          "sharingLinkCount": 0,
+          "anonymousLinkCount": 0,
+          "roles": ["owner"],
+          "identityFieldsReturned": false,
+          "serverDurationMs": 3527,
+          "chatgptWorkedMs": 11000,
+          "consentDialogAppeared": false,
+          "priorThreePreviewHostMs": 33000,
+          "priorPermissionsSharingHostMs": 109000
+        },
         "permissionCount": 1,
         "sharingLinkPermissionPresent": false,
-        "renameDryRun": {
-          "isError": false,
-          "dryRun": true,
-          "previewTokenPresent": true,
-          "topLevelKeys": ["dryRun", "confirmed", "wouldRename", "newName", "previewToken", "previewTokenExpiresAt"]
-        },
         "filesOrPermissionsModifiedInFinalPass": false,
-        "hostApproximateMs": 39000,
-        "hostWarning": "An earlier isolated CRUD test mutated after ChatGPT's Deny button was clicked; plugin-level confirmation and preview protections remain active, and the isolated fixture was cleaned up."
+        "hostWarning": "An earlier isolated live CRUD test mutated after ChatGPT's Deny button was clicked; plugin-level confirmation and preview protections remain active, and the isolated fixture was cleaned up. The nas14 read-only combined flows showed no consent dialog."
       },
       "pdfSearchFetch": {
         "status": "pass",
@@ -217,8 +248,8 @@
     },
     "currentSourceRollout": {
       "immutableCache": "pending",
-      "synologyImage": "pass_onedrive-chatgpt-nas_0.5.1-nas13_healthy",
-      "chatgptDeveloperAppMetadata": "pass_refreshed_for_77fd7325f2b2_logo_retained"
+      "synologyImage": "pass_onedrive-chatgpt-nas_0.5.1-nas14_healthy",
+      "chatgptDeveloperAppMetadata": "pass_refreshed_for_2133911c994b_logo_retained"
     }
   },
   "blockedCoverage": [
@@ -228,6 +259,6 @@
     { "area": "Forced device-code polling", "reason": "The healthy existing credential and consent remain untouched; suppression and mock flow coverage pass." },
     { "area": "Keychain deletion", "reason": "The existing credential remains untouched; memory-only logout passes." },
     { "area": "Live recycle-bin restore", "reason": "Recycle-bin restore remains dry-run/mock tested; native version restore passes live." },
-    { "area": "Immutable Codex cache rollout", "reason": "The source, NAS nas13 image, and ChatGPT metadata/live host tests pass; only installation into the separate immutable Codex plugin cache remains pending." }
+    { "area": "Immutable Codex cache rollout", "reason": "The source, NAS nas14 image, and ChatGPT metadata/live host tests pass; only installation into the separate immutable Codex plugin cache remains pending." }
   ]
 }
