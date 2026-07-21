@@ -1,12 +1,12 @@
 {
   "schemaVersion": 2,
   "decision": "Pending — Entra registration, NAS OAuth rollout, and ChatGPT Work validation",
-  "date": "2026-07-20",
-  "generatedAt": "2026-07-20T16:10:01Z",
+  "date": "2026-07-21",
+  "generatedAt": "2026-07-21T14:48:00Z",
   "source": {
-    "commit": "78ecce9b79ecc931f2fc5bdee85aed71762474d6",
-    "workingTree": "NAS nas14 and the canonical ChatGPT developer app run this exact focused-profile source. The 21-tool ChatGPT contract, unchanged 84-tool full contract, all 21 golden prompts, and all 167 mock Graph checks pass. Exact multi-file reads and CRUD/sharing previews now use one bounded read-only tool call each. Immutable Codex-cache parity, Entra registration, and the separate ChatGPT Work host issue remain outstanding.",
-    "pluginVersion": "0.5.1+codex.20260720114207",
+    "commit": "1a3a8ff7d71fee9b13f3a249483383c6a1f67120",
+    "workingTree": "NAS nas23 and the canonical ChatGPT developer app run this exact focused-profile source. The 21-tool ChatGPT contract, unchanged 84-tool full contract, all 21 golden prompts, and all 173 mock Graph checks pass. Subtle service-record search now verifies likely document contents before broad metadata fan-out and ranks invoices/service records above generic inspections for repair intent. Immutable Codex-cache parity, Entra registration, and the separate ChatGPT Work host issue remain outstanding.",
+    "pluginVersion": "0.5.1+codex.20260721104500",
     "contentDigest": null
   },
   "contract": {
@@ -22,7 +22,7 @@
     { "name": "Office security corpus", "status": "pass" },
     { "name": "Genuine package reopening", "status": "pass" },
     { "name": "Common document extraction", "status": "pass", "formats": ["rtf", "opendocument", "epub"] },
-    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 167 },
+    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 173 },
     { "name": "Read-only OneDrive doctor and tenant checks", "status": "pass", "checks": 6 },
     { "name": "Cleanup preview", "status": "pass", "candidates": 0 },
     { "name": "Whitespace", "status": "pass" }
@@ -59,31 +59,31 @@
   },
   "installedBuild": {
     "status": "pending_source_update",
-    "version": "0.5.1+codex.20260720114207",
-    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.5.1+codex.20260720114207",
+    "version": "0.5.1+codex.20260721104500",
+    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.5.1+codex.20260721104500",
     "oldCacheOverwritten": false
   },
-  "cleanup": { "status": "pass", "remoteTestRootsRemaining": 0, "permissionsRemaining": 0, "anonymousLinksRemaining": 0, "isolatedLocalResidue": false },
+  "cleanup": { "status": "pass", "remoteTestRootsRemaining": 0, "permissionsRemaining": 0, "anonymousLinksRemaining": 0, "isolatedLocalResidue": false, "orphanNasContainersRemoved": ["romantic_mestorf"], "obsoleteOneDriveImagesRemoved": ["0.5.1-nas19", "0.5.1-nas20", "0.5.1-nas21"], "rollbackImageRetained": "0.5.1-nas22", "ignoredLocalWorkRemovedBytesApprox": 10066330 },
   "sourceCacheParity": { "status": "pending", "bytes": "pending", "modes": "pending", "types": "pending", "symlinkTargets": "pending" },
   "deployment": {
     "status": "pass",
     "platform": "Synology DS923+ Container Manager",
     "project": "onedrive-chatgpt",
-    "image": "onedrive-chatgpt-nas:0.5.1-nas14",
+    "image": "onedrive-chatgpt-nas:0.5.1-nas23",
     "stagedFiles": 66,
     "containerHealth": "healthy",
     "restartCount": 0,
     "nodeVersion": "20.20.2",
-    "connectorSmoke": "Canonical No Auth app exposes the focused 21/21 noauth descriptors; one-call exact-file open and one-call CRUD/sharing preview prompts both completed successfully in the same regular Chat conversation.",
+    "connectorSmoke": "Canonical No Auth app exposes the focused 21/21 noauth descriptors. In the same HVAC Chat conversation, the subtle service request returned invoice-3095.pdf, Evolution Heating & Cooling, and $2,518; the final routing assertion completed in about 16 seconds.",
     "deploymentArtifact": {
-      "path": "/volume1/docker/onedrive-chatgpt/app-0.5.1-nas14.zip",
+      "path": "/volume1/docker/onedrive-chatgpt/app",
       "files": 66,
-      "sha256": "c3f8fdbfc9c21d5f8f2795f63702789a2d5642bbef8f64d9513fee7af553b9a0"
+      "sha256": null
     },
     "rollbackArtifact": {
-      "path": "/volume1/docker/onedrive-chatgpt/app-0.5.1-nas13.zip",
+      "path": "onedrive-chatgpt-nas:0.5.1-nas22",
       "files": 66,
-      "sha256": "6fa8e910e85afbbc096e287ed191ef6c1c90c691697e69c717c966dd082bce44"
+      "sha256": null
     },
     "oauthCandidate": {
       "status": "local_image_pass",
@@ -155,7 +155,7 @@
       "status": "live_pass",
       "appId": "asdk_app_6a5e2416985481918d0f6c68785da2c4",
       "profileToolCount": 21,
-      "profileBytes": 37676,
+      "profileBytes": 37819,
       "fullToolCount": 84,
       "fullProfileBytes": 335837,
       "contractReductionPercent": 88.8,
@@ -172,16 +172,16 @@
       "profileBytes": 37676,
       "fullToolCount": 84,
       "fullProfileBytes": 335837,
-      "contractReductionPercent": 88.8,
-      "serverVersion": "0.5.1+codex.20260720114207.chatgpt.2133911c994b",
-      "serverInstructionBytes": 492,
+      "contractReductionPercent": 88.7,
+      "serverVersion": "0.5.1+codex.20260721104500.chatgpt.0ac4713e06bc",
+      "serverInstructionBytes": 504,
       "goldenPromptCases": 21,
       "ambiguityPairs": 8,
       "initialFetchTextBytes": 32768,
       "continuationChunkBytes": 65536,
       "fetchSnapshotTtlSeconds": 600,
       "staleCacheMaxAgeSeconds": 86400,
-      "mockGraphChecks": 167,
+      "mockGraphChecks": 173,
       "mockGraphFailures": 0,
       "node26Local": "pass",
       "node20Ci": "pending_push",
@@ -236,6 +236,22 @@
         "filesOrPermissionsModifiedInFinalPass": false,
         "hostWarning": "An earlier isolated live CRUD test mutated after ChatGPT's Deny button was clicked; plugin-level confirmation and preview protections remain active, and the isolated fixture was cleaned up. The nas14 read-only combined flows showed no consent dialog."
       },
+      "hvacServiceSearch": {
+        "status": "live_pass",
+        "sameConversation": "https://chatgpt.com/c/6a5f7eb8-afb0-83ea-a34c-9c2b5cb77ea8",
+        "query": "the paperwork the heating technician left after fixing the air conditioner",
+        "selectedFile": "invoice-3095.pdf",
+        "vendor": "Evolution Heating & Cooling",
+        "total": 2518,
+        "initialSideTestMs": 98000,
+        "preFinalFixWorkedMs": 42000,
+        "postDeployWorkedMs": 21000,
+        "finalRoutingObservedMs": 16000,
+        "directSearchObservedMs": 3800,
+        "genericInspectionsRankedBelowServiceInvoice": true,
+        "coldVerificationGraphProbeBudget": 1,
+        "sameThreadMaintained": true
+      },
       "pdfSearchFetch": {
         "status": "pass",
         "file": "#2-200-OSLLenderChangeAmendment (2022_03_25 23_08_06 UTC).pdf",
@@ -248,8 +264,8 @@
     },
     "currentSourceRollout": {
       "immutableCache": "pending",
-      "synologyImage": "pass_onedrive-chatgpt-nas_0.5.1-nas14_healthy",
-      "chatgptDeveloperAppMetadata": "pass_refreshed_for_2133911c994b_logo_retained"
+      "synologyImage": "pass_onedrive-chatgpt-nas_0.5.1-nas23_healthy",
+      "chatgptDeveloperAppMetadata": "pass_refreshed_for_0ac4713e06bc_logo_retained"
     }
   },
   "blockedCoverage": [

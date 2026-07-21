@@ -1,17 +1,19 @@
 # OneDrive 0.5.1 Release Gate Report
 
 Decision: Pending — Entra registration, NAS OAuth rollout, and ChatGPT Work validation
-Date: 2026-07-20
-Generated: 2026-07-20T16:10:01Z
-Tested source base commit: `78ecce9b79ecc931f2fc5bdee85aed71762474d6`
-Plugin version: `0.5.1+codex.20260720114207`
+Date: 2026-07-21
+Generated: 2026-07-21T14:48:00Z
+Tested source base commit: `1a3a8ff7d71fee9b13f3a249483383c6a1f67120`
+Plugin version: `0.5.1+codex.20260721104500`
 Tool contract: 84 exact tool names
 
 ## Current outcome
 
-The current ChatGPT/NAS pass is deployed as `onedrive-chatgpt-nas:0.5.1-nas14`. The focused contract is 21 tools and 37,676 bytes (88.8% smaller than the unchanged full 84-tool/335,837-byte contract), with 492 bytes of routing instructions. All 167 mocked Graph checks and all 21 golden prompt cases pass. DSM built image `9913b12d6f60`, recreated and started the existing project with exit code 0, and reports `onedrive-chatgpt` Healthy. The previous `nas13` app folder and archive remain available for rollback; the exact 66-entry `nas14` source archive is SHA-256 `c3f8fdbfc9c21d5f8f2795f63702789a2d5642bbef8f64d9513fee7af553b9a0`.
+The current ChatGPT/NAS pass is deployed as `onedrive-chatgpt-nas:0.5.1-nas23`. The focused contract is 21 tools and 37,819 bytes (88.7% smaller than the unchanged full 84-tool/335,837-byte contract), with 504 bytes of routing instructions. All 173 mocked Graph checks and all 21 golden prompt cases pass. DSM built image `de91aab85bdb`, recreated and started the existing project with exit code 0, and reports `onedrive-chatgpt` Healthy. `nas22` is retained as the single rollback image; obsolete OneDrive images `nas19`–`nas21` and the stopped orphan container `romantic_mestorf` were removed.
 
 The canonical ChatGPT app remains **OneDrive** (`asdk_app_6a5e2416985481918d0f6c68785da2c4`). Its metadata was refreshed in place without recreating or renaming the app, so the stored local OneDrive logo remains unchanged. The refreshed inspector exposes `onedrive_open_files` and `onedrive_preview_actions`, retains standard `search` and `fetch`, and shows all 21 focused tools as No Auth.
+
+The final service-record beta stayed in one ChatGPT conversation: `https://chatgpt.com/c/6a5f7eb8-afb0-83ea-a34c-9c2b5cb77ea8`. The subtle request for “the paperwork the heating technician left after fixing the air conditioner” now returns `invoice-3095.pdf` before the generic `Glover_Final_Inspection.pdf` and `Glover_Predry_Inspection.pdf` candidates. ChatGPT returned `ROUTING_PASS — Evolution Heating & Cooling — $2,518.00` in about 16 seconds. The earlier comparable host run displayed 42 seconds, and the original user-side result took 1 minute 38 seconds. Successful cold content verification is bounded to one generic document probe before semantic metadata fan-out; warm content-index results avoid Graph search and body rereads.
 
 The exact-file beta stayed in the existing conversation and used one `onedrive_open_files` call for `2026 Family Budgeting.xlsx` plus the amendment PDF. It returned `$12,325` from `content-index-validated`, `Amendment to Agreement` from `local-pdf`, and `found` for both files. Server duration was 8,834 ms; observed Chrome end-to-end time was about 40 seconds versus the prior 58-second two-search/two-fetch path. No write tool ran.
 
