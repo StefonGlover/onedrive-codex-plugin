@@ -6434,6 +6434,23 @@ function scoreFindCandidate(item, context = {}) {
   let score = 0;
   let matchedTokens = 0;
 
+  // Literal query tokens are not enough for common domain aliases. For example,
+  // a user may ask for an "HVAC" record while the filename only says
+  // "Heating & Cooling". Treat concept vocabulary that is visible in cached or
+  // live metadata as first-class evidence so the fast path does not discard the
+  // correct item before concept filtering runs.
+  const metadataConceptMatches = findQueryConcepts(context.query)
+    .filter((concept) => candidateMatchesConceptMetadata({ item }, concept));
+  if (metadataConceptMatches.length) {
+    const conceptScore = metadataConceptMatches.reduce(
+      (total, concept) => total + (concept.kind === "domain" ? 48 : 24),
+      0
+    );
+    score += Math.min(72, conceptScore);
+    matchedTokens += 1;
+    reasons.push(`concept visible in metadata: ${metadataConceptMatches.map((concept) => concept.label).join(", ")}`);
+  }
+
   if (context.source === "exactPath") {
     score += 100;
     reasons.push("exact path");
@@ -6604,6 +6621,7 @@ function addFindCandidate(candidates, item, context) {
     && (context.contentExactPhrase === true || (context.contentMatchedTokens || 0) >= 2 || contentCoverage >= 0.5);
   const canonicalGraphMatch = context.source === "search" && context.canonicalSearch === true;
   const semanticSearchMatch = context.semanticExpansion === true
+    && context.semanticEvidenceSuppressed !== true
     && ["search", "contentIndex"].includes(context.source);
   const hasQueryRelevance = scored.matchedTokens > 0 || scored.reasons.some((reason) =>
     reason.startsWith("exact filename")
@@ -6615,7 +6633,7 @@ function addFindCandidate(candidates, item, context) {
   ) || strongContentIndexMatch || canonicalGraphMatch || semanticSearchMatch;
   if (context.source !== "exactPath" && !hasQueryRelevance) return;
   const existing = candidates.get(key);
-  const semanticEvidence = context.semanticExpansion === true
+  const semanticEvidence = context.semanticExpansion === true && context.semanticEvidenceSuppressed !== true
     ? [`${context.semanticConceptId || "concept"}:${normalizeFindText(context.term)}`]
     : [];
   if (!existing || scored.score > existing.score) {
@@ -6629,10 +6647,26 @@ function addFindCandidate(candidates, item, context) {
       reasons: [...new Set([...(existing?.reasons || []), ...scored.reasons])].slice(0, 6),
       snippets: [...new Set([...(existing?.snippets || []), ...(context.snippet ? [context.snippet] : [])])],
       semanticEvidence: mergedEvidence,
-      sources: [...(existing?.sources || []), { source: context.source, term: context.term, folder: context.folder }]
+      sources: [...(existing?.sources || []), {
+        source: context.source,
+        term: context.term,
+        folder: context.folder,
+        semanticExpansion: context.semanticExpansion === true,
+        semanticConceptId: context.semanticConceptId,
+        semanticEvidenceSuppressed: context.semanticEvidenceSuppressed === true,
+        strongContentIndexMatch
+      }]
     });
   } else {
-    existing.sources.push({ source: context.source, term: context.term, folder: context.folder });
+    existing.sources.push({
+      source: context.source,
+      term: context.term,
+      folder: context.folder,
+      semanticExpansion: context.semanticExpansion === true,
+      semanticConceptId: context.semanticConceptId,
+      semanticEvidenceSuppressed: context.semanticEvidenceSuppressed === true,
+      strongContentIndexMatch
+    });
     existing.reasons = [...new Set([...existing.reasons, ...scored.reasons])].slice(0, 6);
     if (context.snippet && !existing.snippets.includes(context.snippet)) existing.snippets.push(context.snippet);
     existing.semanticEvidence = [...new Set([...(existing.semanticEvidence || []), ...semanticEvidence])];
@@ -6661,15 +6695,20 @@ function candidateMatchesConceptMetadata(candidate, concept) {
 
 function candidateHasConceptEvidence(candidate, queryConcepts = []) {
   if (!queryConcepts.length) return true;
-  if (candidate.sources.some((source) => source.source === "exactPath" || source.source === "contentIndex")) return true;
+  if (candidate.sources.some((source) => source.source === "exactPath")) return true;
   const requiredConcepts = queryConcepts.some((concept) => concept.kind === "domain")
     ? queryConcepts.filter((concept) => concept.kind === "domain")
     : queryConcepts;
   if (requiredConcepts.some((concept) => candidateMatchesConceptMetadata(candidate, concept))) return true;
   const requiredIds = new Set(requiredConcepts.map((concept) => concept.id));
-  const corroboratingEvidence = (candidate.semanticEvidence || [])
-    .filter((evidence) => requiredIds.has(String(evidence).split(":", 1)[0]));
-  return new Set(corroboratingEvidence).size >= 2;
+  const corroboratingLiveSearchTerms = candidate.sources
+    .filter((source) => source.source === "search"
+      && source.semanticExpansion === true
+      && source.semanticEvidenceSuppressed !== true
+      && requiredIds.has(source.semanticConceptId))
+    .map((source) => normalizeFindText(source.term))
+    .filter(Boolean);
+  return new Set(corroboratingLiveSearchTerms).size >= 2;
 }
 
 function conceptRelevantFindCandidates(candidates, queryConcepts = []) {
@@ -6763,6 +6802,8 @@ async function find(args = {}) {
   const folderHints = pruneFolderHints([...scoringFolderHints, ...defaultFindFolderHints(query), ""]);
   const candidates = new Map();
   const searchRuns = [];
+  const broadLiveSearchGroups = [];
+  const suppressedBroadSearchTerms = new Set();
   const scanRuns = [];
   const pendingSearchCacheItems = [];
   const searchConcurrency = clampInteger(args.searchConcurrency, 2, 1, 4);
@@ -6884,6 +6925,25 @@ async function find(args = {}) {
         format: "full",
         cacheResults: false
       });
+      const liveResultIds = [...new Set((result.items || []).map(findCandidateKey).filter(Boolean))];
+      const broadResultIds = liveResultIds.length >= 5 ? new Set(liveResultIds) : null;
+      const overlappingBroadGroup = broadResultIds
+        ? broadLiveSearchGroups.find((group) => {
+            let overlap = 0;
+            for (const id of broadResultIds) if (group.ids.has(id)) overlap += 1;
+            return overlap >= 5 && overlap / Math.min(broadResultIds.size, group.ids.size) >= 0.75;
+          })
+        : null;
+      const repeatedBroadResultSet = Boolean(overlappingBroadGroup);
+      if (broadResultIds) {
+        if (overlappingBroadGroup) {
+          overlappingBroadGroup.terms.add(term);
+          for (const priorTerm of overlappingBroadGroup.terms) suppressedBroadSearchTerms.add(normalizeFindText(priorTerm));
+          for (const id of broadResultIds) overlappingBroadGroup.ids.add(id);
+        } else {
+          broadLiveSearchGroups.push({ ids: broadResultIds, terms: new Set([term]) });
+        }
+      }
       if (args.useCache !== false) pendingSearchCacheItems.push(...(result.items || []));
       for (const [resultIndex, item] of (result.items || []).entries()) {
         addFindCandidate(candidates, item, {
@@ -6892,6 +6952,7 @@ async function find(args = {}) {
           source: "search",
           term,
           canonicalSearch: index === 0,
+          semanticEvidenceSuppressed: repeatedBroadResultSet,
           ...planMetadata,
           searchResultRank: resultIndex + 1,
           extensionInfo,
@@ -6904,6 +6965,7 @@ async function find(args = {}) {
         executed: true,
         count: result.count,
         truncated: result.truncated,
+        repeatedBroadResultSet,
         unsafePageTruncation: result.unsafePageTruncation,
         graphSearchCalls: result.pagesFetched || 0,
         durationMs: elapsedMs(termStartedAt)
@@ -6953,6 +7015,16 @@ async function find(args = {}) {
       }
     }
 
+  }
+  if (suppressedBroadSearchTerms.size) {
+    for (const candidate of candidates.values()) {
+      candidate.semanticEvidence = (candidate.semanticEvidence || []).filter((evidence) => {
+        const separator = String(evidence).indexOf(":");
+        const evidenceTerm = separator >= 0 ? String(evidence).slice(separator + 1) : String(evidence);
+        return !suppressedBroadSearchTerms.has(normalizeFindText(evidenceTerm));
+      });
+      candidate.score = candidate.baseScore + Math.min(40, Math.max(0, candidate.semanticEvidence.length - 1) * 16);
+    }
   }
   for (const [index, term] of searchTerms.slice(executedSearchTerms.length).entries()) {
       skippedSearchTerms.push(term);
@@ -9467,7 +9539,7 @@ async function chatgptSearch(args = {}) {
     confirmCacheCandidates: false,
     useCache: true,
     useContentIndex: true,
-    contentMaxQueries: 6,
+    contentMaxQueries: 3,
     contentMaxResults: 10,
     format: "compact"
   });

@@ -1427,6 +1427,27 @@ const graph = createServer(async (req, res) => {
     })] });
   }
 
+  if (req.method === "GET" && [
+    "the paperwork the mechanic left after fixing my car",
+    "vehicle service",
+    "auto repair",
+    "oil change",
+    "tire service",
+    "dealership"
+  ].some((term) => decodedUrl.includes(`/v1.0/me/drive/root/search(q='${term}')`))) {
+    const canonicalVehicleSearch = decodedUrl.includes("/v1.0/me/drive/root/search(q='the paperwork the mechanic left after fixing my car')");
+    return json(res, 200, { value: [
+      item("noisy-1", "HACCP Training.pptx"),
+      item("noisy-2", "QMS Implementation Brief.docx"),
+      item("noisy-3", "Anniversary Escape.pptx"),
+      item("noisy-4", "Bible Study Tracker.xlsx"),
+      item("noisy-5", "Web Development Tracker.xlsx"),
+      canonicalVehicleSearch
+        ? item("noisy-6", "Business Readiness Checklist.docx")
+        : item("noisy-7", "Career Development Plan.docx")
+    ] });
+  }
+
   if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='Batch Cache Research')")) {
     return json(res, 200, { value: [item("batch-cache-canonical", "Misc Notes.txt")] });
   }
@@ -4754,6 +4775,16 @@ process.exit(2);
     assert(decodedSearches.some((url) => url.includes("search(q='plumbing')")), "subtle plumbing intent should infer the plumbing concept", decodedSearches);
     assert(added.length <= 6, "subtle intent expansion exceeded the bounded search budget", decodedSearches);
     return { topResult: searched.value.results[0], graphSearchCalls: added.length };
+  });
+
+  await check("ChatGPT search rejects repeated broad Graph fallback sets", async () => {
+    const before = requests.length;
+    const searched = await tool("search", { query: "the paperwork the mechanic left after fixing my car" });
+    assert(!searched.isError, "repeated-broad-result suppression should succeed", searched);
+    assert(searched.value.results?.length === 0, "near-duplicate unrelated result sets must not become semantic evidence", searched);
+    const added = requests.slice(before).filter((request) => decodeURIComponent(request.url).includes("/search(q='"));
+    assert(added.length <= 6, "repeated-broad-result suppression exceeded the bounded search budget", added);
+    return { results: searched.value.results.length, graphSearchCalls: added.length };
   });
 
   await check("ChatGPT exact-file opener combines multi-file search and extraction", async () => {
