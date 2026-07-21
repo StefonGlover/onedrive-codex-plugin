@@ -2,7 +2,7 @@
 
 Local Codex plugin for OneDrive file operations through Microsoft Graph.
 
-Release `0.5.1+codex.20260720114207` includes a focused ChatGPT latency and consent hardening pass. Exact filenames can be searched and extracted together through one bounded read-only call, and rename/move/copy/sharing/revoke previews can be batched through one read-only tool that returns scoped live-call tokens. Sharing previews return identity-free permission counts instead of permission objects. The release also retains structured Office reads on restricted NAS/container storage roots and the pending ChatGPT Work OAuth compatibility build.
+Release `0.5.1+codex.20260721100015` adds bounded content verification for subtle service-record searches whose subject appears only inside an opaque PDF or common document. Successful cold reads now warm the local content index, so repeated searches can avoid both Graph search and file-body reads. The release keeps the focused 21-tool ChatGPT surface, exact-file extraction, guarded CRUD/permissions actions, and structured Office/common-format reads.
 
 ChatGPT surface note (verified 2026-07-19): the regular Chat surface passes the full health check with the No Auth tunnel app. Work requires the delegated OAuth deployment described below; its no-auth host path can display an incorrect expired-connection card before dispatching a tool call.
 

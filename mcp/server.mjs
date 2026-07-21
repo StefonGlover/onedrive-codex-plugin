@@ -3922,11 +3922,17 @@ function contentIndexableReason(item = {}, args = {}) {
   const maxBytes = clampInteger(args.maxBytesPerFile, settings.maxIndexedFileSize, 1024, textFileLimit);
   const isOffice = officeExportIndexable(item);
   const openXmlKind = officePackageKindFromName(item.name);
+  const commonKind = commonExtractionKind(item);
   if (args.officeOnly === true && !isOffice) return { ok: false, reason: "not-office" };
   if (isOffice && openXmlKind && args.includeOfficeStructured !== false) {
     const officeIndexLimit = clampInteger(args.maxOfficePackageBytes, 50 * 1024 * 1024, 1024, maxOfficePackageBytes);
     if (item.size && item.size > officeIndexLimit) return { ok: false, reason: "office-package-too-large" };
     return { ok: true, source: "office-openxml", kind: openXmlKind };
+  }
+  if (commonKind && args.includeCommonDocuments !== false) {
+    const commonIndexLimit = clampInteger(args.maxCommonDocumentBytes, maxCommonExtractionBytes, 1024, maxCommonExtractionBytes);
+    if (item.size && item.size > commonIndexLimit) return { ok: false, reason: "common-document-too-large" };
+    return { ok: true, source: `local-${commonKind}`, kind: commonKind };
   }
   if (item.size && item.size > maxBytes) return { ok: false, reason: "too-large" };
   const allowedExtensions = normalizeExtensions(args.extensions?.length ? args.extensions : settings.supportedIndexedFileTypes);
@@ -4004,6 +4010,17 @@ async function extractIndexText(item, args = {}) {
       source: "office-openxml"
     };
   }
+  if (indexable.source.startsWith("local-")) {
+    const extracted = await extractCommonDocumentText(item, {
+      maxBytes: clampInteger(args.maxBytesPerFile, chatgptFetchTextByteLimit, 1024, chatgptFetchTextByteLimit)
+    });
+    return {
+      text: extracted.preview || "",
+      bytesRead: extracted.bytesRead,
+      truncated: extracted.truncated,
+      source: extracted.source
+    };
+  }
   const target = { itemId: item.id };
   const sourcePath = indexable.source === "graph-text-export"
     ? `${contentPath(target)}?${new URLSearchParams({ format: "text" }).toString()}`
@@ -4022,6 +4039,28 @@ function contentIndexTextFields(text = "") {
   return {
     normalizedText: normalizeFindText(text),
     tokens: findTokens(text)
+  };
+}
+
+function contentIndexEntryFromExtracted(item, extracted = {}) {
+  const text = String(extracted.text ?? extracted.preview ?? "");
+  const textFields = contentIndexTextFields(text);
+  return {
+    item,
+    text,
+    normalizedText: textFields.normalizedText,
+    tokens: textFields.tokens,
+    indexedAt: new Date().toISOString(),
+    source: extracted.source,
+    bytesRead: extracted.bytesRead,
+    textBytes: Buffer.byteLength(text, "utf8"),
+    truncated: Boolean(extracted.truncated),
+    segments: extracted.segments || [],
+    structuredKind: extracted.structuredKind || null,
+    eTag: item.eTag,
+    cTag: item.cTag,
+    lastModifiedDateTime: item.lastModifiedDateTime,
+    size: item.size
   };
 }
 
@@ -4242,24 +4281,7 @@ async function contentIndexRefresh(args = {}) {
     try {
       results.graphContentReadsAttempted += 1;
       const extracted = await extractIndexText(item, args);
-      const textFields = contentIndexTextFields(extracted.text);
-      index.entriesById[item.id] = {
-        item,
-        text: extracted.text,
-        normalizedText: textFields.normalizedText,
-        tokens: textFields.tokens,
-        indexedAt: new Date().toISOString(),
-        source: extracted.source,
-        bytesRead: extracted.bytesRead,
-        textBytes: Buffer.byteLength(extracted.text, "utf8"),
-        truncated: extracted.truncated,
-        segments: extracted.segments || [],
-        structuredKind: extracted.structuredKind || null,
-        eTag: item.eTag,
-        cTag: item.cTag,
-        lastModifiedDateTime: item.lastModifiedDateTime,
-        size: item.size
-      };
+      index.entriesById[item.id] = contentIndexEntryFromExtracted(item, extracted);
       results.indexed += 1;
     } catch (error) {
       results.failed += 1;
@@ -6701,6 +6723,10 @@ function candidateHasConceptEvidence(candidate, queryConcepts = []) {
     : queryConcepts;
   if (requiredConcepts.some((concept) => candidateMatchesConceptMetadata(candidate, concept))) return true;
   const requiredIds = new Set(requiredConcepts.map((concept) => concept.id));
+  if (candidate.sources.some((source) => source.source === "contentIndex"
+    && source.semanticExpansion === true
+    && source.strongContentIndexMatch === true
+    && requiredIds.has(source.semanticConceptId))) return true;
   const corroboratingLiveSearchTerms = candidate.sources
     .filter((source) => source.source === "search"
       && source.semanticExpansion === true
@@ -9517,6 +9543,153 @@ function scheduleChatgptCacheRevalidation(query, cache) {
   return true;
 }
 
+function chatgptContentFallbackEligible(query, concepts = findQueryConcepts(query)) {
+  if (!concepts.some((concept) => concept.kind === "domain")) return false;
+  const normalized = ` ${normalizeFindText(query)} `;
+  return [
+    " fixed ", " fixing ", " inspection ", " invoice ", " maintenance ", " paperwork ",
+    " receipt ", " record ", " repair ", " report ", " service ", " technician ", " work order "
+  ].some((marker) => normalized.includes(marker));
+}
+
+function chatgptContentFallbackProbes(query) {
+  const normalized = ` ${normalizeFindText(query)} `;
+  if (normalized.includes(" inspection ")) return ["inspection report", "invoice"];
+  if (normalized.includes(" estimate ")) return ["estimate", "invoice"];
+  if (normalized.includes(" receipt ")) return ["receipt", "invoice"];
+  if (normalized.includes(" work order ")) return ["work order", "invoice"];
+  return ["invoice", "service report"];
+}
+
+function chatgptStrictDocumentMarkers(query) {
+  const normalized = ` ${normalizeFindText(query)} `;
+  return ["invoice", "receipt", "estimate"].filter((marker) => normalized.includes(` ${marker} `));
+}
+
+function chatgptMatchesStrictDocumentIntent(item, query) {
+  const markers = chatgptStrictDocumentMarkers(query);
+  if (!markers.length) return true;
+  const metadataText = ` ${normalizeFindText(`${item?.name || ""} ${item?.remotePath || item?.path || ""}`)} `;
+  if (markers.some((marker) => metadataText.includes(` ${marker} `))) return true;
+  return (item?.sources || []).some((source) => source.source === "contentIndex" && source.strongContentIndexMatch === true);
+}
+
+function textMatchesFindConcept(text, concept) {
+  const normalizedText = normalizeFindText(text);
+  const tokens = new Set(findTokens(normalizedText));
+  return [...concept.triggers, ...concept.expansions].some((value) => {
+    const normalized = normalizeFindText(value);
+    if (!normalized) return false;
+    if (/\s|[-.]/.test(normalized)) return ` ${normalizedText} `.includes(` ${normalized} `);
+    return tokens.has(normalized);
+  });
+}
+
+async function warmContentIndexFromChatgptSnapshots(resolvedEntries = []) {
+  if (!pluginSettings().contentIndexEnabled) return 0;
+  const entriesById = {};
+  for (const resolved of resolvedEntries) {
+    const snapshot = resolved?.snapshot;
+    const item = snapshot?.item;
+    const text = String(snapshot?.preview || "");
+    if (!item?.id || !text || resolved?.usedContentIndex === true) continue;
+    if (!contentIndexableReason(item).ok) continue;
+    entriesById[item.id] = contentIndexEntryFromExtracted(item, {
+      text,
+      source: snapshot.source,
+      bytesRead: snapshot.bytesRead,
+      truncated: snapshot.truncated,
+      structuredKind: snapshot.officeKind || null
+    });
+  }
+  const entries = Object.values(entriesById);
+  if (!entries.length) return 0;
+  await saveContentIndex({ entriesById });
+  return entries.length;
+}
+
+async function chatgptContentDiscoveryFallback(query, cache, contentIndex) {
+  const concepts = findQueryConcepts(query);
+  const domainConcepts = concepts.filter((concept) => concept.kind === "domain");
+  const documentConcepts = concepts.filter((concept) => concept.kind === "document");
+  if (!chatgptContentFallbackEligible(query, concepts)) {
+    return { attempted: false, items: [], probes: [], candidatesRead: 0, indexEntriesWarmed: 0 };
+  }
+
+  const attemptedIds = new Set();
+  const probes = [];
+  let candidatesRead = 0;
+  let indexEntriesWarmed = 0;
+  for (const probe of chatgptContentFallbackProbes(query)) {
+    probes.push(probe);
+    const discovered = await find({
+      query: probe,
+      maxResults: 8,
+      maxResultsLimit: 8,
+      maxSearchTerms: 1,
+      searchConcurrency: 1,
+      initialSearchTermCount: 1,
+      searchPageSize: 10,
+      searchMaxItemsPerTerm: 10,
+      minConfidenceForSearchOnly: 60,
+      preferFreshLocalResults: false,
+      preferStaleLocalResults: false,
+      scanFallback: false,
+      confirmCacheCandidates: false,
+      useCache: true,
+      useContentIndex: true,
+      contentMaxQueries: 1,
+      contentMaxResults: 10,
+      format: "full"
+    });
+    const candidates = (discovered.items || [])
+      .map((candidate) => candidate)
+      .filter((candidate) => candidate?.id && !attemptedIds.has(candidate.id) && !candidate.folder)
+      .slice(0, 6);
+    for (const candidate of candidates) attemptedIds.add(candidate.id);
+    const resolvedEntries = (await mapWithConcurrency(candidates, 3, async (candidate) => {
+      try {
+        const resolved = await resolveChatgptFetchSnapshot(candidate.id, cache, contentIndex);
+        return { candidate, resolved };
+      } catch (error) {
+        return { candidate, error };
+      }
+    })).filter((entry) => entry.resolved?.snapshot);
+    candidatesRead += resolvedEntries.length;
+    indexEntriesWarmed += await bestEffortLocalWrite(
+      "ChatGPT search content-index warm",
+      async () => await warmContentIndexFromChatgptSnapshots(resolvedEntries.map((entry) => entry.resolved))
+    ) || 0;
+
+    const matches = resolvedEntries.flatMap(({ candidate, resolved }) => {
+      const text = `${candidate.name || ""}\n${candidate.remotePath || ""}\n${resolved.snapshot.preview || ""}`;
+      const domainHits = domainConcepts.filter((concept) => textMatchesFindConcept(text, concept));
+      const documentHits = documentConcepts.filter((concept) => textMatchesFindConcept(text, concept));
+      if (!domainHits.length || (documentConcepts.length && !documentHits.length)) return [];
+      return [{
+        ...candidate,
+        score: Number(candidate.score || 0) + domainHits.length * 80 + documentHits.length * 30,
+        reasons: [...new Set([
+          ...(candidate.reasons || []),
+          `content verified: ${domainHits.map((concept) => concept.label).join(", ")}`,
+          ...(documentHits.length ? [`document content: ${documentHits.map((concept) => concept.label).join(", ")}`] : [])
+        ])].slice(0, 6)
+      }];
+    }).sort((left, right) => {
+      if (/\b(latest|newest|recent|most recent)\b/iu.test(query)) {
+        const recencyDifference = (Date.parse(right.lastModifiedDateTime || "") || 0) - (Date.parse(left.lastModifiedDateTime || "") || 0);
+        if (recencyDifference) return recencyDifference;
+      }
+      if (right.score !== left.score) return right.score - left.score;
+      return String(left.name || "").localeCompare(String(right.name || ""));
+    });
+    if (matches.length) {
+      return { attempted: true, items: matches.slice(0, 10), probes, candidatesRead, indexEntriesWarmed };
+    }
+  }
+  return { attempted: true, items: [], probes, candidatesRead, indexEntriesWarmed };
+}
+
 async function chatgptSearch(args = {}) {
   const startedAt = Date.now();
   const cache = await loadMetadataCache();
@@ -9543,10 +9716,24 @@ async function chatgptSearch(args = {}) {
     contentMaxResults: 10,
     format: "compact"
   });
+  let selectedItems = (found.items || []).filter((item) => chatgptMatchesStrictDocumentIntent(item, String(args.query || "")));
+  let contentFallback = { attempted: false, items: [], probes: [], candidatesRead: 0, indexEntriesWarmed: 0 };
+  if (!selectedItems.length) {
+    try {
+      contentFallback = await chatgptContentDiscoveryFallback(
+        String(args.query || "").trim(),
+        cache,
+        await loadContentIndex()
+      );
+      if (contentFallback.items.length) selectedItems = contentFallback.items;
+    } catch (error) {
+      recordLocalWarning("ChatGPT content-verified search fallback", error);
+    }
+  }
   const revalidationScheduled = found.summary?.usedStaleLocalFastPath === true
     ? scheduleChatgptCacheRevalidation(args.query, cache)
     : false;
-  const results = (found.items || []).slice(0, 10).map((item) => ({
+  const results = selectedItems.slice(0, 10).map((item) => ({
     id: String(item.id || ""),
     title: String(item.name || item.remotePath || item.id || "OneDrive item"),
     url: absoluteWebUrl(item.webUrl)
@@ -9565,6 +9752,10 @@ async function chatgptSearch(args = {}) {
       metadataCacheWrites: found.summary?.metadataCacheWrites || 0,
       usedFreshLocalFastPath: Boolean(found.summary?.usedFreshLocalFastPath),
       usedStaleLocalFastPath: Boolean(found.summary?.usedStaleLocalFastPath),
+      contentFallbackAttempted: contentFallback.attempted,
+      contentFallbackProbes: contentFallback.probes.length,
+      contentFallbackCandidatesRead: contentFallback.candidatesRead,
+      contentFallbackIndexEntriesWarmed: contentFallback.indexEntriesWarmed,
       revalidationScheduled,
       usedScanFallback: Boolean(found.summary?.usedScanFallback)
     }));
@@ -9980,6 +10171,12 @@ async function chatgptFetch(args = {}) {
       })
     };
   }
+  const contentIndexEntriesWarmed = continuation || resolved?.usedContentIndex
+    ? 0
+    : await bestEffortLocalWrite(
+      "ChatGPT fetch content-index warm",
+      async () => await warmContentIndexFromChatgptSnapshots([resolved])
+    ) || 0;
   if (toolProfile === "chatgpt" || process.env.ONEDRIVE_PERFORMANCE_LOG === "1") {
     console.error(JSON.stringify({
       event: "onedrive-chatgpt-fetch",
@@ -9987,6 +10184,7 @@ async function chatgptFetch(args = {}) {
       cacheFresh: resolved?.cacheFresh ?? metadataCacheFresh(cache),
       usedCachedMetadata: Boolean(resolved?.usedCachedMetadata),
       usedContentIndex: Boolean(resolved?.usedContentIndex || String(snapshot.source || "").startsWith("content-index")),
+      contentIndexEntriesWarmed,
       previewSource: snapshot.source || "metadata",
       continuation: Boolean(continuation),
       progressive: result.metadata?.progressive === "true",

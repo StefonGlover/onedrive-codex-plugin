@@ -39,6 +39,10 @@ let officeExcelBuffer = readFileSync(join(officeFixtureDir, "sample.xlsx"));
 let officeBusinessBuffer = Buffer.from(officeExcelBuffer);
 let officePowerPointBuffer = readFileSync(join(officeFixtureDir, "sample.pptx"));
 const commonRtfBuffer = Buffer.from("{\\rtf1\\ansi Common file extraction\\par Budget total: \\b $1,234\\b0\\par}", "utf8");
+const hiddenElectricalInvoiceRtfBuffer = Buffer.from(
+  "{\\rtf1\\ansi BrightSpark Electrical Invoice 4421\\par Service date July 20, 2026\\par Breaker panel wiring repair completed by the electrician.\\par Total paid: \\b $875.00\\b0\\par}",
+  "utf8"
+);
 const largeChatgptTextBuffer = Buffer.from([
   "Large ChatGPT document",
   ...Array.from({ length: 18 }, (_, sectionIndex) => [
@@ -528,6 +532,20 @@ const graph = createServer(async (req, res) => {
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/common-rtf/content") {
     return binary(res, 200, commonRtfBuffer, { "Content-Type": "application/rtf" });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/hidden-electrical-invoice") {
+    return json(res, 200, item("hidden-electrical-invoice", "invoice-4421.rtf", {
+      size: hiddenElectricalInvoiceRtfBuffer.length,
+      lastModifiedDateTime: "2026-07-20T14:30:00Z",
+      parentReference: { path: "/drive/root:/Home Maintenance/Contractors" },
+      file: { mimeType: "application/rtf" }
+    }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/hidden-electrical-invoice/content") {
+    count("hidden-electrical-invoice-content-read");
+    return binary(res, 200, hiddenElectricalInvoiceRtfBuffer, { "Content-Type": "application/rtf" });
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/large-chatgpt-text") {
@@ -1404,6 +1422,15 @@ const graph = createServer(async (req, res) => {
     return json(res, 200, { value: [item("electrical-report", "2026 Electrical Report.pdf", {
       parentReference: { path: "/drive/root:/Home Maintenance" },
       file: { mimeType: "application/pdf" }
+    })] });
+  }
+
+  if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='invoice')")) {
+    return json(res, 200, { value: [item("hidden-electrical-invoice", "invoice-4421.rtf", {
+      size: hiddenElectricalInvoiceRtfBuffer.length,
+      lastModifiedDateTime: "2026-07-20T14:30:00Z",
+      parentReference: { path: "/drive/root:/Home Maintenance/Contractors" },
+      file: { mimeType: "application/rtf" }
     })] });
   }
 
@@ -4712,6 +4739,18 @@ process.exit(2);
     return { deletedIndexHits: afterDelete.value.items.length, preservedAfterPartialScan: true };
   });
 
+  await check("content index refresh extracts common document formats", async () => {
+    await tool("onedrive_cache_clear");
+    await tool("onedrive_content_index_clear");
+    const info = await tool("onedrive_get_info", { itemId: "common-rtf" });
+    assert(!info.isError, "common RTF metadata should seed for indexing", info);
+    const refreshed = await tool("onedrive_content_index_refresh", { itemId: "common-rtf", maxFiles: 1, maxBytesPerFile: 4096 });
+    assert(!refreshed.isError && refreshed.value.indexed === 1, "common RTF should be indexed by the bounded local extractor", refreshed);
+    const searched = await tool("onedrive_content_search", { query: "Budget total", maxResults: 5 });
+    assert(!searched.isError && searched.value.items?.[0]?.id === "common-rtf", "common RTF content should be searchable after indexing", searched);
+    return { indexed: refreshed.value.indexed, source: searched.value.items[0].source };
+  });
+
   await check("find uses content index without fetching file bodies", async () => {
     await tool("onedrive_cache_clear");
     await tool("onedrive_content_index_clear");
@@ -4777,13 +4816,37 @@ process.exit(2);
     return { topResult: searched.value.results[0], graphSearchCalls: added.length };
   });
 
+  await check("ChatGPT cold search verifies opaque service records and warms repeat search", async () => {
+    const query = "the invoice from the electrician after fixing the breaker";
+    const beforeCold = requests.length;
+    const cold = await tool("search", { query });
+    assert(!cold.isError, "cold content-verified ChatGPT search should succeed", cold);
+    assert(cold.value.results?.[0]?.id === "hidden-electrical-invoice", "cold search should verify the opaque electrical invoice from its contents", cold);
+    const coldAdded = requests.slice(beforeCold);
+    const coldDecoded = coldAdded.map((request) => decodeURIComponent(request.url));
+    assert(coldDecoded.some((url) => url.includes("search(q='invoice')")), "cold fallback should use one bounded generic document probe", coldDecoded);
+    assert(coldAdded.some((request) => request.path === "/v1.0/me/drive/items/hidden-electrical-invoice/content"), "cold fallback should read the candidate once for content verification", coldAdded);
+
+    const beforeWarm = requests.length;
+    const warm = await tool("search", { query });
+    assert(!warm.isError && warm.value.results?.[0]?.id === "hidden-electrical-invoice", "warm search should preserve the verified result", warm);
+    const warmAdded = requests.slice(beforeWarm);
+    assert(!warmAdded.some((request) => request.path.endsWith("/content")), "warm search should reuse the local content index without another file read", warmAdded);
+    assert(!warmAdded.some((request) => decodeURIComponent(request.url).includes("/search(q='")), "warm search should use the fresh local fast path without Graph search", warmAdded);
+    return {
+      coldGraphRequests: coldAdded.length,
+      warmGraphRequests: warmAdded.length,
+      contentReads: counters.get("hidden-electrical-invoice-content-read") || 0
+    };
+  });
+
   await check("ChatGPT search rejects repeated broad Graph fallback sets", async () => {
     const before = requests.length;
     const searched = await tool("search", { query: "the paperwork the mechanic left after fixing my car" });
     assert(!searched.isError, "repeated-broad-result suppression should succeed", searched);
     assert(searched.value.results?.length === 0, "near-duplicate unrelated result sets must not become semantic evidence", searched);
     const added = requests.slice(before).filter((request) => decodeURIComponent(request.url).includes("/search(q='"));
-    assert(added.length <= 6, "repeated-broad-result suppression exceeded the bounded search budget", added);
+    assert(added.length <= 8, "repeated-broad search plus content-verification fallback exceeded the bounded search budget", added);
     return { results: searched.value.results.length, graphSearchCalls: added.length };
   });
 
@@ -4854,7 +4917,7 @@ process.exit(2);
     assert(added.some((request) => request.path.endsWith("/items/office-excel/content")), "Excel fetch should download the workbook package", { added });
     assert(!added.some((request) => request.url.includes("format=text")), "Excel fetch must not rely on unreliable Graph text export", { added });
     const refreshed = await tool("onedrive_content_index_refresh", { itemId: "office-excel", maxFiles: 1, maxBytesPerFile: 4096 });
-    assert(!refreshed.isError && refreshed.value.indexed === 1, "Excel workbook should be reusable from the structured content index", refreshed);
+    assert(!refreshed.isError && refreshed.value.indexed + refreshed.value.reused === 1, "Excel workbook should be reusable from the structured content index", refreshed);
     const beforeWarm = requests.length;
     const warm = await tool("fetch", { id: "office-excel" });
     assert(!warm.isError && warm.value.metadata?.previewSource === "content-index", "warm Excel fetch should use the content index", warm);
@@ -4879,7 +4942,7 @@ process.exit(2);
     const before = requests.length;
     const fetched = await tool("fetch", { id: "common-rtf" });
     assert(!fetched.isError, "ChatGPT RTF fetch should succeed", fetched);
-    assert(fetched.value.metadata?.previewSource === "local-rtf", "RTF fetch should use the bounded local extractor", fetched.value);
+    assert(["local-rtf", "content-index"].includes(fetched.value.metadata?.previewSource), "RTF fetch should use the bounded local extractor or its warmed content-index entry", fetched.value);
     assert(fetched.value.text.includes("Common file extraction"), "RTF text should be readable", fetched.value.text);
     assert(fetched.value.text.includes("Budget total: $1,234"), "RTF extractor should preserve figures", fetched.value.text);
     const added = requests.slice(before);
