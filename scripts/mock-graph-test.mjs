@@ -4731,6 +4731,7 @@ process.exit(2);
     const searched = await tool("search", { query: "HVAC work order" });
     assert(!searched.isError, "concept-aware ChatGPT search should succeed", searched);
     assert(searched.value.results?.[0]?.id === "hvac-contractor-record", "HVAC concept evidence should outrank the unrelated canonical result", searched);
+    assert(!searched.value.results?.some((entry) => entry.id === "electrical-report"), "uncorroborated non-HVAC Graph results should be filtered", searched);
     const added = requests.slice(before).filter((request) => decodeURIComponent(request.url).includes("/search(q='"));
     const decodedSearches = added.map((request) => decodeURIComponent(request.url));
     assert(decodedSearches.some((url) => url.includes("search(q='heating')")), "HVAC search should expand to heating", decodedSearches);

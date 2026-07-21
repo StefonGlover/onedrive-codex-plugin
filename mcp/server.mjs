@@ -6648,6 +6648,34 @@ function rankedFindCandidates(candidates) {
   });
 }
 
+function candidateMatchesConceptMetadata(candidate, concept) {
+  const metadataText = normalizeFindText(`${candidate.item?.name || ""} ${candidate.item?.remotePath || candidate.item?.path || ""}`);
+  const metadataTokens = new Set(findTokens(metadataText));
+  return [...concept.triggers, ...concept.expansions].some((value) => {
+    const normalized = normalizeFindText(value);
+    if (!normalized) return false;
+    if (/\s|[-.]/.test(normalized)) return ` ${metadataText} `.includes(` ${normalized} `);
+    return metadataTokens.has(normalized);
+  });
+}
+
+function candidateHasConceptEvidence(candidate, queryConcepts = []) {
+  if (!queryConcepts.length) return true;
+  if (candidate.sources.some((source) => source.source === "exactPath" || source.source === "contentIndex")) return true;
+  const requiredConcepts = queryConcepts.some((concept) => concept.kind === "domain")
+    ? queryConcepts.filter((concept) => concept.kind === "domain")
+    : queryConcepts;
+  if (requiredConcepts.some((concept) => candidateMatchesConceptMetadata(candidate, concept))) return true;
+  const requiredIds = new Set(requiredConcepts.map((concept) => concept.id));
+  const corroboratingEvidence = (candidate.semanticEvidence || [])
+    .filter((evidence) => requiredIds.has(String(evidence).split(":", 1)[0]));
+  return new Set(corroboratingEvidence).size >= 2;
+}
+
+function conceptRelevantFindCandidates(candidates, queryConcepts = []) {
+  return rankedFindCandidates(candidates).filter((candidate) => candidateHasConceptEvidence(candidate, queryConcepts));
+}
+
 function candidateHasLiveSource(candidate) {
   return candidate.sources.some((source) => ["exactPath", "search", "scan", "metadataConfirm"].includes(source.source));
 }
@@ -6728,6 +6756,7 @@ async function find(args = {}) {
   const maxSearchTerms = Math.min(args.maxSearchTerms ?? 8, 12);
   const searchPlanEntries = buildFindSearchPlan(query, maxSearchTerms);
   const searchTerms = searchPlanEntries.map((entry) => entry.term);
+  const queryConcepts = findQueryConcepts(query);
   const extensionInfo = inferFindExtensions(query, args.extensions || []);
   const scoringFolderHints = pruneFolderHints(args.folderHints || []);
   const explicitFolderHintKeys = new Set(scoringFolderHints.map(normalizeFolderHintKey));
@@ -6829,7 +6858,7 @@ async function find(args = {}) {
   }
 
   if ((args.preferFreshLocalResults === true && cacheFresh) || cacheWithinStaleWindow) {
-    const bestLocal = rankedFindCandidates(candidates)[0];
+    const bestLocal = conceptRelevantFindCandidates(candidates, queryConcepts)[0];
     const localConfidenceThreshold = cacheFresh
       ? clampInteger(args.freshLocalMinConfidence, 60, 0, 200)
       : clampInteger(args.staleLocalMinConfidence, 75, 0, 200);
@@ -6906,7 +6935,7 @@ async function find(args = {}) {
       .map((entry, index) => ({ ...entry, index, stage: index === 0 ? "canonical" : "initial-expansion" }));
     await executeSearchWave(initialWave);
     let nextSearchTermIndex = initialWave.length;
-    let bestLiveSearchScore = rankedFindCandidates(candidates).find(candidateHasLiveSource)?.score || 0;
+    let bestLiveSearchScore = conceptRelevantFindCandidates(candidates, queryConcepts).find(candidateHasLiveSource)?.score || 0;
     if (args.executeAllSearchTerms !== true && bestLiveSearchScore >= searchConfidenceThreshold && nextSearchTermIndex < searchTerms.length) {
       searchStopReason = "high-confidence-canonical";
     } else {
@@ -6916,7 +6945,7 @@ async function find(args = {}) {
           .map((entry, offset) => ({ ...entry, index: nextSearchTermIndex + offset, stage: "expansion" }));
         nextSearchTermIndex += wave.length;
         await executeSearchWave(wave);
-        bestLiveSearchScore = rankedFindCandidates(candidates).find(candidateHasLiveSource)?.score || 0;
+        bestLiveSearchScore = conceptRelevantFindCandidates(candidates, queryConcepts).find(candidateHasLiveSource)?.score || 0;
         if (args.executeAllSearchTerms !== true && bestLiveSearchScore >= searchConfidenceThreshold && nextSearchTermIndex < searchTerms.length) {
           searchStopReason = "high-confidence-expansion";
           break;
@@ -6943,7 +6972,7 @@ async function find(args = {}) {
     }));
   }
 
-  let ranked = rankedFindCandidates(candidates);
+  let ranked = conceptRelevantFindCandidates(candidates, queryConcepts);
   if (args.confirmCacheCandidates !== false) {
     const confirmStartedAt = Date.now();
     cacheConfirmations = await confirmCachedFindCandidates(candidates, ranked, {
@@ -6953,7 +6982,7 @@ async function find(args = {}) {
       scoringFolderHints
     });
     cacheConfirmDurationMs += elapsedMs(confirmStartedAt);
-    ranked = rankedFindCandidates(candidates);
+    ranked = conceptRelevantFindCandidates(candidates, queryConcepts);
   }
   const bestLiveScore = ranked.find(candidateHasLiveSource)?.score || 0;
   const shouldScan = args.scanFallback !== false && bestLiveScore < searchConfidenceThreshold;
@@ -7062,15 +7091,15 @@ async function find(args = {}) {
             });
           }
         }
-        ranked = rankedFindCandidates(candidates);
+        ranked = conceptRelevantFindCandidates(candidates, queryConcepts);
         if ((ranked[0]?.score || 0) >= searchConfidenceThreshold && ranked.length >= maxResults) break;
       }
-      ranked = rankedFindCandidates(candidates);
+      ranked = conceptRelevantFindCandidates(candidates, queryConcepts);
       if (ranked.length > 0) break;
     }
   }
 
-  ranked = rankedFindCandidates(candidates);
+  ranked = conceptRelevantFindCandidates(candidates, queryConcepts);
   if (shouldScan) {
     ranked = ranked.filter(candidateHasLiveSource);
   }
