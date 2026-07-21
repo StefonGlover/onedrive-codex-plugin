@@ -1977,7 +1977,7 @@ const chatgptCompatibilityTools = [
   {
     name: "search",
     title: "Search OneDrive",
-    description: "Use this when the user wants to find files or folders in OneDrive by name, keywords, or content. Every result includes the opaque ID required by fetch.",
+    description: "Find OneDrive files or folders by name, topic, aliases, or indexed content, including records saved under an unknown contractor or work-order name. Every result includes the opaque ID required by fetch.",
     inputSchema: {
       type: "object",
       required: ["query"],
@@ -2398,7 +2398,7 @@ const compactOfficeOperationSchema = {
 
 const chatgptToolMetadata = Object.freeze({
   search: {
-    description: "Use this when the user wants OneDrive discovery by topic, partial name, keywords, indexed content, or an ambiguous target. For exact filenames plus content use onedrive_open_files; otherwise pass the chosen opaque id unchanged to fetch.",
+    description: "Use this when the user wants OneDrive discovery from a natural-language or subtle description, topic, partial name, keywords, aliases, indexed content, or an unknown title. Pass the intent once; bounded concept inference handles common document and subject aliases. For exact filenames plus content use onedrive_open_files; otherwise pass the chosen opaque id unchanged to fetch.",
     invoking: "Searching OneDrive…",
     invoked: "OneDrive results ready"
   },
@@ -2546,7 +2546,7 @@ const advertisedServerVersion = toolProfile === "chatgpt"
   ? `${manifestServerVersion}${manifestServerVersion.includes("+") ? "." : "+"}chatgpt.${advertisedContractHash}`
   : manifestServerVersion;
 const serverInstructions = toolProfile === "chatgpt"
-  ? "Use onedrive_open_files once for exact filenames and content; use search then fetch for discovery. Pass search ids unchanged. Use onedrive_preview_actions to batch read-only rename, move, copy, sharing-link, or revoke previews; its sharing preview includes identity-free access counts. Call live mutation tools only after approval with the preview token and expected id. Use onedrive_list only for a known folder. For Office edits, open or fetch each file, check capabilities, then transform."
+  ? "Use onedrive_open_files once for exact filenames/content. For subtle descriptions, topics, aliases, or unknown titles, pass natural-language intent once to search, then fetch; search infers aliases. Pass ids unchanged. Use onedrive_preview_actions for read-only rename/move/copy/sharing/revoke previews with identity-free access counts. Live mutations require approval, preview token, and expected id. Use onedrive_list only for known folders. For Office edits, fetch, check capabilities, then transform."
   : "Use onedrive_find for normal OneDrive lookup and the matching structured read tool before an Office edit. Use onedrive_list only for direct folder listings. Keep results bounded. Locate an item before changing it. Mutations default to preview and require confirmation.";
 
 const toolByName = new Map(executableTools.map((tool) => [tool.name, tool]));
@@ -6114,12 +6114,13 @@ async function prepareSearchItems(items = [], options = {}) {
 }
 
 const findStopWords = new Set([
-  "a", "an", "and", "by", "can", "could", "find", "for", "from", "get", "i", "in", "is", "it",
-  "locate", "me", "my", "named", "of", "on", "or", "please", "show", "the", "to", "where", "with"
+  "a", "an", "and", "by", "can", "could", "did", "do", "find", "for", "from", "gave", "get", "had", "has",
+  "i", "in", "is", "it", "left", "locate", "me", "my", "named", "of", "on", "or", "please", "show", "that",
+  "the", "they", "this", "to", "was", "were", "what", "where", "which", "who", "with"
 ]);
 const findGenericWords = new Set([
   "called", "file", "files", "folder", "folders", "named", "document", "documents", "summary",
-  "codex", "onedrive", "plugin", "test"
+  "codex", "copy", "onedrive", "paper", "paperwork", "plugin", "something", "stuff", "test", "thing"
 ]);
 const findKindHints = [
   {
@@ -6146,6 +6147,136 @@ const findKindHints = [
     kind: "image",
     words: ["image", "images", "photo", "photos", "picture", "pictures", "screenshot", "screenshots", "png", "jpg", "jpeg"],
     extensions: [".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".tif", ".tiff"]
+  }
+];
+
+// Keep semantic discovery deterministic and bounded. These aliases are only
+// used to plan extra Graph/content-index searches; they never rewrite the
+// user's query or claim that a result matched a concept without evidence from
+// one of those searches.
+const findConceptFamilies = [
+  {
+    id: "hvac",
+    label: "HVAC",
+    kind: "domain",
+    triggers: [
+      "hvac", "heating", "cooling", "air conditioning", "air conditioner", "ac repair",
+      "furnace", "heat pump", "thermostat", "boiler", "ventilation"
+    ],
+    expansions: [
+      "heating", "cooling", "air conditioning", "furnace", "heat pump", "thermostat", "boiler", "ventilation"
+    ],
+    folderHints: ["Documents/Home", "Personal/Documents/Home", "Home", "House", "Home Maintenance"]
+  },
+  {
+    id: "plumbing",
+    label: "plumbing",
+    kind: "domain",
+    triggers: ["plumbing", "plumber", "leak", "drain", "water heater", "sewer", "faucet", "toilet"],
+    expansions: ["plumbing", "leak repair", "drain service", "pipe repair", "water heater", "sewer"],
+    folderHints: ["Documents/Home", "Personal/Documents/Home", "Home", "House", "Home Maintenance"]
+  },
+  {
+    id: "electrical",
+    label: "electrical",
+    kind: "domain",
+    triggers: ["electrical", "electrician", "wiring", "breaker", "electrical panel", "outlet", "generator service"],
+    expansions: ["electrical", "electrician", "wiring", "breaker panel", "outlet repair", "generator service"],
+    folderHints: ["Documents/Home", "Personal/Documents/Home", "Home", "House", "Home Maintenance"]
+  },
+  {
+    id: "roofing",
+    label: "roofing",
+    kind: "domain",
+    triggers: ["roof", "roofing", "roofer", "shingle", "gutter", "roof leak"],
+    expansions: ["roofing", "roof repair", "shingles", "gutter service", "roof inspection"],
+    folderHints: ["Documents/Home", "Personal/Documents/Home", "Home", "House", "Home Maintenance"]
+  },
+  {
+    id: "pest-control",
+    label: "pest control",
+    kind: "domain",
+    triggers: ["pest", "exterminator", "termite", "rodent", "insects", "bed bugs"],
+    expansions: ["pest control", "exterminator", "termite treatment", "rodent service", "pest inspection"],
+    folderHints: ["Documents/Home", "Personal/Documents/Home", "Home", "House", "Home Maintenance"]
+  },
+  {
+    id: "appliance-repair",
+    label: "appliance repair",
+    kind: "domain",
+    triggers: ["appliance", "refrigerator", "fridge", "washer", "dryer", "dishwasher", "oven"],
+    expansions: ["appliance repair", "refrigerator service", "washer repair", "dryer repair", "dishwasher service"],
+    folderHints: ["Documents/Home", "Personal/Documents/Home", "Home", "House", "Home Maintenance"]
+  },
+  {
+    id: "vehicle-service",
+    label: "vehicle service",
+    kind: "domain",
+    triggers: ["car", "vehicle", "mechanic", "dealership", "oil change", "tire", "auto repair"],
+    expansions: ["vehicle service", "auto repair", "mechanic", "oil change", "tire service", "dealership"],
+    folderHints: ["Documents/Vehicles", "Personal/Documents/Vehicles", "Vehicles", "Auto"]
+  },
+  {
+    id: "medical-record",
+    label: "medical record",
+    kind: "domain",
+    triggers: ["doctor", "medical", "clinic", "hospital", "patient", "lab result", "prescription", "visit summary"],
+    expansions: ["medical record", "visit summary", "after visit", "lab results", "patient report", "prescription"],
+    folderHints: ["Personal/Documents/Health", "Documents/Health", "Health", "Medical"]
+  },
+  {
+    id: "tax-record",
+    label: "tax record",
+    kind: "domain",
+    triggers: ["tax", "taxes", "tax return", "w-2", "w2", "1099", "irs", "deduction"],
+    expansions: ["tax return", "W-2", "1099", "IRS", "tax worksheet", "deductions"],
+    folderHints: ["Documents/Taxes", "Personal/Documents/Taxes", "Taxes"]
+  },
+  {
+    id: "insurance-record",
+    label: "insurance record",
+    kind: "domain",
+    triggers: ["insurance", "insurance policy", "insurance claim", "claim number", "claim adjuster", "premium notice", "coverage letter", "deductible"],
+    expansions: ["insurance policy", "claim", "coverage", "premium notice", "deductible", "declarations page"],
+    folderHints: ["Documents/Insurance", "Personal/Documents/Insurance", "Insurance"]
+  },
+  {
+    id: "travel-record",
+    label: "travel record",
+    kind: "domain",
+    triggers: ["travel", "flight", "hotel", "booking", "reservation", "itinerary"],
+    expansions: ["travel itinerary", "flight confirmation", "hotel reservation", "booking confirmation", "boarding pass"],
+    folderHints: ["Documents/Travel", "Personal/Documents/Travel", "Travel"]
+  },
+  {
+    id: "employment-record",
+    label: "employment record",
+    kind: "domain",
+    triggers: ["resume", "résumé", "cv", "job offer", "offer letter", "pay stub", "paycheck", "employment"],
+    expansions: ["resume", "curriculum vitae", "offer letter", "pay stub", "employment agreement"],
+    folderHints: ["Documents/Career", "Personal/Documents/Career", "Career", "Employment"]
+  },
+  {
+    id: "agreement",
+    label: "agreement",
+    kind: "document",
+    triggers: ["contract", "agreement", "lease", "landlord", "tenant", "rental", "terms", "signed copy"],
+    expansions: ["contract", "agreement", "signed document", "lease", "terms and conditions"],
+    folderHints: ["Documents", "Personal/Documents", "Contracts", "Legal"]
+  },
+  {
+    id: "service-record",
+    label: "service record",
+    kind: "document",
+    triggers: [
+      "work order", "service order", "service report", "maintenance report", "repair report",
+      "job ticket", "invoice", "estimate", "inspection", "inspection report", "receipt", "technician", "contractor",
+      "repair paperwork", "service paperwork", "proof of service"
+    ],
+    expansions: [
+      "service order", "service report", "maintenance record", "repair invoice", "job ticket", "inspection report"
+    ],
+    folderHints: ["Documents/Home", "Personal/Documents/Home", "Home Maintenance", "Receipts"]
   }
 ];
 
@@ -6178,30 +6309,71 @@ function findImportantTokens(query) {
   return findTokens(query).filter((token) => !findGenericWords.has(token));
 }
 
-function buildFindSearchTerms(query, maxSearchTerms = 8) {
-  const terms = [];
-  const add = (term) => {
+function findConceptTriggerMatches(query, family) {
+  const normalized = ` ${normalizeFindText(query)} `;
+  return family.triggers.filter((trigger) => normalized.includes(` ${normalizeFindText(trigger)} `));
+}
+
+function findQueryConcepts(query) {
+  return findConceptFamilies.flatMap((family) => {
+    const triggers = findConceptTriggerMatches(query, family);
+    return triggers.length ? [{ ...family, matchedTriggers: triggers }] : [];
+  });
+}
+
+function buildFindSearchPlan(query, maxSearchTerms = 8) {
+  const plan = [];
+  const add = (term, metadata = {}) => {
     const clean = String(term || "").replace(/\s+/g, " ").trim();
-    if (clean && !terms.some((existing) => existing.toLowerCase() === clean.toLowerCase())) terms.push(clean);
+    if (clean && !plan.some((existing) => existing.term.toLowerCase() === clean.toLowerCase())) {
+      plan.push({ term: clean, ...metadata });
+    }
   };
   const dateTokens = findDateTokens(query);
   const dateParts = new Set(dateTokens.flatMap((token) => [token, ...token.split("-")]));
   const important = findImportantTokens(query).filter((token) => !dateParts.has(token));
+  const concepts = findQueryConcepts(query);
+  const conceptVocabulary = new Set(concepts.flatMap((concept) => [
+    ...concept.triggers.flatMap((value) => findTokens(value)),
+    ...concept.expansions.flatMap((value) => findTokens(value))
+  ]));
+  const intentActionWords = new Set([
+    "after", "checked", "checking", "fixed", "fixing", "inspection", "maintenance", "order", "record",
+    "repair", "report", "service", "someone", "technician", "work", "worked"
+  ]);
+  const specificTokens = important.filter((token) => !conceptVocabulary.has(token) && !intentActionWords.has(token));
 
-  add(query);
-  for (const dateToken of dateTokens) add(dateToken);
-  if (important.length) add(important.join(" "));
-  if (important.length >= 3) add(important.slice(-3).join(" "));
+  add(query, { kind: "canonical" });
+  for (const dateToken of dateTokens) add(dateToken, { kind: "literal" });
+  if (specificTokens.length) add(specificTokens.join(" "), { kind: "specific-literal" });
+  for (const concept of concepts) {
+    for (const expansion of concept.expansions) {
+      if (concept.matchedTriggers.some((trigger) => normalizeFindText(trigger) === normalizeFindText(expansion))) continue;
+      add(expansion, {
+        kind: "semantic",
+        semanticExpansion: true,
+        semanticConceptId: concept.id,
+        semanticConceptLabel: concept.label,
+        semanticKind: concept.kind
+      });
+    }
+  }
+  if (important.length) add(important.join(" "), { kind: "literal" });
+  if (important.length >= 3) add(important.slice(-3).join(" "), { kind: "literal" });
   if (important.length >= 2) {
     for (let index = 0; index < important.length - 1; index += 1) {
-      add(`${important[index]} ${important[index + 1]}`);
+      add(`${important[index]} ${important[index + 1]}`, { kind: "literal" });
     }
   }
   for (const token of [...important].sort((a, b) => b.length - a.length)) {
-    if (token.length >= 4) add(token);
+    if (token.length >= 4) add(token, { kind: "literal" });
   }
 
-  return terms.slice(0, Math.min(maxSearchTerms, 12));
+  return plan.slice(0, Math.min(maxSearchTerms, 12));
+}
+
+function buildFindSearchTerms(query, maxSearchTerms = 8) {
+  return buildFindSearchPlan(query, maxSearchTerms).map((entry) => entry.term);
 }
 
 function inferFindExtensions(query, explicitExtensions = []) {
@@ -6286,6 +6458,19 @@ function scoreFindCandidate(item, context = {}) {
     if (context.contentReason) reasons.push(context.contentReason);
   }
 
+  if (context.semanticExpansion === true) {
+    score += context.semanticKind === "domain" ? 26 : 16;
+    reasons.push(`concept match: ${context.semanticConceptLabel || context.semanticConceptId || context.term}`);
+    const semanticText = normalizeFindText(context.term);
+    const semanticTokens = findImportantTokens(context.term);
+    const semanticMetadataMatch = (semanticText && (nameText.includes(semanticText) || pathText.includes(semanticText)))
+      || semanticTokens.some((token) => nameTokenSet.has(token) || pathTokenSet.has(token));
+    if (semanticMetadataMatch) {
+      score += 16;
+      reasons.push(`concept visible in metadata: ${context.term}`);
+    }
+  }
+
   if (queryText && nameText === queryText) {
     score += 90;
     reasons.push("exact filename");
@@ -6362,6 +6547,7 @@ function defaultFindFolderHints(query = "") {
   if (normalized.includes("health") || normalized.includes("eval") || normalized.includes("evaluation")) {
     hints.unshift("Personal/Documents/Health");
   }
+  for (const concept of findQueryConcepts(query)) hints.unshift(...(concept.folderHints || []));
   return [...new Set(hints)];
 }
 
@@ -6417,6 +6603,8 @@ function addFindCandidate(candidates, item, context) {
   const strongContentIndexMatch = context.source === "contentIndex"
     && (context.contentExactPhrase === true || (context.contentMatchedTokens || 0) >= 2 || contentCoverage >= 0.5);
   const canonicalGraphMatch = context.source === "search" && context.canonicalSearch === true;
+  const semanticSearchMatch = context.semanticExpansion === true
+    && ["search", "contentIndex"].includes(context.source);
   const hasQueryRelevance = scored.matchedTokens > 0 || scored.reasons.some((reason) =>
     reason.startsWith("exact filename")
     || reason.startsWith("filename contains")
@@ -6424,21 +6612,32 @@ function addFindCandidate(candidates, item, context) {
     || reason.startsWith("date match")
     || reason.startsWith("requested extension")
     || reason.startsWith("likely file type")
-  ) || strongContentIndexMatch || canonicalGraphMatch;
+  ) || strongContentIndexMatch || canonicalGraphMatch || semanticSearchMatch;
   if (context.source !== "exactPath" && !hasQueryRelevance) return;
   const existing = candidates.get(key);
+  const semanticEvidence = context.semanticExpansion === true
+    ? [`${context.semanticConceptId || "concept"}:${normalizeFindText(context.term)}`]
+    : [];
   if (!existing || scored.score > existing.score) {
+    const previousEvidence = existing?.semanticEvidence || [];
+    const mergedEvidence = [...new Set([...previousEvidence, ...semanticEvidence])];
+    const baseScore = Math.max(existing?.baseScore || 0, scored.score);
     candidates.set(key, {
       item,
-      score: scored.score,
-      reasons: scored.reasons,
-      snippets: context.snippet ? [context.snippet] : [],
-      sources: [{ source: context.source, term: context.term, folder: context.folder }]
+      baseScore,
+      score: baseScore + Math.min(40, Math.max(0, mergedEvidence.length - 1) * 16),
+      reasons: [...new Set([...(existing?.reasons || []), ...scored.reasons])].slice(0, 6),
+      snippets: [...new Set([...(existing?.snippets || []), ...(context.snippet ? [context.snippet] : [])])],
+      semanticEvidence: mergedEvidence,
+      sources: [...(existing?.sources || []), { source: context.source, term: context.term, folder: context.folder }]
     });
   } else {
     existing.sources.push({ source: context.source, term: context.term, folder: context.folder });
     existing.reasons = [...new Set([...existing.reasons, ...scored.reasons])].slice(0, 6);
     if (context.snippet && !existing.snippets.includes(context.snippet)) existing.snippets.push(context.snippet);
+    existing.semanticEvidence = [...new Set([...(existing.semanticEvidence || []), ...semanticEvidence])];
+    existing.baseScore = Math.max(existing.baseScore || existing.score, scored.score);
+    existing.score = existing.baseScore + Math.min(40, Math.max(0, existing.semanticEvidence.length - 1) * 16);
   }
 }
 
@@ -6527,7 +6726,8 @@ async function find(args = {}) {
 
   const maxResults = Math.min(args.maxResults ?? 10, args.maxResultsLimit ?? 50);
   const maxSearchTerms = Math.min(args.maxSearchTerms ?? 8, 12);
-  const searchTerms = buildFindSearchTerms(query, maxSearchTerms);
+  const searchPlanEntries = buildFindSearchPlan(query, maxSearchTerms);
+  const searchTerms = searchPlanEntries.map((entry) => entry.term);
   const extensionInfo = inferFindExtensions(query, args.extensions || []);
   const scoringFolderHints = pruneFolderHints(args.folderHints || []);
   const explicitFolderHintKeys = new Set(scoringFolderHints.map(normalizeFolderHintKey));
@@ -6577,27 +6777,39 @@ async function find(args = {}) {
 
   if (args.useContentIndex !== false && (args.contentMaxResults ?? 10) > 0) {
     const contentStartedAt = Date.now();
-    const indexed = await contentSearch({
-      query,
-      maxResults: clampInteger(args.contentMaxResults, 10, 0, 100) || 1,
-      format: "full"
-    });
+    const contentQueries = searchPlanEntries
+      .filter((entry) => entry.kind === "canonical" || entry.semanticExpansion === true)
+      .slice(0, clampInteger(args.contentMaxQueries, 4, 1, 8));
+    const indexedRuns = await Promise.all(contentQueries.map(async (entry) => ({
+      entry,
+      result: await contentSearch({
+        query: entry.term,
+        maxResults: clampInteger(args.contentMaxResults, 10, 0, 100) || 1,
+        format: "full"
+      })
+    })));
     contentIndexDurationMs += elapsedMs(contentStartedAt);
-    contentIndexCandidateCount = indexed.items?.length || 0;
-    for (const match of indexed.items || []) {
-      addFindCandidate(candidates, match, {
-        args,
-        query,
-        source: "contentIndex",
-        term: "content-index",
-        extensionInfo,
-        scoringFolderHints,
-        contentScore: match.score,
-        contentMatchedTokens: match.matchedTokens || 1,
-        contentExactPhrase: match.reasons?.includes("indexed content phrase"),
-        contentReason: match.reasons?.[0],
-        snippet: match.snippet
-      });
+    contentIndexCandidateCount = indexedRuns.reduce((sum, run) => sum + (run.result.items?.length || 0), 0);
+    for (const { entry, result: indexed } of indexedRuns) {
+      for (const match of indexed.items || []) {
+        addFindCandidate(candidates, match, {
+          args,
+          query,
+          source: "contentIndex",
+          term: entry.term,
+          semanticExpansion: entry.semanticExpansion,
+          semanticConceptId: entry.semanticConceptId,
+          semanticConceptLabel: entry.semanticConceptLabel,
+          semanticKind: entry.semanticKind,
+          extensionInfo,
+          scoringFolderHints,
+          contentScore: match.score,
+          contentMatchedTokens: match.matchedTokens || 1,
+          contentExactPhrase: match.reasons?.includes("indexed content phrase"),
+          contentReason: match.reasons?.[0],
+          snippet: match.snippet
+        });
+      }
     }
   }
 
@@ -6632,7 +6844,7 @@ async function find(args = {}) {
     }
   }
 
-  const executeSearchTerm = async ({ term, index, stage }) => {
+  const executeSearchTerm = async ({ term, index, stage, ...planMetadata }) => {
     const termStartedAt = Date.now();
     executedSearchTerms.push(term);
     try {
@@ -6651,6 +6863,7 @@ async function find(args = {}) {
           source: "search",
           term,
           canonicalSearch: index === 0,
+          ...planMetadata,
           searchResultRank: resultIndex + 1,
           extensionInfo,
           scoringFolderHints
@@ -6688,19 +6901,19 @@ async function find(args = {}) {
 
   if (searchTerms.length && !usedFreshLocalFastPath && !usedStaleLocalFastPath) {
     const initialSearchTermCount = clampInteger(args.initialSearchTermCount, 1, 1, searchConcurrency);
-    const initialWave = searchTerms
+    const initialWave = searchPlanEntries
       .slice(0, initialSearchTermCount)
-      .map((term, index) => ({ term, index, stage: index === 0 ? "canonical" : "initial-expansion" }));
+      .map((entry, index) => ({ ...entry, index, stage: index === 0 ? "canonical" : "initial-expansion" }));
     await executeSearchWave(initialWave);
     let nextSearchTermIndex = initialWave.length;
     let bestLiveSearchScore = rankedFindCandidates(candidates).find(candidateHasLiveSource)?.score || 0;
     if (args.executeAllSearchTerms !== true && bestLiveSearchScore >= searchConfidenceThreshold && nextSearchTermIndex < searchTerms.length) {
       searchStopReason = "high-confidence-canonical";
     } else {
-      while (nextSearchTermIndex < searchTerms.length) {
-        const wave = searchTerms
+      while (nextSearchTermIndex < searchPlanEntries.length) {
+        const wave = searchPlanEntries
           .slice(nextSearchTermIndex, nextSearchTermIndex + searchConcurrency)
-          .map((term, offset) => ({ term, index: nextSearchTermIndex + offset, stage: "expansion" }));
+          .map((entry, offset) => ({ ...entry, index: nextSearchTermIndex + offset, stage: "expansion" }));
         nextSearchTermIndex += wave.length;
         await executeSearchWave(wave);
         bestLiveSearchScore = rankedFindCandidates(candidates).find(candidateHasLiveSource)?.score || 0;
@@ -9210,12 +9423,12 @@ async function chatgptSearch(args = {}) {
     query: String(args.query || "").trim(),
     maxResults: 10,
     maxResultsLimit: 10,
-    maxSearchTerms: 2,
-    searchConcurrency: 2,
-    initialSearchTermCount: 2,
+    maxSearchTerms: 6,
+    searchConcurrency: 3,
+    initialSearchTermCount: 3,
     searchPageSize: 10,
     searchMaxItemsPerTerm: 10,
-    minConfidenceForSearchOnly: 60,
+    minConfidenceForSearchOnly: 74,
     preferFreshLocalResults: true,
     freshLocalMinConfidence: 60,
     preferStaleLocalResults: true,
@@ -9225,6 +9438,7 @@ async function chatgptSearch(args = {}) {
     confirmCacheCandidates: false,
     useCache: true,
     useContentIndex: true,
+    contentMaxQueries: 6,
     contentMaxResults: 10,
     format: "compact"
   });

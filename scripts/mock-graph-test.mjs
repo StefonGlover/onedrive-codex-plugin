@@ -1400,6 +1400,33 @@ const graph = createServer(async (req, res) => {
     return json(res, 200, { value: [item("chatgpt-stale-cache", "ChatGPT Stale Cache.txt")] });
   }
 
+  if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='HVAC work order')")) {
+    return json(res, 200, { value: [item("electrical-report", "2026 Electrical Report.pdf", {
+      parentReference: { path: "/drive/root:/Home Maintenance" },
+      file: { mimeType: "application/pdf" }
+    })] });
+  }
+
+  if (req.method === "GET" && ["heating", "cooling", "air conditioning", "furnace", "heat pump"]
+    .some((term) => decodedUrl.includes(`/v1.0/me/drive/root/search(q='${term}')`))) {
+    return json(res, 200, { value: [item("hvac-contractor-record", "Green Comfort 0427.pdf", {
+      parentReference: { path: "/drive/root:/Home Maintenance/Contractors" },
+      file: { mimeType: "application/pdf" }
+    })] });
+  }
+
+  if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='the paperwork the plumber left after fixing the leak')")) {
+    return json(res, 200, { value: [] });
+  }
+
+  if (req.method === "GET" && ["plumbing", "leak repair", "drain service", "pipe repair", "water heater"]
+    .some((term) => decodedUrl.includes(`/v1.0/me/drive/root/search(q='${term}')`))) {
+    return json(res, 200, { value: [item("plumbing-contractor-record", "AquaFlow 8841.pdf", {
+      parentReference: { path: "/drive/root:/Home Maintenance/Contractors" },
+      file: { mimeType: "application/pdf" }
+    })] });
+  }
+
   if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='Batch Cache Research')")) {
     return json(res, 200, { value: [item("batch-cache-canonical", "Misc Notes.txt")] });
   }
@@ -4697,6 +4724,35 @@ process.exit(2);
     assert(!added.some((request) => decodeURIComponent(request.url).includes("/search(q='")), "fresh ChatGPT search should not call Graph search", { added });
     assert(!added.some((request) => request.path.endsWith("/content")), "fresh ChatGPT fetch should not call Graph content", { added });
     return { searchResults: searched.value.results.length, fetchSource: fetched.value.metadata.previewSource, graphRequestsAdded: added.length };
+  });
+
+  await check("ChatGPT concept-aware search rescues contractor-named HVAC records", async () => {
+    const before = requests.length;
+    const searched = await tool("search", { query: "HVAC work order" });
+    assert(!searched.isError, "concept-aware ChatGPT search should succeed", searched);
+    assert(searched.value.results?.[0]?.id === "hvac-contractor-record", "HVAC concept evidence should outrank the unrelated canonical result", searched);
+    const added = requests.slice(before).filter((request) => decodeURIComponent(request.url).includes("/search(q='"));
+    const decodedSearches = added.map((request) => decodeURIComponent(request.url));
+    assert(decodedSearches.some((url) => url.includes("search(q='heating')")), "HVAC search should expand to heating", decodedSearches);
+    assert(decodedSearches.some((url) => url.includes("search(q='cooling')")), "HVAC search should expand to cooling", decodedSearches);
+    assert(added.length <= 6, "ChatGPT concept expansion exceeded the bounded search budget", decodedSearches);
+    return {
+      topResult: searched.value.results[0],
+      graphSearchCalls: added.length,
+      terms: decodedSearches.map((url) => url.match(/search\(q='([^']+)'\)/)?.[1]).filter(Boolean)
+    };
+  });
+
+  await check("ChatGPT search infers a subtle plumbing-service description", async () => {
+    const before = requests.length;
+    const searched = await tool("search", { query: "the paperwork the plumber left after fixing the leak" });
+    assert(!searched.isError, "subtle natural-language ChatGPT search should succeed", searched);
+    assert(searched.value.results?.[0]?.id === "plumbing-contractor-record", "subtle plumbing intent should find the contractor-named record", searched);
+    const added = requests.slice(before).filter((request) => decodeURIComponent(request.url).includes("/search(q='"));
+    const decodedSearches = added.map((request) => decodeURIComponent(request.url));
+    assert(decodedSearches.some((url) => url.includes("search(q='plumbing')")), "subtle plumbing intent should infer the plumbing concept", decodedSearches);
+    assert(added.length <= 6, "subtle intent expansion exceeded the bounded search budget", decodedSearches);
+    return { topResult: searched.value.results[0], graphSearchCalls: added.length };
   });
 
   await check("ChatGPT exact-file opener combines multi-file search and extraction", async () => {
