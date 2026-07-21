@@ -2,85 +2,63 @@
 
 Decision: Pending — Entra registration, NAS OAuth rollout, and ChatGPT Work validation
 Date: 2026-07-21
-Generated: 2026-07-21T14:48:00Z
-Tested source base commit: `1a3a8ff7d71fee9b13f3a249483383c6a1f67120`
-Plugin version: `0.5.1+codex.20260721104500`
+Generated: 2026-07-21T19:59:32Z
+Tested source base commit: `3bd2f3d6617a74843dd7a953ff51305e74ac6f0d`
+Plugin version: `0.5.1+codex.20260721181802`
 Tool contract: 84 exact tool names
 
 ## Current outcome
 
-The current ChatGPT/NAS pass is deployed as `onedrive-chatgpt-nas:0.5.1-nas23`. The focused contract is 21 tools and 37,819 bytes (88.7% smaller than the unchanged full 84-tool/335,837-byte contract), with 504 bytes of routing instructions. All 173 mocked Graph checks and all 21 golden prompt cases pass. DSM built image `de91aab85bdb`, recreated and started the existing project with exit code 0, and reports `onedrive-chatgpt` Healthy. `nas22` is retained as the single rollback image; obsolete OneDrive images `nas19`–`nas21` and the stopped orphan container `romantic_mestorf` were removed.
+The real-productivity beta passes on the canonical ChatGPT developer app **OneDrive** (`asdk_app_6a5e2416985481918d0f6c68785da2c4`). ChatGPT metadata version `dev-22` exposes the focused 21-tool No Auth surface, retains the stored local OneDrive logo, and runs the final source contract `0.5.1+codex.20260721181802.chatgpt.2d26f01bba1b`.
 
-The canonical ChatGPT app remains **OneDrive** (`asdk_app_6a5e2416985481918d0f6c68785da2c4`). Its metadata was refreshed in place without recreating or renaming the app, so the stored local OneDrive logo remains unchanged. The refreshed inspector exposes `onedrive_open_files` and `onedrive_preview_actions`, retains standard `search` and `fetch`, and shows all 21 focused tools as No Auth.
+The final NAS runtime is `onedrive-chatgpt-nas:0.5.1-nas27`, built as image `81bd2d14c6a6` from the fresh versioned source directory `/volume1/docker/onedrive-chatgpt/app-0.5.1-nas27-20260721`. Container Manager recreated and started the project with exit code 0. The prior `nas26` image is retained as rollback, and `compose.nas25.rollback.yaml` preserves the earlier manifest.
 
-The final service-record beta stayed in one ChatGPT conversation: `https://chatgpt.com/c/6a5f7eb8-afb0-83ea-a34c-9c2b5cb77ea8`. The subtle request for “the paperwork the heating technician left after fixing the air conditioner” now returns `invoice-3095.pdf` before the generic `Glover_Final_Inspection.pdf` and `Glover_Predry_Inspection.pdf` candidates. ChatGPT returned `ROUTING_PASS — Evolution Heating & Cooling — $2,518.00` in about 16 seconds. The earlier comparable host run displayed 42 seconds, and the original user-side result took 1 minute 38 seconds. Successful cold content verification is bounded to one generic document probe before semantic metadata fan-out; warm content-index results avoid Graph search and body rereads.
+The focused ChatGPT contract is 21 tools and 40,536 bytes, 88.0% smaller than the unchanged 84-tool, 338,721-byte full contract. The 1,316-byte server instructions and focused descriptors now prefer user-visible OneDrive paths over opaque item IDs. The ChatGPT copy schema no longer advertises `waitForCompletion` or `timeoutSeconds`, avoiding unnecessary inline Graph polling while preserving separate verification.
 
-The exact-file beta stayed in the existing conversation and used one `onedrive_open_files` call for `2026 Family Budgeting.xlsx` plus the amendment PDF. It returned `$12,325` from `content-index-validated`, `Amendment to Agreement` from `local-pdf`, and `found` for both files. Server duration was 8,834 ms; observed Chrome end-to-end time was about 40 seconds versus the prior 58-second two-search/two-fetch path. No write tool ran.
+Search now handles a whole multi-document intent in one pass, merges fallback results instead of replacing good matches, ranks requested document kinds and years, and verifies uncovered concept domains only. RFC 822 `.eml` extraction now returns bounded headers, readable text bodies, and attachment inventories. Modern Office, PDF, text/code, RTF, OpenDocument, EPUB, legacy Office, and common image handling remain available.
 
-The CRUD/permissions beta used one read-only `onedrive_preview_actions` call for rename, copy, move, and anonymous-view sharing preview. All four operations returned scoped preview tokens with no error, and the identity-free access summary returned one permission, zero sharing links, zero anonymous links, and role `owner`. Server duration was 3,527 ms and ChatGPT displayed `Worked for 11s`, replacing the prior 33-second three-preview path and 109-second permissions/sharing path. No consent dialog appeared, so the earlier unrelated sensitive-data categories were not exposed on this read-only flow; no file, permission, or sharing link was changed.
+The live productivity beta stayed in one ChatGPT thread: `https://chatgpt.com/c/6a5f7eb8-afb0-83ea-a34c-9c2b5cb77ea8`.
 
-One separate ChatGPT host-safety defect remains outside the plugin: during an earlier isolated live CRUD fixture, clicking **Deny** on the host permission dialog did not prevent the folder/file mutation. The plugin's scoped preview, identity, confirmation, audit, and cleanup protections remain enabled; the isolated fixture was moved to the recycle bin and its exact folder ID was verified.
+- One multi-document search correctly returned `invoice-3095.pdf` and `2026 Electrical Report.pdf` in about 32 seconds.
+- Explicit `.eml` extraction returned subject, sender, date, readable body, and all named attachments in 15 seconds.
+- Disposable folder/file creation completed in 25 seconds.
+- Copy, rename, and dependent patch operations completed in sequence with fresh identities and no stale retry; the longer host flow took 1 minute 36 seconds.
+- An anonymous view-only link was created in 11 seconds, then revoked in 28 seconds; the file was owner-only afterward.
+- Both disposable QA folders were moved to the recycle bin, no item was permanently deleted, no anonymous link remains, and active OneDrive searches no longer find the fixtures.
+- The final `dev-22` read-only smoke in the same thread again returned exactly `invoice-3095.pdf` and `2026 Electrical Report.pdf` with no mutation.
 
-The ChatGPT workbook-content failure is fixed in the tested source. Standard `fetch` now downloads modern Office packages once and renders bounded Word paragraphs/tables, Excel worksheet names/cells/formulas, and PowerPoint slides/shapes instead of relying on Microsoft Graph `format=text`. The exact `2026 Family Budgeting.xlsx` failure was reproduced in Chrome, the refreshed developer-mode app then returned a real worksheet-by-worksheet summary with exact figures, and the plugin logged `previewSource: office-openxml` with 40,679 bytes returned in 3.534 seconds on the cold read. A final warm run used only one `search` (1.052 seconds, zero Graph search calls) and one `fetch` (1.6 milliseconds from the content index); the ChatGPT host completed the detailed answer in 79.742 seconds.
+DSM staging cleanup removed the uploaded archive and moved the obsolete `app-0.5.1-nas17-20260721` directory to the NAS recycle bin. Exact local temporary archives, manifest copies, and deployment screenshots were removed. The fresh `nas27` source directory, active manifest, encrypted runtime/data, `nas26` rollback image, and rollback manifest remain.
 
-The live ChatGPT contract now has 19 focused tools and 32,446 bytes, 90.3% smaller than the unchanged 84-tool/335,403-byte full contract. Redundant high-volume Office read tools were removed from the ChatGPT surface after the live host called `onedrive_excel_get_workbook` twice, produced 12.9 MB responses, and remained unfinished after 110 seconds. Standard `fetch` is now the single ChatGPT read path. The final live runs made no redundant Office call.
+## Verification
 
-The current source hardens that focused path without changing the 19-tool surface. Its 32,446-byte descriptor set gives every tool a discriminative `Use this when` description and bounded ChatGPT invocation status, corrects the fetch-first Office-edit instructions, returns representative 32 KiB previews with sequential 64 KiB `fetch` continuation IDs, serves high-confidence matches from caches up to 24 hours old while revalidating in the background, and validates stale indexed content by ETag/cTag before reuse. The 19-case metadata golden-prompt gate, six ambiguity pairs, and all 164 mocked Graph checks pass. The exact source was deployed as `onedrive-chatgpt-nas:0.5.1-nas11`, came up healthy with server hash `5972c6de2076`, and was refreshed into the canonical 19-tool ChatGPT app.
-
-The refreshed metadata fixes the live PDF search-to-fetch handoff by explicitly telling ChatGPT that every search result contains an opaque ID and to pass it unchanged to `fetch`. A clean regular-Chat run successfully returned `#2-200-OSLLenderChangeAmendment (2022_03_25 23_08_06 UTC).pdf`, preview source `local-pdf`, and heading `Amendment to Agreement`. The cold plugin calls took 1.323 seconds for stale-local search and 2.609 seconds for PDF extraction with zero Graph search calls. A warm repeat took 802 milliseconds for fresh-local search and 1.604 seconds for cached-metadata fetch. ChatGPT itself took roughly 35 seconds on the cold run, confirming that most remaining wall time is host orchestration rather than plugin execution.
-
-Common file handling now includes direct text/code/CSV/TSV/JSON/XML/Markdown reads plus bounded local extraction for PDF, RTF, OpenDocument, EPUB, legacy `.doc`/`.xls`/`.ppt`, and common images. The Synology image installs Poppler, Tesseract, and catdoc. Dependency-free RTF, OpenDocument, and EPUB tests pass; the full mock Graph suite passes 164/164, including cold and warm structured Excel fetches, stale-index validation, progressive continuations, background search revalidation, and integrated RTF extraction.
-
-The `0.5.1` patch fixes both live Synology failures that prevented structured workbook reads: `EPERM: operation not permitted, chmod '/data'` and the follow-on `EACCES: permission denied, mkdir '/data/pycache'`. The Office helper no longer modifies the storage mount and keeps disposable Python bytecode in a private temporary directory outside `/data`. A focused real-XLSX fixture test, the full 157-check mock Graph/Office suite, the `nas9` non-writable `/data` mount test, immutable-cache parity across 52 packaged files, and the deployed `nas8` live workbook retest all pass. The exact `Personal/Documents/Career Development/QSE Job Tracker.xlsx` read completed through the Open XML backend with three worksheets, two tables, three charts, and 5,000 returned cells.
-
-The pending OAuth build adds Entra protected-resource discovery, strict bearer-token validation, Graph on-behalf-of exchange, Streamable HTTP transport, per-tool `oauth2` scopes, runtime reauthorization challenges, and an HTTP-target Secure MCP Tunnel profile. The isolated OAuth integration test passes discovery, JWT signature/issuer/audience/time/scope checks, OBO exchange/cache behavior, all 84 OAuth descriptors, an unauthenticated challenge, and an authenticated call. This build is not yet a release Pass: it still needs the two Entra registrations, NAS OAuth deployment, and a fresh ChatGPT Work host-loop result.
-
-The canonical developer-mode app, **OneDrive** (`asdk_app_6a5e2416985481918d0f6c68785da2c4`), was created with the exact local `assets/chatgpt-icon.png` before any metadata refresh and later renamed from its temporary `OneDrive Fast` label after the stale name conflicts were removed. The uploaded asset is a 256×256 PNG, 2,276 bytes, SHA-256 `b9db1f911c59c34ce12cdfdfbae1a6b9933b140e3b024068a8df6ddac43fe5e1`. The app still displays the same image after the nas11 metadata refresh and rename. Both obsolete OneDrive developer registrations were permanently deleted, and their former plugin URLs now fail to load, leaving one installed OneDrive entry in the catalog.
-
-The No Auth descriptor repair previously passed both full 106-check source and immutable-cache betas with 96 passes, zero failures, ten explicit environment or safety blocks, exact coverage of all 84 tools, verified remote cleanup, and no isolated local residue. The current source passes all 164 mock Graph checks. The Synology and ChatGPT rollouts now match this source; immutable Codex-cache parity remains a separate pending distribution step.
-
-The NAS project retained the previous rollback directories and now also stores the exact 66-file nas11 source archive `app-0.5.1-nas11.zip`, SHA-256 `4343d3cb15342389cca9b72ccd2210e28ded0504a4f097751dcbdbd8cd18b756`.
-
-The canonical No Auth app exposes `noauth` on all 19 focused actions and completes live workbook and PDF search/fetch flows in regular Chat. The same custom app class remains blocked by an incorrect expired-connection card in the Work surface before a tool call reaches the tunnel. Because the server is never invoked and the app succeeds in Chat, this is recorded as a ChatGPT Work host limitation; selecting **Chat** is the verified workaround.
-
-The first installed-build attempt hit the harness's default 10-second Graph timeout during managed Office backup restore. The harness hard-failed, deleted and verified absence of its exact isolated remote folder, and removed local work. A fresh complete run using the documented 60-second request ceiling then passed 96/10/0 with exact cleanup.
+- Node syntax check: pass.
+- Common extraction fixtures: RTF, OpenDocument, EPUB, and email pass.
+- Full contract: 84 tools, 338,721 bytes.
+- ChatGPT contract: 21 tools, 40,536 bytes, 88.0% reduction.
+- Golden prompts: 21/21, with eight ambiguity pairs.
+- Mock Microsoft Graph: 174/174.
+- Semantic anchors: 6/6.
+- Text patch preservation and safety: 6/6.
+- Office Open XML operations: 79 total (21 Word, 33 Excel, 25 PowerPoint).
+- Storage-root permissions: pass.
+- Whitespace: pass.
+- Live NAS image/tag, ChatGPT metadata, logo, focused tool count, path-first schemas, and final same-thread search: pass.
 
 ## Fixes validated
 
-- Every MCP tool explicitly advertises `securitySchemes: [{ "type": "noauth" }]` and mirrors it under `_meta.securitySchemes`; ChatGPT's action inspector now shows the correct scheme on all 84 tools and the fresh app runs successfully in Chat.
-- Orphaned `relativePath` arguments now fail closed instead of silently resolving scans or delta reads against the drive root.
-- Doctor resolves every configured preset and warns with exact missing aliases instead of unconditionally reporting preset health.
-- Recursive scans use bounded folder concurrency, report the effective concurrency, and exclude special non-file items from file-only results.
-- Tool failures retain compatible text while adding stable machine-readable error metadata.
-- The README now enumerates all 84 tools, including managed workspaces and change watches.
-- The new doctor behavior is verified through the deployed NAS tunnel: authentication, profile, drive, and root access pass, while absent `Desktop` and `Pictures/Screenshots` targets are surfaced as explicit configuration warnings.
-- The NAS rollout staged and verified all packaged files in a versioned app directory before switching the project to `nas8`; persistent encrypted auth and data mounts were preserved, and the exact QSE workbook now opens successfully through the live tunnel.
-
-- Native version restore now uses Microsoft Graph's `restoreVersion` action and passes live plus mock verification.
-- The beta harness uses one configurable Office Python runtime, cleans partial fixture setup, persists optional JSON reports, emits compact progress, and bounds child Graph request latency.
-- Live search no longer multiplies transient retries across layers.
-- Named-share testing rejects the owner's own mailbox and safely classifies a verified `sharingFailed` result only when no permission was created.
-- Excel Open XML edits now preserve declared compatibility namespaces, reject undeclared `mc:Ignorable` prefixes, copy row formatting and height for appended table rows, and extend matching conditional-formatting and data-validation ranges.
-- Excel `deleteTableRow` now compacts a bounded table row, preserves surrounding worksheet content, translates ordinary relative formulas, shrinks bounded single-column shared-formula groups without changing formulas or cached values, shifts native hyperlinks, shrinks matching ranges, preserves row formatting, and maintains Excel-required ascending cell order.
-- Linux and NAS deployments use an AES-256-GCM encrypted token vault with a separately mounted owner-only key, atomic writes, symlink refusal, and strict permission validation.
-- Synology startup now normalizes an uploaded encrypted token to `0600` before dropping privileges, fixing DSM/File Station's permissive upload mode without weakening vault checks.
-- The DS923+ image pins the classic DSM builder to `amd64`, verifies the OpenAI tunnel-client checksum, runs without published inbound ports, drops all capabilities before adding only the startup minimum, and auto-restarts.
-- The supplied square 256×256 OneDrive artwork is now used for the composer, primary, and dark-mode plugin icons; this removes the wide-banner aspect-ratio mismatch on plugin icon surfaces.
-- ChatGPT `fetch` now reads real `.xlsx` cells and formulas through the local Open XML helper, preserves worksheet context on both cold and indexed reads, and never depends on Graph text export for modern Office packages.
-- The ChatGPT profile exposes 21 focused tools; standard `search` and `fetch` remain available while `onedrive_open_files` combines exact-name discovery and bounded extraction for up to five requested files.
-- `onedrive_preview_actions` batches up to ten read-only rename, move, copy, create-link, or revoke previews with bounded concurrency, scoped single-use preview tokens, and identity-free permission/link counts.
-- The focused contract now has exact-file and preview-batch routing instructions, per-tool selection cues and status text, plus an offline golden-prompt gate covering all 21 tools and eight commonly confused tool pairs.
-- Read-only preview batching is annotated as non-destructive and closed-world; live sharing-link creation is correctly annotated open-world. The refreshed ChatGPT host completed the batch without a consent dialog or unrelated sensitive-data categories.
-- ChatGPT search now supports a high-confidence stale-while-revalidate path with bounded background delta/query refresh; fetch validates unchanged indexed content by ETag/cTag and uses progressive 32 KiB previews with memory-backed 64 KiB continuation chunks.
-- Bounded extraction covers common text/code formats, PDF, RTF, OpenDocument, EPUB, legacy Office, and common image OCR, with private temporary files, size limits, fixed extractor paths, timeouts, and cleanup.
-- Upload, folder creation, rename, move, copy, file replacement/update, sharing-link create/revoke, recycle-bin delete/restore, and guarded permanent delete remain available on the focused ChatGPT surface with preview tokens and identity checks for risky mutations.
+- `.eml` files are extracted locally instead of being treated as opaque text-export failures.
+- Search understands subtle service-language aliases, document-kind intent, multi-domain requests, and year/report recency without discarding strong initial matches.
+- Search and fetch return user-visible paths so ChatGPT can keep mutation flows readable and avoid mistaking opaque item IDs for credentials.
+- Dependent mutations are serialized and refetch current item identity before the next preview or write.
+- Copy returns its accepted asynchronous result promptly; ChatGPT verifies the destination separately.
+- Folder creation is a direct conflict-safe create, while risky mutations retain preview tokens, expected identity, confirmation, and audit protections.
+- Upload, folder creation, rename, move, copy, replacement/update, sharing-link creation/revocation, recycle-bin delete/restore, guarded permanent deletion, and permission inspection remain available on the focused surface.
+- The stored OneDrive logo remains correct because the canonical developer-mode app was refreshed in place rather than recreated.
 
 ## Explicitly constrained coverage
 
-- Business Graph Excel and organization-only sharing are mock-tested because the live account is personal.
-- The isolated plus-address recipient was rejected by Graph; the harness verified that no grant existed, then completed live anonymous-link creation, audit, and exact revocation.
-- Existing credentials, consent, and Keychain data remain untouched; forced login polling and Keychain deletion are excluded.
-- Live recycle-bin restore remains excluded; native version restore passes live, while recycle-bin behavior passes mock and dry-run coverage.
-- ChatGPT Work currently blocks this custom No Auth app with a false expired-connection card before tool dispatch. Regular Chat passes the same prompt and is the supported workaround pending a ChatGPT host correction.
-- The current performance-hardening source commit is live on the Synology NAS and refreshed in ChatGPT; installation into the immutable Codex plugin cache remains pending and is outside this NAS/ChatGPT deployment.
-- Synology administrative verification used HTTPS over the LAN fallback with insecure TLS certificate validation enabled after the Tailscale endpoint failed. The deployed service itself remains outbound-only, but DSM should be given a trusted certificate or certificate pinning to remove this operational warning.
+- Business-only Graph Excel and organization-only sharing remain mock-tested because the connected account is personal.
+- Live recycle-bin restore is excluded; recycle, restore, and permanent-delete safety contracts are covered by mocks and previews.
+- ChatGPT Work still shows an incorrect expired-connection/authentication card before a tool call reaches this custom No Auth app. Regular Chat is the verified workaround pending a ChatGPT host correction.
+- Installation into the immutable Codex plugin cache remains pending and does not affect the deployed NAS/ChatGPT app.
+- Entra protected-resource discovery and OAuth integration pass locally but still require the production Entra registrations and NAS OAuth rollout before this release gate can become Pass.
