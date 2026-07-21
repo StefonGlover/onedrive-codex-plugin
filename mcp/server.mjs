@@ -9578,6 +9578,42 @@ function chatgptMatchesStrictDocumentIntent(item, query) {
   return (item?.sources || []).some((source) => source.source === "contentIndex" && source.strongContentIndexMatch === true);
 }
 
+function chatgptServiceDocumentAffinity(item, query) {
+  const normalizedQuery = ` ${normalizeFindText(query)} `;
+  const metadataText = normalizeFindText(`${item?.name || ""} ${item?.remotePath || item?.path || ""}`);
+  const metadataTokens = new Set(findTokens(metadataText));
+  const hasMetadataMarker = (marker) => {
+    const normalizedMarker = normalizeFindText(marker);
+    if (!normalizedMarker) return false;
+    if (` ${metadataText} `.includes(` ${normalizedMarker} `)) return true;
+    const markerTokens = findTokens(normalizedMarker);
+    return markerTokens.length > 0 && markerTokens.every((token) => metadataTokens.has(token));
+  };
+  const asksForInspection = normalizedQuery.includes(" inspection ");
+  const repairServiceIntent = [
+    " fixed ", " fixing ", " maintenance ", " repair ", " service ", " technician ", " work order "
+  ].some((marker) => normalizedQuery.includes(marker));
+  if (asksForInspection) return hasMetadataMarker("inspection") ? 60 : 0;
+  if (!repairServiceIntent) return 0;
+  let affinity = 0;
+  if ([
+    " invoice ", " receipt ", " estimate ", " work order ", " service order ", " service report ",
+    " repair invoice ", " maintenance record ", " job ticket "
+  ].some((marker) => hasMetadataMarker(marker))) affinity += 80;
+  if (hasMetadataMarker("inspection")) affinity -= 80;
+  return affinity;
+}
+
+function chatgptRankSearchItems(items, query) {
+  return [...items].sort((left, right) => {
+    const affinityDifference = chatgptServiceDocumentAffinity(right, query) - chatgptServiceDocumentAffinity(left, query);
+    if (affinityDifference) return affinityDifference;
+    const scoreDifference = Number(right?.score || 0) - Number(left?.score || 0);
+    if (scoreDifference) return scoreDifference;
+    return String(left?.name || left?.remotePath || "").localeCompare(String(right?.name || right?.remotePath || ""));
+  });
+}
+
 function textMatchesFindConcept(text, concept) {
   const normalizedText = normalizeFindText(text);
   const tokens = new Set(findTokens(normalizedText));
@@ -9734,7 +9770,10 @@ async function chatgptSearch(args = {}) {
     ...findArgs,
     ...(contentFallbackEligible ? { liveSearch: false } : {})
   });
-  let selectedItems = (found.items || []).filter((item) => chatgptMatchesStrictDocumentIntent(item, query));
+  let selectedItems = chatgptRankSearchItems(
+    (found.items || []).filter((item) => chatgptMatchesStrictDocumentIntent(item, query)),
+    query
+  );
   let contentFallback = { attempted: false, items: [], probes: [], candidatesRead: 0, indexEntriesWarmed: 0, graphSearchCalls: 0, searchTermsExecuted: 0 };
   if (!selectedItems.length) {
     try {
@@ -9743,14 +9782,17 @@ async function chatgptSearch(args = {}) {
         cache,
         await loadContentIndex()
       );
-      if (contentFallback.items.length) selectedItems = contentFallback.items;
+      if (contentFallback.items.length) selectedItems = chatgptRankSearchItems(contentFallback.items, query);
     } catch (error) {
       recordLocalWarning("ChatGPT content-verified search fallback", error);
     }
   }
   if (!selectedItems.length && contentFallbackEligible) {
     found = await find(findArgs);
-    selectedItems = (found.items || []).filter((item) => chatgptMatchesStrictDocumentIntent(item, query));
+    selectedItems = chatgptRankSearchItems(
+      (found.items || []).filter((item) => chatgptMatchesStrictDocumentIntent(item, query)),
+      query
+    );
   }
   const revalidationScheduled = found.summary?.usedStaleLocalFastPath === true
     ? scheduleChatgptCacheRevalidation(args.query, cache)

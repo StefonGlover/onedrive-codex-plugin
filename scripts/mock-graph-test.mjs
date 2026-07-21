@@ -43,6 +43,10 @@ const hiddenElectricalInvoiceRtfBuffer = Buffer.from(
   "{\\rtf1\\ansi BrightSpark Electrical Invoice 4421\\par Service date July 20, 2026\\par Breaker panel wiring repair completed by the electrician.\\par Total paid: \\b $875.00\\b0\\par}",
   "utf8"
 );
+const homeElectricalInspectionRtfBuffer = Buffer.from(
+  "{\\rtf1\\ansi Whole Home Final Inspection\\par Electrical systems inspection included the breaker panel, wiring, outlets, and service equipment.\\par This was a general property inspection, not a technician repair invoice.\\par}",
+  "utf8"
+);
 const largeChatgptTextBuffer = Buffer.from([
   "Large ChatGPT document",
   ...Array.from({ length: 18 }, (_, sectionIndex) => [
@@ -546,6 +550,19 @@ const graph = createServer(async (req, res) => {
   if (req.method === "GET" && path === "/v1.0/me/drive/items/hidden-electrical-invoice/content") {
     count("hidden-electrical-invoice-content-read");
     return binary(res, 200, hiddenElectricalInvoiceRtfBuffer, { "Content-Type": "application/rtf" });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/home-electrical-inspection") {
+    return json(res, 200, item("home-electrical-inspection", "Glover_Final_Inspection.rtf", {
+      size: homeElectricalInspectionRtfBuffer.length,
+      lastModifiedDateTime: "2026-07-21T14:30:00Z",
+      parentReference: { path: "/drive/root:/Home Maintenance/Inspections" },
+      file: { mimeType: "application/rtf" }
+    }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/home-electrical-inspection/content") {
+    return binary(res, 200, homeElectricalInspectionRtfBuffer, { "Content-Type": "application/rtf" });
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/large-chatgpt-text") {
@@ -4810,6 +4827,20 @@ process.exit(2);
       warmGraphRequests: warmAdded.length,
       contentReads: counters.get("hidden-electrical-invoice-content-read") || 0
     };
+  });
+
+  await check("ChatGPT repair intent ranks service invoices above general inspections", async () => {
+    const seeded = await tool("onedrive_get_info", { itemId: "home-electrical-inspection" });
+    assert(!seeded.isError, "general inspection fixture should seed metadata", seeded);
+    const indexed = await tool("onedrive_content_index_refresh", { itemId: "home-electrical-inspection", maxFiles: 1, maxBytesPerFile: 4096 });
+    assert(!indexed.isError && indexed.value.indexed === 1, "general inspection fixture should index", indexed);
+    const before = requests.length;
+    const searched = await tool("search", { query: "the paperwork the electrician left after fixing the breaker" });
+    assert(!searched.isError, "service-versus-inspection ranking search should succeed", searched);
+    assert(searched.value.results?.[0]?.id === "hidden-electrical-invoice", "repair intent should rank the service invoice above a newer general inspection", searched);
+    const added = requests.slice(before);
+    assert(!added.some((request) => decodeURIComponent(request.url).includes("/search(q='")), "indexed service ranking should not require Graph search", added);
+    return { results: searched.value.results.map((entry) => entry.id), graphRequestsAdded: added.length };
   });
 
   await check("ChatGPT concept-aware search rescues contractor-named HVAC records", async () => {
