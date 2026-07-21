@@ -4786,6 +4786,32 @@ process.exit(2);
     return { searchResults: searched.value.results.length, fetchSource: fetched.value.metadata.previewSource, graphRequestsAdded: added.length };
   });
 
+  await check("ChatGPT cold search verifies opaque service records and warms repeat search", async () => {
+    const query = "the invoice from the electrician after fixing the breaker";
+    const beforeCold = requests.length;
+    const cold = await tool("search", { query });
+    assert(!cold.isError, "cold content-verified ChatGPT search should succeed", cold);
+    assert(cold.value.results?.[0]?.id === "hidden-electrical-invoice", "cold search should verify the opaque electrical invoice from its contents", cold);
+    const coldAdded = requests.slice(beforeCold);
+    const coldDecoded = coldAdded.map((request) => decodeURIComponent(request.url));
+    assert(coldDecoded.some((url) => url.includes("search(q='invoice')")), "cold fallback should use one bounded generic document probe", coldDecoded);
+    const coldSearchRequests = coldDecoded.filter((url) => url.includes("/search(q='"));
+    assert(coldSearchRequests.length === 1, "successful content verification should skip semantic Graph fan-out", coldSearchRequests);
+    assert(coldAdded.some((request) => request.path === "/v1.0/me/drive/items/hidden-electrical-invoice/content"), "cold fallback should read the candidate once for content verification", coldAdded);
+
+    const beforeWarm = requests.length;
+    const warm = await tool("search", { query });
+    assert(!warm.isError && warm.value.results?.[0]?.id === "hidden-electrical-invoice", "warm search should preserve the verified result", warm);
+    const warmAdded = requests.slice(beforeWarm);
+    assert(!warmAdded.some((request) => request.path.endsWith("/content")), "warm search should reuse the local content index without another file read", warmAdded);
+    assert(!warmAdded.some((request) => decodeURIComponent(request.url).includes("/search(q='")), "warm search should use the fresh local fast path without Graph search", warmAdded);
+    return {
+      coldGraphRequests: coldAdded.length,
+      warmGraphRequests: warmAdded.length,
+      contentReads: counters.get("hidden-electrical-invoice-content-read") || 0
+    };
+  });
+
   await check("ChatGPT concept-aware search rescues contractor-named HVAC records", async () => {
     const before = requests.length;
     const searched = await tool("search", { query: "HVAC work order" });
@@ -4796,7 +4822,7 @@ process.exit(2);
     const decodedSearches = added.map((request) => decodeURIComponent(request.url));
     assert(decodedSearches.some((url) => url.includes("search(q='heating')")), "HVAC search should expand to heating", decodedSearches);
     assert(decodedSearches.some((url) => url.includes("search(q='cooling')")), "HVAC search should expand to cooling", decodedSearches);
-    assert(added.length <= 6, "ChatGPT concept expansion exceeded the bounded search budget", decodedSearches);
+    assert(added.length <= 8, "ChatGPT concept expansion exceeded the staged search budget", decodedSearches);
     return {
       topResult: searched.value.results[0],
       graphSearchCalls: added.length,
@@ -4812,32 +4838,8 @@ process.exit(2);
     const added = requests.slice(before).filter((request) => decodeURIComponent(request.url).includes("/search(q='"));
     const decodedSearches = added.map((request) => decodeURIComponent(request.url));
     assert(decodedSearches.some((url) => url.includes("search(q='plumbing')")), "subtle plumbing intent should infer the plumbing concept", decodedSearches);
-    assert(added.length <= 6, "subtle intent expansion exceeded the bounded search budget", decodedSearches);
+    assert(added.length <= 8, "subtle intent expansion exceeded the staged search budget", decodedSearches);
     return { topResult: searched.value.results[0], graphSearchCalls: added.length };
-  });
-
-  await check("ChatGPT cold search verifies opaque service records and warms repeat search", async () => {
-    const query = "the invoice from the electrician after fixing the breaker";
-    const beforeCold = requests.length;
-    const cold = await tool("search", { query });
-    assert(!cold.isError, "cold content-verified ChatGPT search should succeed", cold);
-    assert(cold.value.results?.[0]?.id === "hidden-electrical-invoice", "cold search should verify the opaque electrical invoice from its contents", cold);
-    const coldAdded = requests.slice(beforeCold);
-    const coldDecoded = coldAdded.map((request) => decodeURIComponent(request.url));
-    assert(coldDecoded.some((url) => url.includes("search(q='invoice')")), "cold fallback should use one bounded generic document probe", coldDecoded);
-    assert(coldAdded.some((request) => request.path === "/v1.0/me/drive/items/hidden-electrical-invoice/content"), "cold fallback should read the candidate once for content verification", coldAdded);
-
-    const beforeWarm = requests.length;
-    const warm = await tool("search", { query });
-    assert(!warm.isError && warm.value.results?.[0]?.id === "hidden-electrical-invoice", "warm search should preserve the verified result", warm);
-    const warmAdded = requests.slice(beforeWarm);
-    assert(!warmAdded.some((request) => request.path.endsWith("/content")), "warm search should reuse the local content index without another file read", warmAdded);
-    assert(!warmAdded.some((request) => decodeURIComponent(request.url).includes("/search(q='")), "warm search should use the fresh local fast path without Graph search", warmAdded);
-    return {
-      coldGraphRequests: coldAdded.length,
-      warmGraphRequests: warmAdded.length,
-      contentReads: counters.get("hidden-electrical-invoice-content-read") || 0
-    };
   });
 
   await check("ChatGPT search rejects repeated broad Graph fallback sets", async () => {

@@ -7016,7 +7016,11 @@ async function find(args = {}) {
     searchRuns.push(...runs);
   };
 
-  if (searchTerms.length && !usedFreshLocalFastPath && !usedStaleLocalFastPath) {
+  if (args.liveSearch === false && !searchStopReason) {
+    searchStopReason = "live-search-disabled";
+  }
+
+  if (args.liveSearch !== false && searchTerms.length && !usedFreshLocalFastPath && !usedStaleLocalFastPath) {
     const initialSearchTermCount = clampInteger(args.initialSearchTermCount, 1, 1, searchConcurrency);
     const initialWave = searchPlanEntries
       .slice(0, initialSearchTermCount)
@@ -9613,13 +9617,15 @@ async function chatgptContentDiscoveryFallback(query, cache, contentIndex) {
   const domainConcepts = concepts.filter((concept) => concept.kind === "domain");
   const documentConcepts = concepts.filter((concept) => concept.kind === "document");
   if (!chatgptContentFallbackEligible(query, concepts)) {
-    return { attempted: false, items: [], probes: [], candidatesRead: 0, indexEntriesWarmed: 0 };
+    return { attempted: false, items: [], probes: [], candidatesRead: 0, indexEntriesWarmed: 0, graphSearchCalls: 0, searchTermsExecuted: 0 };
   }
 
   const attemptedIds = new Set();
   const probes = [];
   let candidatesRead = 0;
   let indexEntriesWarmed = 0;
+  let graphSearchCalls = 0;
+  let searchTermsExecuted = 0;
   for (const probe of chatgptContentFallbackProbes(query)) {
     probes.push(probe);
     const discovered = await find({
@@ -9642,6 +9648,8 @@ async function chatgptContentDiscoveryFallback(query, cache, contentIndex) {
       contentMaxResults: 10,
       format: "full"
     });
+    graphSearchCalls += discovered.summary?.graphSearchCalls || 0;
+    searchTermsExecuted += discovered.summary?.searchTermsExecuted || 0;
     const candidates = (discovered.items || [])
       .map((candidate) => candidate)
       .filter((candidate) => candidate?.id && !attemptedIds.has(candidate.id) && !candidate.folder)
@@ -9684,17 +9692,19 @@ async function chatgptContentDiscoveryFallback(query, cache, contentIndex) {
       return String(left.name || "").localeCompare(String(right.name || ""));
     });
     if (matches.length) {
-      return { attempted: true, items: matches.slice(0, 10), probes, candidatesRead, indexEntriesWarmed };
+      return { attempted: true, items: matches.slice(0, 10), probes, candidatesRead, indexEntriesWarmed, graphSearchCalls, searchTermsExecuted };
     }
   }
-  return { attempted: true, items: [], probes, candidatesRead, indexEntriesWarmed };
+  return { attempted: true, items: [], probes, candidatesRead, indexEntriesWarmed, graphSearchCalls, searchTermsExecuted };
 }
 
 async function chatgptSearch(args = {}) {
   const startedAt = Date.now();
+  const query = String(args.query || "").trim();
   const cache = await loadMetadataCache();
-  const found = await find({
-    query: String(args.query || "").trim(),
+  const contentFallbackEligible = chatgptContentFallbackEligible(query);
+  const findArgs = {
+    query,
     maxResults: 10,
     maxResultsLimit: 10,
     maxSearchTerms: 6,
@@ -9715,13 +9725,21 @@ async function chatgptSearch(args = {}) {
     contentMaxQueries: 3,
     contentMaxResults: 10,
     format: "compact"
+  };
+  // Service-like descriptions often point to contractor-named or numbered files
+  // whose metadata does not contain the requested domain. Check the local indexes
+  // first, then verify a bounded document probe before spending latency on all
+  // semantic Graph expansions. If verification misses, retain the full search.
+  let found = await find({
+    ...findArgs,
+    ...(contentFallbackEligible ? { liveSearch: false } : {})
   });
-  let selectedItems = (found.items || []).filter((item) => chatgptMatchesStrictDocumentIntent(item, String(args.query || "")));
-  let contentFallback = { attempted: false, items: [], probes: [], candidatesRead: 0, indexEntriesWarmed: 0 };
+  let selectedItems = (found.items || []).filter((item) => chatgptMatchesStrictDocumentIntent(item, query));
+  let contentFallback = { attempted: false, items: [], probes: [], candidatesRead: 0, indexEntriesWarmed: 0, graphSearchCalls: 0, searchTermsExecuted: 0 };
   if (!selectedItems.length) {
     try {
       contentFallback = await chatgptContentDiscoveryFallback(
-        String(args.query || "").trim(),
+        query,
         cache,
         await loadContentIndex()
       );
@@ -9729,6 +9747,10 @@ async function chatgptSearch(args = {}) {
     } catch (error) {
       recordLocalWarning("ChatGPT content-verified search fallback", error);
     }
+  }
+  if (!selectedItems.length && contentFallbackEligible) {
+    found = await find(findArgs);
+    selectedItems = (found.items || []).filter((item) => chatgptMatchesStrictDocumentIntent(item, query));
   }
   const revalidationScheduled = found.summary?.usedStaleLocalFastPath === true
     ? scheduleChatgptCacheRevalidation(args.query, cache)
@@ -9743,8 +9765,8 @@ async function chatgptSearch(args = {}) {
       event: "onedrive-chatgpt-search",
       durationMs: elapsedMs(startedAt),
       results: results.length,
-      graphSearchCalls: found.summary?.graphSearchCalls || 0,
-      searchTermsExecuted: found.summary?.searchTermsExecuted || 0,
+      graphSearchCalls: (found.summary?.graphSearchCalls || 0) + contentFallback.graphSearchCalls,
+      searchTermsExecuted: (found.summary?.searchTermsExecuted || 0) + contentFallback.searchTermsExecuted,
       bestScore: found.summary?.bestScore || 0,
       cacheFresh: Boolean(found.summary?.cacheFresh),
       cacheAgeSeconds: found.summary?.cacheAgeSeconds ?? null,
