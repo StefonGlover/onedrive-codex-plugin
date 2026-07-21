@@ -2,7 +2,7 @@
 
 Local Codex plugin for OneDrive file operations through Microsoft Graph.
 
-Release `0.5.1+codex.20260721104500` adds bounded content verification for subtle service-record searches whose subject appears only inside an opaque PDF or common document. Eligible cold searches now verify one likely document probe before fanning out across semantic metadata expansions, successful reads warm the local content index, and repair/technician intent ranks actual invoices and service records above generic home inspections. The release keeps the focused 21-tool ChatGPT surface, exact-file extraction, guarded CRUD/permissions actions, and structured Office/common-format reads.
+Release `0.5.1+codex.20260721181802` strengthens real productivity workflows in ChatGPT. Search accepts a whole multi-document request, covers every requested domain, treats a year in a report title as recency evidence, and prefers the requested document kind. Standard fetch now extracts bounded RFC 822 `.eml` headers and human-readable bodies. Focused tool metadata accurately distinguishes direct folder creation from preview-guarded mutations, serializes dependent writes so guards stay fresh, identifies same-server OneDrive item, permission, and preview values as non-auth credentials, prefers user-visible paths for mutations, and returns asynchronous copy acceptance without inline polling.
 
 ChatGPT surface note (verified 2026-07-19): the regular Chat surface passes the full health check with the No Auth tunnel app. Work requires the delegated OAuth deployment described below; its no-auth host path can display an incorrect expired-connection card before dispatching a tool call.
 

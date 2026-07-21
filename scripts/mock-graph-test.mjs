@@ -47,6 +47,26 @@ const homeElectricalInspectionRtfBuffer = Buffer.from(
   "{\\rtf1\\ansi Whole Home Final Inspection\\par Electrical systems inspection included the breaker panel, wiring, outlets, and service equipment.\\par This was a general property inspection, not a technician repair invoice.\\par}",
   "utf8"
 );
+const electricalInvoiceEmailBuffer = Buffer.from([
+  "From: BriteBox Electrical <billing@britebox.example>",
+  "To: homeowner@example.test",
+  "Subject: Invoice 605473749 - panel service",
+  "Date: Tue, 28 May 2024 09:15:00 -0400",
+  "MIME-Version: 1.0",
+  "Content-Type: multipart/alternative; boundary=mock-boundary",
+  "",
+  "--mock-boundary",
+  "Content-Type: text/plain; charset=utf-8",
+  "Content-Transfer-Encoding: quoted-printable",
+  "",
+  "Electrical panel inspection and breaker maintenance completed.=0ATotal paid: $425.00",
+  "--mock-boundary",
+  "Content-Type: text/html; charset=utf-8",
+  "",
+  "<p>Electrical panel inspection and breaker maintenance completed.</p>",
+  "--mock-boundary--",
+  ""
+].join("\r\n"), "utf8");
 const largeChatgptTextBuffer = Buffer.from([
   "Large ChatGPT document",
   ...Array.from({ length: 18 }, (_, sectionIndex) => [
@@ -563,6 +583,29 @@ const graph = createServer(async (req, res) => {
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/home-electrical-inspection/content") {
     return binary(res, 200, homeElectricalInspectionRtfBuffer, { "Content-Type": "application/rtf" });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/electrical-invoice-email") {
+    return json(res, 200, item("electrical-invoice-email", "Invoice 605473749 from BriteBox Electrical.eml", {
+      size: electricalInvoiceEmailBuffer.length,
+      createdDateTime: "2024-05-28T13:15:00Z",
+      lastModifiedDateTime: "2024-05-28T13:15:00Z",
+      parentReference: { path: "/drive/root:/Home Maintenance/Contractors" },
+      file: { mimeType: "message/rfc822" }
+    }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/electrical-invoice-email/content") {
+    return binary(res, 200, electricalInvoiceEmailBuffer, { "Content-Type": "message/rfc822" });
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/electrical-report") {
+    return json(res, 200, item("electrical-report", "2026 Electrical Report.pdf", {
+      createdDateTime: "2023-10-01T12:00:00Z",
+      lastModifiedDateTime: "2023-10-01T12:00:00Z",
+      parentReference: { path: "/drive/root:/Home Maintenance" },
+      file: { mimeType: "application/pdf" }
+    }));
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/large-chatgpt-text") {
@@ -4766,6 +4809,27 @@ process.exit(2);
     const searched = await tool("onedrive_content_search", { query: "Budget total", maxResults: 5 });
     assert(!searched.isError && searched.value.items?.[0]?.id === "common-rtf", "common RTF content should be searchable after indexing", searched);
     return { indexed: refreshed.value.indexed, source: searched.value.items[0].source };
+  });
+
+  await check("ChatGPT fetch extracts RFC 822 email and latest ranking honors report-title year", async () => {
+    await tool("onedrive_cache_clear");
+    await tool("onedrive_content_index_clear");
+    const emailInfo = await tool("onedrive_get_info", { itemId: "electrical-invoice-email" });
+    const reportInfo = await tool("onedrive_get_info", { itemId: "electrical-report" });
+    assert(!emailInfo.isError && !reportInfo.isError, "electrical productivity fixtures should seed metadata", { emailInfo, reportInfo });
+    const indexed = await tool("onedrive_content_index_refresh", { itemId: "electrical-invoice-email", maxFiles: 1, maxBytesPerFile: 16384 });
+    assert(!indexed.isError && indexed.value.indexed === 1, "RFC 822 email should be indexed by the bounded common extractor", indexed);
+    const fetched = await tool("fetch", { id: "electrical-invoice-email" });
+    assert(!fetched.isError && fetched.value.text.includes("Subject: Invoice 605473749 - panel service"), "ChatGPT fetch should expose decoded email headers", fetched);
+    assert(fetched.value.text.includes("Total paid: $425.00"), "ChatGPT fetch should decode the email body", fetched);
+    assert(fetched.value.metadata?.path === "Home Maintenance/Contractors/Invoice 605473749 from BriteBox Electrical.eml", "ChatGPT fetch should expose a reusable human-readable path", fetched.value.metadata);
+    const searched = await tool("search", { query: "latest electrical record" });
+    assert(!searched.isError && searched.value.results?.[0]?.id === "electrical-report", "latest ranking should treat the 2026 report title as stronger recency evidence than a 2024 email timestamp", searched);
+    return {
+      extractor: fetched.value.metadata.previewSource,
+      topResult: searched.value.results[0],
+      emailPath: fetched.value.metadata.path
+    };
   });
 
   await check("find uses content index without fetching file bodies", async () => {

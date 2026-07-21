@@ -17,7 +17,7 @@ if (process.argv.includes("--probe")) {
   const tools = listed.result.tools;
   const officeTransform = tools.find((tool) => tool.name === "onedrive_office_batch_transform");
   const compatibility = Object.fromEntries(
-    ["search", "fetch", "onedrive_open_files", "onedrive_preview_actions", "onedrive_upload_file", "onedrive_permanent_delete", "onedrive_create_sharing_link"].map((name) => [name, tools.find((tool) => tool.name === name) || null])
+    ["search", "fetch", "onedrive_open_files", "onedrive_preview_actions", "onedrive_upload_file", "onedrive_permanent_delete", "onedrive_create_sharing_link", "onedrive_create_folder", "onedrive_copy", "onedrive_delete", "onedrive_revoke_permission"].map((name) => [name, tools.find((tool) => tool.name === name) || null])
   );
   const oversized = boundChatgptToolPayload({ rows: [{ value: "x".repeat(11 * 1024 * 1024) }] });
   console.log(JSON.stringify({
@@ -93,9 +93,25 @@ try {
   assert(chatgpt.bytes <= 40 * 1024, "ChatGPT tools/list payload must stay at or below 40 KiB.", chatgpt);
   assert(chatgpt.bytes < full.bytes * 0.15, "ChatGPT tools/list payload must remain at least 85% smaller than full.", { full, chatgpt });
   assert(chatgpt.officeTransformBytes <= 4096, "ChatGPT Office transform descriptor must remain compact.", chatgpt);
-  assert(chatgpt.instructions.length > 0 && chatgpt.instructions.length <= 512, "Server instructions must be present and concise.", chatgpt.instructions);
+  assert(chatgpt.instructions.length > 0 && chatgpt.instructions.length <= 1400, "Server instructions must be present and bounded.", chatgpt.instructions);
   assert(chatgpt.instructions.includes("onedrive_open_files once") && !chatgpt.instructions.includes("matching structured read tool"), "ChatGPT server instructions must use the combined exact-file read path.", chatgpt.instructions);
   assert(chatgpt.instructions.includes("onedrive_preview_actions") && chatgpt.instructions.includes("identity-free access counts"), "ChatGPT server instructions must route previews through the read-only batch path.", chatgpt.instructions);
+  assert(chatgpt.instructions.includes("multiple related documents") && chatgpt.instructions.includes("whole natural-language request once"), "ChatGPT instructions must keep multi-document discovery in one search call.", chatgpt.instructions);
+  assert(chatgpt.instructions.includes("Create folders directly") && chatgpt.instructions.includes("no dryRun, confirmed, or previewToken fields"), "ChatGPT instructions must match the direct create-folder schema.", chatgpt.instructions);
+  assert(chatgpt.instructions.includes("execute and verify one mutation at a time") && chatgpt.instructions.includes("obtain a fresh preview"), "ChatGPT instructions must serialize dependent mutations and refresh their guards.", chatgpt.instructions);
+  assert(chatgpt.instructions.includes("not authentication credentials"), "ChatGPT instructions must classify returned OneDrive identifiers accurately.", chatgpt.instructions);
+  assert(chatgpt.instructions.includes("prefer user-visible paths") && chatgpt.instructions.includes("asynchronous acceptance immediately"), "ChatGPT instructions must prefer path selectors and avoid inline copy polling.", chatgpt.instructions);
+  const createFolderSchema = chatgpt.compatibility.onedrive_create_folder?.inputSchema;
+  assert(createFolderSchema && !["dryRun", "confirmed", "previewToken"].some((field) => field in (createFolderSchema.properties || {})), "Create-folder must not advertise preview-only arguments.", createFolderSchema);
+  assert(createFolderSchema?.properties?.parentPath?.description?.includes("Prefer this whenever known") && createFolderSchema?.properties?.parentItemId?.description?.includes("Use only when no parent path is available"), "Create-folder must steer ChatGPT to a user-visible parent path.", createFolderSchema);
+  assert(chatgpt.metadata.find((tool) => tool.name === "onedrive_create_folder")?.description.includes("do not send dryRun, confirmed, or previewToken"), "Create-folder metadata must explicitly describe its direct conflict-safe call.", chatgpt.metadata);
+  const copySchema = chatgpt.compatibility.onedrive_copy?.inputSchema?.properties || {};
+  assert(!("waitForCompletion" in copySchema) && !("timeoutSeconds" in copySchema), "Focused ChatGPT copy must return asynchronous acceptance instead of inline polling.", copySchema);
+  assert(copySchema.path?.description?.includes("Prefer this user-visible selector") && copySchema.destinationParentPath?.description?.includes("Prefer this whenever known"), "Focused ChatGPT copy must prefer source and destination paths.", copySchema);
+  const deleteSchema = chatgpt.compatibility.onedrive_delete?.inputSchema?.properties || {};
+  assert(deleteSchema.path?.description?.includes("Prefer this user-visible selector") && deleteSchema.itemId?.description?.includes("Use only when no path is available"), "Recycle-bin moves must prefer known paths over opaque IDs.", deleteSchema);
+  const revokeSchema = chatgpt.compatibility.onedrive_revoke_permission?.inputSchema?.properties || {};
+  assert(revokeSchema.itemId?.description?.includes("not an authentication credential") && revokeSchema.permissionId?.description?.includes("not an auth credential") && revokeSchema.previewToken?.description?.includes("not an auth credential"), "Revoke identifiers and preview proof must be accurately classified for the host safety layer.", revokeSchema);
   assert(chatgpt.metadata.every((tool) => /^Use this when\b/u.test(tool.description || "")), "Every focused ChatGPT tool description must begin with a discriminative 'Use this when' cue.", chatgpt.metadata);
   assert(new Set(chatgpt.metadata.map((tool) => tool.description)).size === chatgpt.metadata.length, "Focused ChatGPT tool descriptions must be unique.", chatgpt.metadata);
   assert(chatgpt.metadata.every((tool) => tool.invoking && tool.invoked && tool.invoking.length <= 64 && tool.invoked.length <= 64), "Every focused ChatGPT tool must advertise bounded invocation status text.", chatgpt.metadata);

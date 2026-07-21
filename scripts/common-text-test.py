@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from email.message import EmailMessage
 from pathlib import Path
 
 
@@ -69,7 +70,23 @@ def main() -> None:
         epub_result = extract(epub, "epub")
         assert "Chapter one" in epub_result["text"] and "Savings 3,350" in epub_result["text"]
 
-    print(json.dumps({"ok": True, "tested": ["rtf", "opendocument", "epub"]}, indent=2))
+        email = root / "service-report.eml"
+        message = EmailMessage()
+        message["Subject"] = "Evolution Heating service invoice 3095"
+        message["From"] = "service@example.com"
+        message["To"] = "owner@example.com"
+        message["Date"] = "Wed, 24 Jul 2024 12:00:00 -0400"
+        message.set_content("Compressor warranty replacement completed. Total paid: $2,518.")
+        message.add_alternative("<html><body><p>HTML duplicate should not replace the plain body.</p></body></html>", subtype="html")
+        message.add_attachment(b"not extracted", maintype="application", subtype="pdf", filename="invoice-3095.pdf")
+        email.write_bytes(message.as_bytes())
+        email_result = extract(email, "email")
+        assert "Subject: Evolution Heating service invoice 3095" in email_result["text"]
+        assert "Compressor warranty replacement completed" in email_result["text"]
+        assert "Attachments: invoice-3095.pdf" in email_result["text"]
+        assert "not extracted" not in email_result["text"]
+
+    print(json.dumps({"ok": True, "tested": ["rtf", "opendocument", "epub", "email"]}, indent=2))
 
 
 if __name__ == "__main__":

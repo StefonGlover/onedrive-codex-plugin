@@ -11,6 +11,8 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from email import policy
+from email.parser import BytesParser
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -183,6 +185,75 @@ def extract_epub(path: Path) -> str:
         raise ExtractionError("EPUB is not a valid ZIP archive.") from error
 
 
+def extract_email(path: Path) -> str:
+    """Extract useful RFC 822 headers and bounded human-readable message bodies."""
+    if path.stat().st_size > 25 * 1024 * 1024:
+        raise ExtractionError("Email message is too large to parse safely.")
+    try:
+        with path.open("rb") as source:
+            message = BytesParser(policy=policy.default).parse(source)
+    except Exception as error:
+        raise ExtractionError("Email message could not be parsed: %s" % error) from error
+
+    output: List[str] = []
+    for label, field in (("Subject", "subject"), ("From", "from"), ("To", "to"), ("Cc", "cc"), ("Date", "date")):
+        value = message.get(field)
+        if value:
+            output.append("%s: %s" % (label, str(value).replace("\r", " ").replace("\n", " ")))
+
+    plain_parts: List[str] = []
+    html_parts: List[str] = []
+    attachments: List[str] = []
+    decoded_bytes = 0
+    max_decoded_bytes = 8 * 1024 * 1024
+    for part in message.walk():
+        if part.is_multipart():
+            continue
+        filename = part.get_filename()
+        disposition = (part.get_content_disposition() or "").lower()
+        if filename or disposition == "attachment":
+            if filename:
+                attachments.append(str(filename).replace("\r", " ").replace("\n", " "))
+            continue
+        content_type = part.get_content_type().lower()
+        if content_type not in {"text/plain", "text/html"}:
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            raw_payload = part.get_payload()
+            payload = raw_payload.encode("utf-8", errors="replace") if isinstance(raw_payload, str) else b""
+        remaining = max_decoded_bytes - decoded_bytes
+        if remaining <= 0:
+            break
+        payload = payload[:remaining]
+        decoded_bytes += len(payload)
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            value = payload.decode(charset, errors="replace")
+        except LookupError:
+            value = payload.decode("utf-8", errors="replace")
+        if content_type == "text/html":
+            parser = TextHTMLParser()
+            parser.feed(value)
+            value = parser.text()
+            if value:
+                html_parts.append(value)
+        else:
+            value = value.replace("\x00", "").strip()
+            if value:
+                plain_parts.append(value)
+
+    bodies = plain_parts or html_parts
+    if bodies:
+        output.extend(["", *bodies])
+    if attachments:
+        output.extend(["", "Attachments: %s" % ", ".join(dict.fromkeys(attachments))])
+    text = "\n".join(output).strip()
+    if not text:
+        raise ExtractionError("Email message did not contain readable headers or body text.")
+    return text
+
+
 RTF_DESTINATIONS = {
     "aftncn", "aftnsep", "aftnsepc", "annotation", "atnauthor", "atndate", "atnicn", "atnid",
     "atnparent", "atnref", "atntime", "atrfend", "atrfstart", "author", "background", "blipuid",
@@ -306,6 +377,10 @@ def extract_external(path: Path, kind: str, max_bytes: int) -> Dict[str, Any]:
 
 
 def extract(path: Path, kind: str, max_bytes: int) -> Dict[str, Any]:
+    if kind == "email":
+        result = bounded_text(extract_email(path).encode("utf-8"), max_bytes)
+        result["extractor"] = "python-email"
+        return result
     if kind == "rtf":
         result = bounded_text(extract_rtf(path).encode("utf-8"), max_bytes)
         result["extractor"] = "python-rtf"

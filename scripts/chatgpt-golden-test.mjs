@@ -12,7 +12,7 @@ function assert(condition, message, details = undefined) {
 }
 
 const goldenPrompts = [
-  { prompt: "Find documents about the 2026 family budget", tool: "search", cues: ["keywords", "discovery"] },
+  { prompt: "Find my latest HVAC service paperwork and most recent electrical report", tool: "search", cues: ["multiple related document targets", "ranked set"] },
   { prompt: "Read the budget workbook you found", tool: "fetch", cues: ["read", "returned by search"] },
   { prompt: "Open 2026 Family Budgeting.xlsx and Annual Report.pdf", tool: "onedrive_open_files", cues: ["exact filenames", "one read-only call"] },
   { prompt: "Preview renaming this workbook, copying it, and creating a view link", tool: "onedrive_preview_actions", cues: ["preview", "read-only batch", "sharing counts without identities"] },
@@ -22,13 +22,13 @@ const goldenPrompts = [
   { prompt: "Upload this attached PDF to OneDrive", tool: "onedrive_upload_file", cues: ["chatgpt-provided file", "upload"] },
   { prompt: "Create a new markdown file with this full content", tool: "onedrive_write_text", cues: ["create or fully replace", "text"] },
   { prompt: "Change only one line in this existing text file", tool: "onedrive_patch_text", cues: ["targeted", "preserving"] },
-  { prompt: "Create a folder named Receipts under Documents", tool: "onedrive_create_folder", cues: ["create a new folder"] },
+  { prompt: "Create a folder named Receipts under Documents", tool: "onedrive_create_folder", cues: ["direct conflict-safe create", "do not send dryrun"] },
   { prompt: "I approve the previewed rename; apply it", tool: "onedrive_rename", cues: ["approved a live rename", "newname", "expectedid or expectedname", "previewtoken"] },
   { prompt: "I approve the previewed move into Archive; apply it", tool: "onedrive_move", cues: ["approved a live move", "destination parent", "expectedid or expectedname", "previewtoken"] },
-  { prompt: "I approve the previewed copy; apply it and keep the original", tool: "onedrive_copy", cues: ["approved a live copy", "waitforcompletion", "expectedid or expectedname", "previewtoken"] },
+  { prompt: "I approve the previewed copy; apply it and keep the original", tool: "onedrive_copy", cues: ["approved a live copy", "asynchronous acceptance", "expectedid or expectedname", "previewtoken"] },
   { prompt: "I approve the previewed view-only sharing link; create it", tool: "onedrive_create_sharing_link", cues: ["approved a live sharing link", "type", "scope", "previewtoken"] },
   { prompt: "Give these named people edit access", tool: "onedrive_invite_permission", cues: ["specific named recipients"] },
-  { prompt: "I approve the previewed sharing permission removal", tool: "onedrive_revoke_permission", cues: ["approved a live permission removal", "permissionid", "previewtoken"] },
+  { prompt: "I approve the previewed sharing permission removal", tool: "onedrive_revoke_permission", cues: ["approved a permission removal", "permissionid", "not auth credentials"] },
   { prompt: "Which named people currently have access to this folder?", tool: "onedrive_permissions", cues: ["explicitly wants the identities"] },
   { prompt: "Move this file to the recycle bin", tool: "onedrive_delete", cues: ["recycle bin", "permanent deletion"] },
   { prompt: "Restore this item from the recycle bin", tool: "onedrive_restore_deleted", cues: ["restore", "recycle-bin"] },
@@ -59,6 +59,9 @@ try {
   assert(tools.length === goldenPrompts.length, "Golden prompt coverage must match the complete focused ChatGPT tool surface.", { tools: tools.map((tool) => tool.name), prompts: goldenPrompts.map((entry) => entry.tool) });
   assert(initialized.result.instructions.includes("onedrive_open_files once"), "ChatGPT instructions must describe the combined exact-file read sequence.", initialized.result.instructions);
   assert(initialized.result.instructions.includes("onedrive_preview_actions"), "ChatGPT instructions must describe the read-only batch preview sequence.", initialized.result.instructions);
+  assert(initialized.result.instructions.includes("execute and verify one mutation at a time"), "ChatGPT instructions must prevent stale guards in dependent mutation sequences.", initialized.result.instructions);
+  assert(initialized.result.instructions.includes("Create folders directly"), "ChatGPT instructions must match the create-folder contract.", initialized.result.instructions);
+  assert(initialized.result.instructions.includes("prefer user-visible paths") && initialized.result.instructions.includes("asynchronous acceptance immediately"), "ChatGPT instructions must avoid false credential routing and inline copy waits.", initialized.result.instructions);
   assert(!initialized.result.instructions.includes("matching structured read tool"), "ChatGPT instructions must not reference tools absent from the focused profile.", initialized.result.instructions);
 
   for (const entry of goldenPrompts) {
