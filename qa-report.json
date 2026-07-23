@@ -2,10 +2,10 @@
   "schemaVersion": 2,
   "decision": "Pending — Entra registration, NAS OAuth rollout, and ChatGPT Work validation",
   "date": "2026-07-23",
-  "generatedAt": "2026-07-23T16:13:40Z",
+  "generatedAt": "2026-07-23T17:36:34Z",
   "source": {
-    "commit": "b6425a12e7eb381362350ab834fca8adfbb338c6",
-    "workingTree": "The final nas29 source fixes ChatGPT attachment preview binding and NAS attachment-staging ownership, passes the 21-tool focused contract, 84-tool full contract, 21 golden prompts, 175 mock Graph checks, and live Word/Excel/PowerPoint upload-read-edit verification. NAS nas29 and canonical ChatGPT app dev-24 are deployed. Immutable Codex-cache parity, production Entra registration, NAS OAuth rollout, and the separate ChatGPT Work host issue remain pending.",
+    "commit": "e92e96c7653c685133412f287b6324c6f3693897",
+    "workingTree": "The final nas30 source fixes ChatGPT attachment preview binding, NAS attachment-staging ownership, and safe host-agnostic public HTTPS attachment downloads. It passes the 21-tool focused contract, 84-tool full contract, 21 golden prompts, 176 mock Graph checks, live Word/Excel/PowerPoint verification, and the final regular-Chat attachment upload/readback regression. NAS nas30 and canonical ChatGPT app dev-24 are deployed. Immutable Codex-cache parity, production Entra registration, NAS OAuth rollout, and the separate ChatGPT Work host issue remain pending.",
     "pluginVersion": "0.5.1+codex.20260723153254",
     "contentDigest": null
   },
@@ -19,7 +19,7 @@
     { "name": "ChatGPT focused contract", "status": "pass", "toolCount": 21, "bytes": 40536 },
     { "name": "ChatGPT golden prompts", "status": "pass", "cases": 21, "ambiguityPairs": 8 },
     { "name": "Common document extraction", "status": "pass", "formats": ["rtf", "opendocument", "epub", "email"] },
-    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 175 },
+    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 176 },
     { "name": "Office Open XML operations", "status": "pass", "operations": 79, "word": 21, "excel": 33, "powerpoint": 25 },
     { "name": "Semantic anchors", "status": "pass", "checks": 6 },
     { "name": "Text patch safety", "status": "pass", "checks": 6 },
@@ -77,6 +77,31 @@
         "activeTestRootsRemaining": 0,
         "recycledNotPermanentlyDeleted": true
       }
+    },
+    "nas30AttachmentUrlBeta": {
+      "status": "pass",
+      "mode": "regular Chat",
+      "sameConversation": "https://chatgpt.com/c/6a6240c7-3f30-83ea-98e6-0ebd1a804893",
+      "metadataVersion": "dev-24",
+      "fixture": {
+        "name": "onedrive-nas30-attachment-20260723.csv",
+        "size": 49,
+        "marker": "NAS30_ATTACHMENT_OK_20260723"
+      },
+      "upload": {
+        "status": "pass",
+        "conflictBehavior": "fail",
+        "itemId": "B8C89DB91F19C763!s4f25b7ef520e400e99206f619624faf0",
+        "remoteFetchVerified": true,
+        "markerVerified": true,
+        "untrustedUrlErrorRecurred": false
+      },
+      "cleanup": {
+        "status": "pass",
+        "liveRootPathAbsent": true,
+        "recycledNotPermanentlyDeleted": true,
+        "restorePreviewVerified": true
+      }
     }
   },
   "installedBuild": {
@@ -92,9 +117,10 @@
     "anonymousLinksRemaining": 0,
     "isolatedLocalResidue": false,
     "nasStagingArchiveRemoved": true,
-    "previousNas28SourcePromotedTo": "app-0.5.1-nas29-20260723",
-    "rollbackImagesRetained": ["onedrive-chatgpt-nas:0.5.1-nas27", "onedrive-chatgpt-nas:0.5.1-nas28"],
-    "rollbackManifestsRetained": ["compose.nas25.rollback.yaml", "compose.nas27.rollback.yaml"]
+    "activeNasSource": "app-0.5.1-nas30-20260723",
+    "immediateRollbackSource": "app-0.5.1-nas29-20260723",
+    "rollbackImagesRetained": ["onedrive-chatgpt-nas:0.5.1-nas27", "onedrive-chatgpt-nas:0.5.1-nas28", "onedrive-chatgpt-nas:0.5.1-nas29"],
+    "rollbackManifestsRetained": ["compose.nas25.rollback.yaml", "compose.nas27.rollback.yaml", "compose.nas29.rollback.yaml"]
   },
   "sourceCacheParity": {
     "status": "pending",
@@ -107,10 +133,12 @@
     "status": "pass",
     "platform": "Synology DS923+ Container Manager",
     "project": "onedrive-chatgpt",
-    "image": "onedrive-chatgpt-nas:0.5.1-nas29",
-    "imageId": "c73c1b5d216238cba0cc1cfb6a2ee78024f3b476aa57ce9212740c6ce2dd3d7e",
-    "sourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.5.1-nas29-20260723",
+    "image": "onedrive-chatgpt-nas:0.5.1-nas30",
+    "imageId": "1788b79f39ed1e42bbb8d144fb35948a33f1dd647f8ffb125b30229e7fb0bc4c",
+    "sourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.5.1-nas30-20260723",
     "containerState": "running",
+    "containerHealth": "healthy",
+    "restartCount": 0,
     "buildExitCode": 0,
     "chatgpt": {
       "status": "pass",
