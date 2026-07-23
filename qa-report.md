@@ -4,7 +4,7 @@ Decision: Pending — Entra registration, NAS OAuth rollout, and ChatGPT Work va
 Date: 2026-07-21
 Generated: 2026-07-21T19:59:32Z
 Tested source base commit: `3bd2f3d6617a74843dd7a953ff51305e74ac6f0d`
-Plugin version: `0.5.1+codex.20260721181802`
+Plugin version: `0.5.1+codex.20260723153254`
 Tool contract: 84 exact tool names
 
 ## Current outcome
@@ -36,7 +36,7 @@ DSM staging cleanup removed the uploaded archive and moved the obsolete `app-0.5
 - Full contract: 84 tools, 338,721 bytes.
 - ChatGPT contract: 21 tools, 40,536 bytes, 88.0% reduction.
 - Golden prompts: 21/21, with eight ambiguity pairs.
-- Mock Microsoft Graph: 174/174.
+- Mock Microsoft Graph: 175/175.
 - Semantic anchors: 6/6.
 - Text patch preservation and safety: 6/6.
 - Office Open XML operations: 79 total (21 Word, 33 Excel, 25 PowerPoint).

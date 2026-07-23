@@ -10870,6 +10870,22 @@ function trustedChatgptFileUrl(value) {
   } catch {
     throw new Error("sourceFile.download_url must be a valid HTTPS URL.");
   }
+  const testFileBaseUrl = process.env.ONEDRIVE_TEST_ACCESS_TOKEN
+    ? process.env.ONEDRIVE_TEST_CHATGPT_FILE_BASE_URL
+    : null;
+  if (testFileBaseUrl) {
+    let testBase;
+    try {
+      testBase = new URL(testFileBaseUrl);
+    } catch {
+      throw new Error("ONEDRIVE_TEST_CHATGPT_FILE_BASE_URL must be a valid URL.");
+    }
+    const normalizedTestBasePath = testBase.pathname.endsWith("/") ? testBase.pathname : `${testBase.pathname}/`;
+    if (target.origin === testBase.origin
+      && (target.pathname === testBase.pathname || target.pathname.startsWith(normalizedTestBasePath))) {
+      return target;
+    }
+  }
   const host = target.hostname.toLowerCase();
   const trustedHost = host === "files.openai.com"
     || host.endsWith(".files.openai.com")
@@ -10880,6 +10896,12 @@ function trustedChatgptFileUrl(value) {
     throw new Error("Refusing to download a ChatGPT file from an untrusted URL.");
   }
   return target;
+}
+
+async function sha256LocalFile(localPath) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(localPath)) hash.update(chunk);
+  return hash.digest("hex");
 }
 
 async function downloadChatgptFile(sourceFile = {}) {
@@ -10935,38 +10957,39 @@ async function uploadChatgptFile(args = {}) {
   const destinationPath = assertSafeRemotePath(args.remotePath, "remotePath");
   if (!destinationPath) throw new Error("remotePath must include a filename.");
   const conflictBehavior = args.conflictBehavior || "fail";
-  const source = {
-    fileId: String(args.sourceFile?.file_id || ""),
-    fileName: String(args.sourceFile?.file_name || basename(destinationPath)),
-    mimeType: String(args.sourceFile?.mime_type || "")
-  };
-  const current = conflictBehavior === "replace" ? await existingReplacementTarget(destinationPath) : null;
-  if (current?.folder) throw new Error(`Refusing to replace a folder with file content: ${current.name}`);
-  const proof = {
-    destinationPath,
-    conflictBehavior,
-    source,
-    existing: current ? itemVersionProof(current) : null
-  };
-  const preview = {
-    dryRun: args.dryRun !== false,
-    confirmed: args.confirmed === true,
-    wouldUpload: { source, destinationPath, conflictBehavior },
-    wouldReplace: current ? simplifyItem(current) : null
-  };
-  if (args.dryRun !== false) return previewWithToken(preview, "onedrive_upload_file", proof);
-  if (args.confirmed !== true) {
-    return { ...preview, dryRun: false, requiredToUpload: "Set dryRun: false and confirmed: true after reviewing the upload preview." };
-  }
-  if (current && !hasExpectedIdentity(args)) {
-    return { ...preview, dryRun: false, confirmed: true, requiredToUpload: "Provide expectedName or expectedId matching the existing remote file." };
-  }
-  if (current) assertExpectedItem(current, args, "Upload replacement");
-  const previewTokenRequired = previewTokenRequiredResult(preview, "onedrive_upload_file", proof, args.previewToken, "requiredToUpload");
-  if (previewTokenRequired) return previewTokenRequired;
-
   const downloaded = await downloadChatgptFile(args.sourceFile);
   try {
+    const source = {
+      fileName: String(args.sourceFile?.file_name || basename(destinationPath)),
+      mimeType: String(args.sourceFile?.mime_type || ""),
+      bytes: downloaded.bytes,
+      sha256: await sha256LocalFile(downloaded.localPath)
+    };
+    const current = conflictBehavior === "replace" ? await existingReplacementTarget(destinationPath) : null;
+    if (current?.folder) throw new Error(`Refusing to replace a folder with file content: ${current.name}`);
+    const proof = {
+      destinationPath,
+      conflictBehavior,
+      source,
+      existing: current ? itemVersionProof(current) : null
+    };
+    const preview = {
+      dryRun: args.dryRun !== false,
+      confirmed: args.confirmed === true,
+      wouldUpload: { source, destinationPath, conflictBehavior },
+      wouldReplace: current ? simplifyItem(current) : null
+    };
+    if (args.dryRun !== false) return previewWithToken(preview, "onedrive_upload_file", proof);
+    if (args.confirmed !== true) {
+      return { ...preview, dryRun: false, requiredToUpload: "Set dryRun: false and confirmed: true after reviewing the upload preview." };
+    }
+    if (current && !hasExpectedIdentity(args)) {
+      return { ...preview, dryRun: false, confirmed: true, requiredToUpload: "Provide expectedName or expectedId matching the existing remote file." };
+    }
+    if (current) assertExpectedItem(current, args, "Upload replacement");
+    const previewTokenRequired = previewTokenRequiredResult(preview, "onedrive_upload_file", proof, args.previewToken, "requiredToUpload");
+    if (previewTokenRequired) return previewTokenRequired;
+
     const uploaded = await upload({
       localPath: downloaded.localPath,
       remotePath: destinationPath,

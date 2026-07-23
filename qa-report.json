@@ -5,8 +5,8 @@
   "generatedAt": "2026-07-21T19:59:32Z",
   "source": {
     "commit": "3bd2f3d6617a74843dd7a953ff51305e74ac6f0d",
-    "workingTree": "NAS nas27 and canonical ChatGPT app dev-22 run this exact source from a clean versioned NAS directory. The 21-tool focused contract, 84-tool full contract, 21 golden prompts, and 174 mock Graph checks pass. Immutable Codex-cache parity, production Entra registration, NAS OAuth rollout, and the separate ChatGPT Work host issue remain pending.",
-    "pluginVersion": "0.5.1+codex.20260721181802",
+    "workingTree": "The nas28 release candidate fixes ChatGPT attachment preview binding and passes the 21-tool focused contract, 84-tool full contract, 21 golden prompts, and 175 mock Graph checks. NAS nas27 and canonical ChatGPT app dev-22 remain deployed until the consolidated rollout. Immutable Codex-cache parity, production Entra registration, NAS OAuth rollout, and the separate ChatGPT Work host issue remain pending.",
+    "pluginVersion": "0.5.1+codex.20260723153254",
     "contentDigest": null
   },
   "contract": {
@@ -19,7 +19,7 @@
     { "name": "ChatGPT focused contract", "status": "pass", "toolCount": 21, "bytes": 40536 },
     { "name": "ChatGPT golden prompts", "status": "pass", "cases": 21, "ambiguityPairs": 8 },
     { "name": "Common document extraction", "status": "pass", "formats": ["rtf", "opendocument", "epub", "email"] },
-    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 174 },
+    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 175 },
     { "name": "Office Open XML operations", "status": "pass", "operations": 79, "word": 21, "excel": 33, "powerpoint": 25 },
     { "name": "Semantic anchors", "status": "pass", "checks": 6 },
     { "name": "Text patch safety", "status": "pass", "checks": 6 },
@@ -45,8 +45,8 @@
   },
   "installedBuild": {
     "status": "pending_source_update",
-    "version": "0.5.1+codex.20260721181802",
-    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.5.1+codex.20260721181802",
+    "version": "0.5.1+codex.20260723153254",
+    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.5.1+codex.20260723153254",
     "oldCacheOverwritten": false
   },
   "cleanup": {

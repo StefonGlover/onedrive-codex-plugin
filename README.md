@@ -2,7 +2,7 @@
 
 Local Codex plugin for OneDrive file operations through Microsoft Graph.
 
-Release `0.5.1+codex.20260721181802` strengthens real productivity workflows in ChatGPT. Search accepts a whole multi-document request, covers every requested domain, treats a year in a report title as recency evidence, and prefers the requested document kind. Standard fetch now extracts bounded RFC 822 `.eml` headers and human-readable bodies. Focused tool metadata accurately distinguishes direct folder creation from preview-guarded mutations, serializes dependent writes so guards stay fresh, identifies same-server OneDrive item, permission, and preview values as non-auth credentials, prefers user-visible paths for mutations, and returns asynchronous copy acceptance without inline polling.
+Release `0.5.1+codex.20260723153254` fixes ChatGPT attachment uploads whose host-generated file ID changes between the required preview and confirmed upload calls. Upload proofs now bind to the downloaded file's SHA-256 digest, byte length, filename, MIME type, destination, conflict behavior, and any existing replacement identity. Identical bytes remain valid across transient host IDs, while changed content fails closed before Microsoft Graph receives an upload. The release retains the multi-document search, bounded RFC 822 extraction, path-first mutation guidance, guarded writes, and asynchronous copy behavior from the prior productivity build.
 
 ChatGPT surface note (verified 2026-07-19): the regular Chat surface passes the full health check with the No Auth tunnel app. Work requires the delegated OAuth deployment described below; its no-auth host path can display an incorrect expired-connection card before dispatching a tool call.
 

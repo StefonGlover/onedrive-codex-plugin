@@ -151,6 +151,7 @@ const connectorEnvironmentKeys = [
   "ONEDRIVE_TENANT",
   "ONEDRIVE_TEST_ACCESS_TOKEN",
   "ONEDRIVE_TEST_AUTH_CONTEXT_ID",
+  "ONEDRIVE_TEST_CHATGPT_FILE_BASE_URL",
   "ONEDRIVE_TEST_KEYCHAIN_PATH"
 ];
 const isolatedEnvironmentKeys = ["HOME", "TMPDIR", "PYTHONPYCACHEPREFIX", ...connectorEnvironmentKeys];
@@ -282,6 +283,7 @@ function mockServerEnvironment(overrides = {}, label = "server") {
     ONEDRIVE_IDENTITY_BASE_URL: identityBaseUrl,
     ONEDRIVE_TEST_ACCESS_TOKEN: Object.hasOwn(overrides, "ONEDRIVE_TEST_ACCESS_TOKEN") ? String(overrides.ONEDRIVE_TEST_ACCESS_TOKEN ?? "") : "mock-token",
     ONEDRIVE_TEST_AUTH_CONTEXT_ID: mockAuthContextId,
+    ONEDRIVE_TEST_CHATGPT_FILE_BASE_URL: `${new URL(graphBaseUrl).origin}/chatgpt-files`,
     ONEDRIVE_CLIENT_ID: Object.hasOwn(overrides, "ONEDRIVE_CLIENT_ID") ? String(overrides.ONEDRIVE_CLIENT_ID ?? "") : "mock-client-id"
   });
   return environment;
@@ -463,6 +465,29 @@ const graph = createServer(async (req, res) => {
   const path = url.pathname;
   const decodedUrl = decodeURIComponent(req.url);
   requests.push({ method: req.method, path, url: req.url, headers: req.headers });
+
+  if (req.method === "GET" && ["/chatgpt-files/stable-preview", "/chatgpt-files/stable-live"].includes(path)) {
+    const body = Buffer.from("stable ChatGPT upload\n", "utf8");
+    return binary(res, 200, body, {
+      "Content-Type": "text/plain",
+      "Content-Length": String(body.length)
+    });
+  }
+  if (req.method === "GET" && path === "/chatgpt-files/changed-live") {
+    const body = Buffer.from("changed ChatGPT upload\n", "utf8");
+    return binary(res, 200, body, {
+      "Content-Type": "text/plain",
+      "Content-Length": String(body.length)
+    });
+  }
+  if (req.method === "PUT" && path === "/v1.0/me/drive/root:/Uploads/chatgpt-stable.txt:/content") {
+    const body = await readBufferBody(req);
+    count("chatgpt-stable-upload");
+    return json(res, 200, item("chatgpt-stable-upload", "chatgpt-stable.txt", {
+      size: body.length,
+      parentReference: { path: "/drive/root:/Uploads" }
+    }));
+  }
 
   if (req.method === "GET" && path === "/v1.0/me") {
     return json(res, 200, { displayName: "Mock User", userPrincipalName: "mock@example.test", mail: "mock@example.test" });
@@ -4091,7 +4116,7 @@ process.exit(2);
     return { graphRequestsAdded: requests.length - before };
   });
 
-  await check("ChatGPT file upload requires preview and rejects untrusted download URLs", async () => {
+  await check("ChatGPT file upload rejects untrusted download URLs before issuing a preview", async () => {
     const args = {
       sourceFile: {
         download_url: "https://evil.example.test/private-file",
@@ -4103,18 +4128,64 @@ process.exit(2);
       conflictBehavior: "fail"
     };
     const preview = await tool("onedrive_upload_file", args);
-    assert(!preview.isError && preview.value.previewToken && preview.value.dryRun === true, "ChatGPT upload should require a scoped preview", preview);
+    assert(preview.isError && String(preview.value).includes("untrusted URL"), "ChatGPT upload preview should reject an untrusted file URL", preview);
     const beforePuts = requests.filter((entry) => entry.method === "PUT").length;
-    const live = await tool("onedrive_upload_file", {
-      ...args,
+    const afterPuts = requests.filter((entry) => entry.method === "PUT").length;
+    assert(afterPuts === beforePuts, "untrusted ChatGPT upload must not send file bytes to Graph", { beforePuts, afterPuts });
+    return { previewRefused: true, untrustedUrlRejected: true };
+  });
+
+  await check("ChatGPT upload preview tokens bind stable content instead of transient host file IDs", async () => {
+    const origin = new URL(graphBaseUrl).origin;
+    const previewArgs = {
+      sourceFile: {
+        download_url: `${origin}/chatgpt-files/stable-preview`,
+        file_id: "transient-preview-id",
+        file_name: "chatgpt-stable.txt",
+        mime_type: "text/plain"
+      },
+      remotePath: "Uploads/chatgpt-stable.txt",
+      conflictBehavior: "fail"
+    };
+    const preview = await tool("onedrive_upload_file", previewArgs);
+    assert(!preview.isError && preview.value.previewToken && preview.value.dryRun === true, "ChatGPT upload should return a scoped preview", preview);
+    assert(!Object.hasOwn(preview.value.wouldUpload?.source || {}, "fileId"), "preview proof must not expose or bind the transient host file ID", preview);
+    assert(preview.value.wouldUpload?.source?.bytes === Buffer.byteLength("stable ChatGPT upload\n", "utf8")
+      && /^[a-f0-9]{64}$/.test(preview.value.wouldUpload?.source?.sha256 || ""), "preview should include a stable content fingerprint", preview);
+
+    const mismatched = await tool("onedrive_upload_file", {
+      ...previewArgs,
+      sourceFile: {
+        ...previewArgs.sourceFile,
+        download_url: `${origin}/chatgpt-files/changed-live`,
+        file_id: "transient-changed-id"
+      },
       dryRun: false,
       confirmed: true,
       previewToken: preview.value.previewToken
     });
-    assert(live.isError && String(live.value).includes("untrusted URL"), "ChatGPT upload should reject an untrusted file URL", live);
-    const afterPuts = requests.filter((entry) => entry.method === "PUT").length;
-    assert(afterPuts === beforePuts, "untrusted ChatGPT upload must not send file bytes to Graph", { beforePuts, afterPuts });
-    return { previewRequired: true, untrustedUrlRejected: true };
+    assert(!mismatched.isError && mismatched.value.previewTokenStatus === "mismatch", "changed content must invalidate the upload preview", mismatched);
+
+    const live = await tool("onedrive_upload_file", {
+      ...previewArgs,
+      sourceFile: {
+        ...previewArgs.sourceFile,
+        download_url: `${origin}/chatgpt-files/stable-live`,
+        file_id: "transient-live-id"
+      },
+      dryRun: false,
+      confirmed: true,
+      previewToken: preview.value.previewToken
+    });
+    assert(!live.isError && live.value.item?.id === "chatgpt-stable-upload", "stable content should survive a transient host file ID change", live);
+    assert((counters.get("chatgpt-stable-upload") || 0) === 1, "stable ChatGPT upload should reach Graph exactly once", {
+      uploads: counters.get("chatgpt-stable-upload") || 0
+    });
+    return {
+      transientFileIdIgnored: true,
+      changedContentRejected: true,
+      stableContentUploaded: true
+    };
   });
 
   await check("public upload and write_text replacements require scoped previews and identity", async () => {
