@@ -10,6 +10,9 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { lookup as dnsLookup } from "node:dns/promises";
+import { request as httpsRequest } from "node:https";
+import { BlockList, isIP } from "node:net";
 import { addSemanticAnchors, resolveSemanticOperations } from "./semantic-anchors.mjs";
 import { applyTextPatch, boundedLineDiff, decodeTextBuffer } from "./text-patch.mjs";
 import { createAuthVault } from "./auth-vault.mjs";
@@ -67,6 +70,43 @@ const chatgptFetchSnapshotTtlMs = 10 * 60 * 1000;
 const chatgptFetchSnapshotMaxEntries = 32;
 const chatgptStaleCacheMaxAgeSeconds = 24 * 60 * 60;
 const chatgptRevalidationCooldownMs = 30 * 1000;
+const chatgptFileBlockedIpv4Addresses = new BlockList();
+const chatgptFileBlockedIpv6Addresses = new BlockList();
+for (const [network, prefix, family] of [
+  ["0.0.0.0", 8, "ipv4"],
+  ["10.0.0.0", 8, "ipv4"],
+  ["100.64.0.0", 10, "ipv4"],
+  ["127.0.0.0", 8, "ipv4"],
+  ["169.254.0.0", 16, "ipv4"],
+  ["172.16.0.0", 12, "ipv4"],
+  ["192.0.0.0", 24, "ipv4"],
+  ["192.0.2.0", 24, "ipv4"],
+  ["192.88.99.0", 24, "ipv4"],
+  ["192.168.0.0", 16, "ipv4"],
+  ["198.18.0.0", 15, "ipv4"],
+  ["198.51.100.0", 24, "ipv4"],
+  ["203.0.113.0", 24, "ipv4"],
+  ["224.0.0.0", 4, "ipv4"],
+  ["240.0.0.0", 4, "ipv4"],
+  ["::", 128, "ipv6"],
+  ["::", 96, "ipv6"],
+  ["::1", 128, "ipv6"],
+  ["::ffff:0:0", 96, "ipv6"],
+  ["64:ff9b::", 96, "ipv6"],
+  ["64:ff9b:1::", 48, "ipv6"],
+  ["100::", 64, "ipv6"],
+  ["2001::", 23, "ipv6"],
+  ["2001:db8::", 32, "ipv6"],
+  ["2002::", 16, "ipv6"],
+  ["3fff::", 20, "ipv6"],
+  ["fc00::", 7, "ipv6"],
+  ["fe80::", 10, "ipv6"],
+  ["fec0::", 10, "ipv6"],
+  ["ff00::", 8, "ipv6"]
+]) {
+  const blockList = family === "ipv6" ? chatgptFileBlockedIpv6Addresses : chatgptFileBlockedIpv4Addresses;
+  blockList.addSubnet(network, prefix, family);
+}
 const defaultSelect = "id,name,size,folder,file,webUrl,createdDateTime,lastModifiedDateTime,parentReference,eTag,cTag,deleted";
 const textExtensions = new Set([
   ".bat", ".c", ".cfg", ".conf", ".cpp", ".cs", ".css", ".csv", ".env", ".go", ".h", ".hpp", ".htm",
@@ -10863,39 +10903,189 @@ async function existingReplacementTarget(remotePathValue) {
   }
 }
 
-function trustedChatgptFileUrl(value) {
+function testChatgptFileBaseUrl() {
+  return process.env.ONEDRIVE_TEST_ACCESS_TOKEN
+    ? process.env.ONEDRIVE_TEST_CHATGPT_FILE_BASE_URL
+    : null;
+}
+
+function isTestChatgptFileUrl(target) {
+  const testFileBaseUrl = testChatgptFileBaseUrl();
+  if (!testFileBaseUrl) return false;
+  let testBase;
+  try {
+    testBase = new URL(testFileBaseUrl);
+  } catch {
+    throw new Error("ONEDRIVE_TEST_CHATGPT_FILE_BASE_URL must be a valid URL.");
+  }
+  const normalizedTestBasePath = testBase.pathname.endsWith("/") ? testBase.pathname : `${testBase.pathname}/`;
+  return target.origin === testBase.origin
+    && (target.pathname === testBase.pathname || target.pathname.startsWith(normalizedTestBasePath));
+}
+
+export function trustedChatgptFileUrl(value) {
   let target;
   try {
     target = new URL(String(value || ""));
   } catch {
     throw new Error("sourceFile.download_url must be a valid HTTPS URL.");
   }
-  const testFileBaseUrl = process.env.ONEDRIVE_TEST_ACCESS_TOKEN
-    ? process.env.ONEDRIVE_TEST_CHATGPT_FILE_BASE_URL
-    : null;
-  if (testFileBaseUrl) {
-    let testBase;
-    try {
-      testBase = new URL(testFileBaseUrl);
-    } catch {
-      throw new Error("ONEDRIVE_TEST_CHATGPT_FILE_BASE_URL must be a valid URL.");
-    }
-    const normalizedTestBasePath = testBase.pathname.endsWith("/") ? testBase.pathname : `${testBase.pathname}/`;
-    if (target.origin === testBase.origin
-      && (target.pathname === testBase.pathname || target.pathname.startsWith(normalizedTestBasePath))) {
-      return target;
-    }
-  }
-  const host = target.hostname.toLowerCase();
-  const trustedHost = host === "files.openai.com"
-    || host.endsWith(".files.openai.com")
-    || host === "files.oaiusercontent.com"
-    || host.endsWith(".oaiusercontent.com")
-    || host.endsWith(".openaiusercontent.com");
-  if (target.protocol !== "https:" || target.username || target.password || !trustedHost) {
+  if (isTestChatgptFileUrl(target)) return target;
+  if (target.protocol !== "https:"
+    || target.username
+    || target.password
+    || !target.hostname
+    || isIP(target.hostname) !== 0
+    || target.hostname.startsWith("[")
+    || (target.port && target.port !== "443")) {
     throw new Error("Refusing to download a ChatGPT file from an untrusted URL.");
   }
   return target;
+}
+
+export function isPublicChatgptFileAddress(address, family = isIP(address)) {
+  const normalizedFamily = Number(family) === 6 ? "ipv6" : Number(family) === 4 ? "ipv4" : null;
+  if (!normalizedFamily) return false;
+  const blockList = normalizedFamily === "ipv6" ? chatgptFileBlockedIpv6Addresses : chatgptFileBlockedIpv4Addresses;
+  return !blockList.check(address, normalizedFamily);
+}
+
+function chatgptFileUrlRejection(target, reason) {
+  console.error(JSON.stringify({
+    event: "onedrive-chatgpt-file-url-rejected",
+    host: String(target?.hostname || "").toLowerCase() || null,
+    reason
+  }));
+  return new Error("Refusing to download a ChatGPT file from an untrusted URL.");
+}
+
+async function resolvePublicChatgptFileTarget(target) {
+  const literalFamily = isIP(target.hostname);
+  const addresses = literalFamily
+    ? [{ address: target.hostname, family: literalFamily }]
+    : await dnsLookup(target.hostname, { all: true, verbatim: true }).catch((error) => {
+        throw chatgptFileUrlRejection(target, `dns:${error?.code || error?.name || "error"}`);
+      });
+  if (!addresses.length) throw chatgptFileUrlRejection(target, "dns:no-addresses");
+  if (addresses.some(({ address, family }) => !isPublicChatgptFileAddress(address, family))) {
+    throw chatgptFileUrlRejection(target, "dns:non-public-address");
+  }
+  return addresses;
+}
+
+function pinnedChatgptFileLookup(target, addresses) {
+  return (hostname, options, callback) => {
+    if (String(hostname).toLowerCase() !== target.hostname.toLowerCase()) {
+      callback(chatgptFileUrlRejection(target, "lookup:hostname-changed"));
+      return;
+    }
+    const normalizedOptions = typeof options === "number" ? { family: options } : (options || {});
+    const requestedFamily = Number(normalizedOptions.family || 0);
+    const candidates = requestedFamily === 4 || requestedFamily === 6
+      ? addresses.filter((entry) => Number(entry.family) === requestedFamily)
+      : addresses;
+    if (!candidates.length) {
+      const error = new Error(`No validated address matches the requested IP family for ${target.hostname}.`);
+      error.code = "ENOTFOUND";
+      callback(error);
+      return;
+    }
+    if (normalizedOptions.all) {
+      callback(null, candidates.map(({ address, family }) => ({ address, family: Number(family) })));
+      return;
+    }
+    callback(null, candidates[0].address, Number(candidates[0].family));
+  };
+}
+
+function nodeHttpsResponse(response) {
+  const headers = {
+    get(name) {
+      const value = response.headers[String(name || "").toLowerCase()];
+      if (Array.isArray(value)) return value.join(", ");
+      return value === undefined ? null : String(value);
+    }
+  };
+  const readBuffer = async () => {
+    const chunks = [];
+    for await (const chunk of response) chunks.push(Buffer.from(chunk));
+    return Buffer.concat(chunks);
+  };
+  return {
+    status: response.statusCode || 0,
+    statusText: response.statusMessage || "",
+    ok: (response.statusCode || 0) >= 200 && (response.statusCode || 0) < 300,
+    headers,
+    body: response,
+    async arrayBuffer() {
+      const buffer = await readBuffer();
+      return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+    },
+    async json() {
+      return JSON.parse((await readBuffer()).toString("utf8"));
+    }
+  };
+}
+
+async function requestPublicChatgptFile(target, timeoutMs = fetchTimeoutMs()) {
+  const addresses = await resolvePublicChatgptFileTarget(target);
+  return await new Promise((resolvePromise, reject) => {
+    const request = httpsRequest({
+      protocol: "https:",
+      hostname: target.hostname,
+      port: target.port || 443,
+      path: `${target.pathname}${target.search}`,
+      method: "GET",
+      headers: {
+        Accept: "*/*",
+        "Accept-Encoding": "identity",
+        "User-Agent": "OneDrive-ChatGPT-File-Downloader/1"
+      },
+      lookup: pinnedChatgptFileLookup(target, addresses),
+      servername: target.hostname
+    }, (response) => resolvePromise(nodeHttpsResponse(response)));
+    request.setTimeout(timeoutMs, () => {
+      const error = new Error(`ChatGPT file download timed out after ${timeoutMs}ms.`);
+      error.name = "TimeoutError";
+      request.destroy(error);
+    });
+    request.once("error", reject);
+    request.end();
+  });
+}
+
+async function discardChatgptFileResponse(response) {
+  if (!response?.body) return;
+  if (typeof response.body.cancel === "function") {
+    await response.body.cancel().catch(() => null);
+    return;
+  }
+  if (typeof response.body.destroy === "function") {
+    response.body.destroy();
+    return;
+  }
+  for await (const _chunk of response.body) break;
+}
+
+async function fetchChatgptFileWithRetry(target, options = {}) {
+  if (isTestChatgptFileUrl(target)) {
+    return await fetchWithRetry(target.toString(), { method: "GET", redirect: "manual" }, options);
+  }
+  const maxRetries = options.maxRetries ?? 2;
+  const timeoutMs = options.timeoutMs ?? fetchTimeoutMs();
+  for (let attempt = 0; ; attempt += 1) {
+    let response;
+    try {
+      response = await requestPublicChatgptFile(target, timeoutMs);
+    } catch (error) {
+      if (attempt >= maxRetries || String(error?.message || "").includes("untrusted URL")) throw error;
+      await sleep(Math.min(1000 * 2 ** attempt, 8000));
+      continue;
+    }
+    if (!shouldRetryResponse(response) || attempt >= maxRetries) return response;
+    await discardChatgptFileResponse(response);
+    await sleep(retryDelayMs(response, attempt));
+  }
 }
 
 async function sha256LocalFile(localPath) {
@@ -10910,35 +11100,42 @@ async function downloadChatgptFile(sourceFile = {}) {
   let current = trustedChatgptFileUrl(sourceFile.download_url);
   let response;
   for (let redirects = 0; redirects <= 3; redirects += 1) {
-    response = await fetchWithRetry(current.toString(), { method: "GET", redirect: "manual" }, { maxRetries: 2 });
+    response = await fetchChatgptFileWithRetry(current, { maxRetries: 2 });
     if (![301, 302, 303, 307, 308].includes(response.status)) break;
     const location = response.headers.get("location");
     if (!location) throw new Error("ChatGPT file download redirected without a Location header.");
     if (redirects === 3) throw new Error("ChatGPT file download exceeded the redirect limit.");
+    await discardChatgptFileResponse(response);
     current = trustedChatgptFileUrl(new URL(location, current).toString());
   }
   if (!response?.ok) {
-    await parseResponseBody(response).catch(() => null);
+    await discardChatgptFileResponse(response);
     throw new Error(`ChatGPT file download failed with HTTP ${response?.status || "unknown"}.`);
   }
   const declaredBytes = contentLength(response);
   if (declaredBytes !== null && declaredBytes > simpleUploadLimit) {
+    await discardChatgptFileResponse(response);
     throw new Error(`ChatGPT file is larger than the ${simpleUploadLimit}-byte safe upload limit.`);
+  }
+  const contentEncoding = String(response.headers.get("content-encoding") || "").trim().toLowerCase();
+  if (contentEncoding && contentEncoding !== "identity") {
+    await discardChatgptFileResponse(response);
+    throw new Error(`ChatGPT file download used unsupported content encoding: ${contentEncoding}.`);
   }
   let bytesWritten = 0;
   try {
     if (response.body) {
-      const counter = new TransformStream({
-        transform(chunk, controller) {
-          bytesWritten += chunk.byteLength;
+      const boundedBody = async function* () {
+        for await (const chunk of response.body) {
+          const buffer = Buffer.from(chunk);
+          bytesWritten += buffer.byteLength;
           if (bytesWritten > simpleUploadLimit) {
-            controller.error(new Error(`ChatGPT file exceeded the ${simpleUploadLimit}-byte safe upload limit.`));
-            return;
+            throw new Error(`ChatGPT file exceeded the ${simpleUploadLimit}-byte safe upload limit.`);
           }
-          controller.enqueue(chunk);
+          yield buffer;
         }
-      });
-      await pipeline(Readable.fromWeb(response.body.pipeThrough(counter)), createWriteStream(targetPath, { flags: "wx", mode: 0o600 }));
+      };
+      await pipeline(boundedBody(), createWriteStream(targetPath, { flags: "wx", mode: 0o600 }));
     } else {
       const buffer = Buffer.from(await response.arrayBuffer());
       if (buffer.length > simpleUploadLimit) throw new Error(`ChatGPT file exceeded the ${simpleUploadLimit}-byte safe upload limit.`);

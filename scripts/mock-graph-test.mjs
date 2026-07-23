@@ -480,6 +480,9 @@ const graph = createServer(async (req, res) => {
       "Content-Length": String(body.length)
     });
   }
+  if (req.method === "GET" && path === "/chatgpt-files/redirect-private") {
+    return empty(res, 302, { Location: "https://127.0.0.1/private-file" });
+  }
   if (req.method === "PUT" && path === "/v1.0/me/drive/root:/Uploads/chatgpt-stable.txt:/content") {
     const body = await readBufferBody(req);
     count("chatgpt-stable-upload");
@@ -4119,7 +4122,7 @@ process.exit(2);
   await check("ChatGPT file upload rejects untrusted download URLs before issuing a preview", async () => {
     const args = {
       sourceFile: {
-        download_url: "https://evil.example.test/private-file",
+        download_url: "https://127.0.0.1/private-file",
         file_id: "file-untrusted",
         file_name: "untrusted.txt",
         mime_type: "text/plain"
@@ -4133,6 +4136,27 @@ process.exit(2);
     const afterPuts = requests.filter((entry) => entry.method === "PUT").length;
     assert(afterPuts === beforePuts, "untrusted ChatGPT upload must not send file bytes to Graph", { beforePuts, afterPuts });
     return { previewRefused: true, untrustedUrlRejected: true };
+  });
+
+  await check("ChatGPT file upload revalidates every download redirect before connecting", async () => {
+    const origin = new URL(graphBaseUrl).origin;
+    const beforeRequests = requests.length;
+    const preview = await tool("onedrive_upload_file", {
+      sourceFile: {
+        download_url: `${origin}/chatgpt-files/redirect-private`,
+        file_id: "file-redirect-private",
+        file_name: "redirect-private.txt",
+        mime_type: "text/plain"
+      },
+      remotePath: "Uploads/redirect-private.txt",
+      conflictBehavior: "fail"
+    });
+    assert(preview.isError && String(preview.value).includes("untrusted URL"), "ChatGPT upload should reject a redirect to a non-public address", preview);
+    const addedRequests = requests.slice(beforeRequests);
+    assert(addedRequests.length === 1
+      && addedRequests[0].method === "GET"
+      && addedRequests[0].path === "/chatgpt-files/redirect-private", "private redirect target must be rejected before a network connection", addedRequests);
+    return { redirectRevalidated: true, privateTargetRequests: 0 };
   });
 
   await check("ChatGPT upload preview tokens bind stable content instead of transient host file IDs", async () => {

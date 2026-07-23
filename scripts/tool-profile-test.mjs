@@ -6,7 +6,21 @@ import { fileURLToPath } from "node:url";
 const scriptPath = fileURLToPath(import.meta.url);
 
 if (process.argv.includes("--probe")) {
-  const { boundChatgptToolPayload, processMcpMessage, shutdownOneDriveServer } = await import("../mcp/server.mjs");
+  const {
+    boundChatgptToolPayload,
+    isPublicChatgptFileAddress,
+    processMcpMessage,
+    shutdownOneDriveServer,
+    trustedChatgptFileUrl
+  } = await import("../mcp/server.mjs");
+  const rejectsChatgptFileUrl = (value) => {
+    try {
+      trustedChatgptFileUrl(value);
+      return false;
+    } catch {
+      return true;
+    }
+  };
   const initialized = await processMcpMessage({
     jsonrpc: "2.0",
     id: 1,
@@ -40,7 +54,20 @@ if (process.argv.includes("--probe")) {
     },
     officeTransformBytes: Buffer.byteLength(JSON.stringify(officeTransform || {})),
     instructions: initialized.result.instructions || "",
-    serverVersion: initialized.result.serverInfo?.version || ""
+    serverVersion: initialized.result.serverInfo?.version || "",
+    chatgptFileUrlPolicy: {
+      acceptsHostAgnosticHttps: trustedChatgptFileUrl("https://future-files.example.test/signed-download?token=redacted").hostname === "future-files.example.test",
+      rejectsHttp: rejectsChatgptFileUrl("http://future-files.example.test/file"),
+      rejectsCredentials: rejectsChatgptFileUrl("https://user:password@future-files.example.test/file"),
+      rejectsNonStandardPort: rejectsChatgptFileUrl("https://future-files.example.test:8443/file"),
+      rejectsIpLiteral: rejectsChatgptFileUrl("https://127.0.0.1/file"),
+      acceptsPublicIpv4: isPublicChatgptFileAddress("8.8.8.8"),
+      rejectsLoopbackIpv4: !isPublicChatgptFileAddress("127.0.0.1"),
+      rejectsPrivateIpv4: !isPublicChatgptFileAddress("10.0.0.1"),
+      acceptsPublicIpv6: isPublicChatgptFileAddress("2606:4700:4700::1111"),
+      rejectsLoopbackIpv6: !isPublicChatgptFileAddress("::1"),
+      rejectsMappedIpv4: !isPublicChatgptFileAddress("::ffff:127.0.0.1")
+    }
   }));
   await shutdownOneDriveServer();
   process.exit(0);
@@ -101,6 +128,7 @@ try {
   assert(chatgpt.instructions.includes("execute and verify one mutation at a time") && chatgpt.instructions.includes("obtain a fresh preview"), "ChatGPT instructions must serialize dependent mutations and refresh their guards.", chatgpt.instructions);
   assert(chatgpt.instructions.includes("not authentication credentials"), "ChatGPT instructions must classify returned OneDrive identifiers accurately.", chatgpt.instructions);
   assert(chatgpt.instructions.includes("prefer user-visible paths") && chatgpt.instructions.includes("asynchronous acceptance immediately"), "ChatGPT instructions must prefer path selectors and avoid inline copy polling.", chatgpt.instructions);
+  assert(Object.values(chatgpt.chatgptFileUrlPolicy || {}).every(Boolean), "ChatGPT file URLs must remain host-agnostic while rejecting unsafe URL and network forms.", chatgpt.chatgptFileUrlPolicy);
   const createFolderSchema = chatgpt.compatibility.onedrive_create_folder?.inputSchema;
   assert(createFolderSchema && !["dryRun", "confirmed", "previewToken"].some((field) => field in (createFolderSchema.properties || {})), "Create-folder must not advertise preview-only arguments.", createFolderSchema);
   assert(createFolderSchema?.properties?.parentPath?.description?.includes("Prefer this whenever known") && createFolderSchema?.properties?.parentItemId?.description?.includes("Use only when no parent path is available"), "Create-folder must steer ChatGPT to a user-visible parent path.", createFolderSchema);
