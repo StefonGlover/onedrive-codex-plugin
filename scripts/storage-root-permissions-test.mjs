@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,10 +40,15 @@ try {
   });
 
   if (!workbook?.sheets?.length) throw new Error("Excel fixture inspection returned no worksheets.");
+  const synologyEntrypoint = await readFile(join(pluginRoot, "deploy", "synology", "entrypoint.sh"), "utf8");
+  if (!synologyEntrypoint.includes("/data/chatgpt-uploads")) {
+    throw new Error("Synology entrypoint must pre-create the ChatGPT attachment staging directory for the unprivileged runtime user.");
+  }
   process.stdout.write(`${JSON.stringify({
     ok: true,
     storageRoot: process.env.ONEDRIVE_STORAGE_ROOT,
-    sheets: workbook.sheets.length
+    sheets: workbook.sheets.length,
+    synologyChatgptUploadRootReady: true
   }, null, 2)}\n`);
 } finally {
   await rm(workRoot, { recursive: true, force: true });

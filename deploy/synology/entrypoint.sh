@@ -18,7 +18,7 @@ fi
 
 chmod 0700 "$source_dir"
 chmod 0600 "$source_dir/tunnel.env" "$source_dir/auth-vault.key"
-install -d -m 0700 -o node -g node "$runtime_dir" "$profile_dir" /data/auth /data/cache /data/audit /data/backups /data/downloads /data/office-editing /data/updates /data/watches /data/workspaces
+install -d -m 0700 -o node -g node "$runtime_dir" "$profile_dir" /data/auth /data/cache /data/audit /data/backups /data/chatgpt-uploads /data/downloads /data/office-editing /data/updates /data/watches /data/workspaces
 install -m 0600 -o node -g node "$source_dir/tunnel.env" "$runtime_dir/tunnel.env"
 install -m 0600 -o node -g node "$source_dir/auth-vault.key" "$runtime_dir/auth-vault.key"
 if [ "${ONEDRIVE_MCP_AUTH_MODE:-noauth}" = "oauth" ]; then
