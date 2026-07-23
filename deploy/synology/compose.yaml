@@ -1,12 +1,12 @@
 services:
   onedrive-chatgpt:
     build:
-      context: ./app-0.5.1-nas28-20260723
+      context: ./app-0.5.1-nas29-20260723
       dockerfile: deploy/synology/Dockerfile
       args:
         TUNNEL_CLIENT_VERSION: "0.0.10"
         TARGETARCH: "amd64"
-    image: onedrive-chatgpt-nas:0.5.1-nas28
+    image: onedrive-chatgpt-nas:0.5.1-nas29
     container_name: onedrive-chatgpt
     restart: unless-stopped
     environment:
