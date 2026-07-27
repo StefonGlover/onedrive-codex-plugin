@@ -10,6 +10,11 @@ const httpHost = process.env.ONEDRIVE_MCP_HTTP_HOST || "127.0.0.1";
 const httpPort = process.env.ONEDRIVE_MCP_HTTP_PORT || "3001";
 const toolProfile = process.env.ONEDRIVE_TOOL_PROFILE || "chatgpt";
 const healthUrl = `http://${httpHost}:${httpPort}/healthz`;
+const oauthCompatEnabled = /^(?:1|true)$/i.test(
+  String(process.env.ONEDRIVE_OAUTH_COMPAT_ENABLED || "")
+);
+const oauthCompatPort = process.env.ONEDRIVE_OAUTH_COMPAT_PORT || "3010";
+const oauthCompatHealthUrl = `http://127.0.0.1:${oauthCompatPort}/healthz`;
 let stopping = false;
 
 if (!["full", "chatgpt"].includes(toolProfile)) {
@@ -24,21 +29,21 @@ function child(script, env = process.env) {
   });
 }
 
-async function waitForHttpServer(processHandle) {
+async function waitForServer(processHandle, url, label) {
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
     if (processHandle.exitCode !== null) {
-      throw new Error(`The OneDrive MCP HTTP server exited with code ${processHandle.exitCode} before becoming healthy.`);
+      throw new Error(`${label} exited with code ${processHandle.exitCode} before becoming healthy.`);
     }
     try {
-      const response = await fetch(healthUrl, { signal: AbortSignal.timeout(1_000) });
+      const response = await fetch(url, { signal: AbortSignal.timeout(1_000) });
       if (response.ok) return;
     } catch {
       // Startup races are expected until the listener is ready.
     }
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
   }
-  throw new Error(`The OneDrive MCP HTTP server did not become healthy at ${healthUrl} within 20 seconds.`);
+  throw new Error(`${label} did not become healthy at ${url} within 20 seconds.`);
 }
 
 // The HTTP server owns MCP initialize/tools/list handling, so it must receive
@@ -48,12 +53,16 @@ const httpServer = child(join(pluginRoot, "mcp", "http-server.mjs"), {
   ...process.env,
   ONEDRIVE_TOOL_PROFILE: toolProfile
 });
+const oauthCompatServer = oauthCompatEnabled
+  ? child(join(pluginRoot, "mcp", "oauth-compat-server.mjs"))
+  : null;
 let tunnel = null;
 
 async function stop(signal = "SIGTERM") {
   if (stopping) return;
   stopping = true;
   if (tunnel && tunnel.exitCode === null) tunnel.kill(signal);
+  if (oauthCompatServer && oauthCompatServer.exitCode === null) oauthCompatServer.kill(signal);
   if (httpServer.exitCode === null) httpServer.kill(signal);
 }
 
@@ -64,7 +73,14 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
 }
 
 try {
-  await waitForHttpServer(httpServer);
+  await waitForServer(httpServer, healthUrl, "The OneDrive MCP HTTP server");
+  if (oauthCompatServer) {
+    await waitForServer(
+      oauthCompatServer,
+      oauthCompatHealthUrl,
+      "The OneDrive OAuth compatibility service"
+    );
+  }
   tunnel = child(join(scriptsRoot, "run-chatgpt-tunnel.mjs"));
   tunnel.once("exit", async (code, signal) => {
     await stop(signal || "SIGTERM");
@@ -73,7 +89,15 @@ try {
   httpServer.once("exit", async (code, signal) => {
     if (stopping) return;
     if (tunnel && tunnel.exitCode === null) tunnel.kill("SIGTERM");
+    if (oauthCompatServer && oauthCompatServer.exitCode === null) oauthCompatServer.kill("SIGTERM");
     process.stderr.write(`OneDrive MCP HTTP server exited unexpectedly (${signal || code}).\n`);
+    process.exit(code || 1);
+  });
+  oauthCompatServer?.once("exit", async (code, signal) => {
+    if (stopping) return;
+    if (tunnel && tunnel.exitCode === null) tunnel.kill("SIGTERM");
+    if (httpServer.exitCode === null) httpServer.kill("SIGTERM");
+    process.stderr.write(`OneDrive OAuth compatibility service exited unexpectedly (${signal || code}).\n`);
     process.exit(code || 1);
   });
 } catch (error) {

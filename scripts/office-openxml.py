@@ -2257,7 +2257,42 @@ def apply_excel_recalculate(package: zipfile.ZipFile, modifications: Dict[str, O
                 removed_override = True
         if removed_override:
             modifications["[Content_Types].xml"] = ET.tostring(content_types, encoding="utf-8", xml_declaration=True)
-    return {"before": before, "after": dict(calculation.attrib), "removedCalcChain": removed_chain}
+
+    cleared_formula_caches = 0
+    worksheet_parts = {
+        name
+        for name in package.namelist()
+        if name.startswith("xl/worksheets/") and name.endswith(".xml")
+    }
+    worksheet_parts.update(
+        name
+        for name, value in modifications.items()
+        if value is not None and name.startswith("xl/worksheets/") and name.endswith(".xml")
+    )
+    for worksheet_part in sorted(worksheet_parts):
+        source = modifications.get(worksheet_part)
+        if source is None:
+            source = package.read(worksheet_part)
+        worksheet = ET.fromstring(source)
+        changed = False
+        for cell in worksheet.iter(q("s", "c")):
+            if cell.find(q("s", "f")) is None:
+                continue
+            cached_value = cell.find(q("s", "v"))
+            if cached_value is None:
+                continue
+            cell.remove(cached_value)
+            cleared_formula_caches += 1
+            changed = True
+        if changed:
+            modifications[worksheet_part] = ET.tostring(worksheet, encoding="utf-8", xml_declaration=True)
+    return {
+        "before": before,
+        "after": dict(calculation.attrib),
+        "removedCalcChain": removed_chain,
+        "clearedFormulaCaches": cleared_formula_caches,
+        "calculationNote": "Cached formula values were cleared; Excel will calculate them when the workbook opens.",
+    }
 
 
 def excel_add_fill_dxf(package: zipfile.ZipFile, modifications: Dict[str, Optional[bytes]], color: str) -> int:
@@ -2641,16 +2676,20 @@ def edit_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[
     sheet_parts = excel_sheet_parts(package)
     modifications: Dict[str, Optional[bytes]] = {}
     changes = []
+    calculation_dirty = False
     for operation in request.get("operations", []):
         op_type = operation.get("type")
         if op_type == "addTableRow":
             changes.append({"operation": op_type, **excel_add_table_rows(package, modifications, sheet_parts, operation)})
+            calculation_dirty = True
             continue
         if op_type == "deleteTableRow":
             changes.append({"operation": op_type, **excel_delete_table_row(package, modifications, sheet_parts, operation)})
+            calculation_dirty = True
             continue
         if op_type == "setTableTotals":
             changes.append({"operation": op_type, **excel_set_table_totals(package, modifications, sheet_parts, operation)})
+            calculation_dirty = True
             continue
         if op_type == "recalculate":
             changes.append({"operation": op_type, **apply_excel_recalculate(package, modifications)})
@@ -2671,6 +2710,7 @@ def edit_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[
             modifications["xl/workbook.xml"] = ET.tostring(workbook, encoding="utf-8", xml_declaration=True)
             sheet_parts[new_name] = sheet_parts.pop(old_name)
             changes.append({"operation": op_type, "before": old_name, "after": new_name})
+            calculation_dirty = True
             continue
         if op_type == "setDefinedName":
             name = str(operation.get("name", ""))
@@ -2687,6 +2727,7 @@ def edit_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[
             target.text = str(operation.get("formula", ""))
             modifications["xl/workbook.xml"] = ET.tostring(workbook, encoding="utf-8", xml_declaration=True)
             changes.append({"operation": op_type, "name": name, "before": before, "after": target.text})
+            calculation_dirty = True
             continue
         if op_type not in {"setCell", "setFormula", "setRange", "clearRange", "setStyle", "setNumberFormat", "addConditionalFormat", "setDataValidation", "freezePanes", "setColumnWidth", "createChart", "updateChart"}:
             raise OfficePackageError("Unsupported Excel operation: %s" % op_type)
@@ -2824,7 +2865,11 @@ def edit_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[
                 if op_type == "setNumberFormat":
                     after["numberFormat"] = operation.get("formatCode")
                 changes.append({"operation": op_type, "sheet": sheet_name, "address": cell_address, "before": before, "after": after})
+        if op_type in {"setCell", "setFormula", "setRange", "clearRange"}:
+            calculation_dirty = True
         modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    if calculation_dirty:
+        apply_excel_recalculate(package, modifications)
     return modifications, changes
 
 

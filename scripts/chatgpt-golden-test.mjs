@@ -20,18 +20,18 @@ const goldenPrompts = [
   { prompt: "What structured Excel edits are supported?", tool: "onedrive_office_capabilities", cues: ["supported structured operations"] },
   { prompt: "Update cells in these two Excel workbooks", tool: "onedrive_office_batch_transform", cues: ["structured edits", "preview"] },
   { prompt: "Upload this attached PDF to OneDrive", tool: "onedrive_upload_file", cues: ["chatgpt-provided file", "upload"] },
-  { prompt: "Create a new markdown file with this full content", tool: "onedrive_write_text", cues: ["create or fully replace", "text"] },
-  { prompt: "Change only one line in this existing text file", tool: "onedrive_patch_text", cues: ["targeted", "preserving"] },
+  { prompt: "Create a new markdown file with this full content", tool: "onedrive_write_text", cues: ["create or fully replace", "required content field", "never a text field"] },
+  { prompt: "Change only one line in this existing text file", tool: "onedrive_patch_text", cues: ["targeted", "preserving", "expectedetag", "previewtoken"] },
   { prompt: "Create a folder named Receipts under Documents", tool: "onedrive_create_folder", cues: ["direct conflict-safe create", "do not send dryrun"] },
   { prompt: "I approve the previewed rename; apply it", tool: "onedrive_rename", cues: ["approved a live rename", "newname", "expectedid or expectedname", "previewtoken"] },
   { prompt: "I approve the previewed move into Archive; apply it", tool: "onedrive_move", cues: ["approved a live move", "destination parent", "expectedid or expectedname", "previewtoken"] },
   { prompt: "I approve the previewed copy; apply it and keep the original", tool: "onedrive_copy", cues: ["approved a live copy", "asynchronous acceptance", "expectedid or expectedname", "previewtoken"] },
-  { prompt: "I approve the previewed view-only sharing link; create it", tool: "onedrive_create_sharing_link", cues: ["approved a live sharing link", "type", "scope", "previewtoken"] },
+  { prompt: "I approve the previewed view-only sharing link; create it", tool: "onedrive_create_sharing_link", cues: ["approved a live sharing link", "type", "scope", "previewtoken", "never use for folder creation or access inspection"] },
   { prompt: "Give these named people edit access", tool: "onedrive_invite_permission", cues: ["specific named recipients"] },
   { prompt: "I approve the previewed sharing permission removal", tool: "onedrive_revoke_permission", cues: ["approved a permission removal", "permissionid", "not auth credentials"] },
-  { prompt: "Which named people currently have access to this folder?", tool: "onedrive_permissions", cues: ["explicitly wants the identities"] },
-  { prompt: "Move this file to the recycle bin", tool: "onedrive_delete", cues: ["recycle bin", "permanent deletion"] },
-  { prompt: "Restore this item from the recycle bin", tool: "onedrive_restore_deleted", cues: ["restore", "recycle-bin"] },
+  { prompt: "Which named people currently have access to this folder?", tool: "onedrive_permissions", cues: ["identities that currently access", "send only itemid or path", "never send expectedid"] },
+  { prompt: "Move this file to the recycle bin", tool: "onedrive_delete", cues: ["only for that intent", "active onedrive item", "never use for read-only inspection", "permanent deletion"] },
+  { prompt: "Restore this item from the recycle bin", tool: "onedrive_restore_deleted", cues: ["only for that intent", "while it is in the onedrive recycle bin", "never call again after restoration"] },
   { prompt: "Permanently delete this item and skip the recycle bin", tool: "onedrive_permanent_delete", cues: ["irreversibly", "without the recycle bin"] }
 ];
 
@@ -42,8 +42,11 @@ const ambiguityPairs = [
   ["onedrive_write_text", "onedrive_patch_text"],
   ["onedrive_move", "onedrive_copy"],
   ["onedrive_create_sharing_link", "onedrive_invite_permission"],
+  ["onedrive_create_folder", "onedrive_create_sharing_link"],
+  ["onedrive_create_sharing_link", "onedrive_permissions"],
   ["onedrive_permissions", "onedrive_revoke_permission"],
-  ["onedrive_delete", "onedrive_permanent_delete"]
+  ["onedrive_delete", "onedrive_permanent_delete"],
+  ["onedrive_delete", "onedrive_restore_deleted"]
 ];
 
 try {

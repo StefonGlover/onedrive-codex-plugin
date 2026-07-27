@@ -29,7 +29,7 @@ COPY --from=tunnel-client /usr/local/bin/tunnel-client /usr/local/bin/tunnel-cli
 
 WORKDIR /app
 COPY . /app
-RUN chmod 0755 /app/deploy/synology/entrypoint.sh /app/scripts/run-chatgpt-tunnel.mjs /app/scripts/run-chatgpt-oauth-tunnel.mjs /app/mcp/server.mjs /app/mcp/http-server.mjs
+RUN chmod 0755 /app/deploy/synology/entrypoint.sh /app/scripts/run-chatgpt-tunnel.mjs /app/scripts/run-chatgpt-oauth-tunnel.mjs /app/mcp/server.mjs /app/mcp/http-server.mjs /app/mcp/oauth-compat-server.mjs
 
 ENV HOME=/home/node \
     ONEDRIVE_OFFICE_PYTHON=/usr/bin/python3 \
@@ -42,10 +42,11 @@ ENV HOME=/home/node \
     ONEDRIVE_TOOL_PROFILE=chatgpt \
     ONEDRIVE_MCP_HTTP_HOST=127.0.0.1 \
     ONEDRIVE_MCP_HTTP_PORT=3001 \
-    ONEDRIVE_MCP_OAUTH_API_CLIENT_SECRET_FILE=/run/onedrive-runtime/oauth-api-client.secret
+    ONEDRIVE_MCP_OAUTH_API_CLIENT_SECRET_FILE=/run/onedrive-runtime/oauth-api-client.secret \
+    ONEDRIVE_OAUTH_COMPAT_CLIENT_SECRET_FILE=/run/onedrive-runtime/oauth-chatgpt-client.secret
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD ["node", "-e", "fetch('http://127.0.0.1:8765/readyz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+  CMD ["node", "-e", "const u=['http://127.0.0.1:8765/readyz'];if(/^(1|true)$/i.test(process.env.ONEDRIVE_OAUTH_COMPAT_ENABLED||''))u.push(`http://127.0.0.1:${process.env.ONEDRIVE_OAUTH_COMPAT_PORT||3010}/healthz`);Promise.all(u.map(x=>fetch(x))).then(r=>{if(r.some(x=>!x.ok))process.exit(1)}).catch(()=>process.exit(1))"]
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/deploy/synology/entrypoint.sh"]
 CMD ["node", "/app/scripts/run-chatgpt-oauth-tunnel.mjs"]

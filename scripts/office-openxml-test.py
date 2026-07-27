@@ -218,7 +218,12 @@ def main():
         excel_edit = run_helper(xlsx, "excel", action="edit", outputPath=str(edited_xlsx), operations=[{"type": "setCell", "sheet": "Data", "address": "B2", "value": "Updated"}, {"type": "setFormula", "sheet": "Data", "address": "C2", "formula": "B2+1"}])
         edited_excel = run_helper(edited_xlsx, "excel", includeFormulaDependencies=True)
         edited_cells = {cell["address"]: cell for cell in edited_excel["sheets"][0]["cells"]}
-        checks["excelEdit"] = excel_edit["changeCount"] == 2 and edited_cells["B2"]["value"] == "Updated" and edited_cells["C2"]["formula"] == "B2+1" and edited_excel["formulaDependencyCount"] == 1 and edited_excel["formulaDependencies"][0]["to"]["address"] == "B2"
+        with zipfile.ZipFile(edited_xlsx, "r") as edited_package:
+            implicit_recalc_workbook = edited_package.read("xl/workbook.xml").decode("utf-8")
+            implicit_recalc_sheet = ET.fromstring(edited_package.read("xl/worksheets/sheet1.xml"))
+            implicit_formula_cell = next(cell for cell in implicit_recalc_sheet.iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c") if cell.attrib.get("r") == "A1")
+            implicit_formula_cache_cleared = implicit_formula_cell.find("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}f") is not None and implicit_formula_cell.find("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}v") is None
+        checks["excelEdit"] = excel_edit["changeCount"] == 2 and edited_cells["B2"]["value"] == "Updated" and edited_cells["C2"]["formula"] == "B2+1" and edited_excel["formulaDependencyCount"] == 1 and edited_excel["formulaDependencies"][0]["to"]["address"] == "B2" and implicit_formula_cache_cleared and "fullCalcOnLoad=\"1\"" in implicit_recalc_workbook
         rich_xlsx = root / "rich.xlsx"
         rich_excel_edit = run_helper(xlsx, "excel", action="edit", outputPath=str(rich_xlsx), operations=[
             {"type": "setRange", "sheet": "Data", "address": "A3:B4", "values": [[1, 2], [3, 4]]},
@@ -239,7 +244,10 @@ def main():
             styles_xml = edited_package.read("xl/styles.xml").decode("utf-8")
             relations_xml = edited_package.read("xl/_rels/workbook.xml.rels").decode("utf-8")
             sheet_xml = edited_package.read("xl/worksheets/sheet1.xml").decode("utf-8")
-            recalculation_safe = "fullCalcOnLoad=\"1\"" in workbook_xml and "forceFullCalc=\"1\"" in workbook_xml and "xl/calcChain.xml" not in edited_package.namelist() and "calcChain" not in relations_xml
+            sheet_root = ET.fromstring(edited_package.read("xl/worksheets/sheet1.xml"))
+            formula_cell = next(cell for cell in sheet_root.iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c") if cell.attrib.get("r") == "A1")
+            explicit_recalc_change = next(change for change in rich_excel_edit["changes"] if change["operation"] == "recalculate")
+            recalculation_safe = "fullCalcOnLoad=\"1\"" in workbook_xml and "forceFullCalc=\"1\"" in workbook_xml and "xl/calcChain.xml" not in edited_package.namelist() and "calcChain" not in relations_xml and formula_cell.find("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}v") is None and explicit_recalc_change["clearedFormulaCaches"] >= 1
         checks["excelRangeAndMetadataEdits"] = rich_excel_edit["changeCount"] == 14 and rich_excel["sheets"][0]["name"] == "Results" and rich_cells["B4"]["value"] == 4 and rich_cells["A3"]["styleIndex"] == 2 and rich_cells["A1"]["styleIndex"] == 3 and "$#,##0.00" in styles_xml and "conditionalFormatting" in sheet_xml and "dataValidation" in sheet_xml and "state=\"frozen\"" in sheet_xml and "width=\"18.0\"" in sheet_xml and recalculation_safe and any(entry["name"] == "InputBlock" for entry in rich_excel["definedNames"])
 
         styled_xlsx = root / "styled-for-clear.xlsx"
@@ -479,7 +487,7 @@ def main():
             and shared_master_formula.text == 'A2&"-fit"'
             and shared_follower_formula.attrib == {"t": "shared", "si": "9"}
             and shared_follower_formula.text is None
-            and shared_follower_cache.text == "303"
+            and shared_follower_cache is None
             and shared_rows["3"].attrib.get("ht") == "26"
             and [cell.attrib.get("r") for cell in list(shared_rows["3"])] == ["A3", "B3", "C3"]
             and shared_change["sharedFormulaRefsShrunk"] == 1

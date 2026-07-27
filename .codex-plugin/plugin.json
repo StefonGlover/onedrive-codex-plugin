@@ -1,6 +1,6 @@
 {
   "name": "onedrive",
-  "version": "0.5.1+codex.20260723153254",
+  "version": "0.6.1+codex.20260726012710",
   "description": "Manage OneDrive files and natively inspect or edit Word, Excel, and PowerPoint content from Codex.",
   "author": {
     "name": "Stefon Glover"
@@ -47,5 +47,6 @@
       "./assets/screenshot-file-manager.png"
     ]
   },
+  "apps": "./.app.json",
   "mcpServers": "./.mcp.json"
 }

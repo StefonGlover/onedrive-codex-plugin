@@ -1,170 +1,233 @@
 {
   "schemaVersion": 2,
-  "decision": "Pending — Entra registration, NAS OAuth rollout, and ChatGPT Work validation",
-  "date": "2026-07-23",
-  "generatedAt": "2026-07-23T17:36:34Z",
+  "decision": "Pending — full cross-surface release; current regular-Chat deployment passes",
+  "date": "2026-07-25",
+  "generatedAt": "2026-07-26T05:27:10Z",
   "source": {
-    "commit": "e92e96c7653c685133412f287b6324c6f3693897",
-    "workingTree": "The final nas30 source fixes ChatGPT attachment preview binding, NAS attachment-staging ownership, and safe host-agnostic public HTTPS attachment downloads. It passes the 21-tool focused contract, 84-tool full contract, 21 golden prompts, 176 mock Graph checks, live Word/Excel/PowerPoint verification, and the final regular-Chat attachment upload/readback regression. NAS nas30 and canonical ChatGPT app dev-24 are deployed. Immutable Codex-cache parity, production Entra registration, NAS OAuth rollout, and the separate ChatGPT Work host issue remain pending.",
-    "pluginVersion": "0.5.1+codex.20260723153254",
-    "contentDigest": null
+    "commit": "eb9b66fb5698b8a9003c0a2a51506fc53e61d8fd",
+    "pluginVersion": "0.6.1+codex.20260726012710",
+    "serverVersion": "0.6.1+codex.20260726012710.chatgpt.9956d1d6f66f",
+    "workingTree": "Contains the live-tested focused routing fixes plus a public outer PKCE facade, one-time mapped authorization codes, encrypted rotating refresh handles, and ChatGPT Work app mapping; production Entra, Work, and NAS OAuth cutover remain pending."
   },
   "contract": {
     "toolCount": 84,
-    "exact": true
+    "exact": true,
+    "fullToolCount": 84,
+    "fullBytes": 338721,
+    "chatgptToolCount": 21,
+    "chatgptBytes": 34134,
+    "chatgptOauthBytes": 37830,
+    "reductionPercent": 89.9,
+    "serverInstructionBytes": 1316
   },
   "offlineGates": [
-    { "name": "Node syntax/self-check", "status": "pass" },
-    { "name": "Exact MCP contract", "status": "pass", "toolCount": 84 },
-    { "name": "ChatGPT focused contract", "status": "pass", "toolCount": 21, "bytes": 40536 },
-    { "name": "ChatGPT golden prompts", "status": "pass", "cases": 21, "ambiguityPairs": 8 },
-    { "name": "Common document extraction", "status": "pass", "formats": ["rtf", "opendocument", "epub", "email"] },
-    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 176 },
-    { "name": "Office Open XML operations", "status": "pass", "operations": 79, "word": 21, "excel": 33, "powerpoint": 25 },
-    { "name": "Semantic anchors", "status": "pass", "checks": 6 },
-    { "name": "Text patch safety", "status": "pass", "checks": 6 },
-    { "name": "Storage-root permissions", "status": "pass" },
-    { "name": "Whitespace", "status": "pass" }
+    {
+      "name": "Node syntax/self-check",
+      "status": "pass"
+    },
+    {
+      "name": "Exact full MCP contract",
+      "status": "pass",
+      "toolCount": 84
+    },
+    {
+      "name": "ChatGPT focused contract",
+      "status": "pass",
+      "toolCount": 21,
+      "bytes": 34134,
+      "oauthBytes": 37830
+    },
+    {
+      "name": "ChatGPT golden prompts",
+      "status": "pass",
+      "cases": 21,
+      "ambiguityPairs": 11
+    },
+    {
+      "name": "Mock Microsoft Graph",
+      "status": "pass",
+      "checks": 176
+    },
+    {
+      "name": "Semantic anchors",
+      "status": "pass",
+      "checks": 6
+    },
+    {
+      "name": "Text patch safety",
+      "status": "pass",
+      "checks": 6
+    },
+    {
+      "name": "OAuth HTTP full and ChatGPT profiles",
+      "status": "pass",
+      "profiles": 2,
+      "fullTools": 84,
+      "chatgptTools": 21
+    },
+    {
+      "name": "Prepackage inventory",
+      "status": "pass",
+      "files": 59
+    }
   ],
   "liveRuns": {
-    "productivityBeta": {
+    "edgeRegularChatQa": {
       "status": "pass",
-      "sameConversation": "https://chatgpt.com/c/6a5f7eb8-afb0-83ea-a34c-9c2b5cb77ea8",
-      "multiDocumentSearch": {
-        "status": "pass",
-        "files": ["invoice-3095.pdf", "2026 Electrical Report.pdf"],
-        "observedMs": 32000
+      "conversation": "https://chatgpt.com/c/6a6538f3-d740-83ea-8719-af1308a75b70",
+      "surface": "regular Chat",
+      "coverage": [
+        "search",
+        "create folder",
+        "create and replace text file",
+        "rename",
+        "move",
+        "copy",
+        "permission inspection",
+        "anonymous view sharing link create and revoke",
+        "recycle-bin delete",
+        "restore",
+        "recoverable cleanup"
+      ],
+      "fixtureRoot": {
+        "name": "Codex OneDrive Edge QA 20260725-01",
+        "itemId": "B8C89DB91F19C763!s63cf86813bae4da8a0a4849df0b58d79",
+        "finalState": "recycle_bin_recoverable"
       },
-      "emailExtraction": { "status": "pass", "observedMs": 15000, "attachmentsEnumerated": true },
-      "createFolderAndFile": { "status": "pass", "observedMs": 25000 },
-      "dependentCopyRenamePatch": { "status": "pass", "observedMs": 96000, "staleRetry": false },
-      "sharingLinkRoundTrip": { "status": "pass", "createObservedMs": 11000, "revokeObservedMs": 28000, "ownerOnlyAfterward": true },
-      "cleanup": { "status": "pass", "recycledNotPermanentlyDeleted": true, "activeTestRootsRemaining": 0, "anonymousLinksRemaining": 0 },
-      "finalDev22Smoke": { "status": "pass", "readOnly": true, "files": ["invoice-3095.pdf", "2026 Electrical Report.pdf"] }
+      "permissionCycle": {
+        "before": 1,
+        "withTemporaryAnonymousViewLink": 2,
+        "afterRevocation": 1,
+        "ownerOnlyAfterward": true
+      },
+      "permanentDeletion": false,
+      "recycleBinEmptied": false,
+      "invitationSent": false,
+      "anonymousLinksRemaining": 0
     },
-    "postDeployAttachmentOfficeBeta": {
+    "postNas32Regression": {
       "status": "pass",
-      "metadataVersion": "dev-24",
-      "testRoot": "OneDrive Plugin Beta QA 2026-07-23 C7F2",
-      "attachmentPreviewBinding": {
-        "status": "pass",
-        "stableFields": ["fileName", "mimeType", "bytes", "sha256"],
-        "hostFileIdChangeAcceptedForIdenticalBytes": true,
-        "changedContentRejectedByMocks": true
-      },
-      "uploads": {
-        "status": "pass",
-        "count": 3,
-        "files": ["sample.docx", "sample.xlsx", "sample.pptx"]
-      },
-      "officeReadAndEdit": {
-        "status": "pass",
-        "formats": ["word", "excel", "powerpoint"],
-        "previewChangeCount": 3,
-        "liveChangeCount": 3,
-        "remoteValidation": true,
-        "remoteRefetchVerified": true,
-        "partialState": false
-      },
-      "restoreAndPermanentDeleteProbe": {
-        "status": "pass",
-        "restoreVerified": true,
-        "permanentDeleteVerified": true
-      },
-      "cleanup": {
-        "status": "pass",
-        "ownerOnlyBeforeRecycle": true,
-        "activeTestRootsRemaining": 0,
-        "recycledNotPermanentlyDeleted": true
-      }
-    },
-    "nas30AttachmentUrlBeta": {
-      "status": "pass",
-      "mode": "regular Chat",
-      "sameConversation": "https://chatgpt.com/c/6a6240c7-3f30-83ea-98e6-0ebd1a804893",
-      "metadataVersion": "dev-24",
-      "fixture": {
-        "name": "onedrive-nas30-attachment-20260723.csv",
-        "size": 49,
-        "marker": "NAS30_ATTACHMENT_OK_20260723"
-      },
-      "upload": {
-        "status": "pass",
-        "conflictBehavior": "fail",
-        "itemId": "B8C89DB91F19C763!s4f25b7ef520e400e99206f619624faf0",
-        "remoteFetchVerified": true,
-        "markerVerified": true,
-        "untrustedUrlErrorRecurred": false
-      },
-      "cleanup": {
-        "status": "pass",
-        "liveRootPathAbsent": true,
-        "recycledNotPermanentlyDeleted": true,
-        "restorePreviewVerified": true
-      }
+      "surface": "regular Chat",
+      "conversation": "https://chatgpt.com/c/6a6538f3-d740-83ea-8719-af1308a75b70",
+      "onedriveOpenFilesCalls": 1,
+      "readOnly": true,
+      "files": [
+        {
+          "name": "invoice-3095.pdf",
+          "status": "found",
+          "itemId": "B8C89DB91F19C763!s2c28febab675475d813f0cab07fd4e36",
+          "path": "Family Space/Documents/Home/invoice-3095.pdf",
+          "permissionCount": 1,
+          "ownerOnly": true
+        },
+        {
+          "name": "2026 Electrical Report.pdf",
+          "status": "found",
+          "itemId": "B8C89DB91F19C763!s66748b567d5745b48e96db533485d4ff",
+          "path": "Family Space/Documents/Home/Electrical/2026 Electrical Report.pdf",
+          "permissionCount": 1,
+          "ownerOnly": true
+        }
+      ],
+      "errors": []
     }
   },
   "installedBuild": {
     "status": "pending_source_update",
-    "version": "0.5.1+codex.20260723153254",
-    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.5.1+codex.20260723153254",
+    "version": "0.6.1+codex.20260726012710",
+    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.1+codex.20260726012710",
     "oldCacheOverwritten": false
   },
-  "cleanup": {
-    "status": "pass",
-    "remoteTestRootsRemaining": 0,
-    "permissionsRemaining": 0,
-    "anonymousLinksRemaining": 0,
-    "isolatedLocalResidue": false,
-    "nasStagingArchiveRemoved": true,
-    "activeNasSource": "app-0.5.1-nas30-20260723",
-    "immediateRollbackSource": "app-0.5.1-nas29-20260723",
-    "rollbackImagesRetained": ["onedrive-chatgpt-nas:0.5.1-nas27", "onedrive-chatgpt-nas:0.5.1-nas28", "onedrive-chatgpt-nas:0.5.1-nas29"],
-    "rollbackManifestsRetained": ["compose.nas25.rollback.yaml", "compose.nas27.rollback.yaml", "compose.nas29.rollback.yaml"]
-  },
-  "sourceCacheParity": {
-    "status": "pending",
-    "bytes": "pending",
-    "modes": "pending",
-    "types": "pending",
-    "symlinkTargets": "pending"
-  },
+  "fixes": [
+    {
+      "area": "ChatGPT Work package wiring",
+      "result": "The plugin manifest maps the canonical asdk_app developer app through .app.json and rejects the installation-wrapper ID."
+    },
+    {
+      "area": "Delegated OAuth boundary",
+      "result": "The HTTP server separates public MCP and Entra API resources, validates Entra v2 token issuer/tenant/audience/scope/authorized client and issuer-bound keys, performs OBO, emits HTTP 401 challenges, and returns non-relinking 503 responses for provider or configuration failures."
+    },
+    {
+      "area": "onedrive_write_text routing",
+      "result": "Focused description explicitly requires content and rejects the invalid text-field pattern."
+    },
+    {
+      "area": "folder versus sharing routing",
+      "result": "Sharing-link action explicitly excludes folder creation and access inspection."
+    },
+    {
+      "area": "permission inspection schema",
+      "result": "Focused description constrains calls to item identity and optional format."
+    },
+    {
+      "area": "delete and restore routing",
+      "result": "Delete is limited to active recycle intent; restore is limited to one live call while recycled."
+    },
+    {
+      "area": "exact-file discovery",
+      "result": "When indexed discovery has no exact hit, onedrive_open_files validates cached identities and performs a bounded read-only live scan.",
+      "limits": {
+        "items": 2000,
+        "folders": 300,
+        "depth": 20,
+        "results": 10,
+        "concurrency": 3
+      }
+    },
+    {
+      "area": "endpoint collision",
+      "result": "The stale local launch-agent tunnel was booted out so the NAS is the sole live endpoint."
+    }
+  ],
   "deployment": {
     "status": "pass",
     "platform": "Synology DS923+ Container Manager",
     "project": "onedrive-chatgpt",
-    "image": "onedrive-chatgpt-nas:0.5.1-nas30",
-    "imageId": "1788b79f39ed1e42bbb8d144fb35948a33f1dd647f8ffb125b30229e7fb0bc4c",
-    "sourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.5.1-nas30-20260723",
+    "projectId": "6ade094d-9ebe-46ef-83cb-f9bb443c8300",
+    "image": "onedrive-chatgpt-nas:0.5.1-nas32",
+    "imageId": "sha256:38a3e052a5243133150573de898ee54a21660945a192e812607538454ea8c02c",
+    "containerId": "c1d13e32636428734081335234ed5ff3e37878454a05dc6293f36ed716cb5996",
+    "sourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.5.1-nas32-20260725",
     "containerState": "running",
     "containerHealth": "healthy",
+    "healthFailingStreak": 0,
     "restartCount": 0,
-    "buildExitCode": 0,
+    "rollback": {
+      "image": "onedrive-chatgpt-nas:0.5.1-nas31",
+      "manifest": "/volume1/docker/onedrive-chatgpt/compose.nas31.rollback.yaml"
+    },
     "chatgpt": {
       "status": "pass",
       "appName": "OneDrive",
       "appId": "asdk_app_6a5e2416985481918d0f6c68785da2c4",
-      "metadataVersion": "dev-24",
+      "metadataVersion": "dev-27",
       "authentication": "No Auth",
       "focusedToolCount": 21,
-      "focusedBytes": 40536,
-      "fullToolCount": 84,
-      "fullBytes": 338721,
-      "contractReductionPercent": 88.0,
-      "serverVersion": "0.5.1+codex.20260723153254.chatgpt.2d26f01bba1b",
-      "serverInstructionBytes": 1316,
-      "storedLogoRetained": true,
-      "pathFirstSelectors": true,
-      "copyWaitForCompletionAdvertised": false,
-      "copyTimeoutSecondsAdvertised": false
+      "actionRefreshVerified": true,
+      "routingGuardsVerified": true,
+      "exactFileFallbackDescriptionVerified": true
     }
   },
   "blockedCoverage": [
-    { "area": "Business Graph Excel live account", "reason": "The connected account is personal; business-only behavior is mock-tested." },
-    { "area": "Organization-only sharing", "reason": "The connected personal account cannot exercise tenant-only recipient policies; mock coverage passes." },
-    { "area": "Named-recipient sharing", "reason": "No distinct user-controlled recipient address was provided; anonymous link create/revoke and owner-only verification pass live, while named-recipient behavior passes mocks." },
-    { "area": "ChatGPT Work", "reason": "The host shows an incorrect expired-connection card before dispatching a tool call; regular Chat passes." },
-    { "area": "Immutable Codex plugin cache", "reason": "Versioned cache installation remains pending and is separate from the live NAS/ChatGPT rollout." },
-    { "area": "Production OAuth", "reason": "Production Entra registrations and the NAS OAuth rollout remain pending." }
+    {
+      "area": "ChatGPT Work",
+      "reason": "The Work package and OAuth transport are implemented and mock-tested; live Entra registration, developer-app OAuth configuration, NAS cutover, and Work validation are still in progress."
+    },
+    {
+      "area": "Named-recipient invitation",
+      "reason": "Not exercised live to avoid emailing or granting access to another person; guarded behavior remains mock-tested."
+    },
+    {
+      "area": "Business Graph Excel and organization-only sharing",
+      "reason": "The connected account is personal; business-only behavior remains mock-tested."
+    },
+    {
+      "area": "Production OAuth",
+      "reason": "The current developer deployment still uses the encrypted server-side vault with ChatGPT No Auth; the production Entra and OAuth rollout has not been cut over yet."
+    },
+    {
+      "area": "NAS management TLS",
+      "reason": "The existing management connection disables certificate verification and should be hardened separately."
+    }
   ]
 }

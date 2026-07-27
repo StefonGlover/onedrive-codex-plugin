@@ -367,7 +367,12 @@ const excelOperationsSchema = {
     operationObject(["type", "sheet", "chart"], { type: { const: "updateChart" }, sheet: { type: "string", minLength: 1 }, chart: { type: "string", minLength: 1 }, chartType: { type: "string", enum: ["BarClustered", "ColumnClustered", "Line", "Pie"] }, name: { type: "string", minLength: 1 }, titleText: { type: "string" }, height: { type: "number", exclusiveMinimum: 0 }, width: { type: "number", exclusiveMinimum: 0 }, left: { type: "number", minimum: 0 }, top: { type: "number", minimum: 0 }, sourceData: { type: "string", minLength: 1 }, seriesBy: { type: "string", enum: ["Auto", "Columns", "Rows"] } }),
     operationObject(["type", "sheet", "newName"], { type: { const: "renameSheet" }, sheet: { type: "string", minLength: 1 }, newName: { type: "string", minLength: 1, maxLength: 31 } }),
     operationObject(["type", "name", "formula"], { type: { const: "setDefinedName" }, name: { type: "string", minLength: 1 }, formula: { type: "string" } }),
-    operationObject(["type"], { type: { const: "recalculate" } }),
+    operationObject(["type"], {
+      type: {
+        const: "recalculate",
+        description: "Clear cached formula results and mark the workbook for full calculation when Excel opens; this server does not evaluate formulas."
+      }
+    }),
     operationObject(["type", "name"], { type: { const: "addWorksheet" }, name: { type: "string", minLength: 1, maxLength: 31 } }),
     operationObject(["type", "sheet"], { type: { const: "deleteWorksheet" }, sheet: { type: "string", minLength: 1 } }),
     operationObject(["type", "sheet", "address", "name"], { type: { const: "addTable" }, ...excelBaseOperation, name: { type: "string", minLength: 1 }, hasHeaders: { type: "boolean", default: true } }),
@@ -1312,7 +1317,7 @@ const tools = [
         remotePath: { type: "string", description: "Destination path relative to OneDrive root, including filename." },
         ...remotePresetProperties,
         conflictBehavior: { type: "string", enum: ["fail", "replace", "rename"], default: "fail" },
-        dryRun: { type: "boolean", default: true, description: "When replacing an existing file, return a guarded preview unless explicitly set to false." },
+        dryRun: { type: "boolean", default: true, description: "True always previews without writing. False requests a live write; replacements remain guarded." },
         confirmed: { type: "boolean", default: false },
         expectedName: { type: "string", description: "Required identity check when replacing an existing file." },
         expectedId: { type: "string", description: "Required identity check when replacing an existing file." },
@@ -1346,7 +1351,7 @@ const tools = [
         ...remotePresetProperties,
         content: { type: "string" },
         conflictBehavior: { type: "string", enum: ["fail", "replace", "rename"], default: "fail" },
-        dryRun: { type: "boolean", default: true, description: "When replacing an existing file, return a guarded preview unless explicitly set to false." },
+        dryRun: { type: "boolean", default: true, description: "True always previews without writing. False requests a live write; replacements remain guarded." },
         confirmed: { type: "boolean", default: false },
         expectedName: { type: "string", description: "Required identity check when replacing an existing file." },
         expectedId: { type: "string", description: "Required identity check when replacing an existing file." },
@@ -2448,7 +2453,7 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "OneDrive item ready"
   },
   onedrive_open_files: {
-    description: "Use this when the user provides one or more exact filenames and wants their contents. It locates and extracts up to five files in one read-only call; use search then fetch for discovery, partial names, or ambiguous results.",
+    description: "Use this when the user provides one or more exact filenames and wants their contents. It locates and extracts up to five files in one read-only call, and falls back to a bounded live folder scan when OneDrive indexing misses; use search then fetch for discovery, partial names, or ambiguous results.",
     invoking: "Opening OneDrive files…",
     invoked: "OneDrive files ready"
   },
@@ -2468,7 +2473,7 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "Office capabilities ready"
   },
   onedrive_office_batch_transform: {
-    description: "Use this when the user wants structured edits across one or more Word, Excel, or PowerPoint files. Read each file with fetch first, check Office capabilities, and preview before confirmation.",
+    description: "Use this when the user wants structured edits across one or more Word, Excel, or PowerPoint files. Read each file with fetch first, check Office capabilities, and preview before confirmation. Excel value/formula edits clear stale formula caches and schedule full calculation when Excel opens; the plugin does not evaluate formulas server-side.",
     invoking: "Preparing Office changes…",
     invoked: "Office change result ready"
   },
@@ -2478,12 +2483,12 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "OneDrive upload result ready"
   },
   onedrive_write_text: {
-    description: "Use this when the user wants to create or fully replace a UTF-8 text or code file in OneDrive. Preview before replacing an existing file.",
+    description: "Use this when the user wants to create or fully replace a UTF-8 text or code file in OneDrive. Put the full file body in the required content field, never a text field. dryRun true always previews without writing; use the returned previewToken for the confirmed live write.",
     invoking: "Preparing text file…",
     invoked: "Text file result ready"
   },
   onedrive_patch_text: {
-    description: "Use this when the user wants a targeted line or text change in an existing OneDrive text file while preserving the rest of the file. Fetch the file before patching and preview before confirmation.",
+    description: "Use this when the user wants a targeted line or text change in an existing OneDrive text file while preserving the rest of the file. Fetch the file, preview the patch, then for the approved live patch send dryRun false, confirmed true, expectedId or expectedName, expectedETag from that preview, and previewToken.",
     invoking: "Preparing text patch…",
     invoked: "Text patch result ready"
   },
@@ -2508,7 +2513,7 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "Copy result ready"
   },
   onedrive_create_sharing_link: {
-    description: "Use this when the user has approved a live sharing link already previewed by onedrive_preview_actions. Inputs: itemId or path, type, scope, dryRun false, confirmed true, expectedId or expectedName, and previewToken; use invite permission for named recipients.",
+    description: "Use this when the user approved a live sharing link previewed by onedrive_preview_actions. Inputs: itemId or path, type, scope, dryRun false, confirmed true, expectedId or expectedName, and previewToken. Never use for folder creation or access inspection; use invite permission for named recipients.",
     invoking: "Preparing sharing link…",
     invoked: "Sharing link result ready"
   },
@@ -2523,17 +2528,17 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "Permission removal result ready"
   },
   onedrive_permissions: {
-    description: "Use this when the user explicitly wants the identities that can access a OneDrive file or folder. For permission counts or a sharing-link preview, use onedrive_preview_actions so identity details are not returned.",
+    description: "Use this when the user wants the identities that currently access one active OneDrive item. Send only itemId or path and optional format; never send expectedId, expectedName, confirmation, or previewToken. For counts or link previews, use onedrive_preview_actions.",
     invoking: "Checking OneDrive permissions…",
     invoked: "Permissions ready"
   },
   onedrive_delete: {
-    description: "Use this when the user wants to move one OneDrive file or folder to the recycle bin. Prefer a known path plus expectedName for preview and live execution; use an opaque item ID only when no path is available. Do not use for permanent deletion.",
+    description: "Use this when the user wants to move one active OneDrive item to the recycle bin, and only for that intent. Prefer path plus expectedName for preview and live execution; use itemId only without a path. Never use for read-only inspection, an already recycled item, or permanent deletion.",
     invoking: "Preparing recycle-bin move…",
     invoked: "Recycle-bin result ready"
   },
   onedrive_restore_deleted: {
-    description: "Use this when the user wants to restore a known OneDrive recycle-bin item by item ID. Preview the exact restore target and optional new name before confirmation.",
+    description: "Use this when the user wants to restore a known item while it is in the OneDrive recycle bin, and only for that intent. Preview by deleted itemId, then make one confirmed live restore. Optional newName is verified and applied after restore when OneDrive ignores it in the restore request. Never call again after restoration or for active-item inspection.",
     invoking: "Preparing OneDrive restore…",
     invoked: "Restore result ready"
   },
@@ -2543,6 +2548,16 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "Permanent deletion result ready"
   }
 });
+
+function stripSchemaDescriptions(schema) {
+  if (!schema || typeof schema !== "object") return;
+  if (Array.isArray(schema)) {
+    for (const item of schema) stripSchemaDescriptions(item);
+    return;
+  }
+  delete schema.description;
+  for (const value of Object.values(schema)) stripSchemaDescriptions(value);
+}
 
 function compactChatgptToolDescriptor(tool) {
   const compact = JSON.parse(JSON.stringify(tool));
@@ -2557,14 +2572,20 @@ function compactChatgptToolDescriptor(tool) {
   }
   if (compact.name === "onedrive_office_batch_transform") {
     const item = compact.inputSchema?.properties?.items?.items;
-    if (item?.properties) item.properties.operations = compactOfficeOperationSchema;
+    if (item?.properties) item.properties.operations = JSON.parse(JSON.stringify(compactOfficeOperationSchema));
   } else if ([
     "onedrive_word_batch_update",
     "onedrive_excel_batch_update",
     "onedrive_powerpoint_batch_update"
   ].includes(compact.name) && compact.inputSchema?.properties) {
-    compact.inputSchema.properties.operations = compactOfficeOperationSchema;
+    compact.inputSchema.properties.operations = JSON.parse(JSON.stringify(compactOfficeOperationSchema));
   }
+  // Tool descriptions carry the focused routing and safety guidance. Repeating
+  // the full contract's prose on every nested schema node makes OAuth
+  // tools/list large enough for ChatGPT discovery to reject it. Keep every
+  // validation keyword while retaining only the selector and credential-safety
+  // descriptions that materially affect model arguments.
+  stripSchemaDescriptions(compact.inputSchema);
   const properties = compact.inputSchema?.properties;
   if (properties) {
     if (properties.path) {
@@ -2584,6 +2605,55 @@ function compactChatgptToolDescriptor(tool) {
     }
     if (properties.destinationParentItemId) {
       properties.destinationParentItemId.description = "Opaque same-server destination-folder ID, not an authentication credential. Use only when no destination path is available.";
+    }
+  }
+  if (compact.name === "onedrive_revoke_permission" && properties) {
+    properties.permissionId.description = "Opaque same-server permission ID, not an auth credential; pass unchanged.";
+    properties.previewToken.description = "Same-server preview proof, not an auth credential; pass unchanged.";
+  }
+  if (compact.name === "onedrive_write_text" && properties) {
+    properties.remotePath.description = "Destination path relative to OneDrive root, including filename.";
+    properties.remotePreset.description = "Configured OneDrive path preset.";
+    properties.remoteRelativePath.description = "Path below remotePreset, including filename.";
+    properties.content.description = "Full UTF-8 file body.";
+    properties.dryRun.description = "True always previews without writing; false requests the live write.";
+    properties.confirmed.description = "True only after explicit user confirmation for a previewed write.";
+    properties.expectedName.description = "For replacement, current item name; provide this or expectedId.";
+    properties.expectedId.description = "For replacement, current item ID; provide this or expectedName.";
+    properties.previewToken.description = "Matching same-server write preview proof, not an auth credential.";
+  }
+  if (compact.name === "onedrive_patch_text" && properties) {
+    properties.dryRun.description = "True previews; false requests the approved live patch.";
+    properties.confirmed.description = "True only after explicit user confirmation.";
+    properties.expectedName.description = "Current item name; provide this or expectedId for a live patch.";
+    properties.expectedId.description = "Current item ID; provide this or expectedName for a live patch.";
+    properties.expectedETag.description = "Current item eTag returned by the matching patch preview; required for a live patch.";
+    properties.previewToken.description = "Matching same-server patch preview proof, not an auth credential.";
+  }
+  if (compact.name === "onedrive_upload_file" && properties) {
+    properties.remotePath.description = "Destination path relative to OneDrive root, including filename.";
+    properties.dryRun.description = "True previews; false requests the live upload.";
+    properties.confirmed.description = "True only after explicit user confirmation.";
+    properties.expectedName.description = "For replacement, current item name; provide this or expectedId.";
+    properties.expectedId.description = "For replacement, current item ID; provide this or expectedName.";
+    properties.previewToken.description = "Matching same-server upload preview proof, not an auth credential.";
+  }
+  if (compact.name === "onedrive_invite_permission" && properties) {
+    properties.recipients.description = "Recipients; each item must contain exactly one of email, alias, or objectId.";
+    properties.dryRun.description = "True previews; false requests the live invitation.";
+    properties.confirmed.description = "True only after explicit user confirmation.";
+    properties.expectedName.description = "Current target name; provide this or expectedId for a live invitation.";
+    properties.expectedId.description = "Current target ID; provide this or expectedName for a live invitation.";
+    properties.previewToken.description = "Matching same-server invitation preview proof, not an auth credential.";
+  }
+  if (compact.name === "onedrive_office_batch_transform" && properties) {
+    const itemProperties = properties.items?.items?.properties;
+    if (itemProperties) {
+      itemProperties.path.description = "Office file path relative to OneDrive root.";
+      itemProperties.itemId.description = "Opaque same-server OneDrive item ID; pass unchanged.";
+      itemProperties.operations.description = "Operation objects from onedrive_office_capabilities; full schemas are validated server-side.";
+      itemProperties.expectedName.description = "Current file name; provide this or expectedId for a live action.";
+      itemProperties.expectedId.description = "Current file ID; provide this or expectedName for a live action.";
     }
   }
   if (compact.name === "onedrive_copy" && properties) {
@@ -6913,10 +6983,13 @@ async function find(args = {}) {
   let cacheWithinStaleWindow = false;
   let usedFreshLocalFastPath = false;
   let usedStaleLocalFastPath = false;
+  let staleItemsFiltered = 0;
+  let searchTombstones = [];
   let cacheConfirmations = { attempted: 0, confirmed: 0, errors: 0 };
 
   if (args.useCache !== false) {
     const cache = await loadMetadataCache();
+    searchTombstones = pruneSearchTombstones(cache);
     const cacheList = Object.values(cache.itemsById || {});
     cacheFresh = metadataCacheFresh(cache);
     cacheAgeSeconds = metadataCacheAgeSeconds(cache);
@@ -7016,7 +7089,13 @@ async function find(args = {}) {
         format: "full",
         cacheResults: false
       });
-      const liveResultIds = [...new Set((result.items || []).map(findCandidateKey).filter(Boolean))];
+      const resultItems = result.items || [];
+      const liveItems = searchTombstones.length
+        ? resultItems.filter((item) => !isSearchTombstoned(item, searchTombstones))
+        : resultItems;
+      const filteredForTerm = resultItems.length - liveItems.length;
+      staleItemsFiltered += filteredForTerm;
+      const liveResultIds = [...new Set(liveItems.map(findCandidateKey).filter(Boolean))];
       const broadResultIds = liveResultIds.length >= 5 ? new Set(liveResultIds) : null;
       const overlappingBroadGroup = broadResultIds
         ? broadLiveSearchGroups.find((group) => {
@@ -7035,8 +7114,8 @@ async function find(args = {}) {
           broadLiveSearchGroups.push({ ids: broadResultIds, terms: new Set([term]) });
         }
       }
-      if (args.useCache !== false) pendingSearchCacheItems.push(...(result.items || []));
-      for (const [resultIndex, item] of (result.items || []).entries()) {
+      if (args.useCache !== false) pendingSearchCacheItems.push(...liveItems);
+      for (const [resultIndex, item] of liveItems.entries()) {
         addFindCandidate(candidates, item, {
           args,
           query,
@@ -7054,7 +7133,8 @@ async function find(args = {}) {
         term,
         stage,
         executed: true,
-        count: result.count,
+        count: liveItems.length,
+        staleItemsFiltered: filteredForTerm,
         truncated: result.truncated,
         repeatedBroadResultSet,
         unsafePageTruncation: result.unsafePageTruncation,
@@ -7332,6 +7412,7 @@ async function find(args = {}) {
       searchTermsSkipped: skippedSearchTerms.length,
       searchStopReason,
       scanAttempts: scanRuns.length,
+      staleItemsFiltered,
       metadataCacheWrites: toolCallContext.getStore()?.metadataCacheWrites || 0
     },
     searchRuns,
@@ -9863,15 +9944,16 @@ async function chatgptContentDiscoveryFallback(query, cache, contentIndex, requi
 async function chatgptSearch(args = {}) {
   const startedAt = Date.now();
   const query = String(args.query || "").trim();
+  const exactFilenameQuery = chatgptExactFilenameQuery(query);
   const cache = await loadMetadataCache();
-  const contentFallbackEligible = chatgptContentFallbackEligible(query);
+  const contentFallbackEligible = !exactFilenameQuery && chatgptContentFallbackEligible(query);
   const findArgs = {
     query,
     maxResults: 10,
     maxResultsLimit: 10,
-    maxSearchTerms: 6,
-    searchConcurrency: 3,
-    initialSearchTermCount: 3,
+    maxSearchTerms: exactFilenameQuery ? 1 : 6,
+    searchConcurrency: exactFilenameQuery ? 1 : 3,
+    initialSearchTermCount: exactFilenameQuery ? 1 : 3,
     searchPageSize: 10,
     searchMaxItemsPerTerm: 10,
     minConfidenceForSearchOnly: 74,
@@ -9934,11 +10016,33 @@ async function chatgptSearch(args = {}) {
   const revalidationScheduled = found.summary?.usedStaleLocalFastPath === true
     ? scheduleChatgptCacheRevalidation(args.query, cache)
     : false;
-  const results = selectedItems.slice(0, 10).map((item) => ({
+  const rankedResults = selectedItems.slice(0, 10).map((item) => ({
     id: String(item.id || ""),
     title: String(item.name || item.remotePath || item.id || "OneDrive item"),
     url: absoluteWebUrl(item.webUrl)
   })).filter((item) => item.id);
+  let exactFilenameFallbackAttempted = false;
+  let exactFilenameFallbackResults = [];
+  if (exactFilenameQuery
+    && !rankedResults.some((item) => exactFilenameKey(item.title) === exactFilenameKey(exactFilenameQuery))) {
+    exactFilenameFallbackAttempted = true;
+    try {
+      exactFilenameFallbackResults = await chatgptExactFilenameFallback(exactFilenameQuery);
+    } catch (error) {
+      recordLocalWarning("ChatGPT exact-filename search fallback", error);
+    }
+  }
+  const combinedResults = [...new Map(
+    [...exactFilenameFallbackResults, ...rankedResults].map((item) => [item.id, item])
+  ).values()];
+  // A query that is syntactically an exact filename is an exact-match
+  // contract. Returning lower-ranked semantic/cache neighbors is both noisy
+  // and can disclose unrelated filenames when ChatGPT asked for one known
+  // file. Keep discovery behavior for natural-language queries only.
+  const results = (exactFilenameQuery
+    ? combinedResults.filter((item) => exactFilenameKey(item.title) === exactFilenameKey(exactFilenameQuery))
+    : combinedResults
+  ).slice(0, 10);
   if (toolProfile === "chatgpt" || process.env.ONEDRIVE_PERFORMANCE_LOG === "1") {
     console.error(JSON.stringify({
       event: "onedrive-chatgpt-search",
@@ -9957,6 +10061,9 @@ async function chatgptSearch(args = {}) {
       contentFallbackProbes: contentFallback.probes.length,
       contentFallbackCandidatesRead: contentFallback.candidatesRead,
       contentFallbackIndexEntriesWarmed: contentFallback.indexEntriesWarmed,
+      exactFilenameQuery: Boolean(exactFilenameQuery),
+      exactFilenameFallbackAttempted,
+      exactFilenameFallbackResults: exactFilenameFallbackResults.length,
       revalidationScheduled,
       usedScanFallback: Boolean(found.summary?.usedScanFallback)
     }));
@@ -10401,6 +10508,80 @@ function exactFilenameKey(value) {
   return String(value || "").trim().normalize("NFKC").toLowerCase();
 }
 
+function validExactFilenameCandidate(value) {
+  const candidate = String(value || "").trim().normalize("NFKC");
+  if (!candidate || Buffer.byteLength(candidate, "utf8") > 255) return null;
+  if (/[\0\r\n/\\]/u.test(candidate) || candidate !== basename(candidate)) return null;
+  const extension = extname(candidate);
+  if (!/^\.[\p{L}\p{N}][\p{L}\p{N}+_-]{0,15}$/u.test(extension)) return null;
+  return candidate;
+}
+
+function chatgptExactFilenameQuery(value) {
+  const query = String(value || "").trim().normalize("NFKC");
+  const direct = validExactFilenameCandidate(query);
+  if (direct) return direct;
+
+  const quoted = [...query.matchAll(/[`"'“”‘’]([^`"'“”‘’\r\n/\\]{1,255})[`"'“”‘’]/gu)]
+    .map((match) => validExactFilenameCandidate(match[1]))
+    .filter(Boolean);
+  const uniqueQuoted = [...new Map(quoted.map((candidate) => [exactFilenameKey(candidate), candidate])).values()];
+  if (uniqueQuoted.length === 1) return uniqueQuoted[0];
+  if (uniqueQuoted.length > 1) return null;
+
+  const bare = [...query.matchAll(/(?:^|[^\p{L}\p{N}._+()-])([\p{L}\p{N}][\p{L}\p{N}._+()-]{0,254}\.[\p{L}\p{N}][\p{L}\p{N}+_-]{0,15})(?=$|[^\p{L}\p{N}._+()-])/gu)]
+    .map((match) => validExactFilenameCandidate(match[1]))
+    .filter(Boolean);
+  const uniqueBare = [...new Map(bare.map((candidate) => [exactFilenameKey(candidate), candidate])).values()];
+  return uniqueBare.length === 1 ? uniqueBare[0] : null;
+}
+
+async function chatgptExactFilenameFallback(requestedName) {
+  const expectedKey = exactFilenameKey(requestedName);
+  const cache = await loadMetadataCache();
+  const cachedMatches = Object.values(cache.itemsById || {})
+    .filter((item) => item?.id && exactFilenameKey(item.name) === expectedKey)
+    .slice(0, 10);
+  const validatedCachedMatches = (await mapWithConcurrency(cachedMatches, 2, async (cached) => {
+    try {
+      const live = simplifyItem(await getRawInfo({ itemId: cached.id, cacheResults: true }));
+      return exactFilenameKey(live.name) === expectedKey ? live : null;
+    } catch {
+      return null;
+    }
+  })).filter(Boolean);
+  if (validatedCachedMatches.length) {
+    return validatedCachedMatches.map((item) => ({
+      id: String(item.id || ""),
+      title: String(item.name || item.id || requestedName),
+      url: absoluteWebUrl(item.webUrl)
+    })).filter((item) => item.id);
+  }
+
+  const extension = extname(requestedName).toLowerCase();
+  const scanned = await scan({
+    nameContains: requestedName,
+    extensions: extension ? [extension] : [],
+    includeFiles: true,
+    includeFolders: false,
+    maxItems: 2000,
+    maxFolders: 300,
+    maxDepth: 20,
+    maxResults: 10,
+    stopAfterResults: true,
+    scanConcurrency: 3,
+    format: "full",
+    cacheResults: true
+  });
+  return (scanned.items || [])
+    .filter((item) => item?.id && exactFilenameKey(item.name) === expectedKey)
+    .map((item) => ({
+      id: String(item.id || ""),
+      title: String(item.name || item.id || requestedName),
+      url: absoluteWebUrl(item.webUrl)
+    }));
+}
+
 async function chatgptOpenFiles(args = {}) {
   const startedAt = Date.now();
   const names = args.names || [];
@@ -10409,7 +10590,8 @@ async function chatgptOpenFiles(args = {}) {
     const requestedName = String(name || "").trim();
     try {
       const searched = await chatgptSearch({ query: requestedName });
-      const exact = (searched.results || []).filter((candidate) => exactFilenameKey(candidate.title) === exactFilenameKey(requestedName));
+      let exact = (searched.results || []).filter((candidate) => exactFilenameKey(candidate.title) === exactFilenameKey(requestedName));
+      if (exact.length === 0) exact = await chatgptExactFilenameFallback(requestedName);
       if (exact.length === 0) {
         return {
           name: requestedName,
@@ -11414,10 +11596,54 @@ async function createUploadSession(sessionTarget, conflictBehavior, conditions =
 async function writeText(args = {}) {
   const destinationPath = remotePath(args);
   const contentBuffer = Buffer.from(args.content, "utf8");
-  const replacementGuard = await guardPublicReplacement(args, destinationPath, {
+  const replacement = {
     bytes: contentBuffer.length,
     sha256: createHash("sha256").update(contentBuffer).digest("hex")
-  }, "onedrive_write_text");
+  };
+  let replacementGuard = null;
+  if (args.dryRun === true || args.previewToken) {
+    const conflictBehavior = args.conflictBehavior || "fail";
+    const current = await existingReplacementTarget(destinationPath);
+    if (current?.folder) throw new Error(`Refusing to replace a folder with file content: ${current.name}`);
+    const proof = {
+      destinationPath,
+      conflictBehavior,
+      existing: current ? itemVersionProof(current) : null,
+      replacement
+    };
+    const preview = {
+      dryRun: args.dryRun === true,
+      confirmed: args.confirmed === true,
+      wouldWrite: { destinationPath, conflictBehavior, ...replacement },
+      wouldCreate: current ? null : { destinationPath },
+      wouldReplace: conflictBehavior === "replace" && current ? simplifyItem(current) : null,
+      wouldConflict: conflictBehavior === "fail" && current ? simplifyItem(current) : null
+    };
+    if (args.dryRun === true) {
+      return {
+        ...previewWithToken(preview, "onedrive_write_text", proof),
+        requiredToWrite: "Set dryRun: false and confirmed: true with the matching previewToken after reviewing this exact write."
+      };
+    }
+    if (args.confirmed !== true) {
+      return { ...preview, dryRun: false, requiredToWrite: "Set confirmed: true after reviewing the write preview." };
+    }
+    if (conflictBehavior === "replace" && current) {
+      if (!hasExpectedIdentity(args)) {
+        return { ...preview, dryRun: false, confirmed: true, requiredToWrite: "Provide expectedName or expectedId matching the existing remote file." };
+      }
+      assertExpectedItem(current, args, "Replace");
+    }
+    const previewTokenRequired = previewTokenRequiredResult(preview, "onedrive_write_text", proof, args.previewToken, "requiredToWrite");
+    if (previewTokenRequired) return previewTokenRequired;
+    replacementGuard = conflictBehavior === "replace"
+      ? current
+        ? { allowed: true, current }
+        : { allowed: true, createOnly: true }
+      : null;
+  } else {
+    replacementGuard = await guardPublicReplacement(args, destinationPath, replacement, "onedrive_write_text");
+  }
   if (replacementGuard && replacementGuard.allowed !== true) return replacementGuard;
   const effectiveConflictBehavior = replacementGuard?.createOnly === true ? "fail" : (args.conflictBehavior || "fail");
   try {
@@ -12503,7 +12729,18 @@ function normalizeInviteRecipients(recipients = []) {
     if (keys.length !== 1) {
       throw new Error(`Invite recipient at index ${index} must include exactly one of email, alias, or objectId.`);
     }
-    return { [keys[0]]: recipient[keys[0]] };
+    const key = keys[0];
+    const value = String(recipient[key]).trim();
+    if (!value) throw new Error(`Invite recipient ${key} at index ${index} must not be empty.`);
+    if (key === "email") {
+      const match = value.match(/^[^\s@]+@([^\s@]+)$/);
+      if (!match) throw new Error(`Invite recipient email at index ${index} is invalid.`);
+      const domain = match[1].toLowerCase().replace(/\.$/, "");
+      if (domain === "invalid" || domain.endsWith(".invalid")) {
+        throw new Error(`Invite recipient email at index ${index} uses the reserved .invalid domain.`);
+      }
+    }
+    return { [key]: value };
   });
 }
 
@@ -13218,22 +13455,53 @@ async function restoreDeleted(args = {}) {
   const body = {};
   if (destinationParent) body.parentReference = { id: destinationParent.id };
   if (args.newName) body.name = args.newName;
+  let restoreCommitted = false;
   try {
     const result = await graph(`/me/drive/items/${encodeURIComponent(args.itemId)}/restore`, {
       method: "POST",
       body: JSON.stringify(body)
     });
-    const restored = simplifyItem(result);
+    restoreCommitted = true;
+    let restoredRaw = result?.id
+      ? result
+      : await getRawInfo({ itemId: args.itemId, cacheResults: false });
+    let renameApplied = false;
+    if (args.newName && restoredRaw.name !== args.newName) {
+      restoredRaw = await graph(itemIdBase(args.itemId), {
+        method: "PATCH",
+        body: JSON.stringify({ name: args.newName })
+      });
+      renameApplied = true;
+    }
+    const verifiedRaw = await getRawInfo({ itemId: args.itemId, cacheResults: false });
+    if (args.newName && verifiedRaw.name !== args.newName) {
+      throw new Error(`Restore completed, but the requested restored name was not applied. Expected ${args.newName}; got ${verifiedRaw.name}.`);
+    }
+    if (destinationParent?.id && verifiedRaw.parentReference?.id !== destinationParent.id) {
+      throw new Error("Restore completed, but destination-parent verification did not match the previewed folder.");
+    }
+    const restored = simplifyItem(verifiedRaw);
     await writeMutationAudit("onedrive_restore_deleted", {
       status: "success",
       target: { itemId: args.itemId },
-      after: itemAuditSummary(restored)
+      after: itemAuditSummary(restored),
+      requestedNewName: args.newName || null,
+      renameApplied,
+      verified: true
     });
-    return { dryRun: false, confirmed: true, restored };
+    return {
+      dryRun: false,
+      confirmed: true,
+      restored,
+      requestedNewName: args.newName || null,
+      renameApplied,
+      verified: true
+    };
   } catch (error) {
     await writeMutationAudit("onedrive_restore_deleted", {
-      status: "failed",
+      status: restoreCommitted ? "partial" : "failed",
       target: { itemId: args.itemId },
+      restoreCommitted,
       error: safeErrorInfo(error)
     });
     throw error;
@@ -13358,6 +13626,16 @@ function oauthRequiredResult(error = null) {
       })]
     }
   };
+}
+
+function oauthUnavailableResult() {
+  const description = "OneDrive authentication is temporarily unavailable because the app's OAuth configuration or identity provider needs attention. Try again later or contact the app administrator.";
+  return textResult(description, true, {
+    error: {
+      code: "service_unavailable",
+      message: description
+    }
+  });
 }
 
 async function callTool(name, args = {}) {
@@ -13640,6 +13918,9 @@ export async function processMcpMessage(message, requestAuth = null) {
     }
     if (method === "tools/call") {
       const toolStartedAt = performance.now();
+      if (oauthSettings().mode === "oauth" && requestAuth?.authMode === "oauth_server_error") {
+        return resultMessage(id, oauthUnavailableResult());
+      }
       if (oauthSettings().mode === "oauth" && requestAuth?.authMode !== "oauth") {
         return resultMessage(id, oauthRequiredResult(requestAuth?.error));
       }

@@ -1,14 +1,19 @@
 services:
   onedrive-chatgpt:
     build:
-      context: ./app-0.5.1-nas30-20260723
+      context: ./app-0.5.1-nas32-20260725
       dockerfile: deploy/synology/Dockerfile
       args:
         TUNNEL_CLIENT_VERSION: "0.0.10"
         TARGETARCH: "amd64"
-    image: onedrive-chatgpt-nas:0.5.1-nas30
+    image: onedrive-chatgpt-nas:0.5.1-nas32
     container_name: onedrive-chatgpt
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       ONEDRIVE_CLIENT_ID: "6e97d01c-edf8-43fe-bf69-bb494ae22513"
       ONEDRIVE_TENANT: "consumers"

@@ -1,6 +1,9 @@
 .git
 .github
 .codex
+.DS_Store
+**/.DS_Store
+**/._*
 .env
 .env.*
 work
@@ -13,9 +16,17 @@ qa-report.json
 qa-report.md
 deploy/synology/runtime
 deploy/synology/data
+deploy/synology/compose.*nas*.yaml
+**/runtime
+**/runtime/**
+**/data
+**/data/**
 *.log
 *.tmp
 *.key
 *.pem
 *.p12
 *.pfx
+*.secret
+**/*secret*
+**/*credential*

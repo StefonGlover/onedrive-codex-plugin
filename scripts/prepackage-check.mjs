@@ -44,10 +44,37 @@ const ignoredPackageDirs = new Set([".git", "work", "downloads", "onedrive-beta"
 const ignoredPackageFiles = new Set([".DS_Store"]);
 const ignoredPackageFileExtensions = new Set([".log", ".tmp", ".temp", ".bak", ".swp"]);
 const forbiddenResidueDirs = new Set([".codex", ".pytest_cache", "__pycache__"]);
+const privateNasComposePattern = /^compose\..*nas\d+.*\.ya?ml$/i;
 const sensitivePackageFileNames = new Set([".env", ".env.local", ".env.development", ".env.production", "credentials.json", "token.json"]);
 const sensitivePackageFileExtensions = new Set([".key", ".pem", ".p12", ".pfx"]);
 const sensitivePackageNamePattern = /(token|secret|credential)/i;
-const expectedPluginVersion = /^0\.5\.1\+codex\.\d{14}$/;
+const auditedSensitiveSourcePaths = new Set(["mcp/oauth-facade-token.mjs"]);
+const requiredDockerIgnoreEntries = [
+  ".git",
+  ".env",
+  ".env.*",
+  "work",
+  "deploy/synology/runtime",
+  "deploy/synology/data",
+  "deploy/synology/compose.*nas*.yaml",
+  "**/runtime/**",
+  "**/data/**",
+  "**/._*",
+  "**/*secret*",
+  "**/*credential*",
+  "*.key",
+  "*.pem",
+  "*.p12",
+  "*.pfx"
+];
+const requiredDockerLogRotation = {
+  driver: 'driver: "json-file"',
+  maxSize: 'max-size: "10m"',
+  maxFile: 'max-file: "3"'
+};
+const expectedPluginVersion = /^0\.6\.1\+codex\.\d{14}$/;
+const expectedChatGptAppKey = "onedrive";
+const expectedChatGptAppId = "asdk_app_6a65633d9c4c8191ae8a79b612b38654";
 const expectedOfficeOperationKinds = {
   word: [
     "replaceText", "setParagraphText", "setParagraphStyle", "insertParagraph", "setTableCell",
@@ -93,10 +120,13 @@ const textExtensions = new Set([
 ]);
 const requiredFiles = [
   ".codex-plugin/plugin.json",
+  ".app.json",
+  ".dockerignore",
   ".mcp.json",
   "mcp/server.mjs",
   "mcp/http-server.mjs",
   "mcp/oauth.mjs",
+  "mcp/oauth-compat-server.mjs",
   "mcp/auth-vault.mjs",
   "mcp/semantic-anchors.mjs",
   "mcp/text-patch.mjs",
@@ -108,6 +138,7 @@ const requiredFiles = [
   "scripts/requirements-office-test.txt",
   "scripts/mock-graph-test.mjs",
   "scripts/oauth-http-test.mjs",
+  "scripts/oauth-compat-test.mjs",
   "scripts/storage-root-permissions-test.mjs",
   "scripts/run-chatgpt-oauth-tunnel.mjs",
   "scripts/semantic-anchors-test.mjs",
@@ -155,12 +186,26 @@ function isSensitivePackageEntryName(name) {
     || sensitivePackageNamePattern.test(name);
 }
 
+function isAuditedSensitiveSourcePath(path) {
+  return auditedSensitiveSourcePaths.has(String(path).split(sep).join("/"));
+}
+
 async function walk(dir, files = []) {
   for (const entry of await readdir(dir, { withFileTypes: true })) {
     const path = join(dir, entry.name);
     const extension = extname(entry.name).toLowerCase();
-    if (isSensitivePackageEntryName(entry.name)) {
-      fail(`Sensitive file must not be packaged: ${relative(pluginRoot, path)}`);
+    const rel = relative(pluginRoot, path);
+    const relParts = rel.split(sep);
+    if (
+      relParts.length === 3
+      && relParts[0] === "deploy"
+      && relParts[1] === "synology"
+      && privateNasComposePattern.test(relParts[2])
+    ) {
+      continue;
+    }
+    if (isSensitivePackageEntryName(entry.name) && !isAuditedSensitiveSourcePath(rel)) {
+      fail(`Sensitive file must not be packaged: ${rel}`);
       continue;
     }
     if (entry.isDirectory()) {
@@ -206,13 +251,14 @@ function checkManifest() {
   if (!manifest) return;
   if (manifest.name !== "onedrive") fail(`Unexpected plugin name: ${manifest.name}`);
   if (!expectedPluginVersion.test(manifest.version || "")) {
-    fail(`Plugin version must match 0.5.1+codex.<14-digit timestamp>: ${manifest.version}`);
+    fail(`Plugin version must match 0.6.1+codex.<14-digit timestamp>: ${manifest.version}`);
   }
   const readme = readFileSync(join(pluginRoot, "README.md"), "utf8");
   if (!readme.includes(`Release \`${manifest.version}\``)) {
     fail(`README release version does not match plugin.json: ${manifest.version}`);
   }
   if (manifest.interface?.defaultPrompt?.length > 3) fail("interface.defaultPrompt should contain at most 3 entries.");
+  if (manifest.apps !== "./.app.json") fail("plugin.json apps must point to ./.app.json.");
   for (const field of ["composerIcon", "logo", "logoDark"]) {
     const value = manifest.interface?.[field];
     if (!value) fail(`Missing interface.${field}`);
@@ -226,10 +272,50 @@ function checkManifest() {
   }
 }
 
+function workAppMappingProblems(manifest, appManifest) {
+  const issues = [];
+  if (manifest?.apps !== "./.app.json") issues.push("plugin.json apps must point to ./.app.json.");
+  const apps = appManifest?.apps;
+  if (!apps || typeof apps !== "object" || Array.isArray(apps)) {
+    issues.push(".app.json apps must be an object.");
+    return issues;
+  }
+  const appKeys = Object.keys(apps);
+  if (appKeys.length !== 1 || appKeys[0] !== expectedChatGptAppKey) {
+    issues.push(`.app.json must contain exactly the ${expectedChatGptAppKey} app mapping.`);
+  }
+  const mapping = apps[expectedChatGptAppKey];
+  if (!mapping || typeof mapping !== "object" || Array.isArray(mapping)) {
+    issues.push(`.app.json ${expectedChatGptAppKey} mapping must be an object.`);
+    return issues;
+  }
+  const mappingFields = Object.keys(mapping);
+  if (mappingFields.length !== 1 || mappingFields[0] !== "id") {
+    issues.push(`.app.json ${expectedChatGptAppKey} mapping must contain only id.`);
+  }
+  if (mapping.id !== expectedChatGptAppId) {
+    issues.push(`.app.json must map ${expectedChatGptAppKey} to the registered ChatGPT app ${expectedChatGptAppId}.`);
+  }
+  if (!/^asdk_app_[0-9a-f]{32}$/.test(mapping.id || "")) {
+    issues.push(".app.json id must use the ChatGPT asdk_app_<32 lowercase hex> identifier, not a plugin_asdk_app_ installation ID.");
+  }
+  return issues;
+}
+
+function checkWorkAppMapping() {
+  const manifest = readJson(join(pluginRoot, ".codex-plugin", "plugin.json"));
+  const appManifest = readJson(join(pluginRoot, ".app.json"));
+  if (!manifest || !appManifest) return;
+  for (const issue of workAppMappingProblems(manifest, appManifest)) fail(issue);
+}
+
 function currentHeadCommit() {
+  const gitEnvironment = { ...process.env };
+  delete gitEnvironment.DEVELOPER_DIR;
   const result = spawnSync("git", ["rev-parse", "HEAD"], {
     cwd: pluginRoot,
     encoding: "utf8",
+    env: gitEnvironment,
     timeout: 5_000
   });
   if (result.error || result.status !== 0) {
@@ -374,6 +460,48 @@ function checkMcp() {
 function checkRequiredFiles() {
   for (const file of requiredFiles) {
     if (!existsSync(join(pluginRoot, file))) fail(`Missing required file: ${file}`);
+  }
+}
+
+function dockerIgnoreProblems(text) {
+  const entries = new Set(
+    String(text)
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"))
+  );
+  return requiredDockerIgnoreEntries
+    .filter((entry) => !entries.has(entry))
+    .map((entry) => `.dockerignore must exclude ${entry}.`);
+}
+
+function checkDockerIgnore() {
+  const path = join(pluginRoot, ".dockerignore");
+  if (!existsSync(path)) return;
+  for (const issue of dockerIgnoreProblems(readFileSync(path, "utf8"))) fail(issue);
+}
+
+function composeLogRotationProblems(text, label) {
+  const source = String(text);
+  const issues = [];
+  for (const [field, expected] of Object.entries(requiredDockerLogRotation)) {
+    if (!source.includes(expected)) {
+      issues.push(`${label} must declare bounded Docker logging (${field}: ${expected}).`);
+    }
+  }
+  return issues;
+}
+
+function checkSynologyLogRotation() {
+  for (const relativePath of [
+    "deploy/synology/compose.yaml",
+    "deploy/synology/compose.oauth.example.yaml"
+  ]) {
+    const path = join(pluginRoot, relativePath);
+    if (!existsSync(path)) continue;
+    for (const issue of composeLogRotationProblems(readFileSync(path, "utf8"), relativePath)) {
+      fail(issue);
+    }
   }
 }
 
@@ -629,14 +757,44 @@ if (selfCheck) {
     missingToolRejected: !missingContract.ok && missingContract.missing.length === 1,
     extraToolRejected: !extraContract.ok && extraContract.extra.includes("onedrive_unexpected"),
     duplicateToolRejected: !duplicateContract.ok && duplicateContract.duplicates.length === 1,
-    currentVersionAccepted: expectedPluginVersion.test("0.5.1+codex.20260719224717"),
-    staleVersionRejected: !expectedPluginVersion.test("0.4.0+codex.20260713105951"),
+    validWorkAppMappingAccepted: workAppMappingProblems(
+      { apps: "./.app.json" },
+      { apps: { onedrive: { id: expectedChatGptAppId } } }
+    ).length === 0,
+    installationIdRejectedForWorkApp: workAppMappingProblems(
+      { apps: "./.app.json" },
+      { apps: { onedrive: { id: `plugin_${expectedChatGptAppId}` } } }
+    ).some((issue) => issue.includes("not a plugin_asdk_app_ installation ID")),
+    currentVersionAccepted: expectedPluginVersion.test("0.6.1+codex.20260726012710"),
+    staleVersionRejected: !expectedPluginVersion.test("0.5.1+codex.20260725232809"),
     sensitiveFileNamesRecognized: isSensitivePackageEntryName(".env.local")
       && isSensitivePackageEntryName("signing.pem")
       && isSensitivePackageEntryName("refresh-token.txt")
       && isSensitivePackageEntryName("client-secret.json")
       && isSensitivePackageEntryName("azure-credentials.backup")
       && !isSensitivePackageEntryName("tool-contract.mjs"),
+    auditedSensitiveSourcePathAccepted: isAuditedSensitiveSourcePath("mcp/oauth-facade-token.mjs")
+      && !isAuditedSensitiveSourcePath("mcp/refresh-token.txt"),
+    privateNasComposeSnapshotsRecognized:
+      privateNasComposePattern.test("compose.oauth.nas38.yaml")
+      && privateNasComposePattern.test("compose.nas31.rollback.yaml")
+      && !privateNasComposePattern.test("compose.oauth.example.yaml"),
+    completeDockerIgnoreAccepted:
+      dockerIgnoreProblems(`${requiredDockerIgnoreEntries.join("\n")}\n`).length === 0,
+    incompleteDockerIgnoreRejected:
+      dockerIgnoreProblems(
+        requiredDockerIgnoreEntries.filter((entry) => entry !== "deploy/synology/compose.*nas*.yaml").join("\n")
+      ).some((issue) => issue.includes("compose.*nas*.yaml")),
+    boundedDockerLoggingAccepted:
+      composeLogRotationProblems(
+        Object.values(requiredDockerLogRotation).join("\n"),
+        "fixture"
+      ).length === 0,
+    unboundedDockerLoggingRejected:
+      composeLogRotationProblems(
+        `${requiredDockerLogRotation.driver}\n${requiredDockerLogRotation.maxSize}\n`,
+        "fixture"
+      ).some((issue) => issue.includes("maxFile")),
     residueDirectoriesRecognized: forbiddenResidueDirs.has("__pycache__"),
     nestedLooseObjectSchemaRejected: schemaConsistencyProblems("negative", {
       type: "object",
@@ -699,7 +857,10 @@ if (selfCheck) {
 
 const files = await walk(pluginRoot);
 checkRequiredFiles();
+checkDockerIgnore();
+checkSynologyLogRotation();
 checkManifest();
+checkWorkAppMapping();
 checkMcp();
 checkToolSchemas();
 checkNoAbsoluteLocalPaths(files);

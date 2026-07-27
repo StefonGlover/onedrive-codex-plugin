@@ -10,8 +10,20 @@ import { fileURLToPath } from "node:url";
 const scriptsRoot = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(scriptsRoot, "..");
 const manifest = JSON.parse(readFileSync(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"));
-const versionPattern = /^0\.5\.1\+codex\.\d{14}$/;
+const versionPattern = /^0\.6\.1\+codex\.\d{14}$/;
 const excludedTopLevelNames = new Set([".git", "work", "downloads", "onedrive-beta", "node_modules", "dist", "build", "coverage"]);
+const privateNasComposePattern = /^compose\..*nas\d+.*\.ya?ml$/i;
+
+function excludedPackagePath(sourcePath) {
+  const relativePath = sourcePath.slice(pluginRoot.length + 1);
+  if (!relativePath || relativePath.startsWith("..")) return false;
+  const parts = relativePath.split(/[\\/]/);
+  if (excludedTopLevelNames.has(parts[0])) return true;
+  return parts.length === 3
+    && parts[0] === "deploy"
+    && parts[1] === "synology"
+    && privateNasComposePattern.test(parts[2]);
+}
 
 function parseArgs(argv) {
   const parsed = { confirmed: false, selfCheck: false, syncEvidence: false, target: null };
@@ -102,7 +114,10 @@ if (args.selfCheck) {
     unknownOptionRejected: (() => { try { parseArgs(["--overwrite"]); return false; } catch { return true; } })(),
     evidenceModeParsed: parseArgs(["--sync-evidence"]).syncEvidence === true,
     oldCacheExcludedFromTarget: expectedTarget.endsWith(`/onedrive/${manifest.version}`),
-    sourceControlExcluded: excludedTopLevelNames.has(".git")
+    sourceControlExcluded: excludedTopLevelNames.has(".git"),
+    privateNasComposeExcluded: excludedPackagePath(
+      join(pluginRoot, "deploy", "synology", "compose.oauth.nas38.yaml")
+    )
   };
   const ok = Object.values(checks).every(Boolean);
   console.log(JSON.stringify({ ok, version: manifest.version, expectedTarget, checks }, null, 2));
@@ -226,7 +241,8 @@ try {
       force: false,
       errorOnExist: true,
       preserveTimestamps: true,
-      verbatimSymlinks: true
+      verbatimSymlinks: true,
+      filter: (sourcePath) => !excludedPackagePath(sourcePath)
     });
   }
   const parityEvidence = runPrepackage(["--installed", stagingRoot]);

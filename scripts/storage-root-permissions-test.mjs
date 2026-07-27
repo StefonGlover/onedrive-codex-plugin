@@ -13,7 +13,7 @@ const fixtureRoot = join(workRoot, "fixtures");
 
 process.env.ONEDRIVE_STORAGE_ROOT ||= join(workRoot, "storage");
 process.env.ONEDRIVE_OFFICE_PYCACHE_ROOT ||= join(workRoot, "python-cache");
-process.env.ONEDRIVE_OFFICE_PYTHON ||= "/usr/bin/python3";
+process.env.ONEDRIVE_OFFICE_PYTHON ||= process.env.ONEDRIVE_OFFICE_TEST_PYTHON || "/usr/bin/python3";
 
 try {
   try {
@@ -44,11 +44,23 @@ try {
   if (!synologyEntrypoint.includes("/data/chatgpt-uploads")) {
     throw new Error("Synology entrypoint must pre-create the ChatGPT attachment staging directory for the unprivileged runtime user.");
   }
+  for (const secretName of ["oauth-api-client.secret", "oauth-chatgpt-client.secret"]) {
+    if (!synologyEntrypoint.includes(`$source_dir/${secretName}`)
+      || !synologyEntrypoint.includes(`$runtime_dir/${secretName}`)) {
+      throw new Error(`Synology entrypoint must isolate and copy ${secretName} into the private runtime mount.`);
+    }
+  }
+  const dockerfile = await readFile(join(pluginRoot, "deploy", "synology", "Dockerfile"), "utf8");
+  if (!dockerfile.includes("ONEDRIVE_MCP_OAUTH_API_CLIENT_SECRET_FILE=/run/onedrive-runtime/oauth-api-client.secret")
+    || !dockerfile.includes("ONEDRIVE_OAUTH_COMPAT_CLIENT_SECRET_FILE=/run/onedrive-runtime/oauth-chatgpt-client.secret")) {
+    throw new Error("Synology Docker defaults must keep the API and ChatGPT OAuth client secrets in separate files.");
+  }
   process.stdout.write(`${JSON.stringify({
     ok: true,
     storageRoot: process.env.ONEDRIVE_STORAGE_ROOT,
     sheets: workbook.sheets.length,
-    synologyChatgptUploadRootReady: true
+    synologyChatgptUploadRootReady: true,
+    synologyOAuthSecretsSeparated: true
   }, null, 2)}\n`);
 } finally {
   await rm(workRoot, { recursive: true, force: true });

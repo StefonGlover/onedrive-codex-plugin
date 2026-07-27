@@ -1,74 +1,73 @@
-# OneDrive 0.5.1 Release Gate Report
+# OneDrive 0.6.1 Release Gate Report
 
-Decision: Pending — Entra registration, NAS OAuth rollout, and ChatGPT Work validation
-Date: 2026-07-23
-Generated: 2026-07-23T17:36:34Z
-Tested source base commit: `e92e96c7653c685133412f287b6324c6f3693897`
-Plugin version: `0.5.1+codex.20260723153254`
+Decision: Pending — full cross-surface release; current regular-Chat deployment passes
+Date: 2026-07-25
+Generated: 2026-07-26T05:27:10Z
+Tested source base commit: `eb9b66fb5698b8a9003c0a2a51506fc53e61d8fd`
+Plugin version: `0.6.1+codex.20260726012710`
+Server version: `0.6.1+codex.20260726012710.chatgpt.9956d1d6f66f`
 Tool contract: 84 exact tool names
 
-## Current outcome
+## Outcome
 
-The real-productivity and post-deployment attachment betas pass on the canonical ChatGPT developer app **OneDrive** (`asdk_app_6a5e2416985481918d0f6c68785da2c4`). ChatGPT metadata version `dev-24` exposes the focused 21-tool No Auth surface, retains the stored local OneDrive logo, and runs the final source contract `0.5.1+codex.20260723153254.chatgpt.2d26f01bba1b`. The same regular Chat thread also passes the final `nas30` host-agnostic attachment URL regression: upload, remote fetch, exact marker readback, and recoverable cleanup all passed without the former untrusted-URL error.
+The `0.6.1` candidate adds a fail-closed public outer PKCE facade to the ChatGPT Work package mapping and delegated OAuth/OBO transport. It substitutes one-time mapped authorization codes, verifies S256 locally, and keeps provider refresh tokens in an encrypted owner-only vault behind rotating one-time handles. Both the 84-tool full profile and 21-tool ChatGPT profile pass the OAuth HTTP integration suite, including issuer-bound duplicate-key selection, bounded JWKS rotation refresh, authorized-client enforcement, RFC 9728 protected-resource discovery, HTTP 401 challenges, and non-relinking 503 provider/configuration failures.
 
-The final NAS runtime is `onedrive-chatgpt-nas:0.5.1-nas30`, built as image `1788b79f39ed1e42bbb8d144fb35948a33f1dd647f8ffb125b30229e7fb0bc4c` from `/volume1/docker/onedrive-chatgpt/app-0.5.1-nas30-20260723`. Container Manager recreated and started the project with exit code 0. The final health check reports `running`, `healthy`, zero health-check failures, and restart count 0. The `nas29` image/source and `compose.nas29.rollback.yaml` preserve the immediate rollback.
+The live NAS remains deliberately unchanged at the healthy no-auth rollback point `onedrive-chatgpt-nas:0.5.1-nas32` while the Entra registrations and ChatGPT developer app are configured. The new image and OAuth override will not replace that working runtime until discovery, OBO, and Work connection checks pass.
 
-The focused ChatGPT contract is 21 tools and 40,536 bytes, 88.0% smaller than the unchanged 84-tool, 338,721-byte full contract. The 1,316-byte server instructions and focused descriptors now prefer user-visible OneDrive paths over opaque item IDs. The ChatGPT copy schema no longer advertises `waitForCompletion` or `timeoutSeconds`, avoiding unnecessary inline Graph polling while preserving separate verification.
+## Live regular-Chat coverage
 
-Search now handles a whole multi-document intent in one pass, merges fallback results instead of replacing good matches, ranks requested document kinds and years, and verifies uncovered concept domains only. RFC 822 `.eml` extraction now returns bounded headers, readable text bodies, and attachment inventories. Modern Office, PDF, text/code, RTF, OpenDocument, EPUB, legacy Office, and common image handling remain available.
+The live Edge QA exercised:
 
-The live productivity beta stayed in one ChatGPT thread: `https://chatgpt.com/c/6a5f7eb8-afb0-83ea-a34c-9c2b5cb77ea8`.
+- exact and descriptive search;
+- folder and UTF-8 text-file creation;
+- content replacement and verification;
+- rename, move, and copy;
+- permission inspection;
+- anonymous view-only sharing-link creation and revocation;
+- recycle-bin delete, deleted-item restore, and final recoverable cleanup.
 
-- One multi-document search correctly returned `invoice-3095.pdf` and `2026 Electrical Report.pdf` in about 32 seconds.
-- Explicit `.eml` extraction returned subject, sender, date, readable body, and all named attachments in 15 seconds.
-- Disposable folder/file creation completed in 25 seconds.
-- Copy, rename, and dependent patch operations completed in sequence with fresh identities and no stale retry; the longer host flow took 1 minute 36 seconds.
-- An anonymous view-only link was created in 11 seconds, then revoked in 28 seconds; the file was owner-only afterward.
-- Both disposable QA folders were moved to the recycle bin, no item was permanently deleted, no anonymous link remains, and active OneDrive searches no longer find the fixtures.
-- The final `dev-22` read-only smoke in the same thread again returned exactly `invoice-3095.pdf` and `2026 Electrical Report.pdf` with no mutation.
-- The post-deployment `dev-24` attachment beta uploaded `sample.docx`, `sample.xlsx`, and `sample.pptx` through separate preview and confirmed calls even though the ChatGPT host supplied a fresh transient file ID for each call.
-- The final `nas30` regression stayed in the same regular Chat thread `https://chatgpt.com/c/6a6240c7-3f30-83ea-98e6-0ebd1a804893`: `onedrive-nas30-attachment-20260723.csv` uploaded as 49 bytes, refetched with marker `NAS30_ATTACHMENT_OK_20260723`, and did not reproduce `Refusing to download a ChatGPT file from an untrusted URL.`
-- The exact final smoke-test item `B8C89DB91F19C763!s4f25b7ef520e400e99206f619624faf0` was then previewed, moved to the recycle bin, confirmed absent from the live root, and left recoverable.
-- The three uploaded Office files reopened successfully, preflighted as one guarded batch with three expected changes, committed without partial state, passed remote package validation, and refetched with the exact Word, Excel, and PowerPoint edits.
-- A live recycle-bin restore and exact permanent-delete probe passed before the final Office beta.
-- The final Office QA root was owner-only, moved to the OneDrive recycle bin, and confirmed absent from active OneDrive.
+The isolated fixture root `Codex OneDrive Edge QA 20260725-01` was moved to the recycle bin after testing. It remains recoverable. No permanent deletion occurred, the recycle bin was not emptied, no invitation or email was sent, and the temporary anonymous link was revoked. Permission count returned from 2 to 1 owner-only permission.
 
-DSM staging retains the active `nas30` source, the immediate `nas29` rollback source and manifest, encrypted runtime/data, and earlier rollback artifacts. Exact local archives and Office fixtures were removed. The final disposable OneDrive CSV and earlier Office root are recoverable from the OneDrive recycle bin.
+The live run exposed five ChatGPT tool-selection/schema problems. Focused descriptions now:
+
+- require `content` rather than an invalid `text` field for `onedrive_write_text`;
+- distinguish folder creation from sharing-link creation;
+- constrain `onedrive_permissions` to item identity plus optional format;
+- reserve `onedrive_delete` for active-item recycle intent;
+- reserve `onedrive_restore_deleted` for one restore while an item is recycled.
+
+The post-deployment read-only smoke then exposed a Microsoft Graph discovery/indexing failure: direct paths resolved both known PDFs, but indexed search and the exact-file opener returned no matches. `onedrive_open_files` now validates cached exact identities and, only when no exact indexed hit exists, performs a bounded read-only live folder scan capped at 2,000 items, 300 folders, depth 20, 10 results, and concurrency 3.
+
+After deploying `nas32` and refreshing ChatGPT, a single `onedrive_open_files` call in regular Chat returned both targets as `found`:
+
+| File | Item ID | Path | Permissions |
+| --- | --- | --- | --- |
+| `invoice-3095.pdf` | `B8C89DB91F19C763!s2c28febab675475d813f0cab07fd4e36` | `Family Space/Documents/Home/invoice-3095.pdf` | 1, owner-only |
+| `2026 Electrical Report.pdf` | `B8C89DB91F19C763!s66748b567d5745b48e96db533485d4ff` | `Family Space/Documents/Home/Electrical/2026 Electrical Report.pdf` | 1, owner-only |
+
+The final smoke reported no lookup, schema, host, authentication, or permission-inspection errors and made no changes. Evidence is in the regular Chat thread `https://chatgpt.com/c/6a6538f3-d740-83ea-8719-af1308a75b70`.
 
 ## Verification
 
-- Node syntax check: pass.
-- Common extraction fixtures: RTF, OpenDocument, EPUB, and email pass.
+- Node syntax/self-check: pass.
 - Full contract: 84 tools, 338,721 bytes.
-- ChatGPT contract: 21 tools, 40,536 bytes, 88.0% reduction.
-- Golden prompts: 21/21, with eight ambiguity pairs.
+- ChatGPT contract: 21 tools, 34,134 bytes without OAuth and 37,830 bytes with OAuth, 89.9% reduction from the full descriptor.
+- Server instructions: 1,316 bytes.
+- Golden prompts: 21/21 with 11 ambiguity pairs.
 - Mock Microsoft Graph: 176/176.
 - Semantic anchors: 6/6.
-- Text patch preservation and safety: 6/6.
-- Office Open XML operations: 79 total (21 Word, 33 Excel, 25 PowerPoint).
-- Storage-root permissions: pass.
-- Synology attachment staging ownership regression: pass.
-- Whitespace: pass.
-- Live NAS image/tag/health, ChatGPT metadata, logo, focused tool count, path-first schemas, host-agnostic attachment upload/readback, Office reads/edits, and exact cleanup: pass.
+- Text patch safety: 6/6.
+- OAuth HTTP integration: pass in full (84 tools) and ChatGPT (21 tools) profiles.
+- Prepackage inventory: 59 files.
+- ChatGPT refreshed action descriptions: pass, including all five routing guards and the exact-file fallback.
+- NAS image, container health, restart count, staged source, and rollback: pass.
+- Final regular-Chat exact-file and permissions regression: pass.
 
-## Fixes validated
+## Deployment notes and constraints
 
-- `.eml` files are extracted locally instead of being treated as opaque text-export failures.
-- ChatGPT attachment preview proofs bind to stable filename, MIME type, byte count, and SHA-256 content identity instead of the host's transient attachment file ID. Identical bytes with a new host ID pass; changed bytes fail closed.
-- ChatGPT attachment downloads accept safe public HTTPS URLs regardless of hostname while pinning the public DNS resolution, rejecting private/internal addresses, and revalidating every redirect hop.
-- The Synology entrypoint pre-creates `/data/chatgpt-uploads` as a private `node:node` directory before dropping privileges, preventing deployment-only attachment staging failures.
-- Search understands subtle service-language aliases, document-kind intent, multi-domain requests, and year/report recency without discarding strong initial matches.
-- Search and fetch return user-visible paths so ChatGPT can keep mutation flows readable and avoid mistaking opaque item IDs for credentials.
-- Dependent mutations are serialized and refetch current item identity before the next preview or write.
-- Copy returns its accepted asynchronous result promptly; ChatGPT verifies the destination separately.
-- Folder creation is a direct conflict-safe create, while risky mutations retain preview tokens, expected identity, confirmation, and audit protections.
-- Upload, folder creation, rename, move, copy, replacement/update, sharing-link creation/revocation, recycle-bin delete/restore, guarded permanent deletion, and permission inspection remain available on the focused surface.
-- The stored OneDrive logo remains correct because the canonical developer-mode app was refreshed in place rather than recreated.
-
-## Explicitly constrained coverage
-
+- A stale local launch-agent tunnel was competing with the NAS endpoint. `com.stefonglover.onedrive-chatgpt-tunnel.plist` was booted out, and no local OneDrive tunnel/server process remains. The NAS is now the sole live endpoint.
+- ChatGPT Work is pending live Entra registration, developer-app OAuth configuration, NAS OAuth cutover, and a new Work-chat validation. Its package mapping and transport are implemented and mock-tested.
+- Named-recipient invitation was not exercised live to avoid sending email or granting access to another person. Its guarded behavior remains mock-tested.
 - Business-only Graph Excel and organization-only sharing remain mock-tested because the connected account is personal.
-- Live recycle-bin restore and an exact permanent-delete probe pass. Named-recipient sharing remains mock-tested because no distinct user-controlled recipient address was available; anonymous link create/revoke and owner-only verification pass live.
-- ChatGPT Work still shows an incorrect expired-connection/authentication card before a tool call reaches this custom No Auth app. Regular Chat is the verified workaround pending a ChatGPT host correction.
-- Installation into the immutable Codex plugin cache remains pending and does not affect the deployed NAS/ChatGPT app.
-- Entra protected-resource discovery and OAuth integration pass locally but still require the production Entra registrations and NAS OAuth rollout before this release gate can become Pass.
+- The deployed developer app currently uses the encrypted server-side vault with ChatGPT `No Auth`; it remains the rollback path until production Entra/OAuth validation completes.
+- The existing NAS management connection disables TLS certificate verification. This did not affect runtime health, but certificate validation should be hardened separately.

@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, "..");
 const serverPath = join(pluginRoot, "mcp", "server.mjs");
+const officeTestPython = process.env.ONEDRIVE_OFFICE_TEST_PYTHON || "/usr/bin/python3";
 const mockRunRoot = join(pluginRoot, "work", `mock-${process.pid}-${Date.now()}`);
 const mockHome = join(mockRunRoot, "home");
 const mockExportPdf = join(mockRunRoot, "mock-export.pdf");
@@ -30,7 +31,7 @@ process.once("exit", cleanupRunResidue);
 rmSync(mockRunRoot, { recursive: true, force: true });
 mkdirSync(mockHome, { recursive: true });
 const officeFixtureDir = join(mockHome, "office-fixtures");
-execFileSync("/usr/bin/python3", [join(pluginRoot, "scripts", "office-openxml-test.py"), `--emit-fixtures=${officeFixtureDir}`], {
+execFileSync(officeTestPython, [join(pluginRoot, "scripts", "office-openxml-test.py"), `--emit-fixtures=${officeFixtureDir}`], {
   env: { ...process.env, PYTHONPYCACHEPREFIX: join(mockHome, "pycache") },
   stdio: "ignore"
 });
@@ -102,8 +103,10 @@ let missingPresetPath = null;
 let scanFolderDelayMs = 0;
 let scanFoldersInFlight = 0;
 let maxScanFoldersInFlight = 0;
+let chatgptExactIndexMissEnabled = false;
 let rootDeltaScenario = "empty";
 let deleteTargetRevision = 1;
+let restoredDeletedName = "restore-original.txt";
 const replacementRaceState = new Map();
 let versionTextBuffer = Buffer.from("alpha\ncurrent\n", "utf8");
 let versionTextRevision = 1;
@@ -276,7 +279,7 @@ function mockServerEnvironment(overrides = {}, label = "server") {
     PYTHONPYCACHEPREFIX: pythonCacheRoot,
     ONEDRIVE_STORAGE_ROOT: storageRoot,
     ONEDRIVE_CACHE_ROOT: cacheRoot,
-    ONEDRIVE_OFFICE_PYTHON: "/usr/bin/python3",
+    ONEDRIVE_OFFICE_PYTHON: officeTestPython,
     ONEDRIVE_TEST_KEYCHAIN_PATH: keychainPath,
     ONEDRIVE_KEYCHAIN_SERVICE: `Codex OneDrive Mock ${process.pid}-${sequence}`,
     ONEDRIVE_GRAPH_BASE_URL: graphBaseUrl,
@@ -561,6 +564,25 @@ const graph = createServer(async (req, res) => {
     return json(res, 200, item("delete-target", "renamed-cache.txt"));
   }
 
+  if (req.method === "POST" && path === "/v1.0/me/drive/items/deleted-item/restore") {
+    graphBodies.push({ key: "restore-deleted", body: await readJsonBody(req) });
+    count("restore-deleted");
+    restoredDeletedName = "restore-original.txt";
+    return json(res, 200, item("deleted-item", restoredDeletedName));
+  }
+
+  if (req.method === "PATCH" && path === "/v1.0/me/drive/items/deleted-item") {
+    const body = await readJsonBody(req);
+    graphBodies.push({ key: "restore-deleted-rename", body });
+    count("restore-deleted-rename");
+    restoredDeletedName = body.name || restoredDeletedName;
+    return json(res, 200, item("deleted-item", restoredDeletedName));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/deleted-item") {
+    return json(res, 200, item("deleted-item", restoredDeletedName));
+  }
+
   if (req.method === "GET" && path === "/v1.0/me/drive/items/root-note") {
     return json(res, 200, item("root-note", "root-note.txt"));
   }
@@ -579,6 +601,13 @@ const graph = createServer(async (req, res) => {
     return json(res, 200, item("common-rtf", "Common Notes.rtf", {
       size: commonRtfBuffer.length,
       file: { mimeType: "application/rtf" }
+    }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/chatgpt-exact-index-miss") {
+    return json(res, 200, item("chatgpt-exact-index-miss", "invoice-3095.pdf", {
+      parentReference: { id: "folder-a", path: "/drive/root:/Folder A" },
+      file: { mimeType: "application/pdf" }
     }));
   }
 
@@ -862,6 +891,23 @@ const graph = createServer(async (req, res) => {
 
   if (req.method === "DELETE" && path === "/v1.0/me/drive/items/stale-delete-item") {
     count("delete-stale-search-item");
+    return empty(res, 204);
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/stale-delete-parent") {
+    return json(res, 200, folder("stale-delete-parent", "Stale Deleted Folder", {
+      parentReference: { id: "root", path: "/drive/root:" }
+    }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/stale-delete-child") {
+    return json(res, 200, item("stale-delete-child", "Stale Deleted Child.txt", {
+      parentReference: { id: "stale-delete-parent", path: "/drive/root:/Stale Deleted Folder" }
+    }));
+  }
+
+  if (req.method === "DELETE" && path === "/v1.0/me/drive/items/stale-delete-parent") {
+    count("delete-stale-search-folder");
     return empty(res, 204);
   }
 
@@ -1478,6 +1524,12 @@ const graph = createServer(async (req, res) => {
     })] });
   }
 
+  if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='Stale Deleted Folder')")) {
+    return json(res, 200, { value: [item("stale-delete-child", "Stale Deleted Child.txt", {
+      parentReference: { id: "stale-delete-parent", path: "/drive/root:/Stale Deleted Folder" }
+    })] });
+  }
+
   if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='Paged Research')")) {
     return json(res, 200, {
       value: [item("paged-research-a", "Paged Research A.txt")],
@@ -1626,7 +1678,13 @@ const graph = createServer(async (req, res) => {
         item("deep-deck", "Deep Summary Deck.pptx", {
           parentReference: { path: "/drive/root:/Folder A" },
           file: { mimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
-        })
+        }),
+        ...(chatgptExactIndexMissEnabled
+          ? [item("chatgpt-exact-index-miss", "invoice-3095.pdf", {
+            parentReference: { id: "folder-a", path: "/drive/root:/Folder A" },
+            file: { mimeType: "application/pdf" }
+          })]
+          : [])
       ]
     });
   }
@@ -3461,6 +3519,21 @@ process.exit(2);
     return { graphRequestsAdded: requests.length - before };
   });
 
+  await check("write_text explicit dry-run never creates a new file", async () => {
+    const beforePuts = requests.filter((entry) => entry.method === "PUT" && entry.path.includes("write-preview-only.txt")).length;
+    const result = await tool("onedrive_write_text", {
+      remotePath: "write-preview-only.txt",
+      content: "preview only\n",
+      conflictBehavior: "fail",
+      dryRun: true
+    });
+    const afterPuts = requests.filter((entry) => entry.method === "PUT" && entry.path.includes("write-preview-only.txt")).length;
+    assert(!result.isError, "write_text dry-run should return a structured preview", result);
+    assert(result.value.dryRun === true && result.value.previewToken && result.value.wouldCreate?.destinationPath === "write-preview-only.txt", "write_text dry-run should preview the exact create", result.value);
+    assert(afterPuts === beforePuts, "write_text dry-run must not PUT file content", { beforePuts, afterPuts });
+    return { previewed: true, graphPutsAdded: afterPuts - beforePuts };
+  });
+
   await check("unsafe create folder names are blocked before Graph", async () => {
     const before = requests.length;
     const result = await tool("onedrive_create_folder", { parentPath: "Folder A", name: "bad/name" });
@@ -3500,6 +3573,34 @@ process.exit(2);
     assert(result.isError, "missing restore destination should fail before preview", result);
     assert(!result.value?.previewToken, "missing restore destination must not receive a preview token", result);
     return { missingDestinationRejected: true };
+  });
+
+  await check("restore applies newName when OneDrive ignores it in the restore request", async () => {
+    restoredDeletedName = "restore-original.txt";
+    const preview = await tool("onedrive_restore_deleted", {
+      itemId: "deleted-item",
+      expectedId: "deleted-item",
+      newName: "restore-renamed.txt",
+      dryRun: true
+    });
+    assert(!preview.isError && preview.value.previewToken, "restore should return a guarded preview", preview);
+    const live = await tool("onedrive_restore_deleted", {
+      itemId: "deleted-item",
+      expectedId: "deleted-item",
+      newName: "restore-renamed.txt",
+      dryRun: false,
+      confirmed: true,
+      previewToken: preview.value.previewToken
+    });
+    assert(!live.isError, "restore with post-restore rename should succeed", live);
+    assert(live.value.restored?.name === "restore-renamed.txt" && live.value.renameApplied === true && live.value.verified === true, "restored item should be renamed and verified", live.value);
+    assert((counters.get("restore-deleted") || 0) === 1 && (counters.get("restore-deleted-rename") || 0) === 1, "restore and fallback rename should each run once", {
+      restore: counters.get("restore-deleted") || 0,
+      rename: counters.get("restore-deleted-rename") || 0
+    });
+    assert(graphBodies.findLast((entry) => entry.key === "restore-deleted")?.body?.name === "restore-renamed.txt", "restore request should still include newName", graphBodies);
+    assert(graphBodies.findLast((entry) => entry.key === "restore-deleted-rename")?.body?.name === "restore-renamed.txt", "fallback rename should apply the requested newName", graphBodies);
+    return { restoredName: live.value.restored.name, renameApplied: live.value.renameApplied };
   });
 
   await check("delete requires confirmation before DELETE", async () => {
@@ -3579,6 +3680,38 @@ process.exit(2);
     assert(searched.value.items.length === 0, "deleted item should be filtered from stale Graph search results", searched.value);
     assert(searched.value.staleItemsFiltered === 1, "search should report the filtered stale result", searched.value);
     return { filtered: searched.value.staleItemsFiltered };
+  });
+
+  await check("folder delete suppresses stale descendant Graph search hits", async () => {
+    await tool("onedrive_cache_clear");
+    for (const itemId of ["stale-delete-parent", "stale-delete-child"]) {
+      const info = await tool("onedrive_get_info", { itemId });
+      assert(!info.isError, `stale folder fixture should seed ${itemId}`, info);
+    }
+    const preview = await tool("onedrive_delete", {
+      itemId: "stale-delete-parent",
+      expectedId: "stale-delete-parent"
+    });
+    assert(!preview.isError && preview.value.previewToken, "folder delete preview should issue a token", preview);
+    const deleted = await tool("onedrive_delete", {
+      itemId: "stale-delete-parent",
+      expectedId: "stale-delete-parent",
+      dryRun: false,
+      confirmed: true,
+      previewToken: preview.value.previewToken
+    });
+    assert(!deleted.isError, "stale folder fixture should delete", deleted);
+    const searched = await tool("onedrive_find", {
+      query: "Stale Deleted Folder",
+      useContentIndex: false,
+      maxSearchTerms: 1,
+      scanFallback: false,
+      format: "full"
+    });
+    assert(!searched.isError, "post-folder-delete search should succeed", searched);
+    assert(searched.value.items.length === 0, "deleted folder descendants should be filtered from stale Graph search results", searched.value);
+    assert(searched.value.summary.staleItemsFiltered === 1, "search should report the filtered stale descendant", searched.value);
+    return { filtered: searched.value.summary.staleItemsFiltered };
   });
 
   await check("batch_delete live action preflights expected identity before any DELETE", async () => {
@@ -3915,7 +4048,14 @@ process.exit(2);
     const added = requests.slice(before);
     assert(!added.some((request) => request.method === "POST" && request.path.endsWith("/invite")), "recipient validation should not mutate", { added });
     assert((counters.get("invite-permission") || 0) === beforeInviteCount, "recipient validation should not POST invite", { beforeInviteCount, afterInviteCount: counters.get("invite-permission") || 0 });
-    return { graphRequestsAdded: added.length };
+    const reserved = await tool("onedrive_invite_permission", {
+      itemId: "copy-src",
+      recipients: [{ email: "qa-recipient@example.invalid" }]
+    });
+    assert(reserved.isError, "reserved .invalid recipient should fail");
+    assert(String(reserved.value).includes("reserved .invalid domain"), "unexpected reserved recipient validation error", reserved);
+    assert((counters.get("invite-permission") || 0) === beforeInviteCount, "reserved recipient validation should not POST invite", { beforeInviteCount, afterInviteCount: counters.get("invite-permission") || 0 });
+    return { graphRequestsAdded: added.length, reservedInvalidRejected: true };
   });
 
   await check("compact permissions include grantedToIdentitiesV2", async () => {
@@ -4259,7 +4399,8 @@ process.exit(2);
     const written = await tool("onedrive_write_text", {
       remotePath: "race-text.txt",
       content: "text create-only race",
-      conflictBehavior: "replace"
+      conflictBehavior: "replace",
+      dryRun: false
     });
 
     assert(simple.isError && String(simple.value).includes("concurrent creator won the race"), "simple replacement race should refuse the concurrent item", simple);
@@ -5042,6 +5183,31 @@ process.exit(2);
     return { results: searched.value.results.length, graphSearchCalls: added.length };
   });
 
+  await check("ChatGPT exact-filename search scans when Graph indexing misses", async () => {
+    await tool("onedrive_cache_clear");
+    await tool("onedrive_content_index_clear");
+    chatgptExactIndexMissEnabled = true;
+    try {
+      const before = requests.length;
+      const searched = await tool("search", { query: "Find the exact file invoice-3095.pdf in OneDrive." });
+      assert(!searched.isError, "exact-filename ChatGPT search should succeed", searched);
+      assert(searched.value.results?.[0]?.id === "chatgpt-exact-index-miss", "exact-filename fallback should return the live scanned item", searched);
+      assert(searched.value.results?.[0]?.title === "invoice-3095.pdf", "exact-filename fallback should preserve the exact title", searched.value.results);
+      assert(searched.value.results?.length === 1, "exact-filename search must not return unrelated semantic or cached neighbors", searched.value.results);
+      const added = requests.slice(before);
+      const searchRequests = added.filter((request) => decodeURIComponent(request.url).includes("/search(q='"));
+      assert(searchRequests.length === 1, "a natural-language exact filename request should use one indexed Graph query before scanning", searchRequests.map((request) => decodeURIComponent(request.url)));
+      assert(added.some((request) => request.path === "/v1.0/me/drive/items/folder-a/children"), "exact-filename index miss should use the bounded live folder scan", added);
+      return {
+        result: searched.value.results[0],
+        graphSearchCalls: searchRequests.length,
+        usedFolderScan: true
+      };
+    } finally {
+      chatgptExactIndexMissEnabled = false;
+    }
+  });
+
   await check("ChatGPT exact-file opener combines multi-file search and extraction", async () => {
     const seeded = await tool("onedrive_get_info", { itemId: "common-rtf" });
     assert(!seeded.isError, "common file fixture should seed metadata", seeded);
@@ -5103,7 +5269,7 @@ process.exit(2);
     assert(!fetched.isError, "ChatGPT Excel fetch should succeed", fetched);
     assert(fetched.value.metadata?.previewSource === "office-openxml", "Excel fetch should use the local Open XML extractor", fetched.value);
     assert(fetched.value.text.includes("## Worksheet: Data"), "Excel fetch should preserve worksheet names", fetched.value.text);
-    assert(fetched.value.text.includes("A1\t3\tformula=SUM(1,2)"), "Excel fetch should preserve cell values and formulas", fetched.value.text);
+    assert(fetched.value.text.includes("A1\t\tformula=SUM(1,2)") && !fetched.value.text.includes("A1\t3\tformula=SUM(1,2)"), "Excel fetch should preserve formulas without exposing stale cached values", fetched.value.text);
     assert(/(?:^|\n)B2\t\d+(?:\.\d+)?(?:\n|$)/u.test(fetched.value.text), "Excel fetch should expose numeric workbook figures", fetched.value.text);
     const added = requests.slice(before);
     assert(added.some((request) => request.path.endsWith("/items/office-excel/content")), "Excel fetch should download the workbook package", { added });
@@ -5113,7 +5279,7 @@ process.exit(2);
     const beforeWarm = requests.length;
     const warm = await tool("fetch", { id: "office-excel" });
     assert(!warm.isError && warm.value.metadata?.previewSource === "content-index", "warm Excel fetch should use the content index", warm);
-    assert(warm.value.text.includes("## Worksheet: Data") && warm.value.text.includes("A1\t3\tformula=SUM(1,2)"), "warm Excel fetch should preserve worksheet, cell, and formula context", warm.value.text);
+    assert(warm.value.text.includes("## Worksheet: Data") && warm.value.text.includes("A1\t\tformula=SUM(1,2)"), "warm Excel fetch should preserve worksheet and formula context without a stale cached result", warm.value.text);
     const warmAdded = requests.slice(beforeWarm);
     assert(!warmAdded.some((request) => request.path.endsWith("/content")), "warm Excel fetch should not redownload the workbook", { warmAdded });
     const cachePath = join(mainCacheRoot, "metadata-cache.json");
@@ -5688,7 +5854,7 @@ process.exit(2);
     assert(resolve(status.value.storageRoot) === resolve(mainStorageRoot), "main server storage must remain under the per-run root", status.value);
     assert(resolve(status.value.cachePath) === resolve(join(mainCacheRoot, "metadata-cache.json")), "main server cache must remain under the per-run root", status.value);
     assert(resolve(status.value.contentIndexPath) === resolve(join(mainCacheRoot, "content-index.json")), "main server content index must remain under the per-run root", status.value);
-    assert(capabilities.value.runtime.pythonPath === "/usr/bin/python3", "Office probes must ignore an inherited Python override", capabilities.value.runtime);
+    assert(capabilities.value.runtime.pythonPath === officeTestPython, "Office probes must ignore an inherited Python override", capabilities.value.runtime);
     assert(!existsSync(hostilePaths.officePythonExecuted), "inherited Office Python executable must never run", hostilePaths);
     const currentSnapshot = snapshotTree(hostileInheritedRoot);
     assert(JSON.stringify(currentSnapshot) === JSON.stringify(hostileInheritedSnapshot), "hostile inherited state roots were modified", {

@@ -1074,7 +1074,8 @@ try {
   const written = assertOk("onedrive_write_text", await tool("onedrive_write_text", {
     remotePath: `${folderName}/note.txt`,
     content,
-    conflictBehavior: "fail"
+    conflictBehavior: "fail",
+    dryRun: false
   }));
   record("create text file", written.item?.id && written.bytesUploaded === Buffer.byteLength(content, "utf8") ? "pass" : "fail", {
     name: written.item?.name,
@@ -1222,7 +1223,8 @@ try {
   await assertOk("write csv", await tool("onedrive_write_text", {
     remotePath: `${folderName}/sheet.csv`,
     content: `name,value\n${unique},42\n`,
-    conflictBehavior: "fail"
+    conflictBehavior: "fail",
+    dryRun: false
   }));
   await assertOk("upload valid docx", await tool("onedrive_upload", {
     remotePath: `${folderName}/doc.docx`,
@@ -1245,27 +1247,32 @@ try {
   await assertOk("write duplicate A", await tool("onedrive_write_text", {
     remotePath: `${folderName}/duplicate.txt`,
     content: `Duplicate helper test ${unique}\n`,
-    conflictBehavior: "fail"
+    conflictBehavior: "fail",
+    dryRun: false
   }));
   await assertOk("write duplicate B", await tool("onedrive_write_text", {
     remotePath: `${folderName}/${movedFolderName}/duplicate.txt`,
     content: `Duplicate helper test ${unique}\n`,
-    conflictBehavior: "fail"
+    conflictBehavior: "fail",
+    dryRun: false
   }));
   await assertOk("write batch move A", await tool("onedrive_write_text", {
     remotePath: `${folderName}/batch-move-a.txt`,
     content: `Batch move A ${unique}\n`,
-    conflictBehavior: "fail"
+    conflictBehavior: "fail",
+    dryRun: false
   }));
   await assertOk("write batch move B", await tool("onedrive_write_text", {
     remotePath: `${folderName}/batch-move-b.txt`,
     content: `Batch move B ${unique}\n`,
-    conflictBehavior: "fail"
+    conflictBehavior: "fail",
+    dryRun: false
   }));
   const batchDeleteTarget = assertOk("write batch delete target", await tool("onedrive_write_text", {
     remotePath: `${folderName}/batch-delete.txt`,
     content: `Batch delete ${unique}\n`,
-    conflictBehavior: "fail"
+    conflictBehavior: "fail",
+    dryRun: false
   }));
 
   const excel = assertOk("download_excel", await tool("onedrive_download_excel", {

@@ -32,6 +32,7 @@ jobs:
       - name: Validate manifests and whitespace
         run: |
           node -e "JSON.parse(require('node:fs').readFileSync('.codex-plugin/plugin.json', 'utf8'))"
+          node -e "JSON.parse(require('node:fs').readFileSync('.app.json', 'utf8'))"
           node -e "JSON.parse(require('node:fs').readFileSync('.mcp.json', 'utf8'))"
           git diff-tree --check --root -r HEAD
           git diff --check
@@ -41,8 +42,10 @@ jobs:
           node --check mcp/server.mjs
           node --check mcp/http-server.mjs
           node --check mcp/oauth.mjs
+          node --check mcp/oauth-compat-server.mjs
           node --check scripts/mock-graph-test.mjs
           node --check scripts/oauth-http-test.mjs
+          node --check scripts/oauth-compat-test.mjs
           node --check scripts/storage-root-permissions-test.mjs
           node --check scripts/run-chatgpt-oauth-tunnel.mjs
           node --check scripts/semantic-anchors-test.mjs
@@ -92,6 +95,8 @@ jobs:
           node scripts/semantic-anchors-test.mjs
           node scripts/text-patch-test.mjs
           node scripts/oauth-http-test.mjs
+          ONEDRIVE_TOOL_PROFILE=chatgpt node scripts/oauth-http-test.mjs
+          node scripts/oauth-compat-test.mjs
           node scripts/storage-root-permissions-test.mjs
           node scripts/mock-graph-test.mjs
 
