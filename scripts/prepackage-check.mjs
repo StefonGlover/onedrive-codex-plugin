@@ -72,9 +72,9 @@ const requiredDockerLogRotation = {
   maxSize: 'max-size: "10m"',
   maxFile: 'max-file: "3"'
 };
-const expectedPluginVersion = /^0\.6\.1\+codex\.\d{14}$/;
+const expectedPluginVersion = /^0\.6\.4\+codex\.\d{14}$/;
 const expectedChatGptAppKey = "onedrive";
-const expectedChatGptAppId = "asdk_app_6a65633d9c4c8191ae8a79b612b38654";
+const chatGptConnectionIdPattern = /^plugin_asdk_app_[0-9a-f]{32}$/;
 const expectedOfficeOperationKinds = {
   word: [
     "replaceText", "setParagraphText", "setParagraphStyle", "insertParagraph", "setTableCell",
@@ -147,6 +147,7 @@ const requiredFiles = [
   "scripts/chatgpt-golden-test.mjs",
   "scripts/common-text.py",
   "scripts/common-text-test.py",
+  "scripts/container-healthcheck.mjs",
   "scripts/office-openxml.py",
   "scripts/office-fixture-factory.py",
   "scripts/office-openxml-test.py",
@@ -251,7 +252,7 @@ function checkManifest() {
   if (!manifest) return;
   if (manifest.name !== "onedrive") fail(`Unexpected plugin name: ${manifest.name}`);
   if (!expectedPluginVersion.test(manifest.version || "")) {
-    fail(`Plugin version must match 0.6.1+codex.<14-digit timestamp>: ${manifest.version}`);
+    fail(`Plugin version must match 0.6.4+codex.<14-digit timestamp>: ${manifest.version}`);
   }
   const readme = readFileSync(join(pluginRoot, "README.md"), "utf8");
   if (!readme.includes(`Release \`${manifest.version}\``)) {
@@ -293,11 +294,11 @@ function workAppMappingProblems(manifest, appManifest) {
   if (mappingFields.length !== 1 || mappingFields[0] !== "id") {
     issues.push(`.app.json ${expectedChatGptAppKey} mapping must contain only id.`);
   }
-  if (mapping.id !== expectedChatGptAppId) {
-    issues.push(`.app.json must map ${expectedChatGptAppKey} to the registered ChatGPT app ${expectedChatGptAppId}.`);
-  }
-  if (!/^asdk_app_[0-9a-f]{32}$/.test(mapping.id || "")) {
-    issues.push(".app.json id must use the ChatGPT asdk_app_<32 lowercase hex> identifier, not a plugin_asdk_app_ installation ID.");
+  if (!chatGptConnectionIdPattern.test(mapping.id || "")) {
+    issues.push(
+      ".app.json id must use the registered ChatGPT connection identifier "
+        + "plugin_asdk_app_<32 lowercase hex>."
+    );
   }
   return issues;
 }
@@ -503,6 +504,47 @@ function checkSynologyLogRotation() {
       fail(issue);
     }
   }
+}
+
+function dockerOfficeRuntimeProblems(text) {
+  const source = String(text);
+  const required = [
+    "python3-venv",
+    "scripts/requirements-office-test.txt",
+    "/opt/onedrive-office/bin/pip install --no-cache-dir --requirement",
+    '/opt/onedrive-office/bin/python3 -c "import docx, openpyxl, pptx, PIL"',
+    "ONEDRIVE_OFFICE_PYTHON=/opt/onedrive-office/bin/python3",
+    'CMD ["node", "/app/scripts/container-healthcheck.mjs"]'
+  ];
+  return required
+    .filter((entry) => !source.includes(entry))
+    .map((entry) => `deploy/synology/Dockerfile must pin and health-check the Office runtime (${entry}).`);
+}
+
+function checkDockerOfficeRuntime() {
+  const path = join(pluginRoot, "deploy", "synology", "Dockerfile");
+  if (!existsSync(path)) return;
+  for (const issue of dockerOfficeRuntimeProblems(readFileSync(path, "utf8"))) fail(issue);
+}
+
+function oauthCanaryDefaultProblems(text) {
+  const source = String(text);
+  const required = [
+    'ONEDRIVE_OAUTH_COMPAT_OUTER_TOKEN_AUTH_METHOD: "none"',
+    'ONEDRIVE_OAUTH_COMPAT_ENABLE_CIMD: "true"',
+    'ONEDRIVE_OAUTH_COMPAT_ENABLE_DCR: "false"',
+    'ONEDRIVE_OAUTH_COMPAT_ALLOW_CONFIDENTIAL_NO_PKCE: "false"',
+    'ONEDRIVE_OAUTH_COMPAT_ALLOW_PUBLIC_NO_PKCE: "false"'
+  ];
+  return required
+    .filter((setting) => !source.includes(setting))
+    .map((setting) => `deploy/synology/compose.oauth.example.yaml must fail closed with ${setting}.`);
+}
+
+function checkOAuthCanaryDefaults() {
+  const path = join(pluginRoot, "deploy", "synology", "compose.oauth.example.yaml");
+  if (!existsSync(path)) return;
+  for (const issue of oauthCanaryDefaultProblems(readFileSync(path, "utf8"))) fail(issue);
 }
 
 async function packageSnapshot(root) {
@@ -759,14 +801,14 @@ if (selfCheck) {
     duplicateToolRejected: !duplicateContract.ok && duplicateContract.duplicates.length === 1,
     validWorkAppMappingAccepted: workAppMappingProblems(
       { apps: "./.app.json" },
-      { apps: { onedrive: { id: expectedChatGptAppId } } }
+      { apps: { onedrive: { id: "plugin_asdk_app_6a5e2416985481918d0f6c68785da2c4" } } }
     ).length === 0,
-    installationIdRejectedForWorkApp: workAppMappingProblems(
+    bareAppIdRejectedForWorkMapping: workAppMappingProblems(
       { apps: "./.app.json" },
-      { apps: { onedrive: { id: `plugin_${expectedChatGptAppId}` } } }
-    ).some((issue) => issue.includes("not a plugin_asdk_app_ installation ID")),
-    currentVersionAccepted: expectedPluginVersion.test("0.6.1+codex.20260726012710"),
-    staleVersionRejected: !expectedPluginVersion.test("0.5.1+codex.20260725232809"),
+      { apps: { onedrive: { id: "asdk_app_6a5e2416985481918d0f6c68785da2c4" } } }
+    ).some((issue) => issue.includes("plugin_asdk_app_")),
+    currentVersionAccepted: expectedPluginVersion.test("0.6.4+codex.20260729033800"),
+    staleVersionRejected: !expectedPluginVersion.test("0.6.1+codex.20260726012710"),
     sensitiveFileNamesRecognized: isSensitivePackageEntryName(".env.local")
       && isSensitivePackageEntryName("signing.pem")
       && isSensitivePackageEntryName("refresh-token.txt")
@@ -795,6 +837,37 @@ if (selfCheck) {
         `${requiredDockerLogRotation.driver}\n${requiredDockerLogRotation.maxSize}\n`,
         "fixture"
       ).some((issue) => issue.includes("maxFile")),
+    pinnedDockerOfficeRuntimeAccepted:
+      dockerOfficeRuntimeProblems(
+        [
+          "python3-venv",
+          "scripts/requirements-office-test.txt",
+          "/opt/onedrive-office/bin/pip install --no-cache-dir --requirement",
+          '/opt/onedrive-office/bin/python3 -c "import docx, openpyxl, pptx, PIL"',
+          "ONEDRIVE_OFFICE_PYTHON=/opt/onedrive-office/bin/python3",
+          'CMD ["node", "/app/scripts/container-healthcheck.mjs"]'
+        ].join("\n")
+      ).length === 0,
+    missingDockerOfficeRuntimeRejected:
+      dockerOfficeRuntimeProblems("python3-venv").some((issue) => issue.includes("Office runtime")),
+    oauthCanaryDefaultsAccepted: oauthCanaryDefaultProblems(
+      [
+        'ONEDRIVE_OAUTH_COMPAT_OUTER_TOKEN_AUTH_METHOD: "none"',
+        'ONEDRIVE_OAUTH_COMPAT_ENABLE_CIMD: "true"',
+        'ONEDRIVE_OAUTH_COMPAT_ENABLE_DCR: "false"',
+        'ONEDRIVE_OAUTH_COMPAT_ALLOW_CONFIDENTIAL_NO_PKCE: "false"',
+        'ONEDRIVE_OAUTH_COMPAT_ALLOW_PUBLIC_NO_PKCE: "false"'
+      ].join("\n")
+    ).length === 0,
+    oauthCanaryNoPkceRejected: oauthCanaryDefaultProblems(
+      [
+        'ONEDRIVE_OAUTH_COMPAT_OUTER_TOKEN_AUTH_METHOD: "none"',
+        'ONEDRIVE_OAUTH_COMPAT_ENABLE_CIMD: "true"',
+        'ONEDRIVE_OAUTH_COMPAT_ENABLE_DCR: "false"',
+        'ONEDRIVE_OAUTH_COMPAT_ALLOW_CONFIDENTIAL_NO_PKCE: "false"',
+        'ONEDRIVE_OAUTH_COMPAT_ALLOW_PUBLIC_NO_PKCE: "true"'
+      ].join("\n")
+    ).some((issue) => issue.includes('ALLOW_PUBLIC_NO_PKCE: "false"')),
     residueDirectoriesRecognized: forbiddenResidueDirs.has("__pycache__"),
     nestedLooseObjectSchemaRejected: schemaConsistencyProblems("negative", {
       type: "object",
@@ -859,6 +932,8 @@ const files = await walk(pluginRoot);
 checkRequiredFiles();
 checkDockerIgnore();
 checkSynologyLogRotation();
+checkDockerOfficeRuntime();
+checkOAuthCanaryDefaults();
 checkManifest();
 checkWorkAppMapping();
 checkMcp();

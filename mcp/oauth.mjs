@@ -77,6 +77,57 @@ function splitClientIds(value) {
   return [...new Set(String(value || "").split(/[\s,]+/).map((entry) => entry.trim().toLowerCase()).filter(Boolean))];
 }
 
+function protectedResourceAliases(value, protectedResource) {
+  const aliases = String(value || "").trim().split(/\s+/).filter(Boolean);
+  if (!aliases.length) return [];
+  if (new Set(aliases).size !== aliases.length) {
+    throw new Error(
+      "ONEDRIVE_MCP_PROTECTED_RESOURCE_ALIASES must contain unique URLs."
+    );
+  }
+  let canonical;
+  try {
+    canonical = new URL(protectedResource);
+  } catch {
+    throw new Error(
+      "ONEDRIVE_MCP_PROTECTED_RESOURCE_ALIASES requires a valid protected resource."
+    );
+  }
+  const tunnelMatch = /^\/v1\/mcp\/(tunnel_[a-f0-9]{32})$/.exec(
+    canonical.pathname
+  );
+  if (
+    canonical.origin !== "https://api.openai.com"
+    || !tunnelMatch
+  ) {
+    throw new Error(
+      "ONEDRIVE_MCP_PROTECTED_RESOURCE_ALIASES may be used only with "
+        + "an https://api.openai.com/v1/mcp/tunnel_... protected resource."
+    );
+  }
+  for (const alias of aliases) {
+    const parsed = validateUrl(
+      alias,
+      "ONEDRIVE_MCP_PROTECTED_RESOURCE_ALIASES",
+      { allowQuery: false }
+    );
+    if (
+      !/^tunnel-service\.gateway\.unified-\d+\.internal\.api\.openai\.org$/.test(
+        parsed.hostname
+      )
+      || parsed.port
+      || parsed.pathname !== canonical.pathname
+      || parsed.toString() !== alias
+    ) {
+      throw new Error(
+        "ONEDRIVE_MCP_PROTECTED_RESOURCE_ALIASES must contain only exact "
+          + "ChatGPT tunnel-gateway identifiers for the configured tunnel."
+      );
+    }
+  }
+  return aliases;
+}
+
 function rejectPlaceholder(value, name) {
   if (/REPLACE_WITH|YOUR[-_ ]/i.test(String(value || ""))) {
     throw new Error(`${name} still contains a deployment placeholder.`);
@@ -114,6 +165,10 @@ export function oauthSettings(env = process.env) {
   const apiClientId = String(env.ONEDRIVE_MCP_OAUTH_API_CLIENT_ID || env.ONEDRIVE_CLIENT_ID || "").trim();
   const apiResource = String(env.ONEDRIVE_MCP_OAUTH_API_RESOURCE || (apiClientId ? `api://${apiClientId}` : "")).trim();
   const resource = String(env.ONEDRIVE_MCP_PROTECTED_RESOURCE || "").trim().replace(/\/+$/, "");
+  const resourceAliases = protectedResourceAliases(
+    env.ONEDRIVE_MCP_PROTECTED_RESOURCE_ALIASES,
+    resource
+  );
   const apiScope = String(
     env.ONEDRIVE_MCP_OAUTH_API_SCOPE
     || (apiResource ? `${apiResource.replace(/\/+$/, "")}/access_as_user` : "")
@@ -134,6 +189,7 @@ export function oauthSettings(env = process.env) {
     apiClientId,
     apiResource,
     resource,
+    resourceAliases,
     resourceMetadataUrl,
     apiScope,
     scopeClaim: String(env.ONEDRIVE_MCP_OAUTH_SCOPE_CLAIM || apiScope.split("/").filter(Boolean).at(-1) || "access_as_user").trim(),
@@ -432,7 +488,7 @@ export async function verifyBearerToken(authorization, env = process.env) {
     try {
       verified = verifyFacadeAccessToken(token, {
         issuer: settings.authorizationServer,
-        audience: settings.resource,
+        audience: [settings.resource, ...settings.resourceAliases],
         clientId: settings.allowedClientIds[0],
         requiredScope: settings.apiScope,
         keyFile: settings.facadeAccessTokenKeyFile

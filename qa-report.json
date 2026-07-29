@@ -4,8 +4,8 @@
   "date": "2026-07-25",
   "generatedAt": "2026-07-26T05:27:10Z",
   "source": {
-    "commit": "eb9b66fb5698b8a9003c0a2a51506fc53e61d8fd",
-    "pluginVersion": "0.6.1+codex.20260726012710",
+    "commit": "146f724e5ee0b2c88690749e605449aefaa8e537",
+    "pluginVersion": "0.6.4+codex.20260729033800",
     "serverVersion": "0.6.1+codex.20260726012710.chatgpt.9956d1d6f66f",
     "workingTree": "Contains the live-tested focused routing fixes plus a public outer PKCE facade, one-time mapped authorization codes, encrypted rotating refresh handles, and ChatGPT Work app mapping; production Entra, Work, and NAS OAuth cutover remain pending."
   },
@@ -134,8 +134,8 @@
   },
   "installedBuild": {
     "status": "pending_source_update",
-    "version": "0.6.1+codex.20260726012710",
-    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.1+codex.20260726012710",
+    "version": "0.6.4+codex.20260729033800",
+    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.4+codex.20260729033800",
     "oldCacheOverwritten": false
   },
   "fixes": [

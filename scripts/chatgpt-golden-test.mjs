@@ -20,6 +20,7 @@ const goldenPrompts = [
   { prompt: "What structured Excel edits are supported?", tool: "onedrive_office_capabilities", cues: ["supported structured operations"] },
   { prompt: "Update cells in these two Excel workbooks", tool: "onedrive_office_batch_transform", cues: ["structured edits", "preview"] },
   { prompt: "Upload this attached PDF to OneDrive", tool: "onedrive_upload_file", cues: ["chatgpt-provided file", "upload"] },
+  { prompt: "Export this Word document as a PDF beside the source in OneDrive", tool: "onedrive_export_file", cues: ["converted to pdf or plain text", "saved back in onedrive", "preview"] },
   { prompt: "Create a new markdown file with this full content", tool: "onedrive_write_text", cues: ["create or fully replace", "required content field", "never a text field"] },
   { prompt: "Change only one line in this existing text file", tool: "onedrive_patch_text", cues: ["targeted", "preserving", "expectedetag", "previewtoken"] },
   { prompt: "Create a folder named Receipts under Documents", tool: "onedrive_create_folder", cues: ["direct conflict-safe create", "do not send dryrun"] },
@@ -31,21 +32,20 @@ const goldenPrompts = [
   { prompt: "I approve the previewed sharing permission removal", tool: "onedrive_revoke_permission", cues: ["approved a permission removal", "permissionid", "not auth credentials"] },
   { prompt: "Which named people currently have access to this folder?", tool: "onedrive_permissions", cues: ["identities that currently access", "send only itemid or path", "never send expectedid"] },
   { prompt: "Move this file to the recycle bin", tool: "onedrive_delete", cues: ["only for that intent", "active onedrive item", "never use for read-only inspection", "permanent deletion"] },
-  { prompt: "Restore this item from the recycle bin", tool: "onedrive_restore_deleted", cues: ["only for that intent", "while it is in the onedrive recycle bin", "never call again after restoration"] },
-  { prompt: "Permanently delete this item and skip the recycle bin", tool: "onedrive_permanent_delete", cues: ["irreversibly", "without the recycle bin"] }
+  { prompt: "Restore this item from the recycle bin", tool: "onedrive_restore_deleted", cues: ["only for that intent", "while it is in the onedrive recycle bin", "never call again after restoration"] }
 ];
 
 const ambiguityPairs = [
   ["search", "onedrive_open_files"],
   ["onedrive_preview_actions", "onedrive_rename"],
   ["search", "onedrive_list"],
+  ["onedrive_upload_file", "onedrive_export_file"],
   ["onedrive_write_text", "onedrive_patch_text"],
   ["onedrive_move", "onedrive_copy"],
   ["onedrive_create_sharing_link", "onedrive_invite_permission"],
   ["onedrive_create_folder", "onedrive_create_sharing_link"],
   ["onedrive_create_sharing_link", "onedrive_permissions"],
   ["onedrive_permissions", "onedrive_revoke_permission"],
-  ["onedrive_delete", "onedrive_permanent_delete"],
   ["onedrive_delete", "onedrive_restore_deleted"]
 ];
 

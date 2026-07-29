@@ -1243,6 +1243,50 @@ function strictHttpsUrl(value, name, { rootOnly = false } = {}) {
   return parsed;
 }
 
+function protectedResourceAliases(value, protectedResource) {
+  const raw = String(value || "").trim();
+  if (!raw) return Object.freeze([]);
+  const aliases = raw.split(/\s+/).filter(Boolean);
+  if (!aliases.length || new Set(aliases).size !== aliases.length) {
+    throw new Error(
+      "ONEDRIVE_OAUTH_COMPAT_PROTECTED_RESOURCE_ALIASES must contain a unique, non-empty URL set."
+    );
+  }
+  const canonical = new URL(protectedResource);
+  const tunnelMatch = /^\/v1\/mcp\/(tunnel_[a-f0-9]{32})$/.exec(
+    canonical.pathname
+  );
+  if (
+    canonical.origin !== "https://api.openai.com"
+    || !tunnelMatch
+  ) {
+    throw new Error(
+      "ONEDRIVE_OAUTH_COMPAT_PROTECTED_RESOURCE_ALIASES may be used only with "
+        + "an https://api.openai.com/v1/mcp/tunnel_... protected resource."
+    );
+  }
+  for (const alias of aliases) {
+    const parsed = strictHttpsUrl(
+      alias,
+      "ONEDRIVE_OAUTH_COMPAT_PROTECTED_RESOURCE_ALIASES"
+    );
+    if (
+      !/^tunnel-service\.gateway\.unified-\d+\.internal\.api\.openai\.org$/.test(
+        parsed.hostname
+      )
+      || parsed.port
+      || parsed.pathname !== canonical.pathname
+      || parsed.toString() !== alias
+    ) {
+      throw new Error(
+        "ONEDRIVE_OAUTH_COMPAT_PROTECTED_RESOURCE_ALIASES must contain only exact "
+          + "ChatGPT tunnel-gateway identifiers for the configured tunnel."
+      );
+    }
+  }
+  return Object.freeze([...aliases]);
+}
+
 function parseExactScopes(value, name = "ONEDRIVE_OAUTH_COMPAT_SCOPES") {
   const raw = required(value, name);
   const scopes = raw.split(/\s+/).filter(Boolean);
@@ -1502,12 +1546,17 @@ export function oauthCompatSettings(env = process.env) {
     );
   }
   const scopes = parseExactScopes(env.ONEDRIVE_OAUTH_COMPAT_SCOPES);
+  const protectedResourceValue = resourceUrl.toString();
   const configuredAccessTokenMode = accessTokenMode(
     env.ONEDRIVE_OAUTH_COMPAT_ACCESS_TOKEN_MODE
   );
   return Object.freeze({
     issuer,
-    protectedResource: resourceUrl.toString(),
+    protectedResource: protectedResourceValue,
+    protectedResourceAliases: protectedResourceAliases(
+      env.ONEDRIVE_OAUTH_COMPAT_PROTECTED_RESOURCE_ALIASES,
+      protectedResourceValue
+    ),
     clientId,
     clientSecret: secretSetting(env),
     accessTokenKeyFile: validateFacadeAccessTokenKeyFile(
@@ -1783,6 +1832,23 @@ function authorizationMetadata(settings) {
   return metadata;
 }
 
+function protectedResourceMetadata(settings) {
+  const authorizationServerOnlyScopes = new Set([
+    "offline_access",
+    "openid",
+    "profile",
+    "email"
+  ]);
+  return {
+    resource: settings.protectedResource,
+    authorization_servers: [settings.issuer],
+    scopes_supported: settings.scopes.filter(
+      (scope) => !authorizationServerOnlyScopes.has(scope)
+    ),
+    bearer_methods_supported: ["header"]
+  };
+}
+
 async function readRegistrationJson(request) {
   const contentType = String(request.headers["content-type"] || "").toLowerCase();
   if (!/^application\/json(?:\s*;\s*charset=utf-8)?$/.test(contentType)) {
@@ -1964,6 +2030,25 @@ async function handleRegistration(
 function exactSingleValue(parameters, name, expected) {
   const values = parameters.getAll(name);
   return values.length === 1 && values[0] === expected;
+}
+
+function requireProtectedResource(parameters, settings) {
+  const values = parameters.getAll("resource");
+  if (
+    values.length !== 1
+    || !new Set([
+      settings.protectedResource,
+      ...settings.protectedResourceAliases
+    ]).has(values[0])
+  ) {
+    throw new RequestError(
+      400,
+      "invalid_request",
+      "OAuth request does not match the registered client.",
+      {},
+      "resource_mismatch"
+    );
+  }
 }
 
 function cimdClientUrl(value) {
@@ -2241,7 +2326,7 @@ async function handleAuthorize(
   try {
     rejectDuplicateParameters(parameters);
     enforceAllowedParameters(parameters, AUTHORIZATION_PARAMETERS);
-    requireExact(parameters, "resource", settings.protectedResource, "resource_mismatch");
+    requireProtectedResource(parameters, settings);
     requireExact(parameters, "response_type", "code", "response_type_mismatch");
     if (hasCodeChallenge !== hasCodeChallengeMethod) {
       throw new RequestError(
@@ -2496,7 +2581,7 @@ function validateTokenParameters(request, parameters, settings) {
     );
   }
   enforceAllowedParameters(parameters, allowed);
-  requireExact(parameters, "resource", settings.protectedResource, "resource_mismatch");
+  requireProtectedResource(parameters, settings);
   if (!trustedClientIdValue(parameters.get("client_id"), settings)) {
     throw new RequestError(
       400,
@@ -2738,10 +2823,11 @@ async function proxyToken(
         responseScope
       );
       if (settings.accessTokenMode === "facade") {
+        const requestedResource = parameters.get("resource");
         const facade = issueFacadeAccessToken({
           providerAccessToken: payload.access_token,
           issuer: settings.issuer,
-          audience: settings.protectedResource,
+          audience: requestedResource,
           clientId: settings.clientId,
           scope: responseScope,
           expiresIn: payload.expires_in,
@@ -2749,6 +2835,12 @@ async function proxyToken(
         });
         responsePayload.access_token = facade.accessToken;
         responsePayload.expires_in = facade.expiresIn;
+        diagnostic.tokenResponse.outerAudienceClass =
+          requestedResource === settings.protectedResource
+            ? "canonical"
+            : settings.protectedResourceAliases.includes(requestedResource)
+              ? "same_tunnel_alias"
+              : "invalid";
       }
       diagnostic.tokenResponse.outerAccessTokenBytes = Buffer.byteLength(
         responsePayload.access_token,
@@ -3174,6 +3266,34 @@ export function createOAuthCompatServer(
           ...(lastTokenResponse ? { lastTokenResponse } : {}),
           ...(mcp ? { mcp } : {})
         });
+        return;
+      }
+      const protectedResourceMetadataRoutes = new Set([
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
+        `/.well-known/oauth-protected-resource${
+          new URL(settings.protectedResource).pathname.replace(/\/+$/, "")
+        }`
+      ]);
+      if (protectedResourceMetadataRoutes.has(url.pathname)) {
+        if (request.method !== "GET") {
+          diagnostic.code = "invalid_request";
+          diagnostic.reason = "method_not_allowed";
+          sendJson(response, request, 405, { error: "invalid_request" }, { Allow: "GET, OPTIONS" });
+          return;
+        }
+        if (url.search) {
+          throw new RequestError(
+            400,
+            "invalid_request",
+            "Metadata query is not supported.",
+            {},
+            "metadata_query_rejected"
+          );
+        }
+        diagnostic.code = "ok";
+        diagnostic.reason = "protected_resource_metadata";
+        sendJson(response, request, 200, protectedResourceMetadata(settings));
         return;
       }
       if (

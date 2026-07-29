@@ -1,10 +1,10 @@
-# OneDrive 0.6.1 Release Gate Report
+# OneDrive 0.6.4 Release Gate Report
 
 Decision: Pending — full cross-surface release; current regular-Chat deployment passes
 Date: 2026-07-25
 Generated: 2026-07-26T05:27:10Z
-Tested source base commit: `eb9b66fb5698b8a9003c0a2a51506fc53e61d8fd`
-Plugin version: `0.6.1+codex.20260726012710`
+Tested source base commit: `146f724e5ee0b2c88690749e605449aefaa8e537`
+Plugin version: `0.6.4+codex.20260729033800`
 Server version: `0.6.1+codex.20260726012710.chatgpt.9956d1d6f66f`
 Tool contract: 84 exact tool names
 

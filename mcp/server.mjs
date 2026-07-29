@@ -218,7 +218,7 @@ const chatgptRevalidationLastStartedAt = new Map();
 let watchesLoaded = false;
 const previewTokenTtlMs = 15 * 60 * 1000;
 const previewScopedTools = new Set([
-  "onedrive_preview_actions",
+  "onedrive_preview_actions", "onedrive_export_file",
   "onedrive_upload", "onedrive_upload_file", "onedrive_write_text", "onedrive_batch_delete", "onedrive_delete", "onedrive_permanent_delete",
   "onedrive_rename", "onedrive_move", "onedrive_copy",
   "onedrive_create_sharing_link", "onedrive_invite_permission", "onedrive_revoke_permission",
@@ -2044,7 +2044,20 @@ const chatgptCompatibilityTools = [
             properties: {
               id: { type: "string" },
               title: { type: "string" },
-              url: { type: "string" }
+              url: { type: "string" },
+              name: { type: "string" },
+              path: { type: "string" },
+              parent: {
+                type: "object",
+                required: ["id", "path"],
+                properties: {
+                  id: { type: "string" },
+                  path: { type: "string" }
+                },
+                additionalProperties: false
+              },
+              type: { type: "string", enum: ["file", "folder", "item"] },
+              webUrl: { type: "string" }
             },
             additionalProperties: false
           }
@@ -2073,6 +2086,20 @@ const chatgptCompatibilityTools = [
         title: { type: "string" },
         text: { type: "string" },
         url: { type: "string" },
+        itemId: { type: "string" },
+        name: { type: "string" },
+        path: { type: "string" },
+        parent: {
+          type: "object",
+          required: ["id", "path"],
+          properties: {
+            id: { type: "string" },
+            path: { type: "string" }
+          },
+          additionalProperties: false
+        },
+        type: { type: "string", enum: ["file", "folder", "item"] },
+        webUrl: { type: "string" },
         metadata: {
           type: "object",
           additionalProperties: { type: "string" }
@@ -2249,6 +2276,31 @@ const chatgptCompatibilityTools = [
     }
   },
   {
+    name: "onedrive_export_file",
+    title: "Export Office File in OneDrive",
+    description: "Preview, then ask Microsoft Graph to convert a supported OneDrive document to PDF or plain text and save the converted file back to OneDrive. Every export requires confirmation, a source revision guard, and a scoped preview token.",
+    inputSchema: {
+      type: "object",
+      required: ["format", "remotePath"],
+      anyOf: itemTargetAnyOf,
+      properties: {
+        ...pathTargetProperties,
+        format: { type: "string", enum: ["pdf", "text"] },
+        remotePath: { type: "string", minLength: 1, description: "Destination path relative to the OneDrive root, including a .pdf or .txt filename." },
+        conflictBehavior: { type: "string", enum: ["fail", "replace", "rename"], default: "fail" },
+        dryRun: { type: "boolean", default: true },
+        confirmed: { type: "boolean", default: false },
+        expectedName: { type: "string", description: "Current source item name; provide this or expectedId for a live export." },
+        expectedId: { type: "string", description: "Current source item ID; provide this or expectedName for a live export." },
+        expectedETag: { type: "string", description: "Current source eTag from the matching export preview." },
+        destinationExpectedName: { type: "string", description: "Required when replacing an existing destination unless destinationExpectedId is provided." },
+        destinationExpectedId: { type: "string", description: "Required when replacing an existing destination unless destinationExpectedName is provided." },
+        previewToken: previewTokenSchema
+      },
+      additionalProperties: false
+    }
+  },
+  {
     name: "onedrive_permanent_delete",
     title: "Permanently Delete OneDrive Item",
     description: "Permanently delete a OneDrive item without using the recycle bin. Irreversible; defaults to preview and requires confirmation, expected identity, an acknowledgement, and a scoped preview token.",
@@ -2340,6 +2392,7 @@ const destructiveToolNames = new Set([
   "onedrive_download_powerpoint",
   "onedrive_export_pdf",
   "onedrive_export_text",
+  "onedrive_export_file",
   "onedrive_write_text",
   "onedrive_patch_text",
   "onedrive_restore_version",
@@ -2364,6 +2417,7 @@ const openWorldToolNames = new Set([
   "onedrive_download_powerpoint",
   "onedrive_export_pdf",
   "onedrive_export_text",
+  "onedrive_export_file",
   "onedrive_invite_permission",
   "onedrive_create_sharing_link",
   "onedrive_batch_download",
@@ -2411,6 +2465,7 @@ const chatgptToolNames = new Set([
   "onedrive_office_capabilities",
   "onedrive_office_batch_transform",
   "onedrive_upload_file",
+  "onedrive_export_file",
   "onedrive_write_text",
   "onedrive_patch_text",
   "onedrive_create_folder",
@@ -2422,8 +2477,7 @@ const chatgptToolNames = new Set([
   "onedrive_revoke_permission",
   "onedrive_permissions",
   "onedrive_delete",
-  "onedrive_restore_deleted",
-  "onedrive_permanent_delete"
+  "onedrive_restore_deleted"
 ]);
 
 const compactOfficeOperationSchema = {
@@ -2481,6 +2535,11 @@ const chatgptToolMetadata = Object.freeze({
     description: "Use this when the user wants to upload a ChatGPT-provided file to OneDrive. Preview first; replacement requires the existing item's expected identity and explicit confirmation.",
     invoking: "Preparing OneDrive upload…",
     invoked: "OneDrive upload result ready"
+  },
+  onedrive_export_file: {
+    description: "Use this when the user wants a supported OneDrive document converted to PDF or plain text and the converted copy saved back in OneDrive. Preview first, then use the source identity, source eTag, destination, and previewToken unchanged for the confirmed export.",
+    invoking: "Exporting OneDrive document…",
+    invoked: "OneDrive export ready"
   },
   onedrive_write_text: {
     description: "Use this when the user wants to create or fully replace a UTF-8 text or code file in OneDrive. Put the full file body in the required content field, never a text field. dryRun true always previews without writing; use the returned previewToken for the confirmed live write.",
@@ -2586,6 +2645,23 @@ function compactChatgptToolDescriptor(tool) {
   // validation keyword while retaining only the selector and credential-safety
   // descriptions that materially affect model arguments.
   stripSchemaDescriptions(compact.inputSchema);
+  if (compact.name === "onedrive_export_file") {
+    compact.inputSchema = {
+      type: "object",
+      required: ["itemId", "format", "remotePath"],
+      properties: {
+        itemId: { type: "string", minLength: 1, description: "Stable source ID returned by search or fetch." },
+        format: { type: "string", enum: ["pdf", "text"] },
+        remotePath: { type: "string", minLength: 1, description: "New .pdf or .txt path in OneDrive." },
+        dryRun: { type: "boolean", default: true },
+        confirmed: { type: "boolean", default: false },
+        expectedETag: { type: "string", description: "Source eTag from the matching preview." },
+        previewToken: { type: "string", description: "Same-server export proof, not an auth credential." }
+      },
+      additionalProperties: false
+    };
+    return compact;
+  }
   const properties = compact.inputSchema?.properties;
   if (properties) {
     if (properties.path) {
@@ -2681,7 +2757,7 @@ const advertisedServerVersion = toolProfile === "chatgpt"
   ? `${manifestServerVersion}${manifestServerVersion.includes("+") ? "." : "+"}chatgpt.${advertisedContractHash}`
   : manifestServerVersion;
 const serverInstructions = toolProfile === "chatgpt"
-  ? "Use onedrive_open_files once for exact filenames/content. For descriptions, topics, aliases, unknown titles, or multiple related documents, pass the whole natural-language request once to search, inspect ranked results, then fetch selected ids unchanged. Returned opaque item/permission ids and preview proofs are same-server identifiers, not authentication credentials. For mutations, prefer user-visible paths plus expectedName; use opaque item ids only without a path. Create folders directly with conflictBehavior fail; that tool has no dryRun, confirmed, or previewToken fields. Use onedrive_preview_actions for read-only rename/move/copy/sharing/revoke previews with identity-free access counts. Guarded live mutations require approval, a matching preview proof, and expected identity. In dependent write sequences, execute and verify one mutation at a time, then re-fetch the item and obtain a fresh preview because names, paths, eTags, and earlier proofs may be stale. Copy returns asynchronous acceptance immediately in ChatGPT; continue independent work, then verify the destination separately. For live revoke, prefer the fetched path plus expectedName and pass permissionId and previewToken unchanged. Use onedrive_list only for known folders. For Office edits, fetch, check capabilities, then transform."
+  ? "Use onedrive_open_files once for exact filenames/content. For descriptions, topics, aliases, unknown titles, or multiple related documents, pass the whole natural-language request once to search, inspect ranked results, then fetch selected ids unchanged. Returned opaque item/permission ids and preview proofs are same-server identifiers, not authentication credentials. For mutations, prefer user-visible paths plus expectedName; use opaque item ids only without a path. Create folders directly with conflictBehavior fail; that tool has no dryRun, confirmed, or previewToken fields. Use onedrive_preview_actions for read-only rename/move/copy/sharing/revoke previews with identity-free access counts. Guarded live mutations require approval, a matching preview proof, and expected identity. In dependent write sequences, execute and verify one mutation at a time, then re-fetch the item and obtain a fresh preview because names, paths, eTags, and earlier proofs may be stale. Copy returns asynchronous acceptance immediately in ChatGPT; continue independent work, then verify the destination separately. For live revoke, prefer the fetched path plus expectedName and pass permissionId and previewToken unchanged. Use onedrive_list only for known folders. For Office edits, fetch, check capabilities, then transform; use onedrive_export_file for a converted PDF or text copy saved in OneDrive."
   : "Use onedrive_find for normal OneDrive lookup and the matching structured read tool before an Office edit. Use onedrive_list only for direct folder listings. Keep results bounded. Locate an item before changing it. Mutations default to preview and require confirmation.";
 
 const toolByName = new Map(executableTools.map((tool) => [tool.name, tool]));
@@ -5376,14 +5452,57 @@ function formatDriveItem(item, format = "compact") {
 
 function formatSimplifiedItem(simplified, format = "compact") {
   if (!simplified || format === "full") return simplified;
+  const remotePath = String(simplified.remotePath || "");
+  const parentPathSeparator = remotePath.lastIndexOf("/");
   return {
     id: simplified.id,
     name: simplified.name,
     remotePath: simplified.remotePath,
+    path: remotePath,
+    parent: {
+      id: String(simplified.parentId || ""),
+      path: parentPathSeparator >= 0 ? remotePath.slice(0, parentPathSeparator) : ""
+    },
     type: simplified.folder ? "folder" : simplified.file ? "file" : "item",
     size: simplified.size,
     lastModifiedDateTime: simplified.lastModifiedDateTime,
     webUrl: simplified.webUrl
+  };
+}
+
+function chatgptItemDescriptor(item = {}, fallbackId = "") {
+  const remotePath = String(item.remotePath || item.path || "");
+  const parentPathSeparator = remotePath.lastIndexOf("/");
+  const parent = item.parent && typeof item.parent === "object"
+    ? {
+        id: String(item.parent.id || ""),
+        path: String(item.parent.path || "")
+      }
+    : {
+        id: String(item.parentId || ""),
+        path: parentPathSeparator >= 0 ? remotePath.slice(0, parentPathSeparator) : ""
+      };
+  return {
+    itemId: String(item.id || fallbackId || ""),
+    name: String(item.name || item.title || fallbackId || "OneDrive item"),
+    path: remotePath,
+    parent,
+    type: item.type || (item.folder ? "folder" : item.file ? "file" : "item"),
+    webUrl: absoluteWebUrl(item.webUrl || item.url)
+  };
+}
+
+function chatgptSearchResult(item = {}, fallbackTitle = "") {
+  const descriptor = chatgptItemDescriptor(item);
+  return {
+    id: descriptor.itemId,
+    title: String(item.name || item.title || fallbackTitle || descriptor.name),
+    url: descriptor.webUrl,
+    name: descriptor.name,
+    path: descriptor.path,
+    parent: descriptor.parent,
+    type: descriptor.type,
+    webUrl: descriptor.webUrl
   };
 }
 
@@ -5435,6 +5554,18 @@ function previewProofHash(tool, proof = {}) {
     .update("\n")
     .update(JSON.stringify(stablePreviewValue(proof)))
     .digest("hex");
+}
+
+function mutationOperationId(tool, previewToken = "", fallback = "") {
+  const material = String(previewToken || fallback || "");
+  if (!material) return "";
+  return `odop_${createHash("sha256")
+    .update("onedrive-mutation-operation-v1\0")
+    .update(tool)
+    .update("\0")
+    .update(material)
+    .digest("hex")
+    .slice(0, 32)}`;
 }
 
 function previewProofItemIds(value, key = "") {
@@ -5513,6 +5644,7 @@ function previewTokenRequiredResult(preview, tool, proof, token, requiredField) 
     ...preview,
     dryRun: false,
     confirmed: true,
+    ...(token ? { operationId: mutationOperationId(tool, token) } : {}),
     previewTokenRequired: true,
     previewTokenStatus: result.reason,
     [requiredField]: "Run a dry-run preview for this exact operation and pass the returned previewToken with dryRun: false and confirmed: true."
@@ -9574,6 +9706,182 @@ async function downloadExport(args = {}, formatName) {
   }
 }
 
+async function exportFileToOneDrive(args = {}) {
+  const formats = {
+    pdf: { graphFormat: "pdf", extension: ".pdf", contentType: "application/pdf", label: "PDF" },
+    text: { graphFormat: "text", extension: ".txt", contentType: "text/plain; charset=utf-8", label: "plain text" }
+  };
+  const format = formats[String(args.format || "").toLowerCase()];
+  if (!format) throw new Error("format must be pdf or text.");
+  const destinationPath = assertSafeRemotePath(args.remotePath, "remotePath");
+  if (!destinationPath) throw new Error("remotePath must include a filename.");
+  if (extname(destinationPath).toLowerCase() !== format.extension) {
+    throw new Error(`remotePath must end in ${format.extension} for a ${format.label} export.`);
+  }
+
+  const source = await getRawInfo(args);
+  if (source.folder) throw new Error(`Item is a folder, not an exportable document: ${source.name}`);
+  const conflictBehavior = args.conflictBehavior || "fail";
+  const currentDestination = await existingReplacementTarget(destinationPath);
+  if (currentDestination?.folder) throw new Error(`Refusing to replace a folder with exported file content: ${currentDestination.name}`);
+
+  const proof = {
+    source: itemVersionProof(source),
+    destinationPath,
+    format: args.format,
+    conflictBehavior,
+    existingDestination: currentDestination ? itemVersionProof(currentDestination) : null
+  };
+  const preview = {
+    dryRun: args.dryRun !== false,
+    confirmed: args.confirmed === true,
+    source: simplifyItem(source),
+    format: args.format,
+    destinationPath,
+    conflictBehavior,
+    wouldCreate: currentDestination ? null : { path: destinationPath },
+    wouldReplace: conflictBehavior === "replace" && currentDestination ? simplifyItem(currentDestination) : null,
+    wouldConflict: conflictBehavior === "fail" && currentDestination ? simplifyItem(currentDestination) : null,
+    sourceRevisionGuard: source.eTag
+  };
+  if (args.dryRun !== false) {
+    return {
+      ...previewWithToken(preview, "onedrive_export_file", proof),
+      requiredToExport: "Set dryRun:false and confirmed:true with the stable source itemId (or expected identity), expectedETag, and matching previewToken."
+    };
+  }
+  const stableSourceSelected = Boolean(args.itemId && args.itemId === source.id);
+  if (args.confirmed !== true || (!hasExpectedIdentity(args) && !stableSourceSelected) || !args.expectedETag) {
+    return {
+      ...preview,
+      dryRun: false,
+      requiredToExport: "Pass confirmed:true, the stable source itemId (or expected identity), expectedETag, and the matching previewToken."
+    };
+  }
+  if (hasExpectedIdentity(args)) assertExpectedItem(source, args, "Export source");
+  if (args.expectedETag !== source.eTag) {
+    throw new Error("Export source expectedETag no longer matches the current item. Run a fresh preview.");
+  }
+  if (conflictBehavior === "fail" && currentDestination) {
+    throw new Error(`Export destination already exists: ${destinationPath}. Run a fresh preview with a different path or replace intent.`);
+  }
+  if (conflictBehavior === "replace" && currentDestination) {
+    if (!args.destinationExpectedId && !args.destinationExpectedName) {
+      return {
+        ...preview,
+        dryRun: false,
+        confirmed: true,
+        requiredToExport: "Provide destinationExpectedId or destinationExpectedName matching the existing destination."
+      };
+    }
+    if (args.destinationExpectedId && args.destinationExpectedId !== currentDestination.id) {
+      throw new Error("Export destinationExpectedId does not match the current destination.");
+    }
+    if (args.destinationExpectedName && args.destinationExpectedName !== currentDestination.name) {
+      throw new Error("Export destinationExpectedName does not match the current destination.");
+    }
+  }
+  const tokenRequired = previewTokenRequiredResult(preview, "onedrive_export_file", proof, args.previewToken, "requiredToExport");
+  if (tokenRequired) return tokenRequired;
+
+  await ensurePrivateDirectory(chatgptUploadRoot);
+  const tempPath = join(chatgptUploadRoot, `${randomUUID()}${format.extension}`);
+  const params = new URLSearchParams({ format: format.graphFormat });
+  try {
+    let downloaded;
+    let conversionSource = "microsoft-graph";
+    try {
+      downloaded = await graphDownloadToFile(
+        `${itemIdBase(source.id)}/content?${params.toString()}`,
+        tempPath
+      );
+    } catch (graphError) {
+      const officeKind = officePackageKindFromName(source.name);
+      if (args.format !== "text" || !officeKind) throw graphError;
+      await rm(tempPath, { force: true });
+      const document = await inspectRemoteOfficePackage({
+        itemId: source.id,
+        _resolvedInfo: source,
+        maxParagraphs: 10_000,
+        maxCells: 50_000,
+        maxSlides: 5_000,
+        includeCells: true,
+        includeTables: true,
+        includeCharts: true,
+        includePivots: true,
+        strictRelationships: true
+      }, officeKind, "inspect");
+      const rendered = officePlainText(document, source.name || "Office document");
+      if (rendered.truncated) {
+        throw new Error("Plain-text export would be incomplete because the Office document exceeds the safe extraction limits.");
+      }
+      const bytesWritten = Buffer.byteLength(rendered.text, "utf8");
+      if (bytesWritten <= 0) throw new Error("The Office document did not contain exportable text.");
+      if (bytesWritten > maxOfficePackageBytes) {
+        throw new Error(`Exported text is ${bytesWritten} bytes, above the ${maxOfficePackageBytes}-byte safe export limit.`);
+      }
+      await writePrivateFile(tempPath, rendered.text, { encoding: "utf8", flag: "wx" });
+      downloaded = { bytesWritten };
+      conversionSource = "office-openxml";
+    }
+    if (downloaded.bytesWritten <= 0) throw new Error(`Microsoft Graph returned an empty ${format.label} export.`);
+    if (downloaded.bytesWritten > maxOfficePackageBytes) {
+      throw new Error(`Exported file is ${downloaded.bytesWritten} bytes, above the ${maxOfficePackageBytes}-byte safe export limit.`);
+    }
+    const sha256 = await sha256LocalFile(tempPath);
+    const uploaded = await upload({
+      localPath: tempPath,
+      remotePath: destinationPath,
+      conflictBehavior: currentDestination
+        ? "replace"
+        : conflictBehavior === "replace"
+          ? "fail"
+          : conflictBehavior,
+      guardedInternalReplace: true,
+      ifMatch: currentDestination?.eTag,
+      uploadMode: "auto",
+      skipAudit: true
+    });
+    const verified = await getRawInfo({ itemId: uploaded.item.id, cacheResults: false });
+    if (Number(verified.size) !== downloaded.bytesWritten) {
+      throw new Error(`Export verification failed: OneDrive reports ${verified.size} bytes, expected ${downloaded.bytesWritten}.`);
+    }
+    await writeMutationAudit("onedrive_export_file", {
+      status: "success",
+      target: itemAuditSummary(source),
+      after: itemAuditSummary(verified),
+      exportFormat: args.format,
+      conversionSource,
+      destinationPath,
+      bytes: downloaded.bytesWritten,
+      sha256
+    });
+    return {
+      dryRun: false,
+      confirmed: true,
+      operationId: mutationOperationId("onedrive_export_file", args.previewToken),
+      source: simplifyItem(source),
+      item: simplifyItem(verified),
+      exportFormat: args.format,
+      conversionSource,
+      bytesUploaded: downloaded.bytesWritten,
+      sha256,
+      verified: true
+    };
+  } catch (error) {
+    await writeMutationAudit("onedrive_export_file", {
+      status: "failed",
+      target: itemAuditSummary(source),
+      exportFormat: args.format,
+      destinationPath,
+      error: safeErrorInfo(error)
+    });
+    throw error;
+  } finally {
+    await rm(tempPath, { force: true }).catch(() => null);
+  }
+}
+
 function truncateUtf8(text, maxBytes) {
   const buffer = Buffer.from(String(text), "utf8");
   if (buffer.length <= maxBytes) return { text: String(text), truncated: false, bytes: buffer.length };
@@ -10016,11 +10324,9 @@ async function chatgptSearch(args = {}) {
   const revalidationScheduled = found.summary?.usedStaleLocalFastPath === true
     ? scheduleChatgptCacheRevalidation(args.query, cache)
     : false;
-  const rankedResults = selectedItems.slice(0, 10).map((item) => ({
-    id: String(item.id || ""),
-    title: String(item.name || item.remotePath || item.id || "OneDrive item"),
-    url: absoluteWebUrl(item.webUrl)
-  })).filter((item) => item.id);
+  const rankedResults = selectedItems.slice(0, 10)
+    .map((item) => chatgptSearchResult(item))
+    .filter((item) => item.id);
   let exactFilenameFallbackAttempted = false;
   let exactFilenameFallbackResults = [];
   if (exactFilenameQuery
@@ -10071,7 +10377,7 @@ async function chatgptSearch(args = {}) {
   return { results };
 }
 
-function chatgptOfficeText(document, fileName = "Office document") {
+function officePlainText(document, fileName = "Office document") {
   const lines = [`Document: ${fileName}`, `Format: ${document.kind || "office"}`];
   const addTableRows = (rows = [], prefix = "") => {
     for (const [rowIndex, row] of rows.entries()) {
@@ -10129,8 +10435,16 @@ function chatgptOfficeText(document, fileName = "Office document") {
       if (slide.notes) lines.push(`Speaker notes: ${slide.notes}`);
     }
   }
-  const limited = truncateUtf8(lines.join("\n"), chatgptFetchTextByteLimit);
-  return { ...limited, truncated: limited.truncated || Boolean(document.truncated) };
+  return {
+    text: lines.join("\n"),
+    truncated: Boolean(document.truncated)
+  };
+}
+
+function chatgptOfficeText(document, fileName = "Office document") {
+  const rendered = officePlainText(document, fileName);
+  const limited = truncateUtf8(rendered.text, chatgptFetchTextByteLimit);
+  return { ...limited, truncated: limited.truncated || rendered.truncated };
 }
 
 function chatgptIndexedText(indexed, fileName = "OneDrive item") {
@@ -10429,11 +10743,18 @@ async function chatgptFetch(args = {}) {
       ? encodeChatgptFetchContinuation({ itemId: continuation.itemId, fingerprint: continuation.fingerprint, offset: chunk.end, part: continuation.part + 1 })
       : "";
     const chunkCount = Math.max(1, Math.ceil(chunk.totalBytes / chatgptFetchChunkByteLimit));
+    const descriptor = chatgptItemDescriptor(snapshot.item, continuation.itemId);
     result = {
       id: requestedId,
       title: String(snapshot.item?.name || continuation.itemId || "OneDrive item"),
       text: chunk.text,
-      url: absoluteWebUrl(snapshot.item?.webUrl),
+      url: descriptor.webUrl,
+      itemId: descriptor.itemId,
+      name: descriptor.name,
+      path: descriptor.path,
+      parent: descriptor.parent,
+      type: descriptor.type,
+      webUrl: descriptor.webUrl,
       metadata: chatgptFetchMetadata(snapshot, {
         progressive: true,
         sourceItemId: continuation.itemId,
@@ -10460,11 +10781,18 @@ async function chatgptFetch(args = {}) {
       ? encodeChatgptFetchContinuation({ itemId: String(item.id || requestedId), fingerprint, offset: 0, part: 1 })
       : "";
     if (compact.progressive) rememberChatgptFetchSnapshot(scopeKey, snapshot);
+    const descriptor = chatgptItemDescriptor(item, requestedId);
     result = {
       id: String(item.id || requestedId || ""),
       title: String(item.name || requestedId || "OneDrive item"),
       text: compact.text,
-      url: absoluteWebUrl(item.webUrl),
+      url: descriptor.webUrl,
+      itemId: descriptor.itemId,
+      name: descriptor.name,
+      path: descriptor.path,
+      parent: descriptor.parent,
+      type: descriptor.type,
+      webUrl: descriptor.webUrl,
       metadata: chatgptFetchMetadata(snapshot, {
         progressive: compact.progressive,
         fullTextBytes: compact.fullBytes,
@@ -10551,11 +10879,9 @@ async function chatgptExactFilenameFallback(requestedName) {
     }
   })).filter(Boolean);
   if (validatedCachedMatches.length) {
-    return validatedCachedMatches.map((item) => ({
-      id: String(item.id || ""),
-      title: String(item.name || item.id || requestedName),
-      url: absoluteWebUrl(item.webUrl)
-    })).filter((item) => item.id);
+    return validatedCachedMatches
+      .map((item) => chatgptSearchResult(item, requestedName))
+      .filter((item) => item.id);
   }
 
   const extension = extname(requestedName).toLowerCase();
@@ -10575,11 +10901,7 @@ async function chatgptExactFilenameFallback(requestedName) {
   });
   return (scanned.items || [])
     .filter((item) => item?.id && exactFilenameKey(item.name) === expectedKey)
-    .map((item) => ({
-      id: String(item.id || ""),
-      title: String(item.name || item.id || requestedName),
-      url: absoluteWebUrl(item.webUrl)
-    }));
+    .map((item) => chatgptSearchResult(item, requestedName));
 }
 
 async function chatgptOpenFiles(args = {}) {
@@ -11380,7 +11702,11 @@ async function uploadChatgptFile(args = {}) {
       auditSource: source
     });
     const { localPath: omittedLocalPath, ...safeUploaded } = uploaded;
-    return { ...safeUploaded, sourceFile: source };
+    return {
+      ...safeUploaded,
+      operationId: mutationOperationId("onedrive_upload_file", args.previewToken),
+      sourceFile: source
+    };
   } finally {
     await rm(downloaded.localPath, { force: true }).catch(() => null);
   }
@@ -11657,7 +11983,11 @@ async function writeText(args = {}) {
       }
     });
     await bestEffortLocalWrite("metadata cache update", async () => await cacheItems([result]));
-    const response = { item: simplifyItem(result), bytesUploaded: contentBuffer.length };
+    const response = {
+      item: simplifyItem(result),
+      bytesUploaded: contentBuffer.length,
+      operationId: mutationOperationId("onedrive_write_text", args.previewToken)
+    };
     await writeMutationAudit("onedrive_write_text", {
       status: "success",
       target: { remotePath: destinationPath },
@@ -11871,7 +12201,16 @@ async function patchText(args = {}) {
     if (expectedHash !== observedHash) throw new Error("Text patch post-commit verification failed.");
     await bestEffortLocalWrite("metadata cache update", async () => await cacheItems([result]));
     await writeMutationAudit("onedrive_patch_text", { status: "success", target: itemAuditSummary(rawItem), before: itemAuditSummary(rawItem), after: itemAuditSummary(result), patchMode: args.patch.mode, sha256: observedHash });
-    return { dryRun: false, confirmed: true, item: simplifyItem(result), patch: preview.patch, preservation: preview.preservation, verified: true, sha256: observedHash };
+    return {
+      dryRun: false,
+      confirmed: true,
+      operationId: mutationOperationId("onedrive_patch_text", args.previewToken),
+      item: simplifyItem(result),
+      patch: preview.patch,
+      preservation: preview.preservation,
+      verified: true,
+      sha256: observedHash
+    };
   } catch (error) {
     await writeMutationAudit("onedrive_patch_text", { status: "failed", target: itemAuditSummary(rawItem), patchMode: args.patch.mode, error: safeErrorInfo(error) });
     throw error;
@@ -12315,12 +12654,24 @@ async function createFolder(args = {}) {
     });
     await bestEffortLocalWrite("metadata cache update", async () => await cacheItems([result]));
     const item = simplifyItem(result);
+    const verified = Boolean(item?.id) && item.name === name && Boolean(item.folder);
+    if (!verified) {
+      recordLocalWarning(
+        "create-folder response verification",
+        new Error("Microsoft Graph returned a folder result that did not match the requested name or type.")
+      );
+    }
     await writeMutationAudit("onedrive_create_folder", {
       status: "success",
       target: { parentPath: args.parentPath, parentItemId: args.parentItemId, name },
       after: itemAuditSummary(item)
     });
-    return item;
+    return {
+      ...item,
+      operationId: mutationOperationId("onedrive_create_folder", "", `${item.id}\0${item.eTag || item.name}`),
+      verified,
+      verificationIncomplete: !verified
+    };
   } catch (error) {
     await writeMutationAudit("onedrive_create_folder", {
       status: "failed",
@@ -12368,13 +12719,27 @@ async function rename(args = {}) {
     });
     await cacheMovedOrRenamedItem(current, result);
     const renamed = simplifyItem(result);
+    const verified = Boolean(renamed?.id) && renamed.id === current.id && renamed.name === newName;
+    if (!verified) {
+      recordLocalWarning(
+        "rename response verification",
+        new Error("Microsoft Graph returned a rename result that did not match the requested item and name.")
+      );
+    }
     await writeMutationAudit("onedrive_rename", {
       status: "success",
       target: itemAuditSummary(current),
       before: itemAuditSummary(current),
       after: itemAuditSummary(renamed)
     });
-    return { dryRun: false, confirmed: true, renamed };
+    return {
+      dryRun: false,
+      confirmed: true,
+      operationId: mutationOperationId("onedrive_rename", args.previewToken),
+      renamed,
+      verified,
+      verificationIncomplete: !verified
+    };
   } catch (error) {
     await writeMutationAudit("onedrive_rename", {
       status: "failed",
@@ -12428,6 +12793,23 @@ async function moveItem(args = {}) {
     });
     await cacheMovedOrRenamedItem(current, result);
     const moved = simplifyItem(result);
+    const expectedParentPath = cleanPath(parentReference.remotePath || itemRemotePath(parentReference) || "");
+    const actualParentPath = cleanPath(
+      moved.remotePath && moved.name
+        ? moved.remotePath.slice(0, Math.max(0, moved.remotePath.length - moved.name.length)).replace(/\/+$/u, "")
+        : ""
+    );
+    const parentVerified = moved.parentId
+      ? moved.parentId === parentReference.id
+      : Boolean(expectedParentPath) && actualParentPath === expectedParentPath;
+    const nameVerified = !args.newName || moved.name === args.newName;
+    const verified = Boolean(moved?.id) && moved.id === current.id && parentVerified && nameVerified;
+    if (!verified) {
+      recordLocalWarning(
+        "move response verification",
+        new Error("Microsoft Graph returned a move result that did not match the requested destination or name.")
+      );
+    }
     await writeMutationAudit("onedrive_move", {
       status: "success",
       target: itemAuditSummary(current),
@@ -12435,7 +12817,14 @@ async function moveItem(args = {}) {
       after: itemAuditSummary(moved),
       destination: parentReference
     });
-    return { dryRun: false, confirmed: true, moved };
+    return {
+      dryRun: false,
+      confirmed: true,
+      operationId: mutationOperationId("onedrive_move", args.previewToken),
+      moved,
+      verified,
+      verificationIncomplete: !verified
+    };
   } catch (error) {
     await writeMutationAudit("onedrive_move", {
       status: "failed",
@@ -12543,6 +12932,7 @@ async function copyItem(args = {}) {
     const result = {
       dryRun: false,
       confirmed: true,
+      operationId: mutationOperationId("onedrive_copy", args.previewToken),
       accepted: response.status === 202 || response.ok,
       status: response.status,
       source: item,
@@ -12696,6 +13086,7 @@ async function createSharingLink(args = {}) {
     return {
       dryRun: false,
       confirmed: true,
+      operationId: mutationOperationId("onedrive_create_sharing_link", args.previewToken),
       item: simplifyItem(current),
       permission: result,
       verificationIncomplete: includePermissionDiff && !afterPermissions,
@@ -12854,6 +13245,7 @@ async function invitePermission(args = {}) {
     return {
       dryRun: false,
       confirmed: true,
+      operationId: mutationOperationId("onedrive_invite_permission", args.previewToken),
       item: simplifyItem(current),
       invite: safeInvite,
       permissions: Array.isArray(result.value) ? result.value.map((permission) => simplifyPermission(permission, args.format)) : result,
@@ -12976,6 +13368,7 @@ async function revokePermission(args = {}) {
     return {
       dryRun: false,
       confirmed: true,
+      operationId: mutationOperationId("onedrive_revoke_permission", args.previewToken),
       item: preflight.item,
       permissionId: args.permissionId,
       verificationIncomplete: preflight.includePermissions && !afterPermissions,
@@ -13316,7 +13709,12 @@ async function deleteItem(args = {}) {
       target: itemAuditSummary(rawItem),
       before: itemAuditSummary(rawItem)
     });
-    return { dryRun: false, confirmed: true, deleted: item };
+    return {
+      dryRun: false,
+      confirmed: true,
+      operationId: mutationOperationId("onedrive_delete", args.previewToken),
+      deleted: item
+    };
   } catch (error) {
     await writeMutationAudit("onedrive_delete", {
       status: "failed",
@@ -13492,6 +13890,7 @@ async function restoreDeleted(args = {}) {
     return {
       dryRun: false,
       confirmed: true,
+      operationId: mutationOperationId("onedrive_restore_deleted", args.previewToken),
       restored,
       requestedNewName: args.newName || null,
       renameApplied,
@@ -13797,6 +14196,8 @@ async function callTool(name, args = {}) {
       return textResult(await downloadExport(args, "pdf"));
     case "onedrive_export_text":
       return textResult(await downloadExport(args, "text"));
+    case "onedrive_export_file":
+      return textResult(await exportFileToOneDrive(args));
     case "onedrive_upload":
       return textResult(await upload(args));
     case "onedrive_upload_file":

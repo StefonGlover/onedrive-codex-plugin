@@ -332,6 +332,35 @@ try {
     oauthRequests.at(-1)?.assertion === facadeUpstreamToken,
     "The OBO exchange did not use the Microsoft token securely carried by the facade token."
   );
+  const canonicalTunnelResource =
+    "https://api.openai.com/v1/mcp/tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const chatGptTunnelResourceAlias =
+    "https://tunnel-service.gateway.unified-0.internal.api.openai.org/v1/mcp/tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  process.env.ONEDRIVE_MCP_PROTECTED_RESOURCE = canonicalTunnelResource;
+  process.env.ONEDRIVE_MCP_PROTECTED_RESOURCE_ALIASES =
+    chatGptTunnelResourceAlias;
+  try {
+    const aliasFacadeToken = issueFacadeAccessToken({
+      providerAccessToken: facadeUpstreamToken,
+      issuer: "https://oauth-adapter.example.test",
+      audience: chatGptTunnelResourceAlias,
+      clientId: chatGptClientId,
+      scope: apiScope,
+      expiresIn: 3600,
+      keyFile: facadeAccessTokenKeyFile
+    }).accessToken;
+    const aliasFacadeVerified = await oauth.verifyBearerToken(
+      `Bearer ${aliasFacadeToken}`
+    );
+    assert(
+      aliasFacadeVerified.claims.aud === chatGptTunnelResourceAlias,
+      "The exact same-tunnel ChatGPT gateway audience was not accepted.",
+      aliasFacadeVerified.claims
+    );
+  } finally {
+    process.env.ONEDRIVE_MCP_PROTECTED_RESOURCE = protectedResource;
+    delete process.env.ONEDRIVE_MCP_PROTECTED_RESOURCE_ALIASES;
+  }
   await assertRejects(() => oauth.verifyBearerToken(`Bearer ${bearerToken({ aud: "wrong-audience" })}`), "not minted for this MCP API");
   await assertRejects(
     () => oauth.verifyBearerToken(`Bearer ${bearerToken({ azp: "55555555-5555-4555-8555-555555555555" })}`),
@@ -443,15 +472,54 @@ try {
     { rootMetadata, mcpMetadata, metadata }
   );
 
-  const initialize = await mcpCall(baseUrl, {
+  const unauthenticatedInitialize = await mcpRequest(baseUrl, {
     jsonrpc: "2.0",
     id: 1,
     method: "initialize",
     params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "oauth-test", version: "1" } }
   });
+  assert(
+    unauthenticatedInitialize.status === 200
+      && unauthenticatedInitialize.body?.result?.serverInfo?.name === "onedrive",
+    "Unauthenticated MCP initialize was not available for tunnel discovery.",
+    unauthenticatedInitialize
+  );
+  assert(
+    !unauthenticatedInitialize.headers.has("www-authenticate"),
+    "Unauthenticated MCP initialize unexpectedly returned an authentication challenge.",
+    [...unauthenticatedInitialize.headers]
+  );
+
+  const unauthenticatedToolList = await mcpRequest(
+    baseUrl,
+    { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }
+  );
+  assert(
+    unauthenticatedToolList.status === 401,
+    "Unauthenticated tools/list did not trigger OAuth discovery.",
+    unauthenticatedToolList
+  );
+  const toolListChallenge =
+    unauthenticatedToolList.headers.get("www-authenticate") || "";
+  assert(
+    toolListChallenge.includes(`resource_metadata="${resourceMetadataUrl}"`),
+    "Unauthenticated tools/list advertises the wrong metadata URL.",
+    toolListChallenge
+  );
+
+  const initialize = await mcpCall(baseUrl, {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "oauth-test", version: "1" } }
+  }, bearerToken({ jti: "linked-initialize" }));
   assert(initialize.result?.serverInfo?.name === "onedrive", "HTTP MCP initialize failed.", initialize);
 
-  const listed = await mcpCall(baseUrl, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+  const listed = await mcpCall(
+    baseUrl,
+    { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+    bearerToken({ jti: "linked-tools-list" })
+  );
   const expectedToolCount = process.env.ONEDRIVE_TOOL_PROFILE === "chatgpt" ? 21 : 84;
   assert(listed.result?.tools?.length === expectedToolCount, "OAuth HTTP server did not expose the exact tool contract.", listed.result?.tools?.length);
   assert(listed.result.tools.every((tool) => tool.securitySchemes?.[0]?.type === "oauth2"), "A tool is missing oauth2 security metadata.");
@@ -475,10 +543,9 @@ try {
     method: "tools/call",
     params: { name: "onedrive_config", arguments: {} }
   });
-  assert(unlinked.status === 200, "Unlinked OAuth tool call did not preserve the MCP challenge result.", unlinked);
-  assert(unlinked.body.result?.isError === true, "Unlinked OAuth tool call was not rejected.", unlinked.body);
-  const unlinkedChallenge = unlinked.body.result?._meta?.["mcp/www_authenticate"]?.[0] || "";
-  assert(unlinkedChallenge.startsWith("Bearer "), "OAuth challenge metadata is missing.", unlinked.body);
+  assert(unlinked.status === 401, "Unlinked OAuth tool call did not return HTTP 401.", unlinked);
+  const unlinkedChallenge = unlinked.headers.get("www-authenticate") || "";
+  assert(unlinkedChallenge.startsWith("Bearer "), "OAuth challenge header is missing.", unlinked.body);
   assert(unlinkedChallenge.includes(`resource_metadata="${resourceMetadataUrl}"`), "MCP OAuth challenge advertises the wrong metadata URL.", unlinkedChallenge);
   assert(
     unlinkedChallenge.includes(`scope="${resourceScopes.join(" ")}"`),
@@ -625,7 +692,7 @@ try {
       streamableHttpInitialize: true,
       oauthToolDescriptors: expectedToolCount,
       http401AndRuntimeChallenge: true,
-      missingTokenChallengeUsesMcpResult: true,
+      anonymousDiscoveryAndProtectedToolCalls: true,
       invalidSuppliedTokenUsesHttp401: true,
       providerAndConfigurationFailuresAre503: true,
       authenticatedToolCall: true

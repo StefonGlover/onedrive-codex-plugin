@@ -127,13 +127,23 @@ function isToolCall(message) {
   return message?.method === "tools/call";
 }
 
+function requiresOAuth(message) {
+  return message?.method === "tools/list" || isToolCall(message);
+}
+
 async function requestAuthorization(request, messages) {
   const authorization = request.headers.authorization;
   try {
     const settings = oauthSettings();
     if (settings.mode !== "oauth") return { authMode: "noauth" };
-    if (!messages.some(isToolCall)) return null;
-    const authorized = await authorizeMcpRequest(authorization, { requireGraph: true });
+    const requiresAuthorization = Boolean(authorization) || messages.some(requiresOAuth);
+    if (!requiresAuthorization) {
+      lastAuthFailure = null;
+      return { authMode: "oauth_discovery" };
+    }
+    const authorized = await authorizeMcpRequest(authorization, {
+      requireGraph: messages.some(isToolCall)
+    });
     lastAuthFailure = null;
     return authorized;
   } catch (error) {
@@ -169,29 +179,29 @@ async function handleMcp(request, response) {
     return;
   }
   const auth = await requestAuthorization(request, messages);
-  const results = (await Promise.all(messages.map((message) => processMcpMessage(message, auth)))).filter(Boolean);
-  recordToolDiagnostic(messages, results);
-  if (!results.length) {
-    setCommonHeaders(response);
-    response.writeHead(202);
-    response.end();
-    return;
-  }
-  if (auth?.authMode === "oauth_required") {
-    // Keep the MCP auth challenge in the successful transport response so
-    // Secure MCP Tunnel can deliver the tool result's mcp/www_authenticate
-    // metadata to ChatGPT. A transport-level 401 is reserved for a bearer
-    // credential that was actually supplied but failed validation.
-    sendJson(response, 200, Array.isArray(payload) ? results : results[0]);
-    return;
-  }
-  if (auth?.authMode === "oauth_error") {
+  if (auth?.authMode === "oauth_required" || auth?.authMode === "oauth_error") {
+    const results = messages.map((message) => ({
+      jsonrpc: "2.0",
+      id: message.id ?? null,
+      error: {
+        code: -32001,
+        message: auth.error?.message || "OneDrive authentication is required."
+      }
+    }));
     sendJson(response, 401, Array.isArray(payload) ? results : results[0], {
       "WWW-Authenticate": oauthChallenge({
         error: auth.error?.code || "invalid_token",
         description: auth.error?.message
       })
     });
+    return;
+  }
+  const results = (await Promise.all(messages.map((message) => processMcpMessage(message, auth)))).filter(Boolean);
+  recordToolDiagnostic(messages, results);
+  if (!results.length) {
+    setCommonHeaders(response);
+    response.writeHead(202);
+    response.end();
     return;
   }
   if (auth?.authMode === "oauth_server_error") {

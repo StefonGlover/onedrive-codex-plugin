@@ -39,6 +39,8 @@ let officeWordBuffer = readFileSync(join(officeFixtureDir, "sample.docx"));
 let officeExcelBuffer = readFileSync(join(officeFixtureDir, "sample.xlsx"));
 let officeBusinessBuffer = Buffer.from(officeExcelBuffer);
 let officePowerPointBuffer = readFileSync(join(officeFixtureDir, "sample.pptx"));
+let remoteExportPdfBuffer = null;
+let remoteExportTextBuffer = null;
 const commonRtfBuffer = Buffer.from("{\\rtf1\\ansi Common file extraction\\par Budget total: \\b $1,234\\b0\\par}", "utf8");
 const hiddenElectricalInvoiceRtfBuffer = Buffer.from(
   "{\\rtf1\\ansi BrightSpark Electrical Invoice 4421\\par Service date July 20, 2026\\par Breaker panel wiring repair completed by the electrician.\\par Total paid: \\b $875.00\\b0\\par}",
@@ -1429,6 +1431,64 @@ const graph = createServer(async (req, res) => {
       return text(res, 200, "Quarterly Report mock text export\n");
     }
     return text(res, 200, "Quarterly Report raw content\n");
+  }
+
+  if (req.method === "PUT" && decodeURIComponent(path) === "/v1.0/me/drive/root:/Folder B/Quarterly Report.pdf:/content") {
+    remoteExportPdfBuffer = await readBufferBody(req);
+    count("remote-export-pdf-upload");
+    return json(res, 201, item("quarterly-report-pdf", "Quarterly Report.pdf", {
+      size: remoteExportPdfBuffer.length,
+      parentReference: { path: "/drive/root:/Folder B" },
+      file: { mimeType: "application/pdf" }
+    }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/quarterly-report-pdf") {
+    return json(res, 200, item("quarterly-report-pdf", "Quarterly Report.pdf", {
+      size: remoteExportPdfBuffer?.length || 0,
+      parentReference: { path: "/drive/root:/Folder B" },
+      file: { mimeType: "application/pdf" }
+    }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/quarterly-report-text-fallback") {
+    return json(res, 200, item("quarterly-report-text-fallback", "Quarterly Report Fallback.docx", {
+      size: officeWordBuffer.length,
+      parentReference: { path: "/drive/root:/Folder B" },
+      file: { mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+    }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/quarterly-report-text-fallback/content") {
+    if (url.searchParams.get("format") === "text") {
+      return json(res, 400, {
+        error: {
+          code: "notSupported",
+          message: "Mock Graph text conversion is unavailable for this Word document."
+        }
+      });
+    }
+    return binary(res, 200, officeWordBuffer, {
+      "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    });
+  }
+
+  if (req.method === "PUT" && decodeURIComponent(path) === "/v1.0/me/drive/root:/Folder B/Quarterly Report.txt:/content") {
+    remoteExportTextBuffer = await readBufferBody(req);
+    count("remote-export-text-upload");
+    return json(res, 201, item("quarterly-report-text", "Quarterly Report.txt", {
+      size: remoteExportTextBuffer.length,
+      parentReference: { path: "/drive/root:/Folder B" },
+      file: { mimeType: "text/plain" }
+    }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/quarterly-report-text") {
+    return json(res, 200, item("quarterly-report-text", "Quarterly Report.txt", {
+      size: remoteExportTextBuffer?.length || 0,
+      parentReference: { path: "/drive/root:/Folder B" },
+      file: { mimeType: "text/plain" }
+    }));
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/root") {
@@ -3820,7 +3880,7 @@ process.exit(2);
   });
 
   await check("confirmed copy sends one copy POST and preserves manual 303 monitor", async () => {
-    const result = await toolWithPreview("onedrive_copy", {
+    const copyArgs = {
       itemId: "copy-src",
       destinationParentItemId: "folder-a",
       dryRun: false,
@@ -3828,8 +3888,14 @@ process.exit(2);
       expectedName: "copy-source.txt",
       waitForCompletion: true,
       timeoutSeconds: 5
-    });
+    };
+    const preview = await tool("onedrive_copy", { ...copyArgs, dryRun: true, confirmed: false });
+    const result = await tool("onedrive_copy", { ...copyArgs, previewToken: preview.value.previewToken });
     assert(!result.isError, "copy should succeed", result);
+    assert(/^odop_[0-9a-f]{32}$/u.test(result.value.operationId || ""), "copy should return a stable non-secret operation ID", result.value);
+    const replay = await tool("onedrive_copy", { ...copyArgs, previewToken: preview.value.previewToken });
+    assert(!replay.isError && replay.value.previewTokenRequired === true, "consumed copy preview tokens must prevent duplicate writes", replay);
+    assert(replay.value.operationId === result.value.operationId, "copy retries should preserve the same correlation ID without reissuing the write", { result: result.value, replay: replay.value });
     assert(counters.get("copy") === 1, "copy should POST exactly once", { copyCount: counters.get("copy") });
     assert(result.value.monitor?.status === 303, "copy monitor did not preserve 303", result.value.monitor);
     assert(result.value.monitor?.resourceLocation?.includes("/v1.0/me/drive/items/copied"), "missing resource location", result.value.monitor);
@@ -4483,6 +4549,91 @@ process.exit(2);
     return { bytesWritten: result.value.bytesWritten, localPath: result.value.localPath };
   });
 
+  await check("ChatGPT remote export previews, converts, uploads, and verifies", async () => {
+    const remotePath = "Folder B/Quarterly Report.pdf";
+    const beforeUploads = counters.get("remote-export-pdf-upload") || 0;
+    const preview = await tool("onedrive_export_file", {
+      itemId: "quarterly-report",
+      format: "pdf",
+      remotePath,
+      conflictBehavior: "fail",
+      dryRun: true
+    });
+    assert(!preview.isError, "remote export preview should succeed", preview);
+    assert(preview.value.dryRun === true && preview.value.previewToken, "remote export preview must return a scoped proof", preview.value);
+    assert(preview.value.source?.id === "quarterly-report" && preview.value.sourceRevisionGuard, "remote export preview must identify and revision-guard the source", preview.value);
+    assert((counters.get("remote-export-pdf-upload") || 0) === beforeUploads, "remote export preview must not upload", preview.value);
+
+    const committed = await tool("onedrive_export_file", {
+      itemId: "quarterly-report",
+      format: "pdf",
+      remotePath,
+      conflictBehavior: "fail",
+      dryRun: false,
+      confirmed: true,
+      expectedId: "quarterly-report",
+      expectedETag: preview.value.sourceRevisionGuard,
+      previewToken: preview.value.previewToken
+    });
+    assert(!committed.isError, "remote export commit should succeed", committed);
+    assert(committed.value.verified === true && committed.value.item?.id === "quarterly-report-pdf", "remote export must post-verify the uploaded destination", committed.value);
+    assert(committed.value.bytesUploaded === remoteExportPdfBuffer?.length && remoteExportPdfBuffer?.toString("utf8").startsWith("%PDF-1.7"), "remote export uploaded unexpected bytes", {
+      result: committed.value,
+      uploaded: remoteExportPdfBuffer?.toString("utf8")
+    });
+    assert((counters.get("remote-export-pdf-upload") || 0) === beforeUploads + 1, "remote export should upload exactly once", { beforeUploads, afterUploads: counters.get("remote-export-pdf-upload") || 0 });
+    return {
+      sourceId: committed.value.source.id,
+      destinationId: committed.value.item.id,
+      bytesUploaded: committed.value.bytesUploaded,
+      verified: committed.value.verified
+    };
+  });
+
+  await check("ChatGPT remote text export falls back to bounded Open XML extraction", async () => {
+    const remotePath = "Folder B/Quarterly Report.txt";
+    const beforeUploads = counters.get("remote-export-text-upload") || 0;
+    const preview = await tool("onedrive_export_file", {
+      itemId: "quarterly-report-text-fallback",
+      format: "text",
+      remotePath,
+      conflictBehavior: "fail",
+      dryRun: true
+    });
+    assert(!preview.isError && preview.value.previewToken, "remote text export preview should succeed", preview);
+    assert((counters.get("remote-export-text-upload") || 0) === beforeUploads, "remote text export preview must not upload", preview.value);
+
+    const committed = await tool("onedrive_export_file", {
+      itemId: "quarterly-report-text-fallback",
+      format: "text",
+      remotePath,
+      conflictBehavior: "fail",
+      dryRun: false,
+      confirmed: true,
+      expectedId: "quarterly-report-text-fallback",
+      expectedETag: preview.value.sourceRevisionGuard,
+      previewToken: preview.value.previewToken
+    });
+    assert(!committed.isError, "remote text export fallback should succeed", committed);
+    assert(committed.value.verified === true && committed.value.item?.id === "quarterly-report-text", "remote text export fallback must post-verify the uploaded destination", committed.value);
+    assert(committed.value.conversionSource === "office-openxml", "remote text export should report its Open XML fallback", committed.value);
+    assert(remoteExportTextBuffer?.toString("utf8").includes("Document: Quarterly Report Fallback.docx"), "remote text export fallback uploaded unexpected text", {
+      result: committed.value,
+      uploaded: remoteExportTextBuffer?.toString("utf8")
+    });
+    assert((counters.get("remote-export-text-upload") || 0) === beforeUploads + 1, "remote text export fallback should upload exactly once", {
+      beforeUploads,
+      afterUploads: counters.get("remote-export-text-upload") || 0
+    });
+    return {
+      sourceId: committed.value.source.id,
+      destinationId: committed.value.item.id,
+      conversionSource: committed.value.conversionSource,
+      bytesUploaded: committed.value.bytesUploaded,
+      verified: committed.value.verified
+    };
+  });
+
   await check("Office download helpers reuse resolved metadata", async () => {
     const localPath = mockDownloadWord;
     const before = requests.length;
@@ -5094,9 +5245,31 @@ process.exit(2);
     const before = requests.length;
     const searched = await tool("search", { query: "root note" });
     assert(!searched.isError && searched.value.results?.some((entry) => entry.id === "root-note"), "ChatGPT search should return the fresh cached item", searched);
+    const searchItem = searched.value.results.find((entry) => entry.id === "root-note");
+    assert(
+      searchItem?.name === "root-note.txt"
+        && searchItem.path === "root-note.txt"
+        && searchItem.parent?.id === ""
+        && searchItem.parent?.path === ""
+        && searchItem.type === "file"
+        && searchItem.webUrl === searchItem.url,
+      "ChatGPT search should expose stable item identity, location, type, and web URL fields.",
+      searchItem
+    );
     const fetched = await tool("fetch", { id: "root-note" });
     assert(!fetched.isError && fetched.value.text.includes("root note mock content"), "ChatGPT fetch should return indexed text", fetched);
     assert(fetched.value.metadata?.previewSource === "content-index", "ChatGPT fetch should report its local content-index source", fetched.value);
+    assert(
+      fetched.value.itemId === "root-note"
+        && fetched.value.name === "root-note.txt"
+        && fetched.value.path === "root-note.txt"
+        && fetched.value.parent?.id === ""
+        && fetched.value.parent?.path === ""
+        && fetched.value.type === "file"
+        && fetched.value.webUrl === fetched.value.url,
+      "ChatGPT fetch should preserve the source item identity and reusable location fields.",
+      fetched.value
+    );
     const added = requests.slice(before);
     assert(!added.some((request) => decodeURIComponent(request.url).includes("/search(q='")), "fresh ChatGPT search should not call Graph search", { added });
     assert(!added.some((request) => request.path.endsWith("/content")), "fresh ChatGPT fetch should not call Graph content", { added });
@@ -5193,6 +5366,14 @@ process.exit(2);
       assert(!searched.isError, "exact-filename ChatGPT search should succeed", searched);
       assert(searched.value.results?.[0]?.id === "chatgpt-exact-index-miss", "exact-filename fallback should return the live scanned item", searched);
       assert(searched.value.results?.[0]?.title === "invoice-3095.pdf", "exact-filename fallback should preserve the exact title", searched.value.results);
+      assert(
+        searched.value.results?.[0]?.path === "Folder A/invoice-3095.pdf"
+          && searched.value.results?.[0]?.parent?.id === "folder-a"
+          && searched.value.results?.[0]?.parent?.path === "Folder A"
+          && searched.value.results?.[0]?.type === "file",
+        "exact-filename fallback should preserve the live item's path, parent, and type.",
+        searched.value.results?.[0]
+      );
       assert(searched.value.results?.length === 1, "exact-filename search must not return unrelated semantic or cached neighbors", searched.value.results);
       const added = requests.slice(before);
       const searchRequests = added.filter((request) => decodeURIComponent(request.url).includes("/search(q='"));

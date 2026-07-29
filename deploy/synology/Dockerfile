@@ -22,17 +22,23 @@ RUN set -eu; \
 FROM node:20-bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates catdoc gosu poppler-utils python3 tesseract-ocr tini \
+    && apt-get install -y --no-install-recommends ca-certificates catdoc gosu poppler-utils python3 python3-venv tesseract-ocr tini \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=tunnel-client /usr/local/bin/tunnel-client /usr/local/bin/tunnel-client
+
+COPY scripts/requirements-office-test.txt /tmp/onedrive-office-requirements.txt
+RUN python3 -m venv /opt/onedrive-office \
+    && /opt/onedrive-office/bin/pip install --no-cache-dir --requirement /tmp/onedrive-office-requirements.txt \
+    && /opt/onedrive-office/bin/python3 -c "import docx, openpyxl, pptx, PIL" \
+    && rm -f /tmp/onedrive-office-requirements.txt
 
 WORKDIR /app
 COPY . /app
 RUN chmod 0755 /app/deploy/synology/entrypoint.sh /app/scripts/run-chatgpt-tunnel.mjs /app/scripts/run-chatgpt-oauth-tunnel.mjs /app/mcp/server.mjs /app/mcp/http-server.mjs /app/mcp/oauth-compat-server.mjs
 
 ENV HOME=/home/node \
-    ONEDRIVE_OFFICE_PYTHON=/usr/bin/python3 \
+    ONEDRIVE_OFFICE_PYTHON=/opt/onedrive-office/bin/python3 \
     ONEDRIVE_STORAGE_ROOT=/data \
     ONEDRIVE_CACHE_ROOT=/data/cache \
     ONEDRIVE_TUNNEL_CLIENT=/usr/local/bin/tunnel-client \
@@ -46,7 +52,7 @@ ENV HOME=/home/node \
     ONEDRIVE_OAUTH_COMPAT_CLIENT_SECRET_FILE=/run/onedrive-runtime/oauth-chatgpt-client.secret
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD ["node", "-e", "const u=['http://127.0.0.1:8765/readyz'];if(/^(1|true)$/i.test(process.env.ONEDRIVE_OAUTH_COMPAT_ENABLED||''))u.push(`http://127.0.0.1:${process.env.ONEDRIVE_OAUTH_COMPAT_PORT||3010}/healthz`);Promise.all(u.map(x=>fetch(x))).then(r=>{if(r.some(x=>!x.ok))process.exit(1)}).catch(()=>process.exit(1))"]
+  CMD ["node", "/app/scripts/container-healthcheck.mjs"]
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/deploy/synology/entrypoint.sh"]
 CMD ["node", "/app/scripts/run-chatgpt-oauth-tunnel.mjs"]

@@ -20,6 +20,11 @@ const CLIENT_ID = "3caa4df0-1aa6-4473-9b4a-ecdf8d73bddd";
 const CLIENT_SECRET = "oauth-compat-test-secret-value";
 const REDIRECT_URI = "https://chatgpt.com/connector/oauth/QTOb4VcHdCsW";
 const RESOURCE = "https://onedrive-tunnel.example.test/v1/mcp/tunnel_test";
+const OPENAI_TUNNEL_ID = "tunnel_0123456789abcdef0123456789abcdef";
+const OPENAI_TUNNEL_RESOURCE =
+  `https://api.openai.com/v1/mcp/${OPENAI_TUNNEL_ID}`;
+const CHATGPT_TUNNEL_RESOURCE_ALIAS =
+  `https://tunnel-service.gateway.unified-0.internal.api.openai.org/v1/mcp/${OPENAI_TUNNEL_ID}`;
 const ISSUER = "https://onedrive-oauth.example.test";
 const API_SCOPE = "api://6e97d01c-edf8-43fe-bf69-bb494ae22513/access_as_user";
 const SCOPES = [
@@ -419,6 +424,24 @@ const cimdServer = createOAuthCompatServer(cimdTestEnv, {
   diagnostics: () => {}
 });
 const cimdBase = await listen(cimdServer);
+const resourceAliasEnv = {
+  ...testEnv,
+  ONEDRIVE_OAUTH_COMPAT_PROTECTED_RESOURCE: OPENAI_TUNNEL_RESOURCE,
+  ONEDRIVE_OAUTH_COMPAT_PROTECTED_RESOURCE_ALIASES:
+    CHATGPT_TUNNEL_RESOURCE_ALIAS
+};
+const resourceAliasServer = createOAuthCompatServer(resourceAliasEnv, {
+  fetchImpl: mockFetch,
+  rateLimits: {
+    health: 500,
+    metadata: 500,
+    authorize: 500,
+    token: 500,
+    other: 500
+  },
+  diagnostics: () => {}
+});
+const resourceAliasBase = await listen(resourceAliasServer);
 
 try {
   await test("configuration accepts exact production-shaped allowlist", () => {
@@ -432,6 +455,15 @@ try {
     assert(settings.allowConfidentialNoPkce === true);
     assert(new Set(settings.scopes).size === SCOPES.length);
     assert(settings.upstreamScopes === settings.scopes);
+  });
+
+  await test("configuration accepts only the exact ChatGPT gateway alias for the same tunnel", () => {
+    const settings = validateOAuthCompatConfiguration(resourceAliasEnv);
+    assert(settings.protectedResource === OPENAI_TUNNEL_RESOURCE);
+    assert(
+      JSON.stringify(settings.protectedResourceAliases)
+        === JSON.stringify([CHATGPT_TUNNEL_RESOURCE_ALIAS])
+    );
   });
 
   await test("configuration accepts only the same API /.default combined-consent translation", () => {
@@ -504,6 +536,32 @@ try {
     ["rejects HTTP issuer", { ONEDRIVE_OAUTH_COMPAT_PUBLIC_ISSUER: "http://oauth.example.test" }, "must use HTTPS"],
     ["rejects issuer path", { ONEDRIVE_OAUTH_COMPAT_PUBLIC_ISSUER: `${ISSUER}/oauth` }, "origin root"],
     ["rejects placeholder resource", { ONEDRIVE_OAUTH_COMPAT_PROTECTED_RESOURCE: "https://REPLACE_WITH_TUNNEL.example" }, "placeholder"],
+    [
+      "rejects a gateway alias for a non-OpenAI canonical resource",
+      {
+        ONEDRIVE_OAUTH_COMPAT_PROTECTED_RESOURCE_ALIASES:
+          CHATGPT_TUNNEL_RESOURCE_ALIAS
+      },
+      "may be used only"
+    ],
+    [
+      "rejects an arbitrary protected-resource alias host",
+      {
+        ONEDRIVE_OAUTH_COMPAT_PROTECTED_RESOURCE: OPENAI_TUNNEL_RESOURCE,
+        ONEDRIVE_OAUTH_COMPAT_PROTECTED_RESOURCE_ALIASES:
+          `https://evil.example/v1/mcp/${OPENAI_TUNNEL_ID}`
+      },
+      "ChatGPT tunnel-gateway"
+    ],
+    [
+      "rejects a protected-resource alias for another tunnel",
+      {
+        ONEDRIVE_OAUTH_COMPAT_PROTECTED_RESOURCE: OPENAI_TUNNEL_RESOURCE,
+        ONEDRIVE_OAUTH_COMPAT_PROTECTED_RESOURCE_ALIASES:
+          "https://tunnel-service.gateway.unified-0.internal.api.openai.org/v1/mcp/tunnel_ffffffffffffffffffffffffffffffff"
+      },
+      "ChatGPT tunnel-gateway"
+    ],
     ["rejects bad client ID", { ONEDRIVE_OAUTH_COMPAT_CLIENT_ID: "not-a-guid" }, "UUID"],
     ["rejects non-ChatGPT callback", { ONEDRIVE_OAUTH_COMPAT_REDIRECT_URI: "https://evil.example/callback" }, "exact https://chatgpt.com"],
     ["rejects callback query", { ONEDRIVE_OAUTH_COMPAT_REDIRECT_URI: `${REDIRECT_URI}?x=1` }, "query"],
@@ -746,6 +804,39 @@ try {
     });
   }
 
+  for (const path of [
+    "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-protected-resource/mcp",
+    `/.well-known/oauth-protected-resource${new URL(RESOURCE).pathname}`
+  ]) {
+    await test(`protected-resource metadata ${path} binds the MCP resource to this issuer`, async () => {
+      const response = await fetch(`${base}${path}`, {
+        headers: { Origin: "https://chatgpt.com" }
+      });
+      const body = await response.json();
+      assert(response.status === 200, "Protected-resource metadata request failed.", response.status);
+      assert(body.resource === RESOURCE, "Protected-resource identity drifted.", body);
+      assert(
+        JSON.stringify(body.authorization_servers) === JSON.stringify([ISSUER]),
+        "Protected-resource authorization server drifted.",
+        body
+      );
+      assert(
+        JSON.stringify(body.scopes_supported) === JSON.stringify(
+          SCOPES.filter((scope) => scope !== "offline_access")
+        ),
+        "Protected-resource scopes included authorization-server-only scopes.",
+        body
+      );
+      assert(
+        JSON.stringify(body.bearer_methods_supported) === '["header"]',
+        "Protected-resource bearer method drifted.",
+        body
+      );
+      assert(response.headers.get("access-control-allow-origin") === "https://chatgpt.com");
+    });
+  }
+
   await test("JWKS publishes the facade ES256 verification key", async () => {
     const response = await fetch(`${base}/jwks.json`);
     const body = await response.json();
@@ -804,6 +895,49 @@ try {
       provider.searchParams.get("client_id") === CLIENT_ID,
       "CIMD client identity leaked into the private Microsoft client leg.",
       provider.toString()
+    );
+  });
+
+  await test("ChatGPT tunnel gateway resource aliases propagate to the token audience", async () => {
+    const authorization = await fetch(
+      authorizeUrl(resourceAliasBase, {
+        resource: CHATGPT_TUNNEL_RESOURCE_ALIAS
+      }),
+      { redirect: "manual" }
+    );
+    assert(
+      authorization.status === 302,
+      "ChatGPT tunnel gateway alias was rejected at authorization.",
+      await authorization.text()
+    );
+    const provider = new URL(authorization.headers.get("location"));
+    assert(
+      !provider.searchParams.has("resource"),
+      "Tunnel resource alias leaked to Microsoft.",
+      provider.toString()
+    );
+
+    const response = await requestToken(
+      resourceAliasBase,
+      codeToken({ resource: CHATGPT_TUNNEL_RESOURCE_ALIAS })
+    );
+    const body = await response.json();
+    assert(
+      response.status === 200,
+      "ChatGPT tunnel gateway alias was rejected at token exchange.",
+      body
+    );
+    const verified = verifyFacadeAccessToken(body.access_token, {
+      issuer: ISSUER,
+      audience: CHATGPT_TUNNEL_RESOURCE_ALIAS,
+      clientId: CLIENT_ID,
+      requiredScope: API_SCOPE,
+      keyFile: PUBLIC_REFRESH_STORE_KEY_FILE
+    });
+    assert(
+      verified.claims.aud === CHATGPT_TUNNEL_RESOURCE_ALIAS,
+      "Resource alias did not propagate to the facade-token audience.",
+      verified.claims
     );
   });
 
@@ -2670,7 +2804,8 @@ try {
     close(combinedConsentServer),
     close(publicServer),
     close(publicCompatServer),
-    close(cimdServer)
+    close(cimdServer),
+    close(resourceAliasServer)
   ]);
   rmSync(TEST_DIRECTORY, { recursive: true, force: true });
 }

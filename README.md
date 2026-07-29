@@ -2,7 +2,7 @@
 
 Local Codex plugin for OneDrive file operations through Microsoft Graph.
 
-Release `0.6.1+codex.20260726012710` hardens the ChatGPT Work OAuth facade with mandatory S256 PKCE, one-time mapped authorization codes, and encrypted rotating refresh handles while preserving MCP authorization challenges through Secure MCP Tunnel. It also keeps the public MCP resource, Entra API resource, advertised authorization server, and Microsoft token-validation authority explicitly separate. Exact filename searches use one indexed Graph query followed by a bounded, cache-validated live folder scan when OneDrive indexing misses the file.
+Release `0.6.4+codex.20260729033800` delivers the privately distributed ChatGPT Work OAuth connection for personal Microsoft accounts, preserves mandatory S256 PKCE and per-user credential isolation, and adds verified PDF/text export with a safe local Open XML fallback when Microsoft Graph does not support plain-text conversion. It keeps the public MCP resource, Entra API resource, advertised authorization server, and Microsoft token-validation authority explicitly separate. Exact filename searches use one indexed Graph query followed by a bounded, cache-validated live folder scan when OneDrive indexing misses the file.
 
 ChatGPT surface note (verified 2026-07-25): regular Chat passes the focused 21-action read/CRUD/sharing/permissions suite. Work requires the delegated OAuth deployment and public compatibility origin described below. Direct Entra v2 endpoints are not sufficient because ChatGPT correctly sends the MCP `resource` parameter and Entra v2 rejects that parameter.
 
@@ -81,9 +81,9 @@ Keep the resource, authorization, and validation identities separate:
 
 The MCP Streamable HTTP process stays on loopback behind Secure MCP Tunnel. The separate compatibility service is mapped to NAS loopback port `3010` and must be exposed through a trusted public HTTPS reverse proxy such as Tailscale Funnel. Its public surface is limited to OAuth metadata, `/authorize`, `/callback`, `/token`, and `/healthz`. Because Funnel uses a shared loopback peer, no limiter trusts the socket address or forwarded headers. In outer-public mode the facade requires S256, rate-binds the validated state/PKCE pair, applies route-wide count-and-byte admission budgets, forces the Entra callback to query mode, rejects callback POST bodies, and returns one-time mapped codes plus rotating refresh handles. Token POSTs are protected by bounded pre-parse concurrency, strict body/time limits, and a capped LRU keyed only by a domain-separated hash of the validated facade code or handle. Outer state is capped at 512 UTF-8 bytes and provider codes at 3 KiB. The mode-`0600` encrypted store reserves independent 320 KiB refresh and 640 KiB ephemeral partitions inside its 1 MiB total cap; plaintext codes, refresh tokens, client secrets, and request values are excluded from logs and metadata. Its encryption key is domain-derived from the stable owner-only auth-vault key, so routine OAuth client-secret rotation preserves active sessions; rotating the auth-vault key intentionally requires a clean reconnect. Before cutover, verify the public compatibility metadata and run `tunnel-client doctor --profile onedrive-chatgpt --explain`.
 
-The plugin's `.app.json` maps the Work package to the registered ChatGPT developer app by its `asdk_app_...` ID. Do not use the similarly named `plugin_asdk_app_...` installation ID. If ChatGPT requires a replacement developer app instead of allowing the existing app to be changed to OAuth, update `.app.json` to the replacement app's `asdk_app_...` ID and run `scripts/prepackage-check.mjs` before installation.
+The plugin's `.app.json` maps the package to the exact registered ChatGPT connection ID copied from its developer-mode URL. The ID must use the `plugin_asdk_app_...` form; it is not an Entra application ID and must not be replaced by a bare `asdk_app_...` value.
 
-For the user-defined public-client flow in ChatGPT Work developer settings, use `<ONEDRIVE_OAUTH_COMPAT_PUBLIC_ISSUER>/authorize` and `<ONEDRIVE_OAUTH_COMPAT_PUBLIC_ISSUER>/token` and select token authentication method `none`. Work currently omits an outer PKCE pair for this setup, so set `ONEDRIVE_OAUTH_COMPAT_ALLOW_PUBLIC_NO_PKCE=true` only for this verified client shape. The facade then generates and enforces an independent S256 pair for the Microsoft leg; clients that send S256 are still verified normally. Register the separate facade callback `<ONEDRIVE_OAUTH_COMPAT_PUBLIC_ISSUER>/callback` in Entra while keeping ChatGPT's fixed callback in `ONEDRIVE_OAUTH_COMPAT_REDIRECT_URI`. Request:
+For ChatGPT Work, advertise Client ID Metadata Document support and use the public-client authorization-code flow with token authentication method `none` and mandatory S256 PKCE. Set `ONEDRIVE_OAUTH_COMPAT_ENABLE_CIMD=true`, `ONEDRIVE_OAUTH_COMPAT_ENABLE_DCR=false`, and both no-PKCE compatibility switches to `false`. Register the separate facade callback `<ONEDRIVE_OAUTH_COMPAT_PUBLIC_ISSUER>/callback` in Entra while keeping ChatGPT's fixed callback in `ONEDRIVE_OAUTH_COMPAT_REDIRECT_URI`. Request:
 
 ```text
 api://<MCP_API_CLIENT_ID>/access_as_user offline_access
@@ -91,8 +91,24 @@ api://<MCP_API_CLIENT_ID>/access_as_user offline_access
 
 Do not add `openid` or `profile`: the compatibility tier is deliberately OAuth-only. It forwards Entra access tokens but never exposes Entra refresh tokens; refresh uses encrypted, rotating facade handles instead.
 
-If a different ChatGPT client cannot use the public facade, use the existing
-opt-in confidential compatibility lane instead:
+When ChatGPT Work rewrites a Secure MCP Tunnel resource to its internal
+tunnel-gateway identifier, put only that exact same-tunnel value in
+`ONEDRIVE_OAUTH_COMPAT_PROTECTED_RESOURCE_ALIASES`. The facade accepts aliases
+only from the bounded OpenAI gateway host pattern and only when the tunnel ID
+matches the canonical `https://api.openai.com/v1/mcp/tunnel_...` resource.
+Metadata stays canonical, while the exact validated resource from ChatGPT
+propagates to the access-token audience. Configure the same value in
+`ONEDRIVE_MCP_PROTECTED_RESOURCE_ALIASES` so the MCP accepts that equivalent,
+same-tunnel audience.
+
+The DCR implementation stays covered by compatibility tests but is not
+advertised by the production canary. If a host cannot complete CIMD + S256,
+treat that as a release blocker and capture the OAuth trace before considering
+a separately reviewed DCR deployment. Do not enable a no-PKCE exception to
+bypass connection setup.
+
+The existing confidential compatibility lane is retained for historical
+deployments only:
 
 - Set `ONEDRIVE_OAUTH_COMPAT_OUTER_TOKEN_AUTH_METHOD=client_secret_post`.
 - Set `ONEDRIVE_OAUTH_COMPAT_ALLOW_CONFIDENTIAL_NO_PKCE=true`.
@@ -104,8 +120,8 @@ This fallback is off by default. It preserves the exact client, callback,
 resource, scope, and state checks and requires the client secret on token
 requests. The public facade-code/refresh-handle store and facade provider
 callback are unused in this mode. Rotate the client secret if it may have been
-exposed, and prefer the public lane with generated provider PKCE for the
-verified Work request shape.
+exposed, and prefer the CIMD public lane with mandatory outer and provider S256
+PKCE.
 
 The server verifies RS256 signature, issuer, audience, expiry/not-before, and `access_as_user`; it then exchanges the assertion for `https://graph.microsoft.com/.default`. Missing or invalid auth returns both the MCP OAuth challenge metadata and the advertised per-tool `oauth2` scheme. Device-code start/poll/logout tools are disabled inside delegated OAuth requests so a Work user cannot mutate the NAS's legacy shared credential.
 
@@ -167,13 +183,17 @@ export ONEDRIVE_OAUTH_COMPAT_HOST="0.0.0.0"
 export ONEDRIVE_OAUTH_COMPAT_PORT="3010"
 export ONEDRIVE_OAUTH_COMPAT_PUBLIC_ISSUER="https://your-public-oauth-compat-origin.example"
 export ONEDRIVE_OAUTH_COMPAT_PROTECTED_RESOURCE="$ONEDRIVE_MCP_PROTECTED_RESOURCE"
+export ONEDRIVE_OAUTH_COMPAT_PROTECTED_RESOURCE_ALIASES="https://tunnel-service.gateway.unified-0.internal.api.openai.org/v1/mcp/tunnel_your-id"
+export ONEDRIVE_MCP_PROTECTED_RESOURCE_ALIASES="https://tunnel-service.gateway.unified-0.internal.api.openai.org/v1/mcp/tunnel_your-id"
 export ONEDRIVE_OAUTH_COMPAT_CLIENT_ID="your-chatgpt-entra-client-id"
 export ONEDRIVE_OAUTH_COMPAT_CLIENT_SECRET_FILE="/run/onedrive-runtime/oauth-chatgpt-client.secret"
 export ONEDRIVE_OAUTH_COMPAT_REDIRECT_URI="https://chatgpt.com/connector/oauth/your-callback-id"
 export ONEDRIVE_OAUTH_COMPAT_SCOPES="api://your-mcp-api-app-id/access_as_user offline_access"
 export ONEDRIVE_OAUTH_COMPAT_OUTER_TOKEN_AUTH_METHOD="none"
 export ONEDRIVE_OAUTH_COMPAT_ALLOW_CONFIDENTIAL_NO_PKCE="false"
-export ONEDRIVE_OAUTH_COMPAT_ALLOW_PUBLIC_NO_PKCE="true"
+export ONEDRIVE_OAUTH_COMPAT_ENABLE_CIMD="true"
+export ONEDRIVE_OAUTH_COMPAT_ENABLE_DCR="false"
+export ONEDRIVE_OAUTH_COMPAT_ALLOW_PUBLIC_NO_PKCE="false"
 export ONEDRIVE_OAUTH_COMPAT_REFRESH_STORE_FILE="/data/auth/oauth-compat-refresh-handles.json"
 export ONEDRIVE_OAUTH_COMPAT_REFRESH_STORE_KEY_FILE="/run/onedrive-runtime/auth-vault.key"
 export ONEDRIVE_OAUTH_COMPAT_PROVIDER_CALLBACK_URI="https://your-public-oauth-compat-origin.example/callback"
@@ -485,14 +505,14 @@ Preview the exact new versioned cache directory, then install only after reviewi
 
 ```bash
 node scripts/install-versioned-cache.mjs
-node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.1+codex.20260726012710"
+node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260729033800"
 ```
 
 After both live betas, regenerate the two QA reports, preview their exact sync into that new cache, then apply only those evidence files and re-run parity:
 
 ```bash
-node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.1+codex.20260726012710"
-node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.1+codex.20260726012710"
+node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260729033800"
+node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260729033800"
 ```
 
 Office compatibility checks are split by purpose:

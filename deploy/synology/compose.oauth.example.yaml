@@ -6,6 +6,11 @@ services:
         max-size: "10m"
         max-file: "3"
     environment:
+      # OAuth discovery uses tunnel-client's constrained Harpoon channel to
+      # fetch PRMD from the same-container MCP loopback listener. Allow HTTP
+      # only for that private hop; the issuer and every public URL stay HTTPS.
+      HARPOON_ALLOW_PLAINTEXT_HTTP: "true"
+
       # Entra API registration and token validation. The api:// identifier is
       # not the public MCP URL.
       ONEDRIVE_MCP_AUTH_MODE: "oauth"
@@ -28,6 +33,7 @@ services:
       # Secure MCP Tunnel rewrites same-tunnel discovery/challenge URLs to its
       # public service URLs. Verify the final values with tunnel doctor.
       ONEDRIVE_MCP_PROTECTED_RESOURCE: "https://REPLACE_WITH_EXACT_PUBLIC_TUNNEL_MCP_ENDPOINT"
+      ONEDRIVE_MCP_PROTECTED_RESOURCE_ALIASES: "https://tunnel-service.gateway.unified-0.internal.api.openai.org/v1/mcp/tunnel_REPLACE_WITH_OAUTH_TUNNEL_ID"
       ONEDRIVE_MCP_RESOURCE_METADATA_URL: "https://REPLACE_WITH_EXACT_PUBLIC_TUNNEL_PROTECTED_RESOURCE_METADATA_URL"
 
       # ChatGPT sends the RFC 8707 resource parameter, which Entra v2 does not
@@ -38,6 +44,10 @@ services:
       ONEDRIVE_OAUTH_COMPAT_PORT: "3010"
       ONEDRIVE_OAUTH_COMPAT_PUBLIC_ISSUER: "https://REPLACE_WITH_PUBLIC_OAUTH_COMPAT_HOST"
       ONEDRIVE_OAUTH_COMPAT_PROTECTED_RESOURCE: "https://REPLACE_WITH_EXACT_PUBLIC_TUNNEL_MCP_ENDPOINT"
+      # ChatGPT Work rewrites a tunnel resource to this product-internal
+      # identifier. The facade accepts only an exact same-tunnel gateway alias
+      # and continues to issue the canonical public resource as `aud`.
+      ONEDRIVE_OAUTH_COMPAT_PROTECTED_RESOURCE_ALIASES: "https://tunnel-service.gateway.unified-0.internal.api.openai.org/v1/mcp/tunnel_REPLACE_WITH_OAUTH_TUNNEL_ID"
       ONEDRIVE_OAUTH_COMPAT_CLIENT_ID: "REPLACE_WITH_CHATGPT_ENTRA_CLIENT_ID"
       ONEDRIVE_OAUTH_COMPAT_REDIRECT_URI: "https://chatgpt.com/connector/oauth/REPLACE_WITH_CALLBACK_ID"
       ONEDRIVE_OAUTH_COMPAT_SCOPES: "api://REPLACE_WITH_MCP_API_CLIENT_ID/access_as_user offline_access"
@@ -47,6 +57,11 @@ services:
       # ChatGPT is an outer public client with mandatory S256 PKCE. The Entra
       # client secret remains private and is injected only upstream.
       ONEDRIVE_OAUTH_COMPAT_OUTER_TOKEN_AUTH_METHOD: "none"
+      # Prefer ChatGPT's stable Client ID Metadata Document. DCR remains
+      # implemented and tested as a controlled fallback, but is not exposed by
+      # the production canary.
+      ONEDRIVE_OAUTH_COMPAT_ENABLE_CIMD: "true"
+      ONEDRIVE_OAUTH_COMPAT_ENABLE_DCR: "false"
       # Persist the encrypted one-time facade state under entrypoint-created,
       # node-owned /data/auth. Reuse the stable owner-only auth-vault key with
       # domain separation so rotating the OAuth client secret preserves sessions.
@@ -59,10 +74,8 @@ services:
       # the same secret in ChatGPT, and register the exact ChatGPT callback in
       # Entra. Partial or non-S256 PKCE is always rejected.
       ONEDRIVE_OAUTH_COMPAT_ALLOW_CONFIDENTIAL_NO_PKCE: "false"
-      # ChatGPT Work's user-defined public client currently omits an outer PKCE pair.
-      # This narrowly gated mode generates and enforces an independent S256 pair
-      # for the Microsoft provider leg while keeping facade codes one-time.
-      ONEDRIVE_OAUTH_COMPAT_ALLOW_PUBLIC_NO_PKCE: "true"
+      # Missing, partial, plain, or otherwise invalid outer PKCE is rejected.
+      ONEDRIVE_OAUTH_COMPAT_ALLOW_PUBLIC_NO_PKCE: "false"
 
     # Put the API registration's secret in runtime/oauth-api-client.secret and
     # the facade's separate private upstream Entra client secret in

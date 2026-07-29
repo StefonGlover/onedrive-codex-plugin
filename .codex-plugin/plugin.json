@@ -1,7 +1,7 @@
 {
   "name": "onedrive",
-  "version": "0.6.1+codex.20260726012710",
-  "description": "Manage OneDrive files and natively inspect or edit Word, Excel, and PowerPoint content from Codex.",
+  "version": "0.6.4+codex.20260729033800",
+  "description": "Search, create, edit, share, and recover personal OneDrive files with preview-and-confirm safeguards.",
   "author": {
     "name": "Stefon Glover"
   },
@@ -15,8 +15,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "OneDrive",
-    "shortDescription": "Search, manage, and natively edit OneDrive Office files.",
-    "longDescription": "Connect Codex to Microsoft OneDrive through Microsoft Graph without relying on the laptop's local sync folder. Safely search, patch, version, watch, share, and manage files; use owner-only editing workspaces; and structurally inspect and preview-first edit Word, Excel, and PowerPoint with durable semantic anchors. Personal OneDrive remains fully supported, while supported business Excel writes use scoped Graph workbook sessions.",
+    "shortDescription": "Search, edit, share, and recover personal OneDrive files safely.",
+    "longDescription": "Use personal Microsoft OneDrive in ChatGPT Work to search and open files; create folders; upload, update, rename, copy, and move content; inspect and edit Word, Excel, and PowerPoint files; export PDF or text; manage links and permissions; and recover recycle-bin deletions. Consequential writes and sharing actions use preview-and-confirm safeguards plus post-action verification. Every user signs in with OAuth, and credentials and caches stay isolated by account.",
     "developerName": "Stefon Glover",
     "category": "Productivity",
     "capabilities": [

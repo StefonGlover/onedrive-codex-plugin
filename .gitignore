@@ -30,3 +30,6 @@ coverage/
 *.pfx
 *token*
 *secret*
+
+# NAS-specific rollback snapshots can contain live tunnel credentials
+deploy/synology/compose.*nas*.yaml
