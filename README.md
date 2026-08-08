@@ -2,7 +2,7 @@
 
 Local Codex plugin for OneDrive file operations through Microsoft Graph.
 
-Release `0.6.4+codex.20260808010958` delivers the privately distributed ChatGPT Work OAuth connection for personal Microsoft accounts, preserves mandatory S256 PKCE and per-user credential isolation, and adds verified PDF/text export with a safe local Open XML fallback when Microsoft Graph does not support plain-text conversion. It keeps the public MCP resource, Entra API resource, advertised authorization server, and Microsoft token-validation authority explicitly separate. Exact filename searches use one indexed Graph query followed by a bounded, cache-validated live folder scan when OneDrive indexing misses the file.
+Release `0.6.4+codex.20260808225332` delivers the privately distributed ChatGPT Work OAuth connection for personal Microsoft accounts, preserves mandatory S256 PKCE and per-user credential isolation, and adds verified PDF/text export with a safe local Open XML fallback when Microsoft Graph does not support plain-text conversion. It keeps the public MCP resource, Entra API resource, advertised authorization server, and Microsoft token-validation authority explicitly separate. Exact filename searches use one indexed Graph query followed by a bounded, cache-validated live folder scan when OneDrive indexing misses the file.
 
 ChatGPT surface note (updated 2026-07-29): the focused 15-tool surface covers read/CRUD/sharing/permissions, including parallel reads and guarded single-or-batch commits. Redundant standalone list/search/permission tools are hidden from Work so its runtime selector consistently chooses the combined read path. Work requires the delegated OAuth deployment and public compatibility origin described below. Direct Entra v2 endpoints are not sufficient because ChatGPT correctly sends the MCP `resource` parameter and Entra v2 rejects that parameter.
 
@@ -514,14 +514,14 @@ Preview the exact new versioned cache directory, then install only after reviewi
 
 ```bash
 node scripts/install-versioned-cache.mjs
-node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260808010958"
+node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260808225332"
 ```
 
 After both live betas, regenerate the two QA reports, preview their exact sync into that new cache, then apply only those evidence files and re-run parity:
 
 ```bash
-node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260808010958"
-node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260808010958"
+node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260808225332"
+node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260808225332"
 ```
 
 Office compatibility checks are split by purpose:

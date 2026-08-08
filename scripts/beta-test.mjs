@@ -1578,24 +1578,24 @@ try {
     classification: exportText.isError ? exportFailureStatus(exportText.value) : "success"
   });
 
-  const renamed = assertOk("onedrive_rename", await tool("onedrive_rename", {
+  const renamed = assertCommitted("onedrive_rename", await toolWithPreview("onedrive_rename", {
     path: `${folderName}/note.txt`,
     newName: renamedTextFile,
     expectedName: "note.txt",
     dryRun: false,
     confirmed: true
-  }));
+  }), (value) => value.verified === true && value.renamed?.name === renamedTextFile);
   const renamedItem = renamed.renamed || renamed;
   record("rename file", renamedItem.name === renamedTextFile && renamed.confirmed === true ? "pass" : "fail", { name: renamedItem.name });
 
-  const moved = assertOk("onedrive_move", await tool("onedrive_move", {
+  const moved = assertCommitted("onedrive_move", await toolWithPreview("onedrive_move", {
     path: `${folderName}/${renamedTextFile}`,
     destinationParentPath: `${folderName}/${movedFolderName}`,
     newName: movedTextFile,
     expectedName: renamedTextFile,
     dryRun: false,
     confirmed: true
-  }));
+  }), (value) => value.verified === true && value.moved?.name === movedTextFile);
   const movedItem = moved.moved || moved;
   const movedInfo = assertOk("moved file info", await tool("onedrive_get_info", {
     path: `${folderName}/${movedFolderName}/${movedTextFile}`
@@ -1605,7 +1605,7 @@ try {
     id: movedItem.id
   });
 
-  const copied = assertOk("onedrive_copy", await tool("onedrive_copy", {
+  const copied = assertCommitted("onedrive_copy", await toolWithPreview("onedrive_copy", {
     path: `${folderName}/${movedFolderName}/${movedTextFile}`,
     destinationParentPath: folderName,
     newName: copyFileName,
@@ -1614,7 +1614,7 @@ try {
     confirmed: true,
     waitForCompletion: true,
     timeoutSeconds: 90
-  }));
+  }), (value) => value.accepted === true && value.monitor?.terminal === true && value.monitor?.succeeded === true);
   record("copy monitor reaches an explicit successful terminal state", copied.accepted
     && copied.monitorUrl
     && copied.monitor?.terminal === true
