@@ -215,10 +215,11 @@ const excelSessionPool = new Map();
 const chatgptFetchSnapshots = new Map();
 const chatgptRevalidations = new Map();
 const chatgptRevalidationLastStartedAt = new Map();
+const chatgptCacheWarmStates = new Map();
 let watchesLoaded = false;
 const previewTokenTtlMs = 15 * 60 * 1000;
 const previewScopedTools = new Set([
-  "onedrive_preview_actions", "onedrive_export_file",
+  "onedrive_preview_actions", "onedrive_commit_actions", "onedrive_export_file",
   "onedrive_upload", "onedrive_upload_file", "onedrive_write_text", "onedrive_batch_delete", "onedrive_delete", "onedrive_permanent_delete",
   "onedrive_rename", "onedrive_move", "onedrive_copy",
   "onedrive_create_sharing_link", "onedrive_invite_permission", "onedrive_revoke_permission",
@@ -229,6 +230,36 @@ const previewScopedTools = new Set([
 ]);
 const partialBatchMutationWarning = "Batch live mutations are preflighted but not atomic; if a later item fails, earlier remote changes may already have taken effect.";
 const toolCallContext = new AsyncLocalStorage();
+
+function recordToolTiming(field, durationMs, countField = null) {
+  const store = toolCallContext.getStore();
+  if (!store) return;
+  store.timings ||= {};
+  store.timings[field] = (store.timings[field] || 0) + Math.max(0, Number(durationMs) || 0);
+  if (countField) store.timings[countField] = (store.timings[countField] || 0) + 1;
+}
+
+async function withToolTiming(field, fn, countField = null) {
+  const startedAt = performance.now();
+  try {
+    return await fn();
+  } finally {
+    recordToolTiming(field, performance.now() - startedAt, countField);
+  }
+}
+
+function roundedToolTimings(store, totalMs) {
+  const timings = store?.timings || {};
+  return {
+    serverMs: Number(totalMs.toFixed(1)),
+    authMs: Number((timings.authMs || 0).toFixed(1)),
+    graphMs: Number((timings.graphMs || 0).toFixed(1)),
+    graphCalls: timings.graphCalls || 0,
+    verificationMs: Number((timings.verificationMs || 0).toFixed(1)),
+    cacheMs: Number((timings.cacheMs || 0).toFixed(1)),
+    cacheWrites: store?.metadataCacheWrites || 0
+  };
+}
 
 const outputFormatSchema = {
   type: "string",
@@ -1355,6 +1386,7 @@ const tools = [
         confirmed: { type: "boolean", default: false },
         expectedName: { type: "string", description: "Required identity check when replacing an existing file." },
         expectedId: { type: "string", description: "Required identity check when replacing an existing file." },
+        expectedETag: { type: "string", description: "Optional revision guard from the matching replacement preview." },
         previewToken: previewTokenSchema
       },
       additionalProperties: false
@@ -2243,6 +2275,102 @@ const chatgptCompatibilityTools = [
     }
   },
   {
+    name: "onedrive_read_actions",
+    title: "Read OneDrive in parallel",
+    description: "Run up to ten independent OneDrive list, search, item-info, or permission reads concurrently in one bounded call.",
+    inputSchema: {
+      type: "object",
+      required: ["actions"],
+      properties: {
+        actions: {
+          type: "array",
+          minItems: 1,
+          maxItems: 10,
+          items: {
+            type: "object",
+            required: ["operation"],
+            properties: {
+              operation: { type: "string", enum: ["list", "search", "getInfo", "permissions"] },
+              query: { type: "string", minLength: 1 },
+              path: { type: "string" },
+              itemId: { type: "string", minLength: 1 },
+              limit: { type: "integer", minimum: 1, maximum: 200, default: 25 },
+              format: { type: "string", enum: ["compact", "full"], default: "compact" }
+            },
+            additionalProperties: false
+          }
+        }
+      },
+      additionalProperties: false
+    },
+    outputSchema: {
+      type: "object",
+      required: ["results", "durationMs"],
+      properties: {
+        results: {
+          type: "array",
+          maxItems: 10,
+          items: { type: "object", additionalProperties: true }
+        },
+        durationMs: { type: "integer", minimum: 0 }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_commit_actions",
+    title: "Commit approved OneDrive actions",
+    description: "Execute up to ten previously previewed OneDrive rename, move, copy, sharing-link, or permission-revocation actions. Every action needs its matching same-server preview proof.",
+    inputSchema: {
+      type: "object",
+      required: ["confirmed", "actions"],
+      properties: {
+        confirmed: { type: "boolean", const: true },
+        stopOnError: { type: "boolean", default: true },
+        copyTimeoutSeconds: { type: "integer", minimum: 1, maximum: 60, default: 20 },
+        actions: {
+          type: "array",
+          minItems: 1,
+          maxItems: 10,
+          items: {
+            type: "object",
+            required: ["operation", "itemId", "previewToken"],
+            properties: {
+              operation: { type: "string", enum: ["rename", "move", "copy", "createSharingLink", "revokePermission"] },
+              itemId: { type: "string", minLength: 1 },
+              expectedName: { type: "string", minLength: 1 },
+              newName: { type: "string", minLength: 1 },
+              destinationParentPath: { type: "string" },
+              destinationParentItemId: { type: "string", minLength: 1 },
+              linkType: { type: "string", enum: ["view", "edit", "embed"], default: "view" },
+              scope: { type: "string", enum: ["anonymous", "organization", "users"], default: "anonymous" },
+              permissionId: { type: "string", minLength: 1 },
+              previewToken: { type: "string", minLength: 1 }
+            },
+            additionalProperties: false
+          }
+        }
+      },
+      additionalProperties: false
+    },
+    outputSchema: {
+      type: "object",
+      required: ["confirmed", "partialMutationPossible", "results", "durationMs"],
+      properties: {
+        confirmed: { type: "boolean" },
+        partialMutationPossible: { type: "boolean" },
+        stoppedEarly: { type: "boolean" },
+        results: {
+          type: "array",
+          maxItems: 10,
+          items: { type: "object", additionalProperties: true }
+        },
+        durationMs: { type: "integer", minimum: 0 }
+      },
+      additionalProperties: false
+    }
+  },
+  {
     name: "onedrive_upload_file",
     title: "Upload File to OneDrive",
     description: "Preview, then upload a ChatGPT-provided file to OneDrive. Every upload requires confirmation and a scoped preview token; replacement also requires the existing item's expected identity.",
@@ -2335,6 +2463,7 @@ const readOnlyToolNames = new Set([
   "fetch",
   "onedrive_open_files",
   "onedrive_preview_actions",
+  "onedrive_read_actions",
   "onedrive_config",
   "onedrive_me",
   "onedrive_drive",
@@ -2407,7 +2536,8 @@ const destructiveToolNames = new Set([
   "onedrive_audit_clear",
   "onedrive_delete",
   "onedrive_permanent_delete",
-  "onedrive_upload_file"
+  "onedrive_upload_file",
+  "onedrive_commit_actions"
 ]);
 
 const openWorldToolNames = new Set([
@@ -2423,7 +2553,8 @@ const openWorldToolNames = new Set([
   "onedrive_batch_download",
   "onedrive_update_file",
   "onedrive_audit_export",
-  "onedrive_upload_file"
+  "onedrive_upload_file",
+  "onedrive_commit_actions"
 ]);
 
 function toolTitle(name) {
@@ -2457,11 +2588,11 @@ for (const tool of executableTools) {
 // contract for Codex and local automation while offering a focused ChatGPT
 // profile for tunnel deployments.
 const chatgptToolNames = new Set([
-  "search",
   "fetch",
   "onedrive_open_files",
   "onedrive_preview_actions",
-  "onedrive_list",
+  "onedrive_read_actions",
+  "onedrive_commit_actions",
   "onedrive_office_capabilities",
   "onedrive_office_batch_transform",
   "onedrive_upload_file",
@@ -2469,13 +2600,7 @@ const chatgptToolNames = new Set([
   "onedrive_write_text",
   "onedrive_patch_text",
   "onedrive_create_folder",
-  "onedrive_rename",
-  "onedrive_move",
-  "onedrive_copy",
-  "onedrive_create_sharing_link",
   "onedrive_invite_permission",
-  "onedrive_revoke_permission",
-  "onedrive_permissions",
   "onedrive_delete",
   "onedrive_restore_deleted"
 ]);
@@ -2502,7 +2627,7 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "OneDrive results ready"
   },
   fetch: {
-    description: "Use this when the user wants to read an item returned by search. Pass the returned id unchanged; it extracts bounded content and returns a continuation ID only when more detail is needed.",
+    description: "Use this when the user wants to read an item returned by onedrive_read_actions. Pass the returned id unchanged; it extracts bounded content and returns a continuation ID only when more detail is needed.",
     invoking: "Reading OneDrive item…",
     invoked: "OneDrive item ready"
   },
@@ -2512,9 +2637,19 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "OneDrive files ready"
   },
   onedrive_preview_actions: {
-    description: "Use this when the user wants to preview rename, move, copy, sharing-link, or permission-revocation actions. This read-only batch makes no changes, returns same-server action proofs, and returns sharing counts without identities; its IDs are not auth credentials.",
+    description: "Use this when the user wants to preview one or more independent rename, move, copy, sharing-link, or permission-revocation actions. Preview all actions once; this read-only batch returns same-server proofs for onedrive_commit_actions.",
     invoking: "Previewing OneDrive actions…",
     invoked: "OneDrive previews ready"
+  },
+  onedrive_read_actions: {
+    description: "Use this when a request needs one or more folder listings, descriptive searches, item-info reads, or permission inspections. Send all independent operations once so OneDrive can run them concurrently; use fetch only for selected readable content.",
+    invoking: "Reading OneDrive in parallel…",
+    invoked: "OneDrive reads ready"
+  },
+  onedrive_commit_actions: {
+    description: "Use this when the user approves one or more actions returned by onedrive_preview_actions. Pass every action and previewToken unchanged with confirmed true. Execution is ordered, stops on the first error by default, verifies stable results, and reports partial completion.",
+    invoking: "Applying approved OneDrive actions…",
+    invoked: "OneDrive actions complete"
   },
   onedrive_list: {
     description: "Use this when the user wants the direct children of a known OneDrive folder or path. Use search instead when the folder location is not already known.",
@@ -2557,17 +2692,17 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "Folder creation result ready"
   },
   onedrive_rename: {
-    description: "Use this when the user has approved a live rename already previewed by onedrive_preview_actions. Inputs: itemId or path, newName, dryRun false, confirmed true, expectedId or expectedName, and the returned previewToken.",
+    description: "Use this when applying one approved rename previewed by onedrive_preview_actions; use onedrive_commit_actions when multiple actions were approved. Send itemId or path, newName, dryRun false, confirmed true, expected identity, and previewToken.",
     invoking: "Preparing OneDrive rename…",
     invoked: "Rename result ready"
   },
   onedrive_move: {
-    description: "Use this when the user has approved a live move already previewed by onedrive_preview_actions. Inputs: source itemId or path, destination parent, dryRun false, confirmed true, expectedId or expectedName, and the returned previewToken.",
+    description: "Use this when applying one approved move previewed by onedrive_preview_actions; use onedrive_commit_actions when multiple actions were approved. Send source, destination parent, dryRun false, confirmed true, expected identity, and previewToken.",
     invoking: "Preparing OneDrive move…",
     invoked: "Move result ready"
   },
   onedrive_copy: {
-    description: "Use this when the user has approved a live copy already previewed by onedrive_preview_actions. Inputs: prefer source path and destinationParentPath when known; send dryRun false, confirmed true, expectedId or expectedName, previewToken, and optional newName. ChatGPT receives asynchronous acceptance immediately and should verify the destination separately instead of blocking on inline polling.",
+    description: "Use this when applying one approved copy previewed by onedrive_preview_actions; use onedrive_commit_actions for multiple approved actions and bounded verification. Send source, destination, dryRun false, confirmed true, expected identity, previewToken, and optional newName.",
     invoking: "Preparing OneDrive copy…",
     invoked: "Copy result ready"
   },
@@ -2629,6 +2764,9 @@ function compactChatgptToolDescriptor(tool) {
       "openai/toolInvocation/invoked": metadata.invoked
     };
   }
+  if (["onedrive_read_actions", "onedrive_commit_actions"].includes(compact.name)) {
+    delete compact.outputSchema;
+  }
   if (compact.name === "onedrive_office_batch_transform") {
     const item = compact.inputSchema?.properties?.items?.items;
     if (item?.properties) item.properties.operations = JSON.parse(JSON.stringify(compactOfficeOperationSchema));
@@ -2662,6 +2800,24 @@ function compactChatgptToolDescriptor(tool) {
     };
     return compact;
   }
+  if (compact.name === "onedrive_write_text") {
+    compact.inputSchema = {
+      type: "object",
+      required: ["remotePath", "content"],
+      properties: {
+        remotePath: { type: "string", minLength: 1 },
+        content: { type: "string" },
+        conflictBehavior: { type: "string", enum: ["fail", "replace", "rename"], default: "fail" },
+        dryRun: { type: "boolean", default: true },
+        confirmed: { type: "boolean", default: false },
+        expectedName: { type: "string" },
+        expectedId: { type: "string" },
+        expectedETag: { type: "string" },
+        previewToken: { type: "string" }
+      },
+      additionalProperties: false
+    };
+  }
   const properties = compact.inputSchema?.properties;
   if (properties) {
     if (properties.path) {
@@ -2689,13 +2845,12 @@ function compactChatgptToolDescriptor(tool) {
   }
   if (compact.name === "onedrive_write_text" && properties) {
     properties.remotePath.description = "Destination path relative to OneDrive root, including filename.";
-    properties.remotePreset.description = "Configured OneDrive path preset.";
-    properties.remoteRelativePath.description = "Path below remotePreset, including filename.";
     properties.content.description = "Full UTF-8 file body.";
     properties.dryRun.description = "True always previews without writing; false requests the live write.";
     properties.confirmed.description = "True only after explicit user confirmation for a previewed write.";
     properties.expectedName.description = "For replacement, current item name; provide this or expectedId.";
     properties.expectedId.description = "For replacement, current item ID; provide this or expectedName.";
+    properties.expectedETag.description = "For replacement, current item eTag from the matching preview; when provided it must still match.";
     properties.previewToken.description = "Matching same-server write preview proof, not an auth credential.";
   }
   if (compact.name === "onedrive_patch_text" && properties) {
@@ -2757,7 +2912,7 @@ const advertisedServerVersion = toolProfile === "chatgpt"
   ? `${manifestServerVersion}${manifestServerVersion.includes("+") ? "." : "+"}chatgpt.${advertisedContractHash}`
   : manifestServerVersion;
 const serverInstructions = toolProfile === "chatgpt"
-  ? "Use onedrive_open_files once for exact filenames/content. For descriptions, topics, aliases, unknown titles, or multiple related documents, pass the whole natural-language request once to search, inspect ranked results, then fetch selected ids unchanged. Returned opaque item/permission ids and preview proofs are same-server identifiers, not authentication credentials. For mutations, prefer user-visible paths plus expectedName; use opaque item ids only without a path. Create folders directly with conflictBehavior fail; that tool has no dryRun, confirmed, or previewToken fields. Use onedrive_preview_actions for read-only rename/move/copy/sharing/revoke previews with identity-free access counts. Guarded live mutations require approval, a matching preview proof, and expected identity. In dependent write sequences, execute and verify one mutation at a time, then re-fetch the item and obtain a fresh preview because names, paths, eTags, and earlier proofs may be stale. Copy returns asynchronous acceptance immediately in ChatGPT; continue independent work, then verify the destination separately. For live revoke, prefer the fetched path plus expectedName and pass permissionId and previewToken unchanged. Use onedrive_list only for known folders. For Office edits, fetch, check capabilities, then transform; use onedrive_export_file for a converted PDF or text copy saved in OneDrive."
+  ? "Use onedrive_read_actions once for folder listings, descriptive search, item info, permission inspection, or any combination of independent reads; pass the whole read intent as one bounded operations array, then fetch selected ids unchanged when readable content is needed. For rename/move/copy/sharing/revoke requests, use onedrive_preview_actions once for all independent actions; after user approval, pass those exact actions and proofs once to onedrive_commit_actions. Commit handles one or many actions, is ordered, guarded, non-atomic, stops on the first error by default, and returns verified stable results. Use onedrive_open_files once for exact filenames/content. Opaque item/permission ids and preview proofs are same-server identifiers, not credentials. Prefer user-visible paths plus expectedName; use opaque ids only without a path. Create folders directly with conflictBehavior fail. Dependent actions whose target changes must still be previewed and committed in dependency order because later proofs can become stale. For Office edits, fetch, check capabilities, then transform; use onedrive_export_file for a converted PDF or text copy saved in OneDrive."
   : "Use onedrive_find for normal OneDrive lookup and the matching structured read tool before an Office edit. Use onedrive_list only for direct folder listings. Keep results bounded. Locate an item before changing it. Mutations default to preview and require confirmation.";
 
 const toolByName = new Map(executableTools.map((tool) => [tool.name, tool]));
@@ -3562,6 +3717,7 @@ async function loadMetadataCache() {
 }
 
 async function saveMetadataCache(cache, existingGuard = null) {
+  const cacheStartedAt = performance.now();
   const guard = existingGuard || await captureStorageScopeGuard("metadata cache write");
   assertStorageScopeGuard(guard, "metadata cache write");
   if (cache.scope && !storageScopesEqual(cache.scope, guard.scope)) {
@@ -3583,6 +3739,7 @@ async function saveMetadataCache(cache, existingGuard = null) {
   assertStorageScopeGuard(guard, "metadata cache return");
   const store = toolCallContext.getStore();
   if (store) store.metadataCacheWrites = (store.metadataCacheWrites || 0) + 1;
+  recordToolTiming("cacheMs", performance.now() - cacheStartedAt);
   return cache;
 }
 
@@ -5159,7 +5316,9 @@ async function graph(path, options = {}) {
   const method = String(fetchOptions.method || "GET").toUpperCase();
   const mutationRequest = isMutation ?? !["GET", "HEAD", "OPTIONS"].includes(method);
   const accountContext = captureGraphAccountContext("Microsoft Graph request");
-  const accessToken = skipAuth ? null : await getAccessToken();
+  const accessToken = skipAuth
+    ? null
+    : await withToolTiming("authMs", async () => await getAccessToken());
   if (!skipAuth && !accountContext.authContextId) accountContext.authContextId = currentAuthContextId();
   assertGraphAccountContext(accountContext, "Microsoft Graph request");
   const url = graphUrl(path, { skipAuth });
@@ -5168,36 +5327,41 @@ async function graph(path, options = {}) {
     ...(shouldDefaultJsonContentType(fetchOptions.body) ? { "Content-Type": "application/json" } : {}),
     ...(fetchOptions.headers || {})
   };
-  const retriedResponse = await fetchWithRetry(url, {
-    ...fetchOptions,
-    headers
-  }, { maxRetries: retryCountForRequest(fetchOptions, maxRetries) });
-  const body = await parseResponseBody(retriedResponse);
-  assertGraphAccountContext(accountContext, "Microsoft Graph response");
-  const requestId = graphRequestId(retriedResponse.headers, body);
-  rememberGraphRequestId(requestId, { mutation: mutationRequest });
-  if (returnResponse) {
-    return { body, headers: retriedResponse.headers, status: retriedResponse.status, ok: retriedResponse.ok, graphRequestId: requestId };
+  const graphStartedAt = performance.now();
+  try {
+    const retriedResponse = await fetchWithRetry(url, {
+      ...fetchOptions,
+      headers
+    }, { maxRetries: retryCountForRequest(fetchOptions, maxRetries) });
+    const body = await parseResponseBody(retriedResponse);
+    assertGraphAccountContext(accountContext, "Microsoft Graph response");
+    const requestId = graphRequestId(retriedResponse.headers, body);
+    rememberGraphRequestId(requestId, { mutation: mutationRequest });
+    if (returnResponse) {
+      return { body, headers: retriedResponse.headers, status: retriedResponse.status, ok: retriedResponse.ok, graphRequestId: requestId };
+    }
+    if (!retriedResponse.ok) {
+      throw microsoftGraphError(body, retriedResponse);
+    }
+    return body;
+  } finally {
+    recordToolTiming("graphMs", performance.now() - graphStartedAt, "graphCalls");
   }
-  if (!retriedResponse.ok) {
-    throw microsoftGraphError(body, retriedResponse);
-  }
-  return body;
 }
 
 async function graphDownloadToFile(path, target, options = {}) {
   const accountContext = captureGraphAccountContext("Microsoft Graph download");
-  const accessToken = await getAccessToken();
+  const accessToken = await withToolTiming("authMs", async () => await getAccessToken());
   if (!accountContext.authContextId) accountContext.authContextId = currentAuthContextId();
   assertGraphAccountContext(accountContext, "Microsoft Graph download");
   const url = graphUrl(path);
-  const response = await fetchWithRetry(url, {
+  const response = await withToolTiming("graphMs", async () => await fetchWithRetry(url, {
     method: "GET",
     headers: {
       Authorization: `Bearer ${accessToken}`,
       ...(options.headers || {})
     }
-  }, { maxRetries: 3 });
+  }, { maxRetries: 3 }), "graphCalls");
   assertGraphAccountContext(accountContext, "Microsoft Graph download response");
   if (!response.ok) {
     const body = await parseResponseBody(response);
@@ -5237,18 +5401,18 @@ async function graphDownloadToFile(path, target, options = {}) {
 
 async function graphLimitedBuffer(path, maxBytes, options = {}) {
   const accountContext = captureGraphAccountContext("Microsoft Graph bounded content read");
-  const accessToken = await getAccessToken();
+  const accessToken = await withToolTiming("authMs", async () => await getAccessToken());
   if (!accountContext.authContextId) accountContext.authContextId = currentAuthContextId();
   assertGraphAccountContext(accountContext, "Microsoft Graph bounded content read");
   const url = graphUrl(path);
   const limit = Math.max(1, maxBytes);
-  const response = await fetchWithRetry(url, {
+  const response = await withToolTiming("graphMs", async () => await fetchWithRetry(url, {
     method: "GET",
     headers: {
       Authorization: `Bearer ${accessToken}`,
       Range: `bytes=0-${limit}`
     }
-  }, { maxRetries: 3 });
+  }, { maxRetries: 3 }), "graphCalls");
   assertGraphAccountContext(accountContext, "Microsoft Graph bounded content response");
   if (!response.ok && response.status !== 206) {
     const body = await parseResponseBody(response);
@@ -5747,11 +5911,15 @@ function recordLocalWarning(operation, error) {
 }
 
 async function bestEffortLocalWrite(operation, fn) {
+  const startedAt = performance.now();
   try {
     return await fn();
   } catch (error) {
     recordLocalWarning(operation, error);
     return null;
+  } finally {
+    if (/verification/i.test(operation)) recordToolTiming("verificationMs", performance.now() - startedAt);
+    else if (/cache/i.test(operation)) recordToolTiming("cacheMs", performance.now() - startedAt);
   }
 }
 
@@ -8233,9 +8401,12 @@ function simplifyPermission(permission, format = "compact") {
 }
 
 async function permissions(args = {}) {
-  const result = await graph(`${itemBase(args)}/permissions`);
+  const [result, item] = await Promise.all([
+    graph(`${itemBase(args)}/permissions`),
+    getInfo({ ...args, format: args.format || "compact" }).catch(() => null)
+  ]);
   return {
-    item: await getInfo({ ...args, format: args.format || "compact" }).catch(() => null),
+    item,
     permissions: (result.value || []).map((permission) => simplifyPermission(permission, args.format)),
     count: (result.value || []).length
   };
@@ -8345,7 +8516,12 @@ async function resolveDestinationParent(args = {}) {
   if (explicitParentId) {
     const raw = await getRawInfo({ itemId: explicitParentId });
     if (!raw.folder && !raw.root) throw new Error(`Destination parent is not a folder: ${raw.name}`);
-    return { id: raw.id, path: raw.parentReference?.path, name: raw.name };
+    return {
+      id: raw.id,
+      path: raw.parentReference?.path,
+      name: raw.name,
+      remotePath: raw.root ? "" : simplifyItem(raw).remotePath
+    };
   }
   let parentPath = "";
   if (args.destinationParentPreset) {
@@ -8365,7 +8541,7 @@ async function resolveDestinationParent(args = {}) {
   }
   const raw = cleanPath(parentPath) === "" ? await graph("/me/drive/root") : await getRawInfo({ path: parentPath });
   if (!raw.folder && !raw.root) throw new Error(`Destination parent is not a folder: ${raw.name}`);
-  return { id: raw.id, path: raw.parentReference?.path, name: raw.name };
+  return { id: raw.id, path: raw.parentReference?.path, name: raw.name, remotePath: cleanPath(parentPath) };
 }
 
 async function readText(args = {}) {
@@ -10912,8 +11088,7 @@ async function chatgptOpenFiles(args = {}) {
     const requestedName = String(name || "").trim();
     try {
       const searched = await chatgptSearch({ query: requestedName });
-      let exact = (searched.results || []).filter((candidate) => exactFilenameKey(candidate.title) === exactFilenameKey(requestedName));
-      if (exact.length === 0) exact = await chatgptExactFilenameFallback(requestedName);
+      const exact = (searched.results || []).filter((candidate) => exactFilenameKey(candidate.title) === exactFilenameKey(requestedName));
       if (exact.length === 0) {
         return {
           name: requestedName,
@@ -11060,6 +11235,12 @@ async function chatgptPreviewAction(action, index) {
         dryRun: true,
         confirmed: false
       });
+      if (preview?.wouldRevoke?.revocable !== true) {
+        throw new Error(
+          preview?.warnings?.[0]
+          || `Permission ${action.permissionId} is not revocable. Choose a direct sharing permission instead.`
+        );
+      }
     } else {
       throw new Error(`Unsupported preview operation: ${action.operation}.`);
     }
@@ -11110,6 +11291,424 @@ async function chatgptPreviewActions(args = {}) {
     }));
   }
   return result;
+}
+
+function validateChatgptReadAction(action, index) {
+  if (action.operation === "search" && !String(action.query || "").trim()) {
+    throw new Error(`Read action ${index} search requires query.`);
+  }
+  if (["getInfo", "permissions"].includes(action.operation) && !action.itemId && action.path === undefined) {
+    throw new Error(`Read action ${index} ${action.operation} requires itemId or path.`);
+  }
+  if (action.itemId && action.path !== undefined) {
+    throw new Error(`Read action ${index} must use only one item selector.`);
+  }
+}
+
+async function chatgptReadAction(action, index) {
+  const startedAt = Date.now();
+  try {
+    validateChatgptReadAction(action, index);
+    const target = action.itemId ? { itemId: action.itemId } : { path: action.path || "" };
+    let value;
+    if (action.operation === "list") {
+      value = await list({ ...target, limit: action.limit || 25, format: action.format || "compact" });
+    } else if (action.operation === "search") {
+      value = await search({ query: action.query, limit: action.limit || 25, format: action.format || "compact" });
+      const exactFilenameQuery = chatgptExactFilenameQuery(action.query);
+      const hasExactFilename = exactFilenameQuery && (value.items || []).some((item) => (
+        exactFilenameKey(item.name) === exactFilenameKey(exactFilenameQuery)
+      ));
+      if (exactFilenameQuery && !hasExactFilename) {
+        const fallback = await chatgptSearch({ query: exactFilenameQuery });
+        const exactItems = (fallback.results || []).filter((item) => (
+          exactFilenameKey(item.title || item.name) === exactFilenameKey(exactFilenameQuery)
+        ));
+        value = {
+          ...value,
+          items: exactItems.slice(0, action.limit || 25),
+          exactFilenameFallbackAttempted: true
+        };
+      }
+    } else if (action.operation === "getInfo") {
+      value = { item: await getInfo({ ...target, format: action.format || "compact" }) };
+    } else if (action.operation === "permissions") {
+      value = await permissions({ ...target, format: action.format || "compact" });
+    } else {
+      throw new Error(`Unsupported read operation: ${action.operation}.`);
+    }
+    return { index, operation: action.operation, isError: false, value, durationMs: elapsedMs(startedAt) };
+  } catch (error) {
+    return {
+      index,
+      operation: action.operation,
+      isError: true,
+      error: safeToolErrorMessage(error),
+      durationMs: elapsedMs(startedAt)
+    };
+  }
+}
+
+function authoritativeReadItemCandidates(results = []) {
+  const candidates = [];
+  for (const result of results) {
+    if (result?.isError || !result?.value) continue;
+    if (result.operation === "list") {
+      for (const item of result.value.items || []) candidates.push({ item, priority: 1 });
+    } else if (result.operation === "permissions" && result.value.item) {
+      candidates.push({ item: result.value.item, priority: 2 });
+    } else if (result.operation === "getInfo" && result.value.item) {
+      candidates.push({ item: result.value.item, priority: 3 });
+    }
+  }
+  const byId = new Map();
+  for (const candidate of candidates) {
+    const id = String(candidate.item?.id || candidate.item?.itemId || "");
+    if (!id) continue;
+    const previous = byId.get(id);
+    if (!previous || candidate.priority > previous.priority) byId.set(id, candidate);
+  }
+  return byId;
+}
+
+function definedReadMetadata(item = {}) {
+  const remotePath = item.remotePath !== undefined ? item.remotePath : item.path;
+  const parentPathSeparator = String(remotePath || "").lastIndexOf("/");
+  const parent = item.parent && typeof item.parent === "object"
+    ? item.parent
+    : {
+        id: item.parentId,
+        path: item.path !== undefined
+          ? item.path
+          : parentPathSeparator >= 0
+            ? String(remotePath).slice(0, parentPathSeparator)
+            : ""
+      };
+  return {
+    id: item.id || item.itemId,
+    name: item.name || item.title,
+    remotePath,
+    parent,
+    parentId: item.parentId !== undefined ? item.parentId : parent.id,
+    path: item.path,
+    type: item.type || (item.folder ? "folder" : item.file ? "file" : undefined),
+    size: item.size,
+    createdDateTime: item.createdDateTime,
+    lastModifiedDateTime: item.lastModifiedDateTime,
+    webUrl: item.webUrl || item.url,
+    eTag: item.eTag,
+    cTag: item.cTag,
+    folder: item.folder,
+    file: item.file
+  };
+}
+
+function reconcileSearchReadItem(searchItem, authoritativeItem) {
+  const authoritative = definedReadMetadata(authoritativeItem);
+  const compact = searchItem?.parent && typeof searchItem.parent === "object";
+  const overlay = compact
+    ? {
+        id: authoritative.id,
+        name: authoritative.name,
+        remotePath: authoritative.remotePath,
+        path: authoritative.remotePath,
+        parent: authoritative.parent,
+        type: authoritative.type,
+        size: authoritative.size,
+        lastModifiedDateTime: authoritative.lastModifiedDateTime,
+        webUrl: authoritative.webUrl
+      }
+    : {
+        id: authoritative.id,
+        name: authoritative.name,
+        remotePath: authoritative.remotePath,
+        path: authoritative.path,
+        parentId: authoritative.parentId,
+        type: authoritative.type,
+        size: authoritative.size,
+        createdDateTime: authoritative.createdDateTime,
+        lastModifiedDateTime: authoritative.lastModifiedDateTime,
+        webUrl: authoritative.webUrl,
+        eTag: authoritative.eTag,
+        cTag: authoritative.cTag,
+        folder: authoritative.folder,
+        file: authoritative.file
+      };
+  const definedOverlay = Object.fromEntries(Object.entries(overlay).filter(([, value]) => value !== undefined));
+  const changed = Object.entries(definedOverlay).some(([key, value]) => (
+    JSON.stringify(searchItem?.[key]) !== JSON.stringify(value)
+  ));
+  return changed
+    ? {
+        ...searchItem,
+        ...definedOverlay,
+        metadataReconciled: true,
+        metadataSource: "same_batch_direct_read"
+      }
+    : searchItem;
+}
+
+function reconcileChatgptReadResults(results = []) {
+  const authoritativeById = authoritativeReadItemCandidates(results);
+  if (!authoritativeById.size) return { results, metadataReconciledCount: 0 };
+  let metadataReconciledCount = 0;
+  const reconciledResults = results.map((result) => {
+    if (result?.isError || result?.operation !== "search" || !Array.isArray(result.value?.items)) return result;
+    const items = result.value.items.map((item) => {
+      const id = String(item?.id || item?.itemId || "");
+      const authoritative = authoritativeById.get(id)?.item;
+      if (!authoritative) return item;
+      const reconciled = reconcileSearchReadItem(item, authoritative);
+      if (reconciled !== item) metadataReconciledCount += 1;
+      return reconciled;
+    });
+    return { ...result, value: { ...result.value, items } };
+  });
+  return { results: reconciledResults, metadataReconciledCount };
+}
+
+async function chatgptReadActions(args = {}) {
+  const startedAt = Date.now();
+  const indexed = (args.actions || []).map((action, index) => ({ action, index }));
+  const results = await mapWithConcurrency(indexed, 3, async ({ action, index }) => (
+    await chatgptReadAction(action, index)
+  ));
+  const reconciled = reconcileChatgptReadResults(results);
+  return {
+    results: reconciled.results,
+    metadataReconciledCount: reconciled.metadataReconciledCount,
+    durationMs: elapsedMs(startedAt)
+  };
+}
+
+function guardedMutationRequirement(value = {}) {
+  if (value.previewTokenRequired) {
+    return `The preview proof was rejected (${value.previewTokenStatus || "unknown status"}). Run a fresh preview.`;
+  }
+  const requiredKey = Object.keys(value).find((key) => /^requiredTo[A-Z]/u.test(key));
+  return requiredKey ? value[requiredKey] : null;
+}
+
+function compactVerifiedMutationItem(item, verified = undefined, contentFingerprint = undefined) {
+  if (!item) return null;
+  const simplified = item.remotePath !== undefined ? item : simplifyItem(item);
+  const descriptor = chatgptItemDescriptor(simplified, simplified?.id);
+  return {
+    ...descriptor,
+    eTag: simplified?.eTag,
+    cTag: simplified?.cTag,
+    size: simplified?.size,
+    ...(verified === undefined ? {} : { verified }),
+    ...(contentFingerprint ? { contentFingerprint } : {})
+  };
+}
+
+function chatgptMutationSummary(operation, value = {}) {
+  const item = value.renamed || value.moved || value.item || value.verifiedItem || null;
+  const verified = value.verified === true
+    || (["createSharingLink", "revokePermission"].includes(operation) && value.verificationIncomplete !== true)
+    || (operation === "copy" && value.verifiedItem && value.monitor?.succeeded === true);
+  return {
+    operationId: value.operationId,
+    verified,
+    verificationIncomplete: value.verificationIncomplete === true,
+    item: compactVerifiedMutationItem(item, verified),
+    ...(value.permission ? {
+      permission: {
+        id: value.permission.id,
+        roles: value.permission.roles,
+        link: value.permission.link ? {
+          type: value.permission.link.type,
+          scope: value.permission.link.scope,
+          webUrl: value.permission.link.webUrl
+        } : undefined
+      }
+    } : {}),
+    ...(value.permissionId ? { permissionId: value.permissionId } : {}),
+    ...(value.accepted !== undefined ? { accepted: value.accepted, status: value.status } : {}),
+    ...(value.monitor ? {
+      monitor: {
+        complete: value.monitor.complete,
+        terminal: value.monitor.terminal,
+        succeeded: value.monitor.succeeded,
+        terminalState: value.monitor.terminalState
+      }
+    } : {})
+  };
+}
+
+function validateChatgptCommitAction(action, index) {
+  validateChatgptPreviewAction(action, index);
+  if (!action.previewToken) throw new Error(`Commit action ${index} requires previewToken.`);
+}
+
+async function chatgptCommitAction(action, index, options = {}) {
+  const startedAt = Date.now();
+  try {
+    validateChatgptCommitAction(action, index);
+    const common = {
+      itemId: action.itemId,
+      expectedId: action.itemId,
+      ...(action.expectedName ? { expectedName: action.expectedName } : {}),
+      dryRun: false,
+      confirmed: true,
+      previewToken: action.previewToken
+    };
+    let value;
+    if (action.operation === "rename") {
+      value = await rename({ ...common, newName: action.newName });
+    } else if (action.operation === "move") {
+      value = await moveItem({
+        ...common,
+        destinationParentPath: action.destinationParentPath,
+        destinationParentItemId: action.destinationParentItemId,
+        newName: action.newName
+      });
+    } else if (action.operation === "copy") {
+      value = await copyItem({
+        ...common,
+        destinationParentPath: action.destinationParentPath,
+        destinationParentItemId: action.destinationParentItemId,
+        newName: action.newName,
+        waitForCompletion: true,
+        timeoutSeconds: options.copyTimeoutSeconds
+      });
+    } else if (action.operation === "createSharingLink") {
+      value = await createSharingLink({
+        ...common,
+        type: action.linkType || "view",
+        scope: action.scope || "anonymous",
+        includePermissionDiff: true
+      });
+    } else if (action.operation === "revokePermission") {
+      value = await revokePermission({
+        ...common,
+        permissionId: action.permissionId,
+        includePermissions: true
+      });
+    } else {
+      throw new Error(`Unsupported commit operation: ${action.operation}.`);
+    }
+    const requirement = guardedMutationRequirement(value);
+    if (requirement) {
+      throw new Error(typeof requirement === "string"
+        ? requirement
+        : `The ${action.operation} action was not committed because its preview proof was rejected.`);
+    }
+    const result = chatgptMutationSummary(action.operation, value);
+    return {
+      index,
+      operation: action.operation,
+      isError: false,
+      operationId: result.operationId,
+      verified: result.verified,
+      result,
+      durationMs: elapsedMs(startedAt)
+    };
+  } catch (error) {
+    return {
+      index,
+      operation: action.operation,
+      isError: true,
+      error: safeToolErrorMessage(error),
+      durationMs: elapsedMs(startedAt)
+    };
+  }
+}
+
+async function chatgptCommitActions(args = {}) {
+  const startedAt = Date.now();
+  const results = [];
+  for (const [index, action] of (args.actions || []).entries()) {
+    const result = await chatgptCommitAction(action, index, {
+      copyTimeoutSeconds: clampInteger(args.copyTimeoutSeconds, 20, 1, 60)
+    });
+    results.push(result);
+    if (result.isError && args.stopOnError !== false) break;
+  }
+  const stoppedEarly = results.length < (args.actions || []).length;
+  const hasSuccess = results.some((result) => !result.isError);
+  const hasFailure = stoppedEarly || results.some((result) => result.isError);
+  return {
+    confirmed: true,
+    partialMutationPossible: hasSuccess && hasFailure,
+    stoppedEarly,
+    results,
+    durationMs: elapsedMs(startedAt)
+  };
+}
+
+function chatgptCacheWarmSettings() {
+  return {
+    enabled: boolSetting(process.env.ONEDRIVE_CHATGPT_CACHE_WARM_ENABLED, true),
+    intervalMs: intSetting(process.env.ONEDRIVE_CHATGPT_CACHE_WARM_INTERVAL_SECONDS, 900, 60, 86_400) * 1000,
+    maxItems: intSetting(process.env.ONEDRIVE_CHATGPT_CACHE_WARM_MAX_ITEMS, 500, 50, 5000),
+    maxFolders: intSetting(process.env.ONEDRIVE_CHATGPT_CACHE_WARM_MAX_FOLDERS, 100, 10, 1000),
+    maxDepth: intSetting(process.env.ONEDRIVE_CHATGPT_CACHE_WARM_MAX_DEPTH, 8, 1, 25),
+    maxPages: intSetting(process.env.ONEDRIVE_CHATGPT_CACHE_WARM_MAX_PAGES, 3, 1, 20)
+  };
+}
+
+function pruneChatgptCacheWarmStates(maxEntries = 128) {
+  if (chatgptCacheWarmStates.size <= maxEntries) return;
+  const oldest = [...chatgptCacheWarmStates.entries()]
+    .filter(([, state]) => !state.pending)
+    .sort((left, right) => (left[1].lastStartedAt || 0) - (right[1].lastStartedAt || 0));
+  for (const [key] of oldest.slice(0, Math.max(0, chatgptCacheWarmStates.size - maxEntries))) {
+    chatgptCacheWarmStates.delete(key);
+  }
+}
+
+function scheduleChatgptCacheWarm() {
+  const settings = chatgptCacheWarmSettings();
+  const store = toolCallContext.getStore();
+  if (!settings.enabled || toolProfile !== "chatgpt" || store?.authMode !== "oauth") return;
+  const scheduledGeneration = storageScopeGeneration;
+  void (async () => {
+    try {
+      const scope = await activeStorageScope();
+      if (scheduledGeneration !== storageScopeGeneration) return;
+      const key = storageScopeKey(scope);
+      if (!key) return;
+      const current = chatgptCacheWarmStates.get(key);
+      if (current?.pending || Date.now() - (current?.lastStartedAt || 0) < settings.intervalMs) return;
+      const state = { pending: true, lastStartedAt: Date.now() };
+      chatgptCacheWarmStates.set(key, state);
+      pruneChatgptCacheWarmStates();
+      const startedAt = performance.now();
+      try {
+        const result = await cacheRefresh({
+          mode: "auto",
+          maxItems: settings.maxItems,
+          maxFolders: settings.maxFolders,
+          maxDepth: settings.maxDepth,
+          maxPages: settings.maxPages,
+          pageSize: 200,
+          includeFolders: true
+        });
+        console.error(JSON.stringify({
+          event: "onedrive-cache-warm-complete",
+          scopeHash: createHash("sha256").update(key).digest("hex").slice(0, 12),
+          effectiveMode: result.effectiveMode || result.mode,
+          durationMs: Number((performance.now() - startedAt).toFixed(1))
+        }));
+      } catch (error) {
+        console.error(JSON.stringify({
+          event: "onedrive-cache-warm-failed",
+          scopeHash: createHash("sha256").update(key).digest("hex").slice(0, 12),
+          durationMs: Number((performance.now() - startedAt).toFixed(1)),
+          error: safeToolErrorMessage(error)
+        }));
+      } finally {
+        state.pending = false;
+        state.lastCompletedAt = Date.now();
+      }
+    } catch (error) {
+      if (process.env.ONEDRIVE_PERFORMANCE_LOG === "1") {
+        console.error(JSON.stringify({ event: "onedrive-cache-warm-skipped", error: safeToolErrorMessage(error) }));
+      }
+    }
+  })();
 }
 
 function updateManifestPath(localPath, manifestPath) {
@@ -11736,6 +12335,9 @@ async function guardPublicReplacement(args, destinationPath, replacement, toolNa
     return { ...preview, dryRun: false, confirmed: true, requiredToReplace: "Provide expectedName or expectedId matching the existing remote file." };
   }
   assertExpectedItem(current, args, "Replace");
+  if (args.expectedETag && args.expectedETag !== current.eTag) {
+    throw new Error("Replacement expectedETag no longer matches the current item. Run a fresh preview.");
+  }
   return previewTokenRequiredResult(preview, toolName, proof, args.previewToken, "requiredToReplace") || { allowed: true, current };
 }
 
@@ -11959,6 +12561,9 @@ async function writeText(args = {}) {
         return { ...preview, dryRun: false, confirmed: true, requiredToWrite: "Provide expectedName or expectedId matching the existing remote file." };
       }
       assertExpectedItem(current, args, "Replace");
+      if (args.expectedETag && args.expectedETag !== current.eTag) {
+        throw new Error("Text replacement expectedETag no longer matches the current item. Run a fresh preview.");
+      }
     }
     const previewTokenRequired = previewTokenRequiredResult(preview, "onedrive_write_text", proof, args.previewToken, "requiredToWrite");
     if (previewTokenRequired) return previewTokenRequired;
@@ -11986,7 +12591,13 @@ async function writeText(args = {}) {
     const response = {
       item: simplifyItem(result),
       bytesUploaded: contentBuffer.length,
-      operationId: mutationOperationId("onedrive_write_text", args.previewToken)
+      operationId: mutationOperationId("onedrive_write_text", args.previewToken),
+      verified: Boolean(result?.id) && Number(result?.size) === contentBuffer.length,
+      verifiedResult: compactVerifiedMutationItem(
+        simplifyItem(result),
+        Boolean(result?.id) && Number(result?.size) === contentBuffer.length,
+        replacement
+      )
     };
     await writeMutationAudit("onedrive_write_text", {
       status: "success",
@@ -12209,7 +12820,11 @@ async function patchText(args = {}) {
       patch: preview.patch,
       preservation: preview.preservation,
       verified: true,
-      sha256: observedHash
+      sha256: observedHash,
+      verifiedResult: compactVerifiedMutationItem(simplifyItem(result), true, {
+        bytes: patched.bytes.length,
+        sha256: observedHash
+      })
     };
   } catch (error) {
     await writeMutationAudit("onedrive_patch_text", { status: "failed", target: itemAuditSummary(rawItem), patchMode: args.patch.mode, error: safeErrorInfo(error) });
@@ -12670,7 +13285,8 @@ async function createFolder(args = {}) {
       ...item,
       operationId: mutationOperationId("onedrive_create_folder", "", `${item.id}\0${item.eTag || item.name}`),
       verified,
-      verificationIncomplete: !verified
+      verificationIncomplete: !verified,
+      verifiedResult: compactVerifiedMutationItem(item, verified)
     };
   } catch (error) {
     await writeMutationAudit("onedrive_create_folder", {
@@ -12738,7 +13354,8 @@ async function rename(args = {}) {
       operationId: mutationOperationId("onedrive_rename", args.previewToken),
       renamed,
       verified,
-      verificationIncomplete: !verified
+      verificationIncomplete: !verified,
+      verifiedResult: compactVerifiedMutationItem(renamed, verified)
     };
   } catch (error) {
     await writeMutationAudit("onedrive_rename", {
@@ -12823,7 +13440,8 @@ async function moveItem(args = {}) {
       operationId: mutationOperationId("onedrive_move", args.previewToken),
       moved,
       verified,
-      verificationIncomplete: !verified
+      verificationIncomplete: !verified,
+      verifiedResult: compactVerifiedMutationItem(moved, verified)
     };
   } catch (error) {
     await writeMutationAudit("onedrive_move", {
@@ -12959,6 +13577,24 @@ async function copyItem(args = {}) {
           };
         }
       }
+      if (result.monitor?.succeeded) {
+        const copiedPath = [cleanPath(parentReference.remotePath || ""), args.newName || current.name]
+          .filter(Boolean)
+          .join("/");
+        const verifiedItem = await withToolTiming("verificationMs", async () => (
+          await getRawInfo({ path: copiedPath, cacheResults: true })
+        )).catch((error) => {
+          result.verificationError = safeToolErrorMessage(error);
+          return null;
+        });
+        const copied = simplifyItem(verifiedItem);
+        result.verifiedItem = copied;
+        result.verified = Boolean(copied?.id)
+          && copied.id !== current.id
+          && copied.name === (args.newName || current.name)
+          && cleanPath(copied.remotePath || "") === cleanPath(copiedPath);
+        result.verificationIncomplete = !result.verified;
+      }
     }
     await writeMutationAudit("onedrive_copy", {
       status: result.monitorError
@@ -13090,6 +13726,8 @@ async function createSharingLink(args = {}) {
       item: simplifyItem(current),
       permission: result,
       verificationIncomplete: includePermissionDiff && !afterPermissions,
+      verified: !includePermissionDiff || Boolean(afterPermissions),
+      verifiedResult: compactVerifiedMutationItem(simplifyItem(current), !includePermissionDiff || Boolean(afterPermissions)),
       ...(includePermissionDiff ? {
         beforePermissions,
         afterPermissions,
@@ -13372,6 +14010,8 @@ async function revokePermission(args = {}) {
       item: preflight.item,
       permissionId: args.permissionId,
       verificationIncomplete: preflight.includePermissions && !afterPermissions,
+      verified: !preflight.includePermissions || Boolean(afterPermissions),
+      verifiedResult: compactVerifiedMutationItem(preflight.item, !preflight.includePermissions || Boolean(afterPermissions)),
       ...(preflight.includePermissions ? {
         beforePermissions: preflight.beforePermissions,
         afterPermissions,
@@ -14073,6 +14713,14 @@ async function callTool(name, args = {}) {
       const value = await chatgptPreviewActions(args);
       return textResult(value, false, value);
     }
+    case "onedrive_read_actions": {
+      const value = await chatgptReadActions(args);
+      return textResult(value, false, value);
+    }
+    case "onedrive_commit_actions": {
+      const value = await chatgptCommitActions(args);
+      return textResult(value, false, value);
+    }
     case "onedrive_config": {
       const status = publicConfig();
       if (args.checkToken) {
@@ -14336,29 +14984,43 @@ export async function processMcpMessage(message, requestAuth = null) {
           }
         }));
       }
-      const result = await toolCallContext.run({
+      const callContext = {
         toolName: params.name,
         localWarnings: [],
         lastGraphRequestId: null,
         lastMutationGraphRequestId: null,
         metadataCacheWrites: 0,
+        timings: {},
         authGeneration,
         storageScopeGeneration,
         ...(requestAuth || {})
-      }, async () => {
+      };
+      const result = await toolCallContext.run(callContext, async () => {
         try {
           const value = await callTool(params.name, validation.args || {});
           assertToolAccountGeneration(`${params.name} completion`);
+          if (!value?.isError && new Set([
+            "search", "fetch", "onedrive_open_files", "onedrive_read_actions",
+            "onedrive_list", "onedrive_permissions"
+          ]).has(params.name)) {
+            scheduleChatgptCacheWarm();
+          }
           return value;
         } catch (error) {
           return toolErrorResult(error, params.name);
         }
       });
+      const totalMs = performance.now() - toolStartedAt;
+      const performanceSummary = roundedToolTimings(callContext, totalMs);
+      result._meta = {
+        ...(result._meta || {}),
+        "onedrive/performance": performanceSummary
+      };
       if (toolProfile === "chatgpt" || process.env.ONEDRIVE_PERFORMANCE_LOG === "1") {
         console.error(JSON.stringify({
           event: "onedrive-tool-complete",
           tool: params.name,
-          durationMs: Number((performance.now() - toolStartedAt).toFixed(1)),
+          ...performanceSummary,
           isError: Boolean(result?.isError)
         }));
       }

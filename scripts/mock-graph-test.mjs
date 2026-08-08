@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, "..");
 const serverPath = join(pluginRoot, "mcp", "server.mjs");
-const officeTestPython = process.env.ONEDRIVE_OFFICE_TEST_PYTHON || "/usr/bin/python3";
+const officeTestPython = process.env.ONEDRIVE_OFFICE_TEST_PYTHON || process.env.ONEDRIVE_OFFICE_PYTHON || "python3";
 const mockRunRoot = join(pluginRoot, "work", `mock-${process.pid}-${Date.now()}`);
 const mockHome = join(mockRunRoot, "home");
 const mockExportPdf = join(mockRunRoot, "mock-export.pdf");
@@ -587,6 +587,17 @@ const graph = createServer(async (req, res) => {
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/root-note") {
     return json(res, 200, item("root-note", "root-note.txt"));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/read-reconcile-folder") {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return json(res, 200, folder("read-reconcile-folder", "Read Reconcile Folder", {
+      size: 0,
+      eTag: "etag-read-reconcile-authoritative",
+      cTag: "ctag-read-reconcile-authoritative",
+      parentReference: { id: "root", path: "/drive/root:" },
+      folder: { childCount: 7 }
+    }));
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/root:/root-note.txt:") {
@@ -1568,6 +1579,17 @@ const graph = createServer(async (req, res) => {
     })] });
   }
 
+  if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='Read Reconcile Folder')")) {
+    return json(res, 200, { value: [folder("read-reconcile-folder", "Read Reconcile Folder", {
+      size: 4096,
+      eTag: "etag-read-reconcile-search-stale",
+      cTag: "ctag-read-reconcile-search-stale",
+      lastModifiedDateTime: "2026-07-30T00:00:00Z",
+      parentReference: { id: "stale-parent", path: "/drive/root:/Stale Parent" },
+      folder: { childCount: 1 }
+    })] });
+  }
+
   if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='9037.csv')")) {
     return json(res, 200, { value: [] });
   }
@@ -2100,7 +2122,8 @@ async function tool(name, args = {}) {
   return {
     isError: Boolean(response.result?.isError),
     value,
-    structuredContent: response.result?.structuredContent
+    structuredContent: response.result?.structuredContent,
+    meta: response.result?._meta
   };
 }
 
@@ -4434,11 +4457,13 @@ process.exit(2);
     assert(!writePreview.isError && writePreview.value.previewToken && writePreview.value.wouldReplace?.id === "root-note", "write_text replacement should return a guarded preview", writePreview);
     const mismatched = await tool("onedrive_write_text", { remotePath: "root-note.txt", content: "different text", conflictBehavior: "replace", dryRun: false, confirmed: true, expectedId: "root-note", previewToken: writePreview.value.previewToken });
     assert(!mismatched.isError && mismatched.value.previewTokenStatus === "mismatch", "preview token must bind the exact write_text content", mismatched);
-    const writeLive = await tool("onedrive_write_text", { remotePath: "root-note.txt", content: "replacement text", conflictBehavior: "replace", dryRun: false, confirmed: true, expectedId: "root-note", previewToken: writePreview.value.previewToken });
+    const staleWrite = await tool("onedrive_write_text", { remotePath: "root-note.txt", content: "replacement text", conflictBehavior: "replace", dryRun: false, confirmed: true, expectedId: "root-note", expectedETag: "stale-etag", previewToken: writePreview.value.previewToken });
+    assert(staleWrite.isError && String(staleWrite.value).includes("expectedETag no longer matches"), "write_text should accept and enforce an explicit revision guard", staleWrite);
+    const writeLive = await tool("onedrive_write_text", { remotePath: "root-note.txt", content: "replacement text", conflictBehavior: "replace", dryRun: false, confirmed: true, expectedId: "root-note", expectedETag: writePreview.value.wouldReplace.eTag, previewToken: writePreview.value.previewToken });
     assert(!writeLive.isError && writeLive.value.item?.id === "root-note", "guarded write_text replacement failed", writeLive);
     const afterPuts = requests.filter((entry) => entry.method === "PUT" && entry.path === "/v1.0/me/drive/root:/root-note.txt:/content").length;
     assert(afterPuts === beforePuts + 2, "replacement guards should permit exactly two reviewed PUTs", { beforePuts, afterPuts });
-    return { uploadPreviewScoped: true, writePreviewBoundToContent: true, reviewedPuts: afterPuts - beforePuts };
+    return { uploadPreviewScoped: true, writePreviewBoundToContent: true, writeRevisionGuarded: true, reviewedPuts: afterPuts - beforePuts };
   });
 
   await check("replace-after-absent preflight is create-only for simple, session, and text uploads", async () => {
@@ -5425,6 +5450,128 @@ process.exit(2);
     const added = requests.slice(before);
     assert(!added.some((request) => ["PATCH", "POST", "DELETE", "PUT"].includes(request.method)), "batched action preview must not mutate Graph state", { added });
     return { actionCount: previewed.value.results.length, sharing: sharing.accessSummary, durationMs: previewed.value.durationMs };
+  });
+
+  await check("ChatGPT action preview refuses non-revocable owner permissions", async () => {
+    const previewed = await tool("onedrive_preview_actions", {
+      actions: [{ operation: "revokePermission", itemId: "root-note", permissionId: "perm-owner-root-note" }]
+    });
+    assert(!previewed.isError && previewed.value.dryRun === true, "owner revoke preview should return a structured batch result", previewed);
+    const result = previewed.value.results?.[0];
+    assert(result?.isError === true, "owner revoke preview must fail closed", result);
+    assert(result.previewTokenPresent === false && !result.previewToken, "owner revoke preview must not disclose a commit token", result);
+    assert(String(result.error || "").includes("should not be revoked"), "owner revoke preview should explain why it was refused", result);
+    return { refused: true, previewTokenPresent: result.previewTokenPresent, error: result.error };
+  });
+
+  await check("ChatGPT parallel read actions combine reads and reconcile stale indexed metadata", async () => {
+    const read = await tool("onedrive_read_actions", {
+      actions: [
+        { operation: "list", path: "", limit: 200 },
+        { operation: "search", query: "Read Reconcile Folder", limit: 200, format: "full" },
+        { operation: "getInfo", itemId: "read-reconcile-folder", format: "full" },
+        { operation: "permissions", itemId: "root-note" }
+      ]
+    });
+    assert(!read.isError && read.value.results?.length === 4, "parallel read actions should return every requested read", read);
+    assert(read.value.results.every((entry) => entry.isError === false), "parallel read actions should succeed independently", read.value.results);
+    const permissionRead = read.value.results.find((entry) => entry.operation === "permissions");
+    assert(permissionRead?.value?.count === 1 && permissionRead.value.item?.id === "root-note", "permission read should return access plus stable item metadata", permissionRead);
+    const searchRead = read.value.results.find((entry) => entry.operation === "search");
+    const reconciled = searchRead?.value?.items?.[0];
+    assert(read.value.metadataReconciledCount === 1, "combined reads should report one reconciled indexed result", read.value);
+    assert(
+      reconciled?.id === "read-reconcile-folder"
+        && reconciled.parentId === "root"
+        && reconciled.remotePath === "Read Reconcile Folder"
+        && reconciled.size === 0
+        && reconciled.folder?.childCount === 7
+        && reconciled.eTag === "etag-read-reconcile-authoritative"
+        && reconciled.metadataReconciled === true
+        && reconciled.metadataSource === "same_batch_direct_read",
+      "search metadata should be overlaid from the same-ID direct read without changing result identity",
+      reconciled
+    );
+    const timing = read.meta?.["onedrive/performance"];
+    assert(Number.isFinite(timing?.serverMs) && timing.graphCalls >= 4 && Number.isFinite(timing.graphMs), "tool result should include safe server/auth/Graph phase timings", timing);
+    return {
+      durationMs: read.value.durationMs,
+      graphCalls: timing.graphCalls,
+      serverMs: timing.serverMs,
+      metadataReconciledCount: read.value.metadataReconciledCount
+    };
+  });
+
+  await check("ChatGPT parallel read actions recover exact filenames missed by Graph indexing", async () => {
+    const read = await tool("onedrive_read_actions", {
+      actions: [
+        { operation: "list", path: "", limit: 5 },
+        { operation: "search", query: "invoice-3095.pdf", limit: 5 }
+      ]
+    });
+    assert(!read.isError && read.value.results?.length === 2, "combined exact-filename read should return both actions", read);
+    const searched = read.value.results.find((entry) => entry.operation === "search");
+    assert(searched?.isError === false, "combined exact-filename search should succeed", searched);
+    assert(searched.value.exactFilenameFallbackAttempted === true, "combined exact-filename search should report its fallback", searched.value);
+    assert(searched.value.items?.length === 1 && searched.value.items[0].id === "chatgpt-exact-index-miss", "combined exact-filename search should return the live scanned item", searched.value);
+    assert(searched.value.items[0].path === "Folder A/invoice-3095.pdf", "combined exact-filename search should preserve the live path", searched.value.items[0]);
+    return { itemId: searched.value.items[0].id, path: searched.value.items[0].path, exactFilenameFallbackAttempted: true };
+  });
+
+  await check("ChatGPT exact-file opener does not repeat a failed live scan", async () => {
+    const before = requests.length;
+    const opened = await tool("onedrive_open_files", { names: ["definitely-missing-3095.pdf"] });
+    assert(!opened.isError && opened.value.files?.[0]?.status === "not_found", "missing exact file should return a controlled not-found result", opened);
+    const added = requests.slice(before);
+    assert(added.filter((request) => request.path === "/v1.0/me/drive/items/folder-a/children").length === 1, "negative exact-file lookup should not repeat the same fallback scan", added);
+    return { status: opened.value.files[0].status, folderAScans: 1 };
+  });
+
+  await check("ChatGPT guarded batch commit consumes previews and returns verified stable results", async () => {
+    const previewed = await tool("onedrive_preview_actions", {
+      actions: [
+        { operation: "rename", itemId: "delete-target", newName: "renamed-cache.txt" },
+        { operation: "rename", itemId: "folder-a", newName: "Folder Renamed" }
+      ]
+    });
+    assert(!previewed.isError && previewed.value.results?.every((entry) => entry.previewToken), "batch commit fixtures should preview successfully", previewed);
+    const committed = await tool("onedrive_commit_actions", {
+      confirmed: true,
+      actions: [
+        {
+          operation: "rename",
+          itemId: "delete-target",
+          expectedName: "delete-me.txt",
+          newName: "renamed-cache.txt",
+          previewToken: previewed.value.results[0].previewToken
+        },
+        {
+          operation: "rename",
+          itemId: "folder-a",
+          expectedName: "Folder A",
+          newName: "Folder Renamed",
+          previewToken: previewed.value.results[1].previewToken
+        }
+      ]
+    });
+    assert(!committed.isError && committed.value.results?.length === 2 && committed.value.stoppedEarly === false, "guarded batch commit should execute both approved actions", committed);
+    assert(committed.value.partialMutationPossible === false, "fully successful guarded commits must not report partial-state risk", committed.value);
+    assert(committed.value.results.every((entry) => entry.isError === false && entry.verified === true && entry.operationId), "batch commit should return verified idempotency identifiers", committed.value.results);
+    assert(committed.value.results[0].result.item?.itemId === "delete-target" && committed.value.results[0].result.item?.path === "renamed-cache.txt", "batch commit should return stable item ID and verified path without another read", committed.value.results[0]);
+    const replayed = await tool("onedrive_commit_actions", {
+      confirmed: true,
+      actions: [{
+        operation: "rename",
+        itemId: "delete-target",
+        newName: "renamed-cache.txt",
+        previewToken: previewed.value.results[0].previewToken
+      }]
+    });
+    assert(!replayed.isError && replayed.value.results?.[0]?.isError === true, "consumed preview proofs must not be replayable", replayed);
+    return {
+      operations: committed.value.results.map((entry) => ({ operationId: entry.operationId, verified: entry.verified })),
+      replayRejected: true
+    };
   });
 
   await check("ChatGPT stale search returns a high-confidence cache hit and revalidates in the background", async () => {

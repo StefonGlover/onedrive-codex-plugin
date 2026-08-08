@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 const scriptsRoot = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(scriptsRoot, "..");
 const manifest = JSON.parse(readFileSync(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"));
-const versionPattern = /^0\.6\.1\+codex\.\d{14}$/;
+const versionPattern = /^0\.6\.4\+codex\.\d{14}$/;
 const excludedTopLevelNames = new Set([".git", "work", "downloads", "onedrive-beta", "node_modules", "dist", "build", "coverage"]);
 const privateNasComposePattern = /^compose\..*nas\d+.*\.ya?ml$/i;
 

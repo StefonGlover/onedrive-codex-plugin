@@ -2,9 +2,9 @@
 
 Local Codex plugin for OneDrive file operations through Microsoft Graph.
 
-Release `0.6.4+codex.20260729033800` delivers the privately distributed ChatGPT Work OAuth connection for personal Microsoft accounts, preserves mandatory S256 PKCE and per-user credential isolation, and adds verified PDF/text export with a safe local Open XML fallback when Microsoft Graph does not support plain-text conversion. It keeps the public MCP resource, Entra API resource, advertised authorization server, and Microsoft token-validation authority explicitly separate. Exact filename searches use one indexed Graph query followed by a bounded, cache-validated live folder scan when OneDrive indexing misses the file.
+Release `0.6.4+codex.20260808010958` delivers the privately distributed ChatGPT Work OAuth connection for personal Microsoft accounts, preserves mandatory S256 PKCE and per-user credential isolation, and adds verified PDF/text export with a safe local Open XML fallback when Microsoft Graph does not support plain-text conversion. It keeps the public MCP resource, Entra API resource, advertised authorization server, and Microsoft token-validation authority explicitly separate. Exact filename searches use one indexed Graph query followed by a bounded, cache-validated live folder scan when OneDrive indexing misses the file.
 
-ChatGPT surface note (verified 2026-07-25): regular Chat passes the focused 21-action read/CRUD/sharing/permissions suite. Work requires the delegated OAuth deployment and public compatibility origin described below. Direct Entra v2 endpoints are not sufficient because ChatGPT correctly sends the MCP `resource` parameter and Entra v2 rejects that parameter.
+ChatGPT surface note (updated 2026-07-29): the focused 15-tool surface covers read/CRUD/sharing/permissions, including parallel reads and guarded single-or-batch commits. Redundant standalone list/search/permission tools are hidden from Work so its runtime selector consistently chooses the combined read path. Work requires the delegated OAuth deployment and public compatibility origin described below. Direct Entra v2 endpoints are not sufficient because ChatGPT correctly sends the MCP `resource` parameter and Entra v2 rejects that parameter.
 
 This is an unofficial integration and is not affiliated with, endorsed by, or sponsored by Microsoft.
 
@@ -50,7 +50,7 @@ tunnel-client init \
   --mcp-command "node \"$onedrive_plugin_root/mcp/server.mjs\""
 ```
 
-6. Validate the stopped profile with `tunnel-client doctor --profile onedrive-chatgpt --explain`, then run it with `node scripts/run-chatgpt-tunnel.mjs`. The launcher reads the private tunnel-client env file without printing the key and defaults to `ONEDRIVE_TOOL_PROFILE=chatgpt`, a focused 21-tool contract with compact Office schemas for lower ChatGPT selection latency. The focused descriptions distinguish adjacent tools, and every tool reports a short in-progress/completed status in ChatGPT. Setup, diagnostics, cache/index maintenance, specialized reporting, and bulk automation remain available with `ONEDRIVE_TOOL_PROFILE=full`; refresh the app metadata in ChatGPT after switching profiles. Set `ONEDRIVE_TUNNEL_ENV_FILE` only when you intentionally use a different credential-file path.
+6. Validate the stopped profile with `tunnel-client doctor --profile onedrive-chatgpt --explain`, then run it with `node scripts/run-chatgpt-tunnel.mjs`. The launcher reads the private tunnel-client env file without printing the key and defaults to `ONEDRIVE_TOOL_PROFILE=chatgpt`, a focused 15-tool contract with compact Office schemas for lower ChatGPT selection latency. The focused profile includes one combined parallel-read path plus one guarded commit path for single or batched rename/move/copy/share/revoke actions; the legacy single-action and single-read handlers remain executable for cached-client compatibility but are not advertised. Every tool reports a short in-progress/completed status in ChatGPT. Setup, diagnostics, cache/index maintenance, specialized reporting, and bulk automation remain available with `ONEDRIVE_TOOL_PROFILE=full`; refresh the app metadata in ChatGPT after switching profiles. Set `ONEDRIVE_TUNNEL_ENV_FILE` only when you intentionally use a different credential-file path.
 7. In ChatGPT **Settings → Plugins**, create a developer-mode plugin, choose **Tunnel**, select the tunnel, choose **No Auth**, create the plugin, and connect it.
 
 Keep `tunnel-client` running for connector discovery and every OneDrive tool call from ChatGPT.
@@ -159,6 +159,13 @@ export ONEDRIVE_CONCURRENCY_LIMIT="2"
 export ONEDRIVE_DELTA_SYNC_ENABLED="true"
 export ONEDRIVE_CONTENT_INDEX_ENABLED="true"
 export ONEDRIVE_INDEX_OFFICE_EXPORT="false"
+export ONEDRIVE_CHATGPT_CACHE_WARM_ENABLED="true"
+export ONEDRIVE_CHATGPT_CACHE_WARM_INTERVAL_SECONDS="900"
+export ONEDRIVE_CHATGPT_CACHE_WARM_MAX_ITEMS="500"
+export ONEDRIVE_CHATGPT_CACHE_WARM_MAX_FOLDERS="100"
+export ONEDRIVE_CHATGPT_CACHE_WARM_MAX_DEPTH="8"
+export ONEDRIVE_CHATGPT_CACHE_WARM_MAX_PAGES="3"
+export ONEDRIVE_PERFORMANCE_LOG="1"
 
 # Optional ChatGPT Work OAuth transport
 export ONEDRIVE_MCP_AUTH_MODE="oauth"
@@ -205,6 +212,8 @@ If Microsoft reports that the app is Microsoft-account-only and requires `/consu
 `ONEDRIVE_TOKEN_STORE` defaults to `keychain` on macOS and `encrypted-file` on other platforms. The encrypted-file store requires `ONEDRIVE_TOKEN_ENCRYPTION_KEY_FILE` or `ONEDRIVE_TOKEN_ENCRYPTION_KEY`; the key must decode to exactly 32 bytes, and key files with group/other permissions or symlinks are rejected. Prefer the key-file option so the encryption key is not inherited broadly through process environments.
 
 `ONEDRIVE_MCP_AUTH_MODE` defaults to `noauth`. Set it to `oauth` only after the Entra API registration, OBO secret, API resource/scope/audience, allowed ChatGPT client ID, public protected-resource URLs, public compatibility origin, private upstream Entra client registration, facade callback, and ChatGPT callback are configured. In OAuth mode both processes fail closed at startup if required settings, key files, or secret files are missing, identifiers retain deployment placeholders, or a public URL is not HTTPS. The API secret is used only for OBO. The separate compatibility secret is used only for the facade's private upstream Entra code/refresh exchange; outer ChatGPT authentication is `none` plus S256 PKCE. Neither secret is returned, logged, or written to audit records.
+
+Every ChatGPT tool result includes safe `_meta["onedrive/performance"]` phase totals for server, auth, Graph, verification, and cache work; the same redacted values are written to structured logs. Tunnel and ChatGPT model-selection time occur outside the MCP server, so compare the host-observed duration with `serverMs` to estimate that external portion. OAuth cache warming runs only in the background, is keyed to the authenticated drive subject, uses delta refresh when possible, and is bounded by the `ONEDRIVE_CHATGPT_CACHE_WARM_*` settings.
 
 You can also add friendly path aliases to the config file:
 
@@ -382,7 +391,7 @@ For cross-drive research, `onedrive_office_index_refresh` stores structured para
 - `onedrive_cache_refresh` rebuilds the cache from a bounded recursive scan and uses delta refreshes when a previous cursor exists for the same root. Cache refresh batches metadata-cache writes during scans, persists only delta-origin `nextLink` cursors for continuation, reconciles pathless delta records through cached parent IDs, and returns progress milestones. Ordinary list/search pagination cannot seed delta state. `onedrive_cache_clear` clears the cache.
 - `onedrive_content_index_refresh` is the explicit content-reading step. It indexes supported cached text and structured Office content into `content-index.json`, stores normalized text/tokens plus semantic Office anchors, reuses entries when ETag/cTag/mtime/size are unchanged, and applies file-size, segment, concurrency, and per-item failure limits. Explicit metadata deletes and changed fingerprints evict stale entries; moves and renames update indexed metadata; unchanged explicit cTags preserve content entries across metadata-only renames, while changed or omitted content tags with changed ETags invalidate conservatively. Bounded partial scans do not globally prune unseen entries.
 - `onedrive_content_search` searches only the local content index and returns lightweight metadata plus snippets. It does not call Microsoft Graph or read file bodies.
-- The focused ChatGPT profile advertises the standard `search` and `fetch` retrieval contract instead of overlapping OneDrive lookup and Office-read tools. `onedrive_open_files` complements that standard for one to five exact filenames by locating and extracting them concurrently in one bounded read-only call; if OneDrive indexing misses an exact filename, it validates exact cached identities and then performs a capped live folder scan. `search` remains the discovery path and returns at most 10 compact results with bounded concurrent Graph search terms. `fetch` accepts a prior result ID and returns at most 192 KiB of readable text. It directly extracts structured `.docx`/`.xlsx`/`.pptx` content; reads CSV/TSV, JSON, XML, Markdown, HTML, source code, and other text formats; and supports bounded local extraction for PDF, RTF, OpenDocument, EPUB, legacy `.doc`/`.xls`/`.ppt`, and common images when the deployment extractor is available. The NAS image includes the required PDF, OCR, and legacy Office extractors. All ChatGPT tool payloads are bounded to 1 MiB. The full profile remains unchanged.
+- The focused ChatGPT profile advertises `onedrive_read_actions` for folder listings, descriptive search, item metadata, permission inspection, and concurrent combinations of those reads. `onedrive_open_files` handles one to five exact filenames by locating and extracting them concurrently in one bounded read-only call; if OneDrive indexing misses an exact filename, it validates exact cached identities and then performs a capped live folder scan. `fetch` accepts a result ID and returns at most 192 KiB of readable text. It directly extracts structured `.docx`/`.xlsx`/`.pptx` content; reads CSV/TSV, JSON, XML, Markdown, HTML, source code, and other text formats; and supports bounded local extraction for PDF, RTF, OpenDocument, EPUB, legacy `.doc`/`.xls`/`.ppt`, and common images when the deployment extractor is available. The NAS image includes the required PDF, OCR, and legacy Office extractors. All ChatGPT tool payloads are bounded to 1 MiB. The full profile remains unchanged.
 - `onedrive_preview_actions` batches up to ten rename, move, copy, sharing-link, or permission-revoke previews as one read-only ChatGPT call. It never performs a mutation, returns the operation-bound tokens needed by the separate live tools, and emits only permission counts/link counts/roles for sharing previews. Names, emails, permission objects, and sharing URLs are omitted from this preview result. Live sharing-link creation is separately marked as open-world and still requires explicit approval, exact expected identity, and the preview token.
 - `onedrive_find` and `onedrive_find_all` can merge local content-index hits into ranking, but they never fetch or parse full content themselves. Build or refresh the index first when content search is needed.
 - `onedrive_find` is the preferred file lookup helper. It uses the local metadata cache when available, confirms exact strong cache hits with live metadata, runs the canonical Graph query first, and expands additional terms in bounded concurrent waves only while confidence remains low. Canonical Graph results can represent filename, metadata, or file-content matches; unrelated expansion-only results remain gated. Results expose the planned, executed, and skipped search terms. `graphSearchCalls` reports actual Graph search pages fetched, not just term count. Tune expansion with `searchConcurrency` and fallback scans with `scanConcurrency`. Fallback scans prune duplicate and nested folder hints regardless of input order. Cache-only hits must still have query relevance and are not treated as authoritative when live evidence cannot confirm them. Pass `useCache: false` for a fully live lookup with no metadata-cache reads or writes.
@@ -463,7 +472,7 @@ node scripts/tool-profile-test.mjs
 node scripts/chatgpt-golden-test.mjs
 ```
 
-The guards preserve the full 84-tool contract for Codex, limit the ChatGPT profile to the reviewed 21-tool surface (including standard `search`/`fetch`, combined exact-file reads, read-only action previews, ChatGPT file-parameter upload, recycle-bin restore, and guarded permanent delete), keep its `tools/list` response under 40 KiB, verify oversized results are bounded, and verify that the compact Office transform descriptor is still backed by the server's full validation schema. The golden-prompt gate covers every focused tool and checks the metadata cues that distinguish commonly confused actions. The ChatGPT server version includes a deterministic contract hash so ChatGPT invalidates stale tool metadata whenever the advertised surface changes.
+The guards preserve the full 84-tool contract for Codex, limit the ChatGPT profile to the reviewed 15-tool surface (including `fetch`, combined exact-file reads, parallel read actions, read-only action previews, guarded commit actions, ChatGPT file-parameter upload, and recycle-bin restore), keep its OAuth `tools/list` response under 38 KiB, verify oversized results are bounded, and verify that the compact Office transform descriptor is still backed by the server's full validation schema. The golden-prompt gate covers every focused tool and checks the metadata cues that distinguish commonly confused actions. The ChatGPT server version includes a deterministic contract hash so ChatGPT invalidates stale tool metadata whenever the advertised surface changes.
 
 Add `--clear` when you intentionally want to clear local metadata/content caches before the cold run. The script performs read-only Microsoft Graph operations, writes local cache/index files, and emits progress events to stderr while keeping the final summary JSON on stdout.
 
@@ -505,14 +514,14 @@ Preview the exact new versioned cache directory, then install only after reviewi
 
 ```bash
 node scripts/install-versioned-cache.mjs
-node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260729033800"
+node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260808010958"
 ```
 
 After both live betas, regenerate the two QA reports, preview their exact sync into that new cache, then apply only those evidence files and re-run parity:
 
 ```bash
-node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260729033800"
-node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260729033800"
+node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260808010958"
+node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260808010958"
 ```
 
 Office compatibility checks are split by purpose:

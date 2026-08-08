@@ -12,11 +12,11 @@ function assert(condition, message, details = undefined) {
 }
 
 const goldenPrompts = [
-  { prompt: "Find my latest HVAC service paperwork and most recent electrical report", tool: "search", cues: ["multiple related document targets", "ranked set"] },
-  { prompt: "Read the budget workbook you found", tool: "fetch", cues: ["read", "returned by search"] },
+  { prompt: "Read the budget workbook you found", tool: "fetch", cues: ["read", "returned by onedrive_read_actions"] },
   { prompt: "Open 2026 Family Budgeting.xlsx and Annual Report.pdf", tool: "onedrive_open_files", cues: ["exact filenames", "one read-only call"] },
-  { prompt: "Preview renaming this workbook, copying it, and creating a view link", tool: "onedrive_preview_actions", cues: ["preview", "read-only batch", "sharing counts without identities"] },
-  { prompt: "Show the files directly inside Documents/Taxes", tool: "onedrive_list", cues: ["direct children", "known"] },
+  { prompt: "Preview renaming this workbook, copying it, and creating a view link", tool: "onedrive_preview_actions", cues: ["preview", "read-only batch", "onedrive_commit_actions"] },
+  { prompt: "List the root and search for insurance while checking this folder's permissions", tool: "onedrive_read_actions", cues: ["folder listings", "descriptive searches", "permission inspections", "concurrently"] },
+  { prompt: "I approve all three previewed actions; apply them", tool: "onedrive_commit_actions", cues: ["approves one or more actions", "stops on the first error", "partial completion"] },
   { prompt: "What structured Excel edits are supported?", tool: "onedrive_office_capabilities", cues: ["supported structured operations"] },
   { prompt: "Update cells in these two Excel workbooks", tool: "onedrive_office_batch_transform", cues: ["structured edits", "preview"] },
   { prompt: "Upload this attached PDF to OneDrive", tool: "onedrive_upload_file", cues: ["chatgpt-provided file", "upload"] },
@@ -24,28 +24,19 @@ const goldenPrompts = [
   { prompt: "Create a new markdown file with this full content", tool: "onedrive_write_text", cues: ["create or fully replace", "required content field", "never a text field"] },
   { prompt: "Change only one line in this existing text file", tool: "onedrive_patch_text", cues: ["targeted", "preserving", "expectedetag", "previewtoken"] },
   { prompt: "Create a folder named Receipts under Documents", tool: "onedrive_create_folder", cues: ["direct conflict-safe create", "do not send dryrun"] },
-  { prompt: "I approve the previewed rename; apply it", tool: "onedrive_rename", cues: ["approved a live rename", "newname", "expectedid or expectedname", "previewtoken"] },
-  { prompt: "I approve the previewed move into Archive; apply it", tool: "onedrive_move", cues: ["approved a live move", "destination parent", "expectedid or expectedname", "previewtoken"] },
-  { prompt: "I approve the previewed copy; apply it and keep the original", tool: "onedrive_copy", cues: ["approved a live copy", "asynchronous acceptance", "expectedid or expectedname", "previewtoken"] },
-  { prompt: "I approve the previewed view-only sharing link; create it", tool: "onedrive_create_sharing_link", cues: ["approved a live sharing link", "type", "scope", "previewtoken", "never use for folder creation or access inspection"] },
   { prompt: "Give these named people edit access", tool: "onedrive_invite_permission", cues: ["specific named recipients"] },
-  { prompt: "I approve the previewed sharing permission removal", tool: "onedrive_revoke_permission", cues: ["approved a permission removal", "permissionid", "not auth credentials"] },
-  { prompt: "Which named people currently have access to this folder?", tool: "onedrive_permissions", cues: ["identities that currently access", "send only itemid or path", "never send expectedid"] },
   { prompt: "Move this file to the recycle bin", tool: "onedrive_delete", cues: ["only for that intent", "active onedrive item", "never use for read-only inspection", "permanent deletion"] },
   { prompt: "Restore this item from the recycle bin", tool: "onedrive_restore_deleted", cues: ["only for that intent", "while it is in the onedrive recycle bin", "never call again after restoration"] }
 ];
 
 const ambiguityPairs = [
-  ["search", "onedrive_open_files"],
-  ["onedrive_preview_actions", "onedrive_rename"],
-  ["search", "onedrive_list"],
+  ["onedrive_preview_actions", "onedrive_commit_actions"],
+  ["onedrive_read_actions", "onedrive_open_files"],
   ["onedrive_upload_file", "onedrive_export_file"],
   ["onedrive_write_text", "onedrive_patch_text"],
-  ["onedrive_move", "onedrive_copy"],
-  ["onedrive_create_sharing_link", "onedrive_invite_permission"],
-  ["onedrive_create_folder", "onedrive_create_sharing_link"],
-  ["onedrive_create_sharing_link", "onedrive_permissions"],
-  ["onedrive_permissions", "onedrive_revoke_permission"],
+  ["onedrive_commit_actions", "onedrive_invite_permission"],
+  ["onedrive_create_folder", "onedrive_commit_actions"],
+  ["onedrive_commit_actions", "onedrive_read_actions"],
   ["onedrive_delete", "onedrive_restore_deleted"]
 ];
 
@@ -61,10 +52,10 @@ try {
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
   assert(tools.length === goldenPrompts.length, "Golden prompt coverage must match the complete focused ChatGPT tool surface.", { tools: tools.map((tool) => tool.name), prompts: goldenPrompts.map((entry) => entry.tool) });
   assert(initialized.result.instructions.includes("onedrive_open_files once"), "ChatGPT instructions must describe the combined exact-file read sequence.", initialized.result.instructions);
-  assert(initialized.result.instructions.includes("onedrive_preview_actions"), "ChatGPT instructions must describe the read-only batch preview sequence.", initialized.result.instructions);
-  assert(initialized.result.instructions.includes("execute and verify one mutation at a time"), "ChatGPT instructions must prevent stale guards in dependent mutation sequences.", initialized.result.instructions);
+  assert(initialized.result.instructions.includes("onedrive_preview_actions once") && initialized.result.instructions.includes("onedrive_commit_actions"), "ChatGPT instructions must describe the guarded batch preview/commit sequence.", initialized.result.instructions);
+  assert(initialized.result.instructions.includes("dependency order") && initialized.result.instructions.includes("proofs can become stale"), "ChatGPT instructions must prevent stale guards in dependent mutation sequences.", initialized.result.instructions);
   assert(initialized.result.instructions.includes("Create folders directly"), "ChatGPT instructions must match the create-folder contract.", initialized.result.instructions);
-  assert(initialized.result.instructions.includes("prefer user-visible paths") && initialized.result.instructions.includes("asynchronous acceptance immediately"), "ChatGPT instructions must avoid false credential routing and inline copy waits.", initialized.result.instructions);
+  assert(initialized.result.instructions.includes("Prefer user-visible paths") && initialized.result.instructions.includes("verified stable results"), "ChatGPT instructions must avoid false credential routing and redundant mutation readbacks.", initialized.result.instructions);
   assert(!initialized.result.instructions.includes("matching structured read tool"), "ChatGPT instructions must not reference tools absent from the focused profile.", initialized.result.instructions);
 
   for (const entry of goldenPrompts) {

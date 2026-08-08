@@ -191,11 +191,11 @@ function isAuditedSensitiveSourcePath(path) {
   return auditedSensitiveSourcePaths.has(String(path).split(sep).join("/"));
 }
 
-async function walk(dir, files = []) {
+async function walk(dir, files = [], packageRoot = dir) {
   for (const entry of await readdir(dir, { withFileTypes: true })) {
     const path = join(dir, entry.name);
     const extension = extname(entry.name).toLowerCase();
-    const rel = relative(pluginRoot, path);
+    const rel = relative(packageRoot, path);
     const relParts = rel.split(sep);
     if (
       relParts.length === 3
@@ -212,13 +212,13 @@ async function walk(dir, files = []) {
     if (entry.isDirectory()) {
       if (ignoredPackageDirs.has(entry.name)) continue;
       if (forbiddenResidueDirs.has(entry.name)) {
-        fail(`Packaged test/review residue directory found: ${relative(pluginRoot, path)}`);
+        fail(`Packaged test/review residue directory found: ${relative(packageRoot, path)}`);
         continue;
       }
-      await walk(path, files);
+      await walk(path, files, packageRoot);
     } else if (entry.isFile()) {
       if (ignoredPackageFiles.has(entry.name) || ignoredPackageFileExtensions.has(extension)) {
-        fail(`Packaged temporary residue file found: ${relative(pluginRoot, path)}`);
+        fail(`Packaged temporary residue file found: ${relative(packageRoot, path)}`);
         continue;
       }
       files.push(path);
@@ -817,6 +817,9 @@ if (selfCheck) {
       && !isSensitivePackageEntryName("tool-contract.mjs"),
     auditedSensitiveSourcePathAccepted: isAuditedSensitiveSourcePath("mcp/oauth-facade-token.mjs")
       && !isAuditedSensitiveSourcePath("mcp/refresh-token.txt"),
+    auditedSensitiveInstalledPathAccepted: isAuditedSensitiveSourcePath(
+      relative("/tmp/onedrive-installed", "/tmp/onedrive-installed/mcp/oauth-facade-token.mjs")
+    ),
     privateNasComposeSnapshotsRecognized:
       privateNasComposePattern.test("compose.oauth.nas38.yaml")
       && privateNasComposePattern.test("compose.nas31.rollback.yaml")

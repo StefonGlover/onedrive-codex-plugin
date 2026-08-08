@@ -13,7 +13,7 @@ const fixtureRoot = join(workRoot, "fixtures");
 
 process.env.ONEDRIVE_STORAGE_ROOT ||= join(workRoot, "storage");
 process.env.ONEDRIVE_OFFICE_PYCACHE_ROOT ||= join(workRoot, "python-cache");
-process.env.ONEDRIVE_OFFICE_PYTHON ||= process.env.ONEDRIVE_OFFICE_TEST_PYTHON || "/usr/bin/python3";
+process.env.ONEDRIVE_OFFICE_PYTHON ||= process.env.ONEDRIVE_OFFICE_TEST_PYTHON || "python3";
 
 try {
   try {
