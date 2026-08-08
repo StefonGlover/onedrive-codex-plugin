@@ -1,66 +1,93 @@
 # OneDrive 0.6.4 End-to-End Beta Report
 
-Decision: Pending — production release; ChatGPT Work end-to-end beta passed with explicit environment and recipient gaps
+Decision: Pending — production release; end-to-end beta is complete across the focused connector, ChatGPT Work, and standard Chat with no plugin defects open
 Date: 2026-08-08
-Generated: 2026-08-08T01:09:58Z
-Tested source base commit: `f7eca243b52c40a15845f4ce22dc76431551f186`
-Plugin version: `0.6.4+codex.20260808010958`
-Server version: `0.6.4+codex.20260808010958.chatgpt.3ade2b1c7f1f`
-Tool contract: 84 exact tool names
+Generated: 2026-08-08T22:57:14Z
+Tested source base commit: `aef2f704adeeca563028772ec1bba1cec292d81a`
+Plugin version: `0.6.4+codex.20260808225332`
+Production server version: `0.6.4+codex.20260808010958.chatgpt.3ade2b1c7f1f`
+Tool contract: 84 exact tool names; 15 focused ChatGPT tools
 
 ## Outcome
 
-The current candidate passed the focused 15-tool ChatGPT contract, OAuth and authorization compatibility, 187 mocked Microsoft Graph scenarios, genuine Office-package validation, a controlled live connector run, and a real ChatGPT Work UI mutation run. In ChatGPT itself, the model selected OneDrive and completed folder/text creation, guarded replacement, fetch verification, copy, move, permission inspection, owner-revoke refusal, anonymous-link create/revoke, recycle deletion, exact-item restore, and final recoverable cleanup.
+The OneDrive plugin passed the complete offline suite, a fresh 84-tool live Microsoft Graph run, direct production calls for every focused ChatGPT function, and real UI workflows in both ChatGPT Work and standard Chat. Every isolated beta root was moved to the recycle bin and its former active path returned `itemNotFound`. No permanent deletion occurred, no anonymous link remained active, and no named-recipient permission was partially created.
 
-The ChatGPT UI run exposed one additional contract bug: ChatGPT correctly carried `expectedETag` from a text-replacement preview, but the focused write schema rejected it. The schema and runtime now accept and enforce that optional revision guard. After deployment to `onedrive-chatgpt-nas:0.6.4-nas56-chatgpt-etag`, the same ChatGPT conversation retried the failed action successfully and finished the suite. The canary is healthy with zero restarts and zero failing streak; nas55 remains the rollback image.
+The beta found and resolved three release issues:
 
-## Live fixture and cleanup
+- The shared Tailscale HTTPS router had lost the root handler needed for OneDrive `/authorize` and `/token`, while `/mcp` remained present. This caused reconnect 404s and ChatGPT internal plugin errors. The root handler was restored to `127.0.0.1:3011`, `/mcp` remains routed to `127.0.0.1:3012/mcp`, all other app prefixes were preserved, OAuth was reconnected, and ChatGPT reads and writes passed afterward.
+- The live harness called rename, move, and copy commits without their now-required preview proofs. It now previews each action and refuses to continue without concrete verified commit evidence. The repaired live run passed all three steps.
+- CI Python syntax checks generated `__pycache__` inside the source tree and then failed the package-residue guard. CI now writes bytecode under the runner temporary directory.
 
-The approved root was `Codex OneDrive Plugin Beta Test codex-beta-20260808t000304894z-8121`. All mutations stayed inside that boundary. Before cleanup it contained seven direct children and two nested text fixtures. The final root deletion used the guarded preview/confirmation flow and moved the folder to the OneDrive recycle bin. A direct path read then returned `itemNotFound`, confirming zero active fixture residue. No permanent deletion occurred and the recycle bin was not emptied.
+The production MCP source did not change during these final fixes, so the healthy nas56 container remains the correct deployment. The manifest was cache-busted for the tested local package.
 
-The temporary anonymous view link was revoked and permissions returned to the single non-revocable owner grant before cleanup. No named invitation or email was sent because no distinct recipient was supplied.
+## Live coverage
 
-The separate ChatGPT UI root `ChatGPT OneDrive Plugin Beta Test chatgpt-ui-20260808-01` was also recycled after its delete/restore test. ChatGPT verified the active path returned `itemNotFound`. Evidence: https://chatgpt.com/c/6a767e8f-0f4c-83ea-884d-9b406980876c
+### Focused 15-tool production connector
 
-## Defects fixed
+All focused functions were exercised against the connected personal OneDrive:
 
-- Focused text-write schemas no longer expose overlapping destination branches; Work receives one unambiguous `remotePath` plus `content` contract.
-- Guarded batch commits now report `partialMutationPossible: false` after a fully successful batch and reserve `true` for mixed success/failure state.
-- Permission batch previews now fail closed for owner or inherited grants and never return a commit token for a non-revocable permission.
-- Local Office-backed tests honor `ONEDRIVE_OFFICE_TEST_PYTHON`, then `ONEDRIVE_OFFICE_PYTHON`, then `python3`, instead of relying on a broken macOS system Python path.
-- OAuth HTTP expectations now match the current 15-tool Work surface instead of the retired 21-tool profile.
-- The versioned cache installer accepts the repository's `0.6.4` release line rather than rejecting it with a stale `0.6.1` guard.
-- Installed-cache verification now evaluates audited sensitive source paths relative to the cache root, so the required OAuth facade token module is accepted consistently in source and installed snapshots.
-- Focused text replacement now accepts and validates `expectedETag`, matching the preview/commit arguments naturally selected by ChatGPT Work.
+- Batched list, search, item-info, and permission reads
+- Bounded content fetch and exact-name open
+- Folder creation
+- Guarded text creation and patching
+- Batched rename, move, copy, anonymous-link creation, and permission revocation
+- Named-recipient invite preview plus live Microsoft Graph error-state audit
+- Local-file upload
+- Office capability discovery
+- Guarded Word batch transformation with backup and remote package verification
+- Word-to-PDF export
+- Recycle deletion and exact deleted-item restore
+- Final recoverable cleanup and active-path absence verification
 
-The permission and partial-state regressions passed after nas55. The ChatGPT-specific replacement regression then passed in the original Work conversation after nas56 deployment, preserving the stable item ID, advancing the eTag, and verifying the expected 49-byte content fingerprint.
+The isolated root was `ChatGPT OneDrive Plugin Beta Test chatgpt-direct-20260808-2236`. It was recycled at the end and no active fixture root or anonymous link remained.
 
-## Verification
+### Full 84-tool live harness
 
-- Mock Microsoft Graph: 187/187.
-- Full MCP contract: 84 tools, 339,137 descriptor bytes.
-- Focused ChatGPT contract: 15 tools, 26,526 bytes; 92.2% reduction.
-- Focused OAuth contract: 15 tools, 28,656 bytes.
-- Golden routing: 15/15 prompts and 8 ambiguity pairs.
-- OAuth HTTP integration: pass.
-- OAuth compatibility: 169/169.
-- Semantic anchors: 6/6.
-- Text patch safety: 6/6.
-- Word local operation coverage: 21/21; genuine package reopened and rendered.
-- Excel local operation coverage: 33/33; genuine package reopened and rendered.
-- PowerPoint local operation coverage: 25/25; genuine package reopened and rendered.
-- Live Office extraction and edits: DOCX, XLSX, PPTX, and PDF all passed; edited values were re-opened and verified.
-- ChatGPT Work read-only UI probe: pass. Evidence: https://chatgpt.com/c/6a76730c-1764-83ea-98ff-be3a2cd18c48
-- ChatGPT Work mutation/recovery UI suite: pass after one discovered-and-fixed schema regression. Evidence: https://chatgpt.com/c/6a767e8f-0f4c-83ea-884d-9b406980876c
-- nas56 deployment: healthy, zero restarts, zero failing streak.
-- Versioned Codex cache: `0.6.4+codex.20260808010958` installed alongside prior builds; 61-file source/cache parity and server SHA-256 passed.
+Fresh run `codex-beta-20260808t2243z-fix` completed 106 checks:
 
-## Improvement opportunities and remaining constraints
+- Pass: 97
+- Fail: 0
+- Blocked by account/environment: 9
+- Exact non-blocked tool contract exercised: pass
+- Final root cleanup: pass
 
-- One exact-filename search returned the correct restored file but took 49.7 seconds after filtering a stale cache item. The next improvement should cap exact-name fallback latency and expose per-stage timing in the user-visible result so indexed search, cache confirmation, and live scan can be distinguished.
-- Named-recipient grant/revoke remains mock-tested only. Completing that live check requires a distinct recipient address and would send or grant external access.
-- Business Graph Excel and organization-scoped sharing remain mock-tested because the connected OneDrive is personal.
-- The extra ChatGPT attachment-to-OneDrive Office test is blocked by the Edge extension setting that permits local file URLs. Live Office upload/edit/export remains passed through the connector and local package suites.
-- The NAS management connector's certificate-validation hardening remains separate infrastructure work.
+Evidence: `work/qa-artifacts/live-codex-beta-20260808t2243z-fix.json`
+
+### ChatGPT Work UI
+
+The final Work workflow passed 15/15 checkpoints: OAuth-backed root read, root and nested-folder creation, guarded text write and exact readback, rename, move, copy, anonymous-link creation, permission inspection, exact link revocation, recycle deletion, deleted-item restore, restored-content verification, final root recycling, and expected `itemNotFound` at the former active path.
+
+Evidence: https://chatgpt.com/c/6a77ad45-6fec-83ea-acae-a930238c07f2
+
+### ChatGPT standard Chat UI
+
+Ordinary Chat selected the connected OneDrive plugin and passed root listing, isolated folder creation, guarded text write, exact readback including the trailing newline, the in-product permission prompt, recycle cleanup, and expected `itemNotFound` at the former active path.
+
+Evidence: https://chatgpt.com/c/6a77b265-cac4-83ea-a802-65c093afe437
+
+## Offline verification
+
+- Mock Microsoft Graph: 187/187
+- Full MCP contract: 84 tools, 339,137 descriptor bytes
+- Focused ChatGPT contract: 15 tools, 26,526 bytes; 92.2% reduction
+- Focused OAuth contract: 15 tools, 28,656 bytes
+- Golden routing: 15/15 prompts and 8 ambiguity pairs
+- OAuth HTTP integration: pass in full and focused profiles
+- OAuth compatibility: 169/169
+- Semantic anchors: 6/6
+- Text patch safety: 6/6
+- Word operation coverage: 21/21
+- Excel operation coverage: 33/33
+- PowerPoint operation coverage: 25/25
+- Genuine Office packages reopened and rendered: DOCX, XLSX, and PPTX pass
+- Storage-root and private-permission tests: pass
+- Plugin package guard and cache parity: pass
+
+## External constraints, not plugin defects
+
+- Named-recipient invitation: a user-controlled Gmail plus alias was tested in both silent and email modes. Microsoft Graph returned `sharingFailed`; a permission audit proved no grant or partial state was created. A distinct non-owner Microsoft recipient is required to demonstrate the success path live. The success and cleanup paths remain covered by the mock suite.
+- Business Graph Excel sessions: unavailable on the connected personal OneDrive; fully mock-tested.
+- Organization-scoped sharing: unavailable on the connected personal OneDrive; fully mock-tested.
+- Forced device-code polling and credential deletion were intentionally excluded to preserve the healthy production credential; their safe paths are mock-tested.
 
 The detailed capability matrix is in `work/qa-artifacts/capability-matrix-20260807.md`.

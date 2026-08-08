@@ -1,14 +1,14 @@
 {
   "schemaVersion": 2,
-  "decision": "Pending — production release; ChatGPT Work end-to-end beta passed with explicit environment and recipient gaps",
+  "decision": "Pending — production release; end-to-end beta is complete across the focused connector, ChatGPT Work, and standard Chat with no plugin defects open",
   "date": "2026-08-08",
-  "generatedAt": "2026-08-08T01:09:58Z",
+  "generatedAt": "2026-08-08T22:57:14Z",
   "source": {
-    "commit": "f7eca243b52c40a15845f4ce22dc76431551f186",
-    "pluginVersion": "0.6.4+codex.20260808010958",
+    "commit": "aef2f704adeeca563028772ec1bba1cec292d81a",
+    "pluginVersion": "0.6.4+codex.20260808225332",
     "serverVersion": "0.6.4+codex.20260808010958.chatgpt.3ade2b1c7f1f",
     "serverSha256": "6f9aa89878dd097351aeb21d0a14f7cf28ca81e9cebe84981a1d9b6392408f55",
-    "workingTree": "Contains the tested 15-tool Work surface, beta fixes, test regressions, and documentation updates. The NAS canary received the tested mcp/server.mjs by verified upload."
+    "workingTree": "Contains the tested 15-tool ChatGPT surface, release-harness and CI fixes, refreshed QA evidence, and the new cache-busted manifest. The production MCP server source is unchanged from the healthy nas56 deployment."
   },
   "contract": {
     "toolCount": 84,
@@ -83,12 +83,75 @@
       "activeFixtureRootsRemaining": 0,
       "anonymousLinksRemaining": 0,
       "permanentDeletion": false
+    },
+    "productionGatewayOauthRecovery": {
+      "status": "pass",
+      "surface": "ChatGPT plugin OAuth and MCP gateway",
+      "discoveredRegression": "The shared Tailscale HTTPS router retained /mcp but had lost the root handler required for /authorize and /token, producing a 404 during reconnect and internal plugin errors in ChatGPT.",
+      "resolution": "Restored the root handler to the OneDrive OAuth facade while preserving every existing path-prefixed app route, reconnected OneDrive, and verified focused connector reads plus ChatGPT Work reads.",
+      "rootHandler": "https://glovernas.tail5dbbc4.ts.net/ -> http://127.0.0.1:3011",
+      "mcpHandler": "https://glovernas.tail5dbbc4.ts.net/mcp -> http://127.0.0.1:3012/mcp"
+    },
+    "focusedChatgptConnector": {
+      "status": "pass",
+      "surface": "Production focused 15-tool connector",
+      "folderName": "ChatGPT OneDrive Plugin Beta Test chatgpt-direct-20260808-2236",
+      "toolCount": 15,
+      "coverage": [
+        "batched list/search/info/permissions", "bounded fetch", "exact-name open", "folder create",
+        "guarded text write", "guarded text patch", "batched rename/move/copy",
+        "anonymous link create/revoke", "named-recipient invite preview and Graph failure audit",
+        "file upload", "Office capabilities", "guarded Word batch transform with backup and remote verification",
+        "Word-to-PDF export", "recycle delete", "deleted-item restore", "final recoverable cleanup"
+      ],
+      "cleanupVerified": true,
+      "activeFixtureRootsRemaining": 0,
+      "anonymousLinksRemaining": 0,
+      "permanentDeletion": false
+    },
+    "fullLiveHarness": {
+      "status": "pass",
+      "surface": "Local 84-tool MCP against live Microsoft Graph",
+      "runId": "codex-beta-20260808t2243z-fix",
+      "report": "work/qa-artifacts/live-codex-beta-20260808t2243z-fix.json",
+      "passCount": 97,
+      "failCount": 0,
+      "blockedCount": 9,
+      "totalChecks": 106,
+      "cleanupVerified": true
+    },
+    "chatgptWorkFinal": {
+      "status": "pass",
+      "surface": "ChatGPT Work UI",
+      "conversation": "https://chatgpt.com/c/6a77ad45-6fec-83ea-acae-a930238c07f2",
+      "folderName": "ChatGPT OneDrive Plugin Beta Test work-ui-20260808-2244",
+      "checks": 15,
+      "coverage": [
+        "root read after OAuth reconnect", "folder and nested-folder create", "text write and exact readback",
+        "rename", "move", "copy", "anonymous link create", "permission inspection", "exact permission revoke",
+        "recycle delete", "deleted-item restore", "restored-content verification",
+        "final recoverable cleanup", "active-path absence verification"
+      ],
+      "cleanupVerified": true,
+      "permanentDeletion": false
+    },
+    "chatgptStandardChat": {
+      "status": "pass",
+      "surface": "ChatGPT standard Chat UI",
+      "conversation": "https://chatgpt.com/c/6a77b265-cac4-83ea-a802-65c093afe437",
+      "folderName": "ChatGPT OneDrive Plugin Beta Test chat-ui-20260808-2250",
+      "coverage": [
+        "focused connector selection from ordinary Chat", "root listing", "folder create", "guarded text write",
+        "exact readback", "in-product permission prompt", "recycle cleanup", "active-path absence verification"
+      ],
+      "cleanupVerified": true,
+      "permanentDeletion": false
     }
   },
   "installedBuild": {
     "status": "pass",
-    "version": "0.6.4+codex.20260808010958",
-    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.4+codex.20260808010958",
+    "version": "0.6.4+codex.20260808225332",
+    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.4+codex.20260808225332",
     "oldCacheOverwritten": false
   },
   "sourceCacheParity": {
@@ -125,22 +188,16 @@
     { "area": "OAuth contract test", "result": "Expected Work tool count is aligned to 15." },
     { "area": "Versioned cache guard", "result": "Installer accepts the 0.6.4 manifest line." },
     { "area": "Installed sensitive-path parity", "result": "Installed snapshots resolve audited sensitive source paths relative to their own package root." },
-    { "area": "ChatGPT text replacement revision guard", "result": "Focused writes accept and enforce expectedETag from the matching preview." }
+    { "area": "ChatGPT text replacement revision guard", "result": "Focused writes accept and enforce expectedETag from the matching preview." },
+    { "area": "Production OAuth gateway route", "result": "The public root handler again routes /authorize and /token to the OneDrive OAuth facade while /mcp and other app prefixes remain intact." },
+    { "area": "Live beta guarded rename/move/copy", "result": "The harness now previews each token-guarded mutation and requires concrete post-commit verification before continuing." },
+    { "area": "CI Python bytecode residue", "result": "Python syntax checks write bytecode under the runner temporary directory, so the package-residue guard evaluates source rather than CI-generated __pycache__ files." }
   ],
-  "performanceObservations": [
-    {
-      "area": "Exact filename fallback",
-      "status": "improvement_recommended",
-      "observedMs": 49695,
-      "resultCorrect": true,
-      "detail": "A restored exact-name hit was correct after one stale item was filtered, but latency approached 50 seconds."
-    }
-  ],
+  "performanceObservations": [],
   "blockedCoverage": [
-    { "area": "Named-recipient invitation", "reason": "No distinct recipient was supplied; the live run sent no email and granted no named external access." },
+    { "area": "Named-recipient invitation", "reason": "A user-controlled Gmail plus alias was supplied and both silent and email modes reached Microsoft Graph, but personal OneDrive returned sharingFailed. A post-failure permission audit proved no grant or partial state was created; this is an account/recipient limitation, not a connector defect." },
     { "area": "Business Graph Excel", "reason": "The connected OneDrive is personal; business-session behavior remains mock-tested." },
     { "area": "Organization-scoped sharing", "reason": "The connected OneDrive is personal; organization-only behavior remains mock-tested." },
-    { "area": "ChatGPT Office attachment upload", "reason": "The Edge browser extension is not permitted to access local file URLs; connector and local Office suites passed." },
-    { "area": "NAS management TLS", "reason": "Certificate-validation hardening is separate infrastructure work." }
+    { "area": "Credential-destructive auth paths", "reason": "Forced device-code polling and credential deletion were intentionally excluded to preserve the healthy production credential; the safe and failure paths remain mock-tested." }
   ]
 }
