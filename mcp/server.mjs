@@ -5670,6 +5670,19 @@ function chatgptSearchResult(item = {}, fallbackTitle = "") {
   };
 }
 
+function chatgptReadSearchItem(result = {}, format = "compact") {
+  if (format !== "full") return result;
+  return {
+    id: result.id,
+    title: result.title,
+    name: result.name || result.title,
+    remotePath: result.path || "",
+    parentId: result.parent?.id || "",
+    type: result.type,
+    webUrl: result.webUrl || result.url
+  };
+}
+
 function itemBase(args = {}) {
   const resolved = itemArgsWithResolvedPath(args);
   if (resolved.itemId) return `/me/drive/items/${encodeURIComponent(resolved.itemId)}`;
@@ -7532,7 +7545,10 @@ async function find(args = {}) {
     ranked = conceptRelevantFindCandidates(candidates, queryConcepts);
   }
   const bestLiveScore = ranked.find(candidateHasLiveSource)?.score || 0;
-  const shouldScan = args.scanFallback !== false && bestLiveScore < searchConfidenceThreshold;
+  const shouldScan = args.scanFallback !== false
+    && !usedFreshLocalFastPath
+    && !usedStaleLocalFastPath
+    && bestLiveScore < searchConfidenceThreshold;
 
   if (shouldScan) {
     const scanNeedle = findScanNeedle(query);
@@ -10266,9 +10282,66 @@ function chatgptSearchRecency(item) {
   return Math.max(metadataTimestamp, titleTimestamp);
 }
 
+function chatgptMetadataRelevance(item, query) {
+  const queryText = normalizeFindText(query);
+  const queryTokens = findImportantTokens(query);
+  const nameText = normalizeFindText(item?.name || item?.title || "");
+  const nameWithoutExtension = normalizeFindText(basename(item?.name || item?.title || "", extname(item?.name || item?.title || "")));
+  const pathText = normalizeFindText(item?.remotePath || item?.path || "");
+  const nameTokens = new Set(findTokens(nameText));
+  const pathTokens = new Set(findTokens(pathText));
+  const nameMatches = queryTokens.filter((token) => nameTokens.has(token) || nameText.includes(token));
+  const pathMatches = queryTokens.filter((token) => !nameMatches.includes(token) && (pathTokens.has(token) || pathText.includes(token)));
+  const matchedTokens = nameMatches.length + pathMatches.length;
+  const coverage = queryTokens.length ? matchedTokens / queryTokens.length : 0;
+  const nameCoverage = queryTokens.length ? nameMatches.length / queryTokens.length : 0;
+
+  if (queryText && (nameText === queryText || nameWithoutExtension === queryText)) {
+    return { tier: 5, coverage, nameCoverage, reason: "exact normalized filename" };
+  }
+  if (queryText && (nameText.includes(queryText) || nameWithoutExtension.includes(queryText))) {
+    return { tier: 4, coverage, nameCoverage, reason: "filename contains the full query" };
+  }
+  if (queryTokens.length >= 2 && nameMatches.length === queryTokens.length) {
+    return { tier: 3, coverage, nameCoverage, reason: "all query tokens occur in the filename" };
+  }
+  if (queryTokens.length && coverage === 1) {
+    return { tier: 3, coverage, nameCoverage, reason: "all query tokens occur in filename or path" };
+  }
+  if (queryTokens.length === 1 && coverage === 1) {
+    return { tier: 3, coverage, nameCoverage, reason: "query token occurs in filename or path" };
+  }
+  if (queryTokens.length >= 2 && coverage >= 0.5) {
+    return { tier: 2, coverage, nameCoverage, reason: "partial metadata token match" };
+  }
+  return { tier: 0, coverage, nameCoverage, reason: "no meaningful filename or path match" };
+}
+
+function chatgptHasVerifiedContentEvidence(item, query) {
+  const queryConcepts = findQueryConcepts(query);
+  if (queryConcepts.some((concept) => chatgptCandidateHasConceptEvidence(item, concept))) return true;
+  if ((item?.sources || []).some((source) => source.source === "contentIndex" && source.strongContentIndexMatch === true)) return true;
+  return (item?.reasons || []).some((reason) => normalizeFindText(reason).startsWith("content verified"));
+}
+
+function chatgptSearchEvidenceTier(item, query) {
+  const metadata = chatgptMetadataRelevance(item, query);
+  if (metadata.tier > 0) return { ...metadata, verifiedContent: false };
+  if (chatgptHasVerifiedContentEvidence(item, query)) {
+    return { ...metadata, tier: 2, reason: "verified indexed or inspected content", verifiedContent: true };
+  }
+  return { ...metadata, verifiedContent: false };
+}
+
+function chatgptFilterSearchEvidence(items, query) {
+  return items.filter((item) => chatgptSearchEvidenceTier(item, query).tier > 0);
+}
+
 function chatgptRankSearchItems(items, query) {
   const asksForLatest = /\b(latest|newest|recent|most recent)\b/iu.test(query);
   return [...items].sort((left, right) => {
+    const evidenceTierDifference = chatgptSearchEvidenceTier(right, query).tier - chatgptSearchEvidenceTier(left, query).tier;
+    if (evidenceTierDifference) return evidenceTierDifference;
     const affinityDifference = (
       chatgptServiceDocumentAffinity(right, query) + chatgptDocumentIntentAffinity(right, query)
     ) - (
@@ -10425,14 +10498,16 @@ async function chatgptContentDiscoveryFallback(query, cache, contentIndex, requi
   return { attempted: true, items: [], probes, candidatesRead, indexEntriesWarmed, graphSearchCalls, searchTermsExecuted };
 }
 
-async function chatgptSearch(args = {}) {
+async function chatgptSearch(args = {}, internal = {}) {
   const startedAt = Date.now();
   const query = String(args.query || "").trim();
   const exactFilenameQuery = chatgptExactFilenameQuery(query);
+  const allowLocalFastPath = Boolean(exactFilenameQuery) || findImportantTokens(query).length >= 2;
   const cache = await loadMetadataCache();
   const contentFallbackEligible = !exactFilenameQuery && chatgptContentFallbackEligible(query);
   const findArgs = {
     query,
+    includeFolders: true,
     maxResults: 10,
     maxResultsLimit: 10,
     maxSearchTerms: exactFilenameQuery ? 1 : 6,
@@ -10441,12 +10516,18 @@ async function chatgptSearch(args = {}) {
     searchPageSize: 10,
     searchMaxItemsPerTerm: 10,
     minConfidenceForSearchOnly: 74,
-    preferFreshLocalResults: true,
+    preferFreshLocalResults: allowLocalFastPath,
     freshLocalMinConfidence: 60,
-    preferStaleLocalResults: true,
+    preferStaleLocalResults: allowLocalFastPath,
     staleLocalMinConfidence: 75,
     staleLocalMaxAgeSeconds: chatgptStaleCacheMaxAgeSeconds,
-    scanFallback: false,
+    // Exact filenames have one cache-validating live traversal below. Keeping
+    // the generic scan enabled here would repeat the same traversal on misses.
+    scanFallback: !exactFilenameQuery,
+    scanMaxItems: 2000,
+    scanMaxFolders: 350,
+    scanMaxDepth: 20,
+    scanConcurrency: 3,
     confirmCacheCandidates: false,
     useCache: true,
     useContentIndex: true,
@@ -10460,10 +10541,13 @@ async function chatgptSearch(args = {}) {
   // semantic Graph expansions. If verification misses, retain the full search.
   let found = await find({
     ...findArgs,
-    ...(contentFallbackEligible ? { liveSearch: false } : {})
+    ...(contentFallbackEligible ? { liveSearch: false, scanFallback: false } : {})
   });
   let selectedItems = chatgptRankSearchItems(
-    (found.items || []).filter((item) => chatgptMatchesStrictDocumentIntent(item, query)),
+    chatgptFilterSearchEvidence(
+      (found.items || []).filter((item) => chatgptMatchesStrictDocumentIntent(item, query)),
+      query
+    ),
     query
   );
   let uncoveredDomainConcepts = chatgptUncoveredDomainConcepts(selectedItems, query);
@@ -10478,7 +10562,10 @@ async function chatgptSearch(args = {}) {
       );
       if (contentFallback.items.length) {
         selectedItems = chatgptRankSearchItems(
-          [...new Map([...selectedItems, ...contentFallback.items].map((item) => [item.id, item])).values()],
+          chatgptFilterSearchEvidence(
+            [...new Map([...selectedItems, ...contentFallback.items].map((item) => [item.id, item])).values()],
+            query
+          ),
           query
         );
         uncoveredDomainConcepts = chatgptUncoveredDomainConcepts(selectedItems, query);
@@ -10490,10 +10577,13 @@ async function chatgptSearch(args = {}) {
   if ((!selectedItems.length || uncoveredDomainConcepts.length) && contentFallbackEligible) {
     found = await find(findArgs);
     selectedItems = chatgptRankSearchItems(
-      [...new Map([
-        ...selectedItems,
-        ...(found.items || []).filter((item) => chatgptMatchesStrictDocumentIntent(item, query))
-      ].map((item) => [item.id, item])).values()],
+      chatgptFilterSearchEvidence(
+        [...new Map([
+          ...selectedItems,
+          ...(found.items || []).filter((item) => chatgptMatchesStrictDocumentIntent(item, query))
+        ].map((item) => [item.id, item])).values()],
+        query
+      ),
       query
     );
   }
@@ -10550,7 +10640,20 @@ async function chatgptSearch(args = {}) {
       usedScanFallback: Boolean(found.summary?.usedScanFallback)
     }));
   }
-  return { results };
+  return {
+    results,
+    ...(internal.includeDiagnostics === true ? {
+      diagnostics: {
+        searchMode: "ranked",
+        exactFilenameFallbackAttempted,
+        metadataQualifiedResults: selectedItems.filter((item) => chatgptMetadataRelevance(item, query).tier > 0).length,
+        verifiedContentResults: selectedItems.filter((item) => chatgptSearchEvidenceTier(item, query).verifiedContent).length,
+        rawGraphContentOnlyResultsSuppressed: Math.max(0, (found.items || []).length - selectedItems.length),
+        graphSearchCalls: (found.summary?.graphSearchCalls || 0) + contentFallback.graphSearchCalls,
+        searchTermsExecuted: (found.summary?.searchTermsExecuted || 0) + contentFallback.searchTermsExecuted
+      }
+    } : {})
+  };
 }
 
 function officePlainText(document, fileName = "Office document") {
@@ -11314,22 +11417,15 @@ async function chatgptReadAction(action, index) {
     if (action.operation === "list") {
       value = await list({ ...target, limit: action.limit || 25, format: action.format || "compact" });
     } else if (action.operation === "search") {
-      value = await search({ query: action.query, limit: action.limit || 25, format: action.format || "compact" });
-      const exactFilenameQuery = chatgptExactFilenameQuery(action.query);
-      const hasExactFilename = exactFilenameQuery && (value.items || []).some((item) => (
-        exactFilenameKey(item.name) === exactFilenameKey(exactFilenameQuery)
-      ));
-      if (exactFilenameQuery && !hasExactFilename) {
-        const fallback = await chatgptSearch({ query: exactFilenameQuery });
-        const exactItems = (fallback.results || []).filter((item) => (
-          exactFilenameKey(item.title || item.name) === exactFilenameKey(exactFilenameQuery)
-        ));
-        value = {
-          ...value,
-          items: exactItems.slice(0, action.limit || 25),
-          exactFilenameFallbackAttempted: true
-        };
-      }
+      const ranked = await chatgptSearch({ query: action.query }, { includeDiagnostics: true });
+      value = {
+        items: (ranked.results || [])
+          .slice(0, Math.min(action.limit || 25, 10))
+          .map((item) => chatgptReadSearchItem(item, action.format || "compact")),
+        nextLink: null,
+        rankedSearch: true,
+        ...(ranked.diagnostics || {})
+      };
     } else if (action.operation === "getInfo") {
       value = { item: await getInfo({ ...target, format: action.format || "compact" }) };
     } else if (action.operation === "permissions") {

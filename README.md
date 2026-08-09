@@ -2,7 +2,7 @@
 
 Local Codex plugin for OneDrive file operations through Microsoft Graph.
 
-Release `0.6.4+codex.20260808225332` delivers the privately distributed ChatGPT Work OAuth connection for personal Microsoft accounts, preserves mandatory S256 PKCE and per-user credential isolation, and adds verified PDF/text export with a safe local Open XML fallback when Microsoft Graph does not support plain-text conversion. It keeps the public MCP resource, Entra API resource, advertised authorization server, and Microsoft token-validation authority explicitly separate. Exact filename searches use one indexed Graph query followed by a bounded, cache-validated live folder scan when OneDrive indexing misses the file.
+Release `0.6.4+codex.20260809062901` brings focused ChatGPT Work search onto the same ranked discovery pipeline as the full OneDrive profile. Combined Work reads now rank exact and metadata-complete matches ahead of verified content matches, suppress unverified content-only noise, preserve stale-cache acceleration with background revalidation, and use one bounded live traversal when an exact filename is absent from Microsoft Graph's index.
 
 ChatGPT surface note (updated 2026-07-29): the focused 15-tool surface covers read/CRUD/sharing/permissions, including parallel reads and guarded single-or-batch commits. Redundant standalone list/search/permission tools are hidden from Work so its runtime selector consistently chooses the combined read path. Work requires the delegated OAuth deployment and public compatibility origin described below. Direct Entra v2 endpoints are not sufficient because ChatGPT correctly sends the MCP `resource` parameter and Entra v2 rejects that parameter.
 
@@ -476,7 +476,7 @@ The guards preserve the full 84-tool contract for Codex, limit the ChatGPT profi
 
 Add `--clear` when you intentionally want to clear local metadata/content caches before the cold run. The script performs read-only Microsoft Graph operations, writes local cache/index files, and emits progress events to stderr while keeping the final summary JSON on stdout.
 
-Expected improvement: exact multi-file reads now require one host tool round instead of a search/fetch round for every file, and multi-action previews require one read-only host round instead of one consent-classified call per action. A high-confidence match in a fresh metadata cache returns without a Graph search. A high-confidence match in a cache no more than 24 hours old also returns immediately while a bounded delta or query refresh runs in the background. Cold ChatGPT discovery searches up to six evidence-ranked terms in waves of three: the natural-language query, any specific names/numbers, and deterministic aliases for common home-service, medical, tax, insurance, travel, employment, and agreement intents. Corroborating concept hits receive a bounded ranking boost, while generic report/service words alone cannot outrank stronger domain evidence. Fetch validates a stale content-index entry with lightweight metadata and reuses it when the ETag/cTag fingerprint is unchanged. Large documents return a representative first response capped at 32 KiB, with `metadata.nextChunkId` for sequential 64 KiB continuation reads through the same `fetch` tool; continuations reuse a short-lived in-memory extraction when possible. Actual speed still depends on ChatGPT host latency, Microsoft Graph latency, OneDrive size, throttling, and configured caps.
+Expected improvement: exact multi-file reads now require one host tool round instead of a search/fetch round for every file, and multi-action previews require one read-only host round instead of one consent-classified call per action. Descriptive search actions in the combined ChatGPT Work read tool now use ranked discovery instead of returning raw Graph order. Exact filenames, complete filename phrases, and full filename/path token coverage form higher relevance tiers than verified content matches; unverified content-only Graph hits are suppressed. Single-token queries perform a live search rather than stopping on one incomplete cache candidate, while low-confidence cold discovery can use a bounded metadata scan. A high-confidence multi-token match in a fresh metadata cache returns without a Graph search. A high-confidence match in a cache no more than 24 hours old also returns immediately while a bounded delta or query refresh runs in the background. Cold ChatGPT discovery searches up to six evidence-ranked terms in waves of three: the natural-language query, any specific names/numbers, and deterministic aliases for common home-service, medical, tax, insurance, travel, employment, and agreement intents. Corroborating concept hits receive a bounded ranking boost, while generic report/service words alone cannot outrank stronger domain evidence. Fetch validates a stale content-index entry with lightweight metadata and reuses it when the ETag/cTag fingerprint is unchanged. Large documents return a representative first response capped at 32 KiB, with `metadata.nextChunkId` for sequential 64 KiB continuation reads through the same `fetch` tool; continuations reuse a short-lived in-memory extraction when possible. Actual speed still depends on ChatGPT host latency, Microsoft Graph latency, OneDrive size, throttling, and configured caps.
 
 ## Safe Example Prompts
 
@@ -498,6 +498,12 @@ Run the mocked Microsoft Graph regression suite first. It does not touch OneDriv
 scripts/mock-graph-test.mjs
 ```
 
+Run the focused ChatGPT Work beta against the connected account after the mocked suite. This is read-only: it starts the exact 15-tool Work profile, measures ranked search quality for representative metadata and exact-filename queries, fetches a known document, writes an evidence report, and makes no remote mutations:
+
+```bash
+node scripts/chatgpt-work-beta-test.mjs --run-id=codex-beta-work-YYYYMMDDTHHMMSSZ --report=work/qa-artifacts/codex-beta-work-YYYYMMDDTHHMMSSZ.json
+```
+
 Run the benchmark script when comparing cold search, warm cache search, indexed content search, and selected preview timing. The script exits nonzero if any MCP tool step reports an error:
 
 ```bash
@@ -514,14 +520,14 @@ Preview the exact new versioned cache directory, then install only after reviewi
 
 ```bash
 node scripts/install-versioned-cache.mjs
-node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260808225332"
+node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260809062901"
 ```
 
 After both live betas, regenerate the two QA reports, preview their exact sync into that new cache, then apply only those evidence files and re-run parity:
 
 ```bash
-node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260808225332"
-node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260808225332"
+node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260809062901"
+node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260809062901"
 ```
 
 Office compatibility checks are split by purpose:

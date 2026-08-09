@@ -145,6 +145,7 @@ const requiredFiles = [
   "scripts/text-patch-test.mjs",
   "scripts/tool-profile-test.mjs",
   "scripts/chatgpt-golden-test.mjs",
+  "scripts/chatgpt-work-beta-test.mjs",
   "scripts/common-text.py",
   "scripts/common-text-test.py",
   "scripts/container-healthcheck.mjs",

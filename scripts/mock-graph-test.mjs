@@ -1640,6 +1640,57 @@ const graph = createServer(async (req, res) => {
     return json(res, 200, { value: [item("chatgpt-stale-cache", "ChatGPT Stale Cache.txt")] });
   }
 
+  if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='Business Plan')")) {
+    return json(res, 200, { value: [
+      item("search-noise-haccp-business", "4. HACCP Intermediate Content_V1_ CHAPTER 4.pptx", {
+        parentReference: { path: "/drive/root:/Microsoft Copilot Chat Files/Copilot Notebook Uploads" },
+        file: { mimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
+      }),
+      item("search-business-plan", "Qaldris Business Plan v1.0.docx", {
+        parentReference: { path: "/drive/root:/Personal/Documents/Glover Foundry LLC/Ventures/Qaldris/Market & Strategy" },
+        file: { mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+      })
+    ] });
+  }
+
+  if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='Stefon Operating Manual')")) {
+    return json(res, 200, { value: [
+      item("search-noise-haccp-manual", "6. HACCP Intermediate Content_V1_ CHAPTER 6.pptx", {
+        parentReference: { path: "/drive/root:/Microsoft Copilot Chat Files/Copilot Notebook Uploads" },
+        file: { mimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
+      }),
+      item("search-operating-manual", "Stefon_Operating_Manual_v1.docx", {
+        parentReference: { path: "/drive/root:/Personal/Documents" },
+        file: { mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+      })
+    ] });
+  }
+
+  if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='Qaldris')")) {
+    return json(res, 200, { value: [
+      item("search-noise-qaldris-content", "asset-manifest.json", {
+        parentReference: { path: "/drive/root:/Unrelated/Launch Kit" },
+        file: { mimeType: "application/json" }
+      }),
+      folder("search-qaldris-folder", "Qaldris", {
+        parentReference: { path: "/drive/root:/Personal/Documents/Glover Foundry LLC/Ventures" }
+      })
+    ] });
+  }
+
+  if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='HACCP')")) {
+    return json(res, 200, { value: [
+      item("search-noise-haccp-content", "General Training Notes.docx", {
+        parentReference: { path: "/drive/root:/Training" },
+        file: { mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+      }),
+      item("search-haccp-guide", "HACCP Study Guide.pdf", {
+        parentReference: { path: "/drive/root:/Training/HACCP" },
+        file: { mimeType: "application/pdf" }
+      })
+    ] });
+  }
+
   if (req.method === "GET" && decodedUrl.includes("/v1.0/me/drive/root/search(q='HVAC work order')")) {
     return json(res, 200, { value: [item("electrical-report", "2026 Electrical Report.pdf", {
       parentReference: { path: "/drive/root:/Home Maintenance" },
@@ -5502,6 +5553,44 @@ process.exit(2);
     };
   });
 
+  await check("ChatGPT Work combined search uses ranked metadata-first discovery", async () => {
+    const cases = [
+      { query: "Business Plan", expectedId: "search-business-plan", forbiddenIds: ["search-noise-haccp-business"] },
+      { query: "Stefon Operating Manual", expectedId: "search-operating-manual", forbiddenIds: ["search-noise-haccp-manual"] },
+      { query: "Qaldris", expectedId: "search-qaldris-folder", forbiddenIds: ["search-noise-qaldris-content"] },
+      { query: "HACCP", expectedId: "search-haccp-guide", forbiddenIds: ["search-noise-haccp-content"] }
+    ];
+    const read = await tool("onedrive_read_actions", {
+      actions: cases.map(({ query }) => ({ operation: "search", query, limit: 10, format: "full" }))
+    });
+    assert(!read.isError && read.value.results?.length === cases.length, "ranked combined search should return every query result", read);
+    const reciprocalRanks = [];
+    let unrelatedTopFive = 0;
+    for (const [index, testCase] of cases.entries()) {
+      const result = read.value.results[index];
+      assert(result?.isError === false && result.operation === "search", `ranked search case failed: ${testCase.query}`, result);
+      assert(result.value?.rankedSearch === true && result.value.searchMode === "ranked", `combined search bypassed the ranked pipeline: ${testCase.query}`, result.value);
+      const items = result.value.items || [];
+      const rank = items.findIndex((item) => item.id === testCase.expectedId) + 1;
+      reciprocalRanks.push(rank ? 1 / rank : 0);
+      unrelatedTopFive += items.slice(0, 5).filter((item) => testCase.forbiddenIds.includes(item.id)).length;
+      assert(rank === 1, `expected metadata match was not rank 1 for ${testCase.query}`, items);
+      assert(!items.some((item) => testCase.forbiddenIds.includes(item.id)), `unverified content-only noise survived for ${testCase.query}`, items);
+      assert(result.value.metadataQualifiedResults >= 1, `ranked search did not report metadata-qualified evidence for ${testCase.query}`, result.value);
+      assert(result.value.rawGraphContentOnlyResultsSuppressed >= 1, `ranked search did not report suppressing content-only noise for ${testCase.query}`, result.value);
+    }
+    const mrrAt10 = reciprocalRanks.reduce((sum, value) => sum + value, 0) / reciprocalRanks.length;
+    assert(mrrAt10 === 1, "ranked ChatGPT Work search MRR@10 must be 1.0 for the regression corpus", { reciprocalRanks, mrrAt10 });
+    assert(unrelatedTopFive === 0, "ranked ChatGPT Work search must return zero known unrelated results in the top five", { unrelatedTopFive });
+    return {
+      queryCount: cases.length,
+      exactAtOne: cases.length,
+      mrrAt10,
+      unrelatedTopFive,
+      rankedPipeline: true
+    };
+  });
+
   await check("ChatGPT parallel read actions recover exact filenames missed by Graph indexing", async () => {
     const read = await tool("onedrive_read_actions", {
       actions: [
@@ -5512,10 +5601,21 @@ process.exit(2);
     assert(!read.isError && read.value.results?.length === 2, "combined exact-filename read should return both actions", read);
     const searched = read.value.results.find((entry) => entry.operation === "search");
     assert(searched?.isError === false, "combined exact-filename search should succeed", searched);
-    assert(searched.value.exactFilenameFallbackAttempted === true, "combined exact-filename search should report its fallback", searched.value);
+    assert(searched.value.rankedSearch === true && searched.value.searchMode === "ranked", "combined exact-filename search should use ranked discovery", searched.value);
+    assert(
+      searched.value.exactFilenameFallbackAttempted === true
+        || (searched.value.graphSearchCalls === 0 && searched.value.metadataQualifiedResults >= 1),
+      "combined exact-filename search should use either the live fallback or a previously verified metadata identity",
+      searched.value
+    );
     assert(searched.value.items?.length === 1 && searched.value.items[0].id === "chatgpt-exact-index-miss", "combined exact-filename search should return the live scanned item", searched.value);
     assert(searched.value.items[0].path === "Folder A/invoice-3095.pdf", "combined exact-filename search should preserve the live path", searched.value.items[0]);
-    return { itemId: searched.value.items[0].id, path: searched.value.items[0].path, exactFilenameFallbackAttempted: true };
+    return {
+      itemId: searched.value.items[0].id,
+      path: searched.value.items[0].path,
+      exactFilenameFallbackAttempted: searched.value.exactFilenameFallbackAttempted,
+      verifiedMetadataFastPath: searched.value.graphSearchCalls === 0
+    };
   });
 
   await check("ChatGPT exact-file opener does not repeat a failed live scan", async () => {
