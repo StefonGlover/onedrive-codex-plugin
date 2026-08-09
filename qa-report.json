@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "decision": "Pending — production deployment; ranked ChatGPT Work search beta passes with no plugin defects open",
+  "decision": "Pending — broader release sign-off; NAS deployment and ChatGPT UI betas pass with no plugin defects open",
   "date": "2026-08-09",
-  "generatedAt": "2026-08-09T06:31:42Z",
+  "generatedAt": "2026-08-09T07:13:35Z",
   "source": {
     "commit": "abd9072ab933dc1dac1cd6341c9f36c092a5d55f",
     "pluginVersion": "0.6.4+codex.20260809062901",
@@ -63,6 +63,53 @@
       "mrrAt10": 1,
       "unrelatedTopFive": 0,
       "readableFetchVerified": true
+    },
+    "productionRankedDeployment": {
+      "status": "pass",
+      "surface": "Synology DS923+ Container Manager and public OAuth/MCP gateway",
+      "deployedAt": "2026-08-09T07:05:23Z",
+      "buildContext": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas57-chatgpt-ranked-20260809",
+      "reportedImageTag": "onedrive-chatgpt-nas:0.6.4-nas56-chatgpt-etag",
+      "imageTagRetentionNote": "DSM persisted and rebuilt the ranked build context while retaining the pre-existing project image tag.",
+      "rollbackSourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas56-chatgpt-etag-20260808-rollback-20260809",
+      "containerStartExitCode": 0,
+      "publicHealth": "pass",
+      "oauthAuthorizationServerMetadata": "pass",
+      "oauthProtectedResourceMetadata": "pass",
+      "mcpRouteReachable": true
+    },
+    "chatgptConnectorRefresh": {
+      "status": "pass",
+      "surface": "ChatGPT OneDrive plugin management",
+      "result": "Success: Actions refreshed.",
+      "url": "https://glovernas.tail5dbbc4.ts.net/mcp",
+      "authorization": "OAuth"
+    },
+    "chatgptWorkRankedUi": {
+      "status": "pass",
+      "surface": "ChatGPT Work UI",
+      "conversation": "https://chatgpt.com/c/6a78270d-4cd8-83ea-83e5-46ac7fd0e750",
+      "readOnly": true,
+      "remoteMutations": 0,
+      "queryCount": 3,
+      "qaldrisFolderRank": 1,
+      "qaldrisResultsReturned": 3,
+      "haccpExactAtOne": true,
+      "digitalQualityExactAtOne": true
+    },
+    "chatgptStandardRankedUi": {
+      "status": "pass",
+      "surface": "ChatGPT standard Chat UI",
+      "conversation": "https://chatgpt.com/c/6a78276b-1634-83ea-ac49-d5e568709f98",
+      "readOnly": true,
+      "remoteMutations": 0,
+      "tool": "onedrive_read_actions",
+      "queryCount": 3,
+      "qaldrisFolderRank": 1,
+      "haccpExactAtOne": true,
+      "digitalQualityExactAtOne": true,
+      "postRestartExactProbe": "pass",
+      "postRestartDurationMs": 3557
     },
     "chatgptWorkReadonly": {
       "status": "pass",
@@ -199,15 +246,16 @@
     "project": "onedrive-chatgpt",
     "projectId": "6ade094d-9ebe-46ef-83cb-f9bb443c8300",
     "image": "onedrive-chatgpt-nas:0.6.4-nas56-chatgpt-etag",
-    "imageId": "sha256:3320ab66ed3ff1c7f74772584e1b00f8f67d18a0102e5277e2de1bb83268559e",
-    "containerId": "ba498cf4e67387a79178e252d66c5db6e0e200ed97953a24e3af43caf1551a00",
-    "sourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas56-chatgpt-etag-20260808",
+    "imageTagRetainedByDsm": true,
+    "imageId": null,
+    "containerId": null,
+    "sourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas57-chatgpt-ranked-20260809",
+    "rollbackSourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas56-chatgpt-etag-20260808-rollback-20260809",
     "containerState": "running",
     "containerHealth": "healthy",
     "healthFailingStreak": 0,
     "restartCount": 0,
-    "stagedServerMd5": "aad7b42d2967ff04361a0e1a33325fe0",
-    "stagedServerSize": 672703,
+    "serverSha256": "9380dfe4636828fd9681e16bf471ee6e90e1dea6204b6924c62810b6aa00f34f",
     "rollbackImage": "onedrive-chatgpt-nas:0.6.4-nas55-beta-safety"
   },
   "fixes": [

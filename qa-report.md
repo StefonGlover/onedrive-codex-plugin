@@ -1,8 +1,8 @@
 # OneDrive 0.6.4 End-to-End Beta Report
 
-Decision: Pending — production deployment; ranked ChatGPT Work search beta passes with no plugin defects open
+Decision: Pending — broader release sign-off; NAS deployment and ChatGPT UI betas pass with no plugin defects open
 Date: 2026-08-09
-Generated: 2026-08-09T06:31:42Z
+Generated: 2026-08-09T07:13:35Z
 Tested source base commit: `abd9072ab933dc1dac1cd6341c9f36c092a5d55f`
 Plugin version: `0.6.4+codex.20260809062901`
 Focused source server version: `0.6.4+codex.20260809062901.chatgpt.3ade2b1c7f1f`
@@ -10,7 +10,7 @@ Tool contract: 84 exact tool names; 15 focused ChatGPT tools
 
 ## Outcome
 
-The OneDrive plugin passed the complete offline suite, the new read-only ranked-search beta against the connected personal OneDrive through the exact 15-tool ChatGPT Work profile, a prior fresh 84-tool live Microsoft Graph run, direct production calls for every focused ChatGPT function, and prior real UI workflows in both ChatGPT Work and standard Chat. The new search beta made no remote mutations and used isolated local state.
+The OneDrive plugin passed the complete offline suite, the new read-only ranked-search beta against the connected personal OneDrive through the exact 15-tool ChatGPT Work profile, a prior fresh 84-tool live Microsoft Graph run, direct production calls for every focused ChatGPT function, and current production UI workflows in both ChatGPT Work and standard Chat. The new search beta made no remote mutations and used isolated local state.
 
 The source ranked-search beta `codex-beta-work-20260809T062753Z` and installed-cache rerun `codex-beta-work-installed-20260809T063041Z` each passed 5/5 checks. In both runs, all three representative queries returned the intended target at rank 1, for exact-at-one 3/3, MRR@10 1.0, and zero known unrelated results in the top five. Both runs also fetched readable text from `HACCP Study Guide.pdf`. Evidence: `work/qa-artifacts/codex-beta-work-20260809T062753Z.json` and `work/qa-artifacts/codex-beta-work-installed-20260809T063041Z.json`.
 
@@ -20,9 +20,20 @@ The beta found and resolved three release issues:
 - The live harness called rename, move, and copy commits without their now-required preview proofs. It now previews each action and refuses to continue without concrete verified commit evidence. The repaired live run passed all three steps.
 - CI Python syntax checks generated `__pycache__` inside the source tree and then failed the package-residue guard. CI now writes bytecode under the runner temporary directory.
 
-The production MCP source did not change during these final fixes, so the healthy nas56 container remains the correct deployment. The manifest was cache-busted for the tested local package.
+The ranked source was deployed to the NAS build context `/volume1/docker/onedrive-chatgpt/app-0.6.4-nas57-chatgpt-ranked-20260809`, built successfully, and started with exit code 0. Synology Container Manager retained the existing project image tag `onedrive-chatgpt-nas:0.6.4-nas56-chatgpt-etag` when it reloaded the compose, but rebuilt that tag from the ranked nas57 source context. The prior source was preserved at `/volume1/docker/onedrive-chatgpt/app-0.6.4-nas56-chatgpt-etag-20260808-rollback-20260809` for rollback. Public health, OAuth authorization-server metadata, protected-resource metadata, and the MCP route all passed after restart.
 
 ## Live coverage
+
+### Production ranked deployment and connector refresh
+
+ChatGPT refreshed the OneDrive connector from `https://glovernas.tail5dbbc4.ts.net/mcp` and reported `Success: Actions refreshed.` OAuth remained the supported and active authorization method. A post-restart public health check returned healthy OAuth and MCP status.
+
+The production read-only ranking beta passed on both current ChatGPT surfaces:
+
+- Work: `Qaldris` returned the Qaldris folder first, followed by two related launch-kit manifests; `HACCP Study Guide.pdf` and `Digital Quality Management Insights (1).docx` each returned the exact file as the only result. Evidence: https://chatgpt.com/c/6a78270d-4cd8-83ea-83e5-46ac7fd0e750
+- Standard Chat: the connected OneDrive plugin invoked `onedrive_read_actions`; the same three queries produced the same ordering and exact matches. A second exact HACCP search after the final NAS restart also passed in 3,557 ms. Evidence: https://chatgpt.com/c/6a78276b-1634-83ea-ac49-d5e568709f98
+
+These UI betas were read-only and made no OneDrive mutations.
 
 ### Focused 15-tool production connector
 
