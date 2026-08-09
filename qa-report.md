@@ -1,16 +1,18 @@
 # OneDrive 0.6.4 End-to-End Beta Report
 
-Decision: Pending — production release; end-to-end beta is complete across the focused connector, ChatGPT Work, and standard Chat with no plugin defects open
-Date: 2026-08-08
-Generated: 2026-08-08T22:57:14Z
-Tested source base commit: `aef2f704adeeca563028772ec1bba1cec292d81a`
-Plugin version: `0.6.4+codex.20260808225332`
-Production server version: `0.6.4+codex.20260808010958.chatgpt.3ade2b1c7f1f`
+Decision: Pending — production deployment; ranked ChatGPT Work search beta passes with no plugin defects open
+Date: 2026-08-09
+Generated: 2026-08-09T06:31:42Z
+Tested source base commit: `abd9072ab933dc1dac1cd6341c9f36c092a5d55f`
+Plugin version: `0.6.4+codex.20260809062901`
+Focused source server version: `0.6.4+codex.20260809062901.chatgpt.3ade2b1c7f1f`
 Tool contract: 84 exact tool names; 15 focused ChatGPT tools
 
 ## Outcome
 
-The OneDrive plugin passed the complete offline suite, a fresh 84-tool live Microsoft Graph run, direct production calls for every focused ChatGPT function, and real UI workflows in both ChatGPT Work and standard Chat. Every isolated beta root was moved to the recycle bin and its former active path returned `itemNotFound`. No permanent deletion occurred, no anonymous link remained active, and no named-recipient permission was partially created.
+The OneDrive plugin passed the complete offline suite, the new read-only ranked-search beta against the connected personal OneDrive through the exact 15-tool ChatGPT Work profile, a prior fresh 84-tool live Microsoft Graph run, direct production calls for every focused ChatGPT function, and prior real UI workflows in both ChatGPT Work and standard Chat. The new search beta made no remote mutations and used isolated local state.
+
+The source ranked-search beta `codex-beta-work-20260809T062753Z` and installed-cache rerun `codex-beta-work-installed-20260809T063041Z` each passed 5/5 checks. In both runs, all three representative queries returned the intended target at rank 1, for exact-at-one 3/3, MRR@10 1.0, and zero known unrelated results in the top five. Both runs also fetched readable text from `HACCP Study Guide.pdf`. Evidence: `work/qa-artifacts/codex-beta-work-20260809T062753Z.json` and `work/qa-artifacts/codex-beta-work-installed-20260809T063041Z.json`.
 
 The beta found and resolved three release issues:
 
@@ -67,7 +69,8 @@ Evidence: https://chatgpt.com/c/6a77b265-cac4-83ea-a802-65c093afe437
 
 ## Offline verification
 
-- Mock Microsoft Graph: 187/187
+- Mock Microsoft Graph: 188/188
+- Ranked ChatGPT Work search: source and installed-cache live read-only betas each passed 5/5 checks; exact-at-one 3/3; MRR@10 1.0; unrelated top-five 0
 - Full MCP contract: 84 tools, 339,137 descriptor bytes
 - Focused ChatGPT contract: 15 tools, 26,526 bytes; 92.2% reduction
 - Focused OAuth contract: 15 tools, 28,656 bytes
@@ -81,7 +84,7 @@ Evidence: https://chatgpt.com/c/6a77b265-cac4-83ea-a802-65c093afe437
 - PowerPoint operation coverage: 25/25
 - Genuine Office packages reopened and rendered: DOCX, XLSX, and PPTX pass
 - Storage-root and private-permission tests: pass
-- Plugin package guard and cache parity: pass
+- Plugin package guard, immutable versioned-cache installation, and installed-build parity: pass across 62 package entries
 
 ## External constraints, not plugin defects
 

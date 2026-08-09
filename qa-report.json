@@ -1,14 +1,14 @@
 {
   "schemaVersion": 2,
-  "decision": "Pending — production release; end-to-end beta is complete across the focused connector, ChatGPT Work, and standard Chat with no plugin defects open",
-  "date": "2026-08-08",
-  "generatedAt": "2026-08-08T22:57:14Z",
+  "decision": "Pending — production deployment; ranked ChatGPT Work search beta passes with no plugin defects open",
+  "date": "2026-08-09",
+  "generatedAt": "2026-08-09T06:31:42Z",
   "source": {
-    "commit": "aef2f704adeeca563028772ec1bba1cec292d81a",
-    "pluginVersion": "0.6.4+codex.20260808225332",
-    "serverVersion": "0.6.4+codex.20260808010958.chatgpt.3ade2b1c7f1f",
-    "serverSha256": "6f9aa89878dd097351aeb21d0a14f7cf28ca81e9cebe84981a1d9b6392408f55",
-    "workingTree": "Contains the tested 15-tool ChatGPT surface, release-harness and CI fixes, refreshed QA evidence, and the new cache-busted manifest. The production MCP server source is unchanged from the healthy nas56 deployment."
+    "commit": "abd9072ab933dc1dac1cd6341c9f36c092a5d55f",
+    "pluginVersion": "0.6.4+codex.20260809062901",
+    "serverVersion": "0.6.4+codex.20260809062901.chatgpt.3ade2b1c7f1f",
+    "serverSha256": "9380dfe4636828fd9681e16bf471ee6e90e1dea6204b6924c62810b6aa00f34f",
+    "workingTree": "Contains the ranked ChatGPT Work search pipeline, evidence-tier filtering, exact-filename and stale-cache fallback safeguards, focused read-only beta harness, release documentation, and refreshed QA evidence."
   },
   "contract": {
     "toolCount": 84,
@@ -26,7 +26,7 @@
     { "name": "Exact full MCP contract", "status": "pass", "toolCount": 84 },
     { "name": "ChatGPT focused contract", "status": "pass", "toolCount": 15, "bytes": 26526, "oauthBytes": 28656 },
     { "name": "ChatGPT golden prompts", "status": "pass", "cases": 15, "ambiguityPairs": 8 },
-    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 187 },
+    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 188 },
     { "name": "OAuth HTTP integration", "status": "pass" },
     { "name": "OAuth compatibility", "status": "pass", "checks": 169 },
     { "name": "Semantic anchors", "status": "pass", "checks": 6 },
@@ -34,6 +34,36 @@
     { "name": "Office package validation", "status": "pass", "wordOperations": 21, "excelOperations": 33, "powerPointOperations": 25 }
   ],
   "liveRuns": {
+    "chatgptWorkRankedSearch": {
+      "status": "pass",
+      "surface": "Focused 15-tool ChatGPT Work profile against connected personal OneDrive",
+      "runId": "codex-beta-work-20260809T062753Z",
+      "report": "work/qa-artifacts/codex-beta-work-20260809T062753Z.json",
+      "readOnly": true,
+      "remoteMutations": 0,
+      "passCount": 5,
+      "failCount": 0,
+      "queryCount": 3,
+      "exactAtOne": 3,
+      "mrrAt10": 1,
+      "unrelatedTopFive": 0,
+      "readableFetchVerified": true
+    },
+    "chatgptWorkRankedSearchInstalled": {
+      "status": "pass",
+      "surface": "Installed focused 15-tool ChatGPT Work profile against connected personal OneDrive",
+      "runId": "codex-beta-work-installed-20260809T063041Z",
+      "report": "work/qa-artifacts/codex-beta-work-installed-20260809T063041Z.json",
+      "readOnly": true,
+      "remoteMutations": 0,
+      "passCount": 5,
+      "failCount": 0,
+      "queryCount": 3,
+      "exactAtOne": 3,
+      "mrrAt10": 1,
+      "unrelatedTopFive": 0,
+      "readableFetchVerified": true
+    },
     "chatgptWorkReadonly": {
       "status": "pass",
       "surface": "ChatGPT Work UI",
@@ -150,13 +180,13 @@
   },
   "installedBuild": {
     "status": "pass",
-    "version": "0.6.4+codex.20260808225332",
-    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.4+codex.20260808225332",
+    "version": "0.6.4+codex.20260809062901",
+    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.4+codex.20260809062901",
     "oldCacheOverwritten": false
   },
   "sourceCacheParity": {
     "status": "pass",
-    "filesChecked": 61,
+    "filesChecked": 62,
     "bytes": "pass",
     "modes": "pass",
     "types": "pass",
