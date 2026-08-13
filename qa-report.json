@@ -2,13 +2,13 @@
   "schemaVersion": 2,
   "decision": "Pending — 2026-08-13 parity release committed and offline-qualified; NAS and ChatGPT cutover still pending",
   "date": "2026-08-13",
-  "generatedAt": "2026-08-13T06:00:51Z",
+  "generatedAt": "2026-08-13T06:02:54Z",
   "source": {
-    "commit": "63843da2a9554a9d5268d15a331cacecfdf0ea74",
+    "commit": "09cd5d8ab2bf97f674e9ce042cfda0ba14a0436d",
     "pluginVersion": "0.6.4+codex.20260813025943",
     "serverVersion": "0.6.4+codex.20260813025943.chatgpt.37923d62a462",
     "serverSha256": "736166a0faa24550b09668af55b491bf893c1facbde966ab3964f83854627537",
-    "contentDigest": "c83f6eed44c7165c2c1ca35d212e2647619034f8facb451858c0fbcb4d54a1ac",
+    "contentDigest": "2cb7f88bdc29772d5453d9d6bb1611de08a58569d09f6e61f216fedb82797ec6",
     "workingTree": "Release code is committed at the recorded commit; changes after that commit are limited to QA evidence."
   },
   "contract": {
