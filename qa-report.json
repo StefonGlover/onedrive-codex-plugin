@@ -1,37 +1,40 @@
 {
   "schemaVersion": 2,
-  "decision": "Pending — broader release sign-off; NAS deployment and ChatGPT UI betas pass with no plugin defects open",
-  "date": "2026-08-09",
-  "generatedAt": "2026-08-09T07:13:35Z",
+  "decision": "Pending — 2026-08-13 parity release committed and offline-qualified; NAS and ChatGPT cutover still pending",
+  "date": "2026-08-13",
+  "generatedAt": "2026-08-13T05:55:23Z",
   "source": {
-    "commit": "abd9072ab933dc1dac1cd6341c9f36c092a5d55f",
-    "pluginVersion": "0.6.4+codex.20260809062901",
-    "serverVersion": "0.6.4+codex.20260809062901.chatgpt.3ade2b1c7f1f",
-    "serverSha256": "9380dfe4636828fd9681e16bf471ee6e90e1dea6204b6924c62810b6aa00f34f",
-    "workingTree": "Contains the ranked ChatGPT Work search pipeline, evidence-tier filtering, exact-filename and stale-cache fallback safeguards, focused read-only beta harness, release documentation, and refreshed QA evidence."
+    "commit": "e9ab58642f867491d3f6de970ffbbe8310c357ca",
+    "pluginVersion": "0.6.4+codex.20260813025943",
+    "serverVersion": "0.6.4+codex.20260813025943.chatgpt.37923d62a462",
+    "serverSha256": "736166a0faa24550b09668af55b491bf893c1facbde966ab3964f83854627537",
+    "contentDigest": "65ecd33602b79b505bb3dabc65c84d81d05ba1a0bf0b1c64a349af37eb9867b9",
+    "workingTree": "Release code is committed at the recorded commit; changes after that commit are limited to QA evidence."
   },
   "contract": {
     "toolCount": 84,
     "exact": true,
     "fullToolCount": 84,
-    "fullBytes": 339137,
-    "chatgptToolCount": 15,
-    "chatgptBytes": 26526,
-    "chatgptOauthBytes": 28656,
-    "reductionPercent": 92.2,
-    "goldenPrompts": 15,
-    "ambiguityPairs": 8
+    "fullBytes": 344300,
+    "chatgptToolCount": 19,
+    "chatgptBytes": 34652,
+    "chatgptOauthBytes": 37350,
+    "reductionPercent": 89.9,
+    "goldenPrompts": 19,
+    "ambiguityPairs": 15
   },
   "offlineGates": [
-    { "name": "Exact full MCP contract", "status": "pass", "toolCount": 84 },
-    { "name": "ChatGPT focused contract", "status": "pass", "toolCount": 15, "bytes": 26526, "oauthBytes": 28656 },
-    { "name": "ChatGPT golden prompts", "status": "pass", "cases": 15, "ambiguityPairs": 8 },
-    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 188 },
-    { "name": "OAuth HTTP integration", "status": "pass" },
-    { "name": "OAuth compatibility", "status": "pass", "checks": 169 },
-    { "name": "Semantic anchors", "status": "pass", "checks": 6 },
-    { "name": "Text patch safety", "status": "pass", "checks": 6 },
-    { "name": "Office package validation", "status": "pass", "wordOperations": 21, "excelOperations": 33, "powerPointOperations": 25 }
+    { "name": "Node 24 and Node 26 syntax/self-checks", "status": "pass" },
+    { "name": "Exact MCP contract", "status": "pass", "toolCount": 84, "focusedToolCount": 19 },
+    { "name": "Plugin manifest/version alignment", "status": "pass" },
+    { "name": "Prepackage negative checks", "status": "pass", "checks": 32 },
+    { "name": "Office Open XML operations", "status": "pass", "wordOperations": 22, "excelOperations": 33, "powerPointOperations": 25 },
+    { "name": "Office security corpus", "status": "pass" },
+    { "name": "Genuine package reopening", "status": "pass" },
+    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 206 },
+    { "name": "Read-only OneDrive doctor and tenant checks", "status": "pending" },
+    { "name": "Cleanup preview", "status": "pending" },
+    { "name": "Whitespace", "status": "pass" }
   ],
   "liveRuns": {
     "chatgptWorkRankedSearch": {
@@ -226,19 +229,19 @@
     }
   },
   "installedBuild": {
-    "status": "pass",
-    "version": "0.6.4+codex.20260809062901",
-    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.4+codex.20260809062901",
+    "status": "pending",
+    "version": "0.6.4+codex.20260813025943",
+    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.4+codex.20260813025943",
     "oldCacheOverwritten": false
   },
   "sourceCacheParity": {
-    "status": "pass",
-    "filesChecked": 62,
-    "bytes": "pass",
-    "modes": "pass",
-    "types": "pass",
-    "symlinkTargets": "pass",
-    "serverSha256Matched": true
+    "status": "pending",
+    "filesChecked": 0,
+    "bytes": "pending",
+    "modes": "pending",
+    "types": "pending",
+    "symlinkTargets": "pending",
+    "serverSha256Matched": false
   },
   "deployment": {
     "status": "pass",

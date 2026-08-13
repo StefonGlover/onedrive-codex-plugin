@@ -1,12 +1,22 @@
-# OneDrive 0.6.4 End-to-End Beta Report
+# OneDrive 0.6.4 Parity Release Report
 
-Decision: Pending — broader release sign-off; NAS deployment and ChatGPT UI betas pass with no plugin defects open
-Date: 2026-08-09
-Generated: 2026-08-09T07:13:35Z
-Tested source base commit: `abd9072ab933dc1dac1cd6341c9f36c092a5d55f`
-Plugin version: `0.6.4+codex.20260809062901`
-Focused source server version: `0.6.4+codex.20260809062901.chatgpt.3ade2b1c7f1f`
-Tool contract: 84 exact tool names; 15 focused ChatGPT tools
+Decision: Pending — 2026-08-13 parity release committed and offline-qualified; NAS and ChatGPT cutover still pending
+Date: 2026-08-13
+Generated: 2026-08-13T05:55:23Z
+Tested source base commit: `e9ab58642f867491d3f6de970ffbbe8310c357ca`
+Plugin version: `0.6.4+codex.20260813025943`
+Focused source server version: `0.6.4+codex.20260813025943.chatgpt.37923d62a462`
+Tool contract: 84 exact tool names; 19 focused ChatGPT tools
+Packaged-content digest: `65ecd33602b79b505bb3dabc65c84d81d05ba1a0bf0b1c64a349af37eb9867b9`
+Server SHA-256: `736166a0faa24550b09668af55b491bf893c1facbde966ab3964f83854627537`
+
+## 2026-08-13 release candidate
+
+The parity implementation is committed and the final frozen offline suite is green. It expands the hosted surface from 15 to 19 focused tools, adds bounded Office inspection/review, materialized downloads and previews, version/recent reads with native guarded restore, enterprise drive discovery/fetch, account-and-drive state isolation, and the associated availability and hosted-boundary hardening.
+
+Current release-candidate evidence: mock Microsoft Graph 206/206, OAuth compatibility 169/169, full/focused/OAuth tool contracts 84/19/19, ChatGPT golden routing 19/19 with 15 ambiguity pairs, prepackage self-check 32/32, materialized resources 50/50, heavyweight admission 24/24, resources/read admission 17/17, bounded local state 3017/3017, and managed quota 11/11. The NAS package and rollback manifest are prepared, but production and installed-cache evidence remain pending until the controlled cutover completes.
+
+The detailed sections below preserve the 2026-08-09 production evidence as historical baseline and rollback context; they do not attest the new 2026-08-13 build.
 
 ## Outcome
 
