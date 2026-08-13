@@ -10,7 +10,10 @@ const office = spawnSync(
 );
 if (office.status !== 0) process.exit(1);
 
-const urls = ["http://127.0.0.1:8765/readyz"];
+const urls = [
+  "http://127.0.0.1:8765/readyz",
+  `http://127.0.0.1:${process.env.ONEDRIVE_MCP_HTTP_PORT || 3001}/healthz`
+];
 if (/^(1|true)$/i.test(process.env.ONEDRIVE_OAUTH_COMPAT_ENABLED || "")) {
   urls.push(`http://127.0.0.1:${process.env.ONEDRIVE_OAUTH_COMPAT_PORT || 3010}/healthz`);
 }
