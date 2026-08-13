@@ -1,22 +1,36 @@
 # OneDrive 0.6.4 Parity Release Report
 
-Decision: Pending — 2026-08-13 parity release committed and offline-qualified; NAS and ChatGPT cutover still pending
+Decision: Pending — NAS59 and the ChatGPT 19-action OAuth canary passed; the 2026-08-13 full live Microsoft Graph and installed-cache parity matrix remains pending
 Date: 2026-08-13
-Generated: 2026-08-13T06:02:54Z
-Tested source base commit: `09cd5d8ab2bf97f674e9ce042cfda0ba14a0436d`
+Generated: 2026-08-13T06:35:58Z
+Tested source base commit: `dd2904418665d576f717a021b1451e5aa9efff9c`
 Plugin version: `0.6.4+codex.20260813025943`
 Focused source server version: `0.6.4+codex.20260813025943.chatgpt.37923d62a462`
+Live OAuth server version: `0.6.4+codex.20260813025943.chatgpt.d8d3679a1016`
 Tool contract: 84 exact tool names; 19 focused ChatGPT tools
-Packaged-content digest: `2cb7f88bdc29772d5453d9d6bb1611de08a58569d09f6e61f216fedb82797ec6`
+Packaged-content digest: `52b4243e4fbd962a18b9388a37492fd9044facddacfaa2a2334a10795e06d568`
+NAS deployment archive SHA-256: `1ce8bcae2b2fa55414804d62b9a32648be33f7485208b58298094064f539f432`
 Server SHA-256: `736166a0faa24550b09668af55b491bf893c1facbde966ab3964f83854627537`
 
 ## 2026-08-13 release candidate
 
 The parity implementation is committed and the final frozen offline suite is green. It expands the hosted surface from 15 to 19 focused tools, adds bounded Office inspection/review, materialized downloads and previews, version/recent reads with native guarded restore, enterprise drive discovery/fetch, account-and-drive state isolation, and the associated availability and hosted-boundary hardening.
 
-Current release-candidate evidence: mock Microsoft Graph 206/206, OAuth compatibility 169/169, full/focused/OAuth tool contracts 84/19/19, ChatGPT golden routing 19/19 with 15 ambiguity pairs, prepackage self-check 32/32, materialized resources 50/50, heavyweight admission 24/24, resources/read admission 17/17, bounded local state 3017/3017, and managed quota 11/11. The NAS package and rollback manifest are prepared, but production and installed-cache evidence remain pending until the controlled cutover completes.
+Current release-candidate evidence: mock Microsoft Graph 206/206, OAuth compatibility 169/169, full/focused/OAuth tool contracts 84/19/19, ChatGPT golden routing 19/19 with 15 ambiguity pairs, prepackage self-check 32/32, materialized resources 50/50, heavyweight admission 24/24, resources/read admission 17/17, bounded local state 3017/3017, and managed quota 11/11. NAS59 is deployed and the ChatGPT OAuth app passed a read-only canary; the full current-release live Graph and installed-cache evidence remain pending.
 
 The detailed sections below preserve the 2026-08-09 production evidence as historical baseline and rollback context; they do not attest the new 2026-08-13 build.
+
+## 2026-08-13 NAS59 and ChatGPT canary
+
+NAS59 is deployed from `/volume1/docker/onedrive-chatgpt/app-0.6.4-nas59-parity-20260813-healthfix` as `onedrive-chatgpt-nas:0.6.4-nas59-parity-20260813`. Container `83b8cb26f3fd75fd3713dc71d3fe302dcde854638a6de8d83c3220c78eecad38` is running and healthy with zero restarts, Node 24.19.0, host networking, and loopback-only MCP and OAuth compatibility listeners on ports 3012 and 3011 respectively. Public health, OAuth authorization-server metadata, protected-resource metadata, and MCP initialization passed. The prior NAS58 image and source directory remain available for exact rollback.
+
+The initial Container Manager cutover failed safely because this Synology kernel does not support the Compose `cpus`/NanoCPUs setting. The old healthy container remained available, the unsupported setting was removed, and the corrected immutable NAS59 image then deployed successfully with its 2 GiB memory and 256-PID limits intact.
+
+ChatGPT refreshed the mapped OneDrive OAuth app from `https://glovernas.tail5dbbc4.ts.net/mcp`; the intended 19-action contract was present. A new-chat read-only `onedrive_office_capabilities` canary returned `addTableRow` with a schema-valid example: https://chatgpt.com/c/6a7d63fe-9dbc-83ea-bf20-90ee31309c17. No remote mutation was performed.
+
+The source/noauth focused suffix `.37923d62a462` and live OAuth suffix `.d8d3679a1016` are deterministic variants of the same artifact: the OAuth security scheme is included in the advertised contract hash. Direct checks inside the deployed container confirmed exact source parity for `mcp/server.mjs`, `assets/chatgpt-icon.png`, and `.codex-plugin/plugin.json`.
+
+This is deployment and connector-canary evidence only. The current-release full live Microsoft Graph matrix, complete focused live exercise, installed-cache parity, doctor/tenant checks, and cleanup evidence remain pending, so the release decision remains Pending.
 
 ## Outcome
 
