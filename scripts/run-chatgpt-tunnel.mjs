@@ -11,8 +11,8 @@ const profile = process.env.ONEDRIVE_TUNNEL_PROFILE || "onedrive-chatgpt";
 const tunnelClient = process.env.ONEDRIVE_TUNNEL_CLIENT || "/opt/homebrew/bin/tunnel-client";
 const toolProfile = process.env.ONEDRIVE_TOOL_PROFILE || "chatgpt";
 
-if (!["full", "chatgpt"].includes(toolProfile)) {
-  console.error("ONEDRIVE_TOOL_PROFILE must be full or chatgpt.");
+if (toolProfile !== "chatgpt") {
+  console.error("The ChatGPT tunnel requires ONEDRIVE_TOOL_PROFILE=chatgpt. Use the full profile only through trusted local stdio.");
   process.exit(1);
 }
 

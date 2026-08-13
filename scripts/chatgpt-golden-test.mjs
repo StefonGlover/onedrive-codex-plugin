@@ -17,8 +17,12 @@ const goldenPrompts = [
   { prompt: "Preview renaming this workbook, copying it, and creating a view link", tool: "onedrive_preview_actions", cues: ["preview", "read-only batch", "onedrive_commit_actions"] },
   { prompt: "List the root and search for insurance while checking this folder's permissions", tool: "onedrive_read_actions", cues: ["folder listings", "descriptive searches", "permission inspections", "concurrently"] },
   { prompt: "I approve all three previewed actions; apply them", tool: "onedrive_commit_actions", cues: ["approves one or more actions", "stops on the first error", "partial completion"] },
-  { prompt: "What structured Excel edits are supported?", tool: "onedrive_office_capabilities", cues: ["supported structured operations"] },
+  { prompt: "What exact payload should I use for Excel addTableRow?", tool: "onedrive_office_capabilities", cues: ["exact schema", "valid example"] },
+  { prompt: "Inspect the formulas and notes in this workbook before editing it", tool: "onedrive_office_inspect", cues: ["bounded structured", "stable id"] },
   { prompt: "Update cells in these two Excel workbooks", tool: "onedrive_office_batch_transform", cues: ["structured edits", "preview"] },
+  { prompt: "Add a review note to Excel cell B7 and list the existing Word comments", tool: "onedrive_office_review", cues: ["word comments", "excel notes", "exact coordinates"] },
+  { prompt: "Give me the original file as a downloadable resource", tool: "onedrive_download_file", cues: ["materialized original", "pdf", "mcp resource"] },
+  { prompt: "Render the first three slides so I can visually check them", tool: "onedrive_render_preview", cues: ["visual qa", "pages or slides", "image"] },
   { prompt: "Upload this attached PDF to OneDrive", tool: "onedrive_upload_file", cues: ["chatgpt-provided file", "upload"] },
   { prompt: "Export this Word document as a PDF beside the source in OneDrive", tool: "onedrive_export_file", cues: ["converted to pdf or plain text", "saved back in onedrive", "preview"] },
   { prompt: "Create a new markdown file with this full content", tool: "onedrive_write_text", cues: ["create or fully replace", "required content field", "never a text field"] },
@@ -33,7 +37,14 @@ const ambiguityPairs = [
   ["onedrive_preview_actions", "onedrive_commit_actions"],
   ["onedrive_read_actions", "onedrive_open_files"],
   ["onedrive_upload_file", "onedrive_export_file"],
+  ["onedrive_upload_file", "onedrive_download_file"],
+  ["onedrive_export_file", "onedrive_download_file"],
+  ["onedrive_download_file", "onedrive_render_preview"],
   ["onedrive_write_text", "onedrive_patch_text"],
+  ["fetch", "onedrive_office_inspect"],
+  ["onedrive_office_capabilities", "onedrive_office_inspect"],
+  ["onedrive_office_inspect", "onedrive_render_preview"],
+  ["onedrive_office_review", "onedrive_office_batch_transform"],
   ["onedrive_commit_actions", "onedrive_invite_permission"],
   ["onedrive_create_folder", "onedrive_commit_actions"],
   ["onedrive_commit_actions", "onedrive_read_actions"],
@@ -62,7 +73,7 @@ try {
     const tool = byName.get(entry.tool);
     assert(tool, `Golden prompt targets a missing tool: ${entry.tool}`, entry);
     const description = String(tool.description || "").toLowerCase();
-    assert(description.startsWith("use this when"), `Tool ${entry.tool} is missing the required selection cue.`, tool);
+    assert(/^use this (?:when|before|to|for)\b/u.test(description), `Tool ${entry.tool} is missing the required selection cue.`, tool);
     for (const cue of entry.cues) {
       assert(description.includes(cue), `Tool ${entry.tool} does not encode the golden-prompt cue '${cue}'.`, { prompt: entry.prompt, description: tool.description });
     }

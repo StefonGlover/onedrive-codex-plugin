@@ -1,0 +1,4 @@
+interface:
+  display_name: "OneDrive Review"
+  short_description: "Review Office files with evidence and comments"
+  default_prompt: "Use $onedrive-review to review an Office file and manage evidence-backed comments."

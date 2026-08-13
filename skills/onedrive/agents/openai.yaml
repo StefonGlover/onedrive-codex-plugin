@@ -1,0 +1,4 @@
+interface:
+  display_name: "OneDrive"
+  short_description: "Find, manage, and route OneDrive file work"
+  default_prompt: "Use $onedrive to find and manage files in OneDrive."

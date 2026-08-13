@@ -28,9 +28,14 @@ from xml.etree import ElementTree as ET
 
 
 MAX_PACKAGE_ENTRIES = 10_000
-MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
+MAX_PACKAGE_ENTRY_BYTES = 64 * 1024 * 1024
+MAX_XML_PART_BYTES = 32 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 250
 MAX_TEXT_CHARS = 2_000_000
+MAX_HELPER_ADDRESS_SPACE_BYTES = 512 * 1024 * 1024
+MAX_HELPER_FILE_BYTES = 320 * 1024 * 1024
+MAX_HELPER_CPU_SECONDS = 55
 
 EXCEL_RICH_OPERATIONS = {"addWorksheet", "deleteWorksheet", "addTable", "deleteTable", "mergeRange", "unmergeRange", "sortRange", "setAutoFilter", "setHyperlink", "addNote", "deleteNote", "insertImage", "formatChart", "setSheetProtection", "refreshPivot"}
 POWERPOINT_RICH_OPERATIONS = {"addSlide", "addImage", "cropImage", "addTable", "insertTableRow", "deleteTableRow", "insertTableColumn", "deleteTableColumn", "setShapeAltText", "setZOrder", "groupShapes", "ungroupShape", "applySlideLayout"}
@@ -61,6 +66,30 @@ for _prefix, _uri in NS.items():
 
 class OfficePackageError(Exception):
     pass
+
+
+def configure_process_limits() -> None:
+    """Apply production Linux resource ceilings before parsing untrusted files."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import resource
+    except ImportError:
+        return
+
+    def cap(kind: int, maximum: int) -> None:
+        _soft, hard = resource.getrlimit(kind)
+        bounded_hard = maximum if hard == resource.RLIM_INFINITY else min(hard, maximum)
+        resource.setrlimit(kind, (bounded_hard, bounded_hard))
+
+    try:
+        cap(resource.RLIMIT_AS, MAX_HELPER_ADDRESS_SPACE_BYTES)
+        cap(resource.RLIMIT_FSIZE, MAX_HELPER_FILE_BYTES)
+        cap(resource.RLIMIT_CPU, MAX_HELPER_CPU_SECONDS)
+    except (OSError, ValueError):
+        # Container/cgroup limits may be stricter or the host may refuse a
+        # particular rlimit. Package-level caps below remain mandatory.
+        pass
 
 
 def q(prefix: str, local: str) -> str:
@@ -119,7 +148,7 @@ def store_modified_xml(
 ) -> None:
     original_payload = modifications.get(part)
     if original_payload is None:
-        original_payload = package.read(part)
+        original_payload = read_package_part(package, part, xml=True)
     modifications[part] = serialize_xml_preserving_namespaces(root, original_payload)
 
 
@@ -151,6 +180,15 @@ def package_inventory(package: zipfile.ZipFile) -> Dict[str, Any]:
     total_uncompressed = sum(info.file_size for info in infos)
     if total_uncompressed > MAX_UNCOMPRESSED_BYTES:
         raise OfficePackageError("Office package expands beyond the configured safety limit.")
+    oversized_xml = [
+        info.filename for info in infos
+        if info.filename.lower().endswith((".xml", ".rels")) and info.file_size > MAX_XML_PART_BYTES
+    ]
+    if oversized_xml:
+        raise OfficePackageError("Office package contains an XML part above the configured safety limit: %s" % oversized_xml[0])
+    oversized_entries = [info.filename for info in infos if info.file_size > MAX_PACKAGE_ENTRY_BYTES]
+    if oversized_entries:
+        raise OfficePackageError("Office package contains a ZIP member above the configured safety limit: %s" % oversized_entries[0])
     unsafe = [info.filename for info in infos if not safe_member_name(info.filename)]
     if unsafe:
         raise OfficePackageError("Office package contains unsafe ZIP paths.")
@@ -180,11 +218,27 @@ def package_inventory(package: zipfile.ZipFile) -> Dict[str, Any]:
     }
 
 
-def xml_root(package: zipfile.ZipFile, name: str) -> ET.Element:
+def read_package_part(package: zipfile.ZipFile, name: str, xml: bool = False) -> bytes:
     try:
-        payload = package.read(name)
+        info = package.getinfo(name)
     except KeyError as error:
         raise OfficePackageError("Required Office package part is missing: %s" % name) from error
+    maximum = MAX_XML_PART_BYTES if xml or name.lower().endswith((".xml", ".rels")) else MAX_PACKAGE_ENTRY_BYTES
+    if info.file_size > maximum:
+        kind = "XML part" if maximum == MAX_XML_PART_BYTES else "ZIP member"
+        raise OfficePackageError("Office package %s exceeds the configured safety limit: %s" % (kind, name))
+    try:
+        with package.open(info, "r") as stream:
+            payload = stream.read(maximum + 1)
+    except (OSError, RuntimeError, zipfile.BadZipFile) as error:
+        raise OfficePackageError("Could not read Office package part: %s" % name) from error
+    if len(payload) > maximum:
+        raise OfficePackageError("Office package part expands beyond the configured safety limit: %s" % name)
+    return payload
+
+
+def xml_root(package: zipfile.ZipFile, name: str) -> ET.Element:
+    payload = read_package_part(package, name, xml=True)
     try:
         return ET.fromstring(payload)
     except ET.ParseError as error:
@@ -267,7 +321,7 @@ def validate_markup_compatibility(package: zipfile.ZipFile, names: Iterable[str]
     """Require every mc:Ignorable token to be declared in its XML scope."""
     errors: List[Dict[str, str]] = []
     for name in sorted(entry for entry in names if entry.endswith((".xml", ".rels"))):
-        payload = package.read(name)
+        payload = read_package_part(package, name, xml=True)
         pending: Dict[str, str] = {}
         scopes: List[Dict[str, str]] = []
         try:
@@ -310,7 +364,15 @@ def package_fingerprint(package: zipfile.ZipFile) -> str:
     for name in sorted(package.namelist()):
         digest.update(name.encode("utf-8"))
         digest.update(b"\0")
-        digest.update(package.read(name))
+        try:
+            with package.open(name, "r") as stream:
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        except (OSError, RuntimeError, zipfile.BadZipFile) as error:
+            raise OfficePackageError("Could not fingerprint Office package part: %s" % name) from error
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -352,18 +414,66 @@ def inspect_word(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str,
     paragraphs: List[Dict[str, Any]] = []
     tables: List[Dict[str, Any]] = []
     content_controls: List[Dict[str, Any]] = []
+    comment_anchors: Dict[str, List[Dict[str, Any]]] = {}
+    paragraph_start = max(0, min(int(request.get("paragraphStart", 0)), 1_000_000))
     max_paragraphs = max(1, min(int(request.get("maxParagraphs", 2000)), 10_000))
+    max_tables = max(1, min(int(request.get("maxTables", 1000)), 10_000))
+    max_table_cells = max(1, min(int(request.get("maxTableCells", 50_000)), 500_000))
+    paragraph_seen = 0
+    table_seen = 0
+    table_cells = 0
+    paragraph_truncated = False
+    table_truncated = False
+    table_cells_truncated = False
     for part in parts:
         root = xml_root(package, part)
         for paragraph in root.iter(q("w", "p")):
+            source_paragraph_index = paragraph_seen
+            paragraph_seen += 1
+            if source_paragraph_index < paragraph_start:
+                continue
             if len(paragraphs) >= max_paragraphs:
+                paragraph_truncated = True
                 break
-            paragraphs.append(word_paragraph(paragraph, len(paragraphs), part))
+            paragraph_index = source_paragraph_index
+            paragraphs.append(word_paragraph(paragraph, paragraph_index, part))
+            referenced_comment_ids = {
+                node.attrib.get(q("w", "id"))
+                for node in paragraph.iter()
+                if node.tag in {q("w", "commentRangeStart"), q("w", "commentReference")}
+                and node.attrib.get(q("w", "id")) is not None
+            }
+            for comment_id in referenced_comment_ids:
+                comment_anchors.setdefault(str(comment_id), []).append({
+                    "part": part,
+                    "paragraphIndex": paragraph_index,
+                    "paragraphText": paragraphs[-1]["text"],
+                })
         for table in root.iter(q("w", "tbl")):
+            source_table_index = table_seen
+            table_seen += 1
+            if len(tables) >= max_tables:
+                table_truncated = True
+                break
             rows = []
             for row in table.findall(q("w", "tr")):
-                rows.append([text_of(cell, (q("w", "t"),)) for cell in row.findall(q("w", "tc"))])
-            tables.append({"index": len(tables), "part": part, "rows": rows})
+                cells = [text_of(cell, (q("w", "t"),)) for cell in row.findall(q("w", "tc"))]
+                remaining = max_table_cells - table_cells
+                if remaining <= 0:
+                    table_cells_truncated = True
+                    break
+                if len(cells) > remaining:
+                    cells = cells[:remaining]
+                    table_cells_truncated = True
+                rows.append(cells)
+                table_cells += len(cells)
+                if table_cells >= max_table_cells:
+                    if any(next_row.findall(q("w", "tc")) for next_row in table.findall(q("w", "tr"))[len(rows):]):
+                        table_cells_truncated = True
+                    break
+            tables.append({"index": source_table_index, "part": part, "rows": rows, "truncated": table_cells_truncated and table_cells >= max_table_cells})
+            if table_cells >= max_table_cells:
+                break
         for sdt in root.iter(q("w", "sdt")):
             props = sdt.find(q("w", "sdtPr"))
             tag = title = control_id = None
@@ -386,14 +496,23 @@ def inspect_word(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str,
     if "word/comments.xml" in names:
         comments_root = xml_root(package, "word/comments.xml")
         for comment in comments_root.findall(q("w", "comment")):
+            comment_id = comment.attrib.get(q("w", "id"))
+            anchors = comment_anchors.get(str(comment_id), [])
             comments.append({
-                "id": comment.attrib.get(q("w", "id")),
+                "id": comment_id,
                 "author": comment.attrib.get(q("w", "author")),
                 "date": comment.attrib.get(q("w", "date")),
                 "text": text_of(comment, (q("w", "t"),)),
+                "anchors": anchors,
+                "paragraphIndex": anchors[0]["paragraphIndex"] if anchors else None,
+                "part": anchors[0]["part"] if anchors else None,
             })
     return {
         "kind": "word",
+        "reviewFeatures": {
+            "legacyComments": "word/comments.xml" in names,
+            "modernThreadedComments": any(name in names for name in ("word/commentsExtended.xml", "word/commentsIds.xml", "word/people.xml")),
+        },
         "paragraphs": paragraphs,
         "paragraphCount": len(paragraphs),
         "tables": tables,
@@ -402,7 +521,9 @@ def inspect_word(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str,
         "contentControlCount": len(content_controls),
         "comments": comments,
         "commentCount": len(comments),
-        "truncated": len(paragraphs) >= max_paragraphs,
+        "selectors": {"paragraphStart": paragraph_start},
+        "truncation": {"paragraphs": paragraph_truncated, "tables": table_truncated, "tableCells": table_cells_truncated},
+        "truncated": paragraph_truncated or table_truncated or table_cells_truncated,
     }
 
 
@@ -470,6 +591,34 @@ def excel_tables_for_sheet(package: zipfile.ZipFile, sheet_part: str) -> List[Di
             "style": dict(style.attrib) if style is not None else None,
         })
     return tables
+
+
+def excel_notes_for_sheet(package: zipfile.ZipFile, sheet_part: str) -> List[Dict[str, Any]]:
+    notes = []
+    for relationship in rels_for_part(package, sheet_part).values():
+        if not relationship.get("Type", "").endswith("/comments"):
+            continue
+        part = resolved_relationship_target(sheet_part, relationship.get("Target", ""))
+        if part not in package.namelist():
+            continue
+        root = xml_root(package, part)
+        authors_node = root.find(q("s", "authors"))
+        authors = [node.text or "" for node in list(authors_node or [])]
+        comment_list = root.find(q("s", "commentList"))
+        for comment in list(comment_list or []):
+            author_id = comment.attrib.get("authorId")
+            try:
+                author = authors[int(author_id)] if author_id is not None else None
+            except (ValueError, IndexError):
+                author = None
+            notes.append({
+                "address": comment.attrib.get("ref"),
+                "author": author,
+                "authorId": author_id,
+                "text": text_of(comment, (q("s", "t"),)),
+                "part": part,
+            })
+    return notes
 
 
 def excel_charts_for_sheet(package: zipfile.ZipFile, sheet_part: str) -> List[Dict[str, Any]]:
@@ -552,6 +701,7 @@ def excel_formula_dependencies(formula: Optional[str], current_sheet: str) -> Li
 
 
 def inspect_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str, Any]:
+    package_names = set(package.namelist())
     workbook = xml_root(package, "xl/workbook.xml")
     relationships = rels_for_part(package, "xl/workbook.xml")
     shared = excel_shared_strings(package)
@@ -564,6 +714,15 @@ def inspect_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str
     include_dependencies = request.get("includeFormulaDependencies", False)
     requested_sheets = {str(name) for name in request.get("sheetNames", []) if str(name)}
     requested_range = str(request.get("address", "")).upper()
+    if requested_range:
+        range_parts = requested_range.split(":")
+        start_column, start_row = excel_address_parts(range_parts[0])
+        end_column, end_row = excel_address_parts(range_parts[-1])
+        if end_column < start_column or end_row < start_row:
+            raise OfficePackageError("Excel range end precedes its start.")
+        range_area = (end_column - start_column + 1) * (end_row - start_row + 1)
+        if range_area > max_cells:
+            raise OfficePackageError("Requested Excel inspection range contains %d cells, above maxCells %d." % (range_area, max_cells))
     selected_addresses = {
         address
         for row in excel_range_addresses(requested_range)
@@ -578,6 +737,7 @@ def inspect_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str
     total_tables = 0
     total_charts = 0
     total_pivots = 0
+    total_notes = 0
     dependency_edges = []
     found_sheet_names = set()
     sheet_nodes = workbook.find(q("s", "sheets"))
@@ -601,9 +761,11 @@ def inspect_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str
         tables = excel_tables_for_sheet(package, part) if include_tables and part and part in package.namelist() else []
         charts = excel_charts_for_sheet(package, part) if include_charts and part and part in package.namelist() else []
         pivots = excel_pivots_for_sheet(package, part) if include_pivots and part and part in package.namelist() else []
+        notes = excel_notes_for_sheet(package, part) if part and part in package.namelist() else []
         total_tables += len(tables)
         total_charts += len(charts)
         total_pivots += len(pivots)
+        total_notes += len(notes)
         if (include_cells or search_text) and part and part in package.namelist():
             root = xml_root(package, part)
             for cell in root.iter(q("s", "c")):
@@ -645,6 +807,8 @@ def inspect_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str
         sheet_result["chartCount"] = len(charts)
         sheet_result["pivots"] = pivots
         sheet_result["pivotCount"] = len(pivots)
+        sheet_result["notes"] = notes
+        sheet_result["noteCount"] = len(notes)
         sheets.append(sheet_result)
         if search_text and len(matches) >= max_matches:
             break
@@ -657,12 +821,17 @@ def inspect_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str
         defined_names.append({"name": name.attrib.get("name"), "value": name.text})
     return {
         "kind": "excel",
+        "reviewFeatures": {
+            "legacyCellNotes": any("/comments" in name and name.endswith(".xml") for name in package_names),
+            "threadedComments": any("threadedComments" in name or re.search(r"(^|/)persons?/", name, re.I) for name in package_names),
+        },
         "sheets": sheets,
         "sheetCount": len(sheets),
         "cellCount": total_cells,
         "tableCount": total_tables,
         "chartCount": total_charts,
         "pivotCount": total_pivots,
+        "noteCount": total_notes,
         "formulaDependencies": dependency_edges,
         "formulaDependencyCount": len(dependency_edges),
         "definedNames": defined_names,
@@ -735,14 +904,24 @@ def inspect_powerpoint(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dic
     relationships = rels_for_part(package, "ppt/presentation.xml")
     slide_list = presentation.find(q("p", "sldIdLst"))
     max_slides = max(1, min(int(request.get("maxSlides", 500)), 5000))
+    max_shapes = max(1, min(int(request.get("maxShapes", 5000)), 50_000))
+    requested_slide_indexes = {int(index) for index in request.get("slideIndexes", [])}
+    requested_shape_ids = {str(shape_id) for shape_id in request.get("shapeIds", [])}
     slides = []
-    for slide_node in list(slide_list or [])[:max_slides]:
+    shape_count = 0
+    shapes_truncated = False
+    all_slide_nodes = list(slide_list or [])
+    for source_slide_index, slide_node in enumerate(all_slide_nodes):
+        if requested_slide_indexes and source_slide_index not in requested_slide_indexes:
+            continue
+        if len(slides) >= max_slides:
+            break
         rel_id = slide_node.attrib.get(q("r", "id"))
         relationship = relationships.get(rel_id or "", {})
         target = relationship.get("Target", "")
         part = resolved_relationship_target("ppt/presentation.xml", target) if target else None
         slide_result: Dict[str, Any] = {
-            "index": len(slides),
+            "index": source_slide_index,
             "slideId": slide_node.attrib.get("id"),
             "relationshipId": rel_id,
             "part": part,
@@ -756,7 +935,14 @@ def inspect_powerpoint(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dic
             if shape_tree is not None:
                 for child in list(shape_tree):
                     if child.tag in {q("p", "sp"), q("p", "pic"), q("p", "graphicFrame"), q("p", "grpSp")}:
-                        slide_result["shapes"].append(ppt_shape_result(child, len(slides), slide_relationships))
+                        shape_result = ppt_shape_result(child, source_slide_index, slide_relationships)
+                        if requested_shape_ids and str(shape_result.get("id")) not in requested_shape_ids:
+                            continue
+                        if shape_count >= max_shapes:
+                            shapes_truncated = True
+                            break
+                        slide_result["shapes"].append(shape_result)
+                        shape_count += 1
             for rel in slide_relationships.values():
                 if rel.get("Type", "").endswith("/notesSlide"):
                     notes_part = resolved_relationship_target(part, rel.get("Target", ""))
@@ -775,7 +961,12 @@ def inspect_powerpoint(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dic
             "height": int(size.attrib.get("cy", "0")) if size is not None else None,
             "type": size.attrib.get("type") if size is not None else None,
         },
-        "truncated": len(list(slide_list or [])) > max_slides,
+        "selectors": {"slideIndexes": sorted(requested_slide_indexes), "shapeIds": sorted(requested_shape_ids)},
+        "truncation": {
+            "slides": len([index for index in range(len(all_slide_nodes)) if not requested_slide_indexes or index in requested_slide_indexes]) > max_slides,
+            "shapes": shapes_truncated,
+        },
+        "truncated": len([index for index in range(len(all_slide_nodes)) if not requested_slide_indexes or index in requested_slide_indexes]) > max_slides or shapes_truncated,
     }
 
 
@@ -829,6 +1020,10 @@ def inspect_package(path: Path, request: Dict[str, Any]) -> Dict[str, Any]:
                         {"objectType": "cell", "sheet": sheet.get("name"), **cell}
                         for sheet in content.get("sheets", []) for cell in sheet.get("cells", [])
                     ]
+                    candidates.extend(
+                        {"objectType": "note", "sheet": sheet.get("name"), **note}
+                        for sheet in content.get("sheets", []) for note in sheet.get("notes", [])
+                    )
                 else:
                     candidates = []
                     for slide in content.get("slides", []):
@@ -1284,6 +1479,50 @@ def edit_word(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[s
             ET.SubElement(reference_run, q("w", "commentReference"), {q("w", "id"): str(comment_id)})
             changes.append({"operation": op_type, "part": part, "paragraphIndex": index, "commentId": str(comment_id), "author": author})
             modifications[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            continue
+        if op_type == "deleteComment":
+            comment_id = str(operation.get("commentId", "")).strip()
+            if not comment_id:
+                raise OfficePackageError("Word deleteComment requires commentId.")
+            comments_part = "word/comments.xml"
+            if comments_part in modifications:
+                comments_root = ET.fromstring(modifications[comments_part])
+            elif comments_part in names:
+                comments_root = ET.fromstring(package.read(comments_part))
+            else:
+                raise OfficePackageError("Word document has no comments to delete.")
+            comment = next((
+                node for node in comments_root.findall(q("w", "comment"))
+                if node.attrib.get(q("w", "id")) == comment_id
+            ), None)
+            if comment is None:
+                raise OfficePackageError("Word commentId was not found: %s" % comment_id)
+            before = {
+                "id": comment_id,
+                "author": comment.attrib.get(q("w", "author")),
+                "text": text_of(comment, (q("w", "t"),)),
+            }
+            if operation.get("expectedText") is not None and str(operation.get("expectedText")) != str(before["text"] or ""):
+                raise OfficePackageError("Word comment text changed; inspect comments again before deleting.")
+            if operation.get("expectedAuthor") is not None and str(operation.get("expectedAuthor")) != str(before["author"] or ""):
+                raise OfficePackageError("Word comment author changed; inspect comments again before deleting.")
+            comments_root.remove(comment)
+            modifications[comments_part] = ET.tostring(comments_root, encoding="utf-8", xml_declaration=True)
+            removed_markers = 0
+            marker_tags = {q("w", "commentRangeStart"), q("w", "commentRangeEnd"), q("w", "commentReference")}
+            comment_parts = sorted(name for name in names if re.fullmatch(r"word/(document|header\d+|footer\d+|footnotes|endnotes)\.xml", name))
+            for comment_part in comment_parts:
+                comment_root = word_part(package, modifications, comment_part)
+                part_changed = False
+                for parent in list(comment_root.iter()):
+                    for child in list(parent):
+                        if child.tag in marker_tags and child.attrib.get(q("w", "id")) == comment_id:
+                            parent.remove(child)
+                            removed_markers += 1
+                            part_changed = True
+                if part_changed:
+                    modifications[comment_part] = ET.tostring(comment_root, encoding="utf-8", xml_declaration=True)
+            changes.append({"operation": op_type, "commentId": comment_id, "before": before, "removedMarkers": removed_markers})
             continue
         if op_type == "insertTable":
             part = "word/document.xml"
@@ -3388,6 +3627,10 @@ def apply_excel_rich(path: Path, operations: List[Dict[str, Any]]) -> List[Dict[
             cell.style = "Hyperlink"; changes.append({"operation": op_type, "sheet": sheet_name, "address": cell.coordinate, "url": operation["url"]}); continue
         if op_type in {"addNote", "deleteNote"}:
             cell = worksheet[str(address).split(":")[0]]; before = cell.comment.text if cell.comment else None
+            before_author = cell.comment.author if cell.comment else None
+            if op_type == "deleteNote" and cell.comment is None: raise OfficePackageError("Excel note was not found at the requested address.")
+            if op_type == "deleteNote" and operation.get("expectedText") is not None and str(operation.get("expectedText")) != str(before or ""): raise OfficePackageError("Excel note text changed; inspect notes again before deleting.")
+            if op_type == "deleteNote" and operation.get("expectedAuthor") is not None and str(operation.get("expectedAuthor")) != str(before_author or ""): raise OfficePackageError("Excel note author changed; inspect notes again before deleting.")
             cell.comment = Comment(str(operation.get("text", "")), str(operation.get("author", "Codex"))) if op_type == "addNote" else None
             changes.append({"operation": op_type, "sheet": sheet_name, "address": cell.coordinate, "before": before, "after": cell.comment.text if cell.comment else None}); continue
         if op_type == "insertImage":
@@ -3583,10 +3826,18 @@ def edit_package(path: Path, request: Dict[str, Any]) -> Dict[str, Any]:
                 % (first.get("part"), first.get("error"))
             )
         if kind == "word":
+            if any(operation.get("type") in {"addComment", "deleteComment"} for operation in request.get("operations", [])) and any(
+                name in inventory["names"] for name in ("word/commentsExtended.xml", "word/commentsIds.xml", "word/people.xml")
+            ):
+                raise OfficePackageError("Word modern/threaded comment parts are present; review mutation is refused to avoid damaging unsupported reply or resolution state.")
             modifications, changes = edit_word(package, request)
             write_modified_package(path, destination, modifications)
         else:
             operations = request.get("operations", [])
+            if kind == "excel" and any(operation.get("type") in {"addNote", "deleteNote"} for operation in operations) and any(
+                "threadedComments" in name or re.search(r"(^|/)persons?/", name, re.I) for name in inventory["names"]
+            ):
+                raise OfficePackageError("Excel threaded comments are present; note mutation is refused to avoid damaging unsupported review state.")
             rich_types = EXCEL_RICH_OPERATIONS if kind == "excel" else POWERPOINT_RICH_OPERATIONS
             if inventory["hasMacros"] and any(operation.get("type") in rich_types for operation in operations):
                 raise OfficePackageError("Rich Office operations are refused for macro-enabled packages because the pinned high-level library cannot prove VBA preservation.")
@@ -3623,6 +3874,7 @@ def edit_package(path: Path, request: Dict[str, Any]) -> Dict[str, Any]:
 
 def main() -> None:
     try:
+        configure_process_limits()
         request = read_request()
         action = request.get("action")
         input_path = request.get("inputPath")

@@ -1,0 +1,4 @@
+interface:
+  display_name: "OneDrive Excel"
+  short_description: "Create, inspect, and safely edit Excel files"
+  default_prompt: "Use $onedrive-excel to create or safely edit an Excel workbook in OneDrive."

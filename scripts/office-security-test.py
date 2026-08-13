@@ -79,6 +79,11 @@ def main():
         code, payload = call(bomb, kind="word")
         checks["compressionBombRejected"] = code != 0 and "suspiciously compressed" in payload.get("error", "")
 
+        oversized_xml = root / "oversized-xml.docx"
+        rewrite(source, oversized_xml, additions={"word/oversized.xml": b"<x>" + b"A" * (32 * 1024 * 1024) + b"</x>"})
+        code, payload = call(oversized_xml, kind="word")
+        checks["oversizedXmlPartRejectedBeforeParsing"] = code != 0 and "XML part above" in payload.get("error", "")
+
         split = root / "split.docx"
         split_xml = b'''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Hello </w:t></w:r><w:r><w:t>split run</w:t></w:r></w:p></w:body></w:document>'''
         rewrite(source, split, replacements={"word/document.xml": split_xml})

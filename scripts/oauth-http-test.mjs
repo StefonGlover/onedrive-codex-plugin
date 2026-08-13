@@ -103,6 +103,10 @@ const identityServer = createServer(async (request, response) => {
     json(response, 200, { access_token: "mock-graph-access-token", token_type: "Bearer", expires_in: 3600 });
     return;
   }
+  if (url.pathname.startsWith("/v1.0/")) {
+    json(response, 404, { error: { code: "itemNotFound", message: `Mock Graph target was not found: ${url.pathname}` } });
+    return;
+  }
   response.writeHead(404);
   response.end();
 });
@@ -148,6 +152,7 @@ Object.assign(process.env, {
   ONEDRIVE_MCP_OAUTH_DISCOVERY_URL: `${issuer}/.well-known/openid-configuration`,
   ONEDRIVE_MCP_OAUTH_OBO_TOKEN_ENDPOINT: `${issuer}/token`,
   ONEDRIVE_MCP_OAUTH_GRAPH_SCOPES: "https://graph.microsoft.com/.default",
+  ONEDRIVE_GRAPH_BASE_URL: `${issuer}/v1.0`,
   ONEDRIVE_MCP_OAUTH_FACADE_ACCESS_TOKEN_KEY_FILE: facadeAccessTokenKeyFile,
   ONEDRIVE_STORAGE_ROOT: storageRoot,
   ONEDRIVE_CACHE_ROOT: join(storageRoot, "cache"),
@@ -438,12 +443,23 @@ try {
   oauth.resetOAuthCachesForTests();
 
   const { createOneDriveHttpServer } = await import("../mcp/http-server.mjs");
-  mcpServer = createOneDriveHttpServer();
+  const { createResourceReadAdmissionController } = await import("../mcp/resource-read-admission.mjs");
+  const resourceReadAdmission = createResourceReadAdmissionController({ maxGlobal: 2, maxPerSubject: 1 });
+  assertThrows(
+    () => createOneDriveHttpServer({ ...process.env, ONEDRIVE_TOOL_PROFILE: "full" }, { resourceReadAdmission }),
+    "requires ONEDRIVE_TOOL_PROFILE=chatgpt"
+  );
+  assertThrows(
+    () => createOneDriveHttpServer({ ...process.env, ONEDRIVE_TOOL_PROFILE: "" }, { resourceReadAdmission }),
+    "requires ONEDRIVE_TOOL_PROFILE=chatgpt"
+  );
+  mcpServer = createOneDriveHttpServer(process.env, { resourceReadAdmission });
   const mcpPort = await listen(mcpServer);
   const baseUrl = `http://127.0.0.1:${mcpPort}`;
 
   const health = await fetch(`${baseUrl}/healthz`).then((response) => response.json());
   assert(health.ok && health.authMode === "oauth", "HTTP health route did not report OAuth mode.", health);
+  assert(!JSON.stringify(health).includes("message"), "Unauthenticated health diagnostics must never expose tenant-specific error messages.", health);
 
   const metadataResponse = await fetch(`${baseUrl}/.well-known/oauth-protected-resource/v1/mcp/tunnel_test`);
   assert(metadataResponse.status === 200, "Configured resource-path metadata route failed.", metadataResponse.status);
@@ -490,6 +506,86 @@ try {
     [...unauthenticatedInitialize.headers]
   );
 
+  const oversizedBatch = await mcpRequest(
+    baseUrl,
+    Array.from({ length: 17 }, (_, index) => ({
+      jsonrpc: "2.0",
+      id: 1_000 + index,
+      method: "initialize",
+      params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "batch-test", version: "1" } }
+    }))
+  );
+  assert(
+    oversizedBatch.status === 400
+      && oversizedBatch.body?.error?.code === -32600
+      && /at most 16/i.test(oversizedBatch.body?.error?.message || ""),
+    "The HTTP transport did not reject a JSON-RPC batch above 16 messages before authorization.",
+    oversizedBatch
+  );
+
+  const mixedResourceReadBatch = await mcpRequest(baseUrl, [
+    { jsonrpc: "2.0", id: 1_100, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "batch-test", version: "1" } } },
+    { jsonrpc: "2.0", id: 1_101, method: "resources/read", params: { uri: "onedrive-resource://00000000-0000-4000-8000-000000000000" } }
+  ]);
+  assert(
+    mixedResourceReadBatch.status === 400
+      && mixedResourceReadBatch.body?.error?.code === -32600
+      && /standalone/i.test(mixedResourceReadBatch.body?.error?.message || ""),
+    "The HTTP transport allowed resources/read to share a JSON-RPC batch.",
+    mixedResourceReadBatch
+  );
+
+  const singletonResourceReadBatch = await mcpRequest(baseUrl, [
+    { jsonrpc: "2.0", id: 1_102, method: "resources/read", params: { uri: "onedrive-resource://00000000-0000-4000-8000-000000000000" } }
+  ]);
+  assert(
+    singletonResourceReadBatch.status === 401,
+    "A one-message resources/read batch should reach the normal OAuth boundary.",
+    singletonResourceReadBatch
+  );
+
+  const heldResourceRead = resourceReadAdmission.acquire(verified.authContextId);
+  assert(heldResourceRead.admitted, "The OAuth resource-read admission fixture could not acquire its first lease.");
+  try {
+    const busyResourceRead = await mcpRequest(baseUrl, {
+      jsonrpc: "2.0",
+      id: 1_103,
+      method: "resources/read",
+      params: { uri: "onedrive-resource://00000000-0000-4000-8000-000000000000" }
+    }, bearerToken({ jti: "resource-read-admission-busy" }));
+    assert(
+      busyResourceRead.status === 429
+        && busyResourceRead.headers.get("retry-after") === "1"
+        && busyResourceRead.body?.error?.code === -32004
+        && busyResourceRead.body?.error?.data?.retryable === true,
+      "The HTTP transport did not return a bounded retryable response when the subject admission limit was full.",
+      busyResourceRead
+    );
+  } finally {
+    heldResourceRead.release();
+  }
+
+  const admittedMissingResource = await mcpRequest(baseUrl, {
+    jsonrpc: "2.0",
+    id: 1_104,
+    method: "resources/read",
+    params: { uri: "onedrive-resource://00000000-0000-4000-8000-000000000000" }
+  }, bearerToken({ jti: "resource-read-admission-release-one" }));
+  const admittedAfterResponse = await mcpRequest(baseUrl, {
+    jsonrpc: "2.0",
+    id: 1_105,
+    method: "resources/read",
+    params: { uri: "onedrive-resource://00000000-0000-4000-8000-000000000000" }
+  }, bearerToken({ jti: "resource-read-admission-release-two" }));
+  assert(
+    admittedMissingResource.status === 200
+      && admittedAfterResponse.status === 200
+      && admittedMissingResource.body?.error?.code === -32002
+      && admittedAfterResponse.body?.error?.code === -32002,
+    "A completed resource response did not release HTTP admission for the next request.",
+    { admittedMissingResource, admittedAfterResponse }
+  );
+
   const unauthenticatedToolList = await mcpRequest(
     baseUrl,
     { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }
@@ -520,7 +616,7 @@ try {
     { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
     bearerToken({ jti: "linked-tools-list" })
   );
-  const expectedToolCount = process.env.ONEDRIVE_TOOL_PROFILE === "chatgpt" ? 15 : 84;
+  const expectedToolCount = 19;
   assert(listed.result?.tools?.length === expectedToolCount, "OAuth HTTP server did not expose the exact tool contract.", listed.result?.tools?.length);
   assert(listed.result.tools.every((tool) => tool.securitySchemes?.[0]?.type === "oauth2"), "A tool is missing oauth2 security metadata.");
   assert(
@@ -536,12 +632,13 @@ try {
     ),
     "A tool mirrors the wrong OAuth scope set."
   );
+  const authenticatedToolCall = { name: "onedrive_office_capabilities", arguments: { kind: "excel", operation: "setCell" } };
 
   const unlinked = await mcpRequest(baseUrl, {
     jsonrpc: "2.0",
     id: 3,
     method: "tools/call",
-    params: { name: "onedrive_config", arguments: {} }
+    params: authenticatedToolCall
   });
   assert(unlinked.status === 401, "Unlinked OAuth tool call did not return HTTP 401.", unlinked);
   const unlinkedChallenge = unlinked.headers.get("www-authenticate") || "";
@@ -559,7 +656,7 @@ try {
     jsonrpc: "2.0",
     id: 4,
     method: "tools/call",
-    params: { name: "onedrive_config", arguments: {} }
+    params: authenticatedToolCall
   }, "not-a-jwt");
   assert(invalidBearer.status === 401, "An invalid supplied bearer token did not return HTTP 401.", invalidBearer);
   const challenge = invalidBearer.headers.get("www-authenticate") || "";
@@ -578,7 +675,7 @@ try {
       jsonrpc: "2.0",
       id: 4,
       method: "tools/call",
-      params: { name: "onedrive_config", arguments: {} }
+      params: authenticatedToolCall
     }, bearerToken({ jti: "discovery-failure-test" })), "OAuth discovery failure");
   } finally {
     discoveryFailureStatus = 0;
@@ -591,7 +688,7 @@ try {
       jsonrpc: "2.0",
       id: 5,
       method: "tools/call",
-      params: { name: "onedrive_config", arguments: {} }
+      params: authenticatedToolCall
     }, bearerToken({ jti: "malformed-discovery-test" })), "Malformed OAuth discovery");
   } finally {
     omitDiscoveryIssuer = false;
@@ -604,7 +701,7 @@ try {
       jsonrpc: "2.0",
       id: 6,
       method: "tools/call",
-      params: { name: "onedrive_config", arguments: {} }
+      params: authenticatedToolCall
     }, bearerToken({ jti: "jwks-failure-test" })), "JWKS failure");
   } finally {
     jwksFailureStatus = 0;
@@ -617,7 +714,7 @@ try {
       jsonrpc: "2.0",
       id: 7,
       method: "tools/call",
-      params: { name: "onedrive_config", arguments: {} }
+      params: authenticatedToolCall
     }, bearerToken({ jti: "malformed-jwks-test" })), "Malformed JWKS");
   } finally {
     jwksPayloadOverride = null;
@@ -633,7 +730,7 @@ try {
       jsonrpc: "2.0",
       id: 8,
       method: "tools/call",
-      params: { name: "onedrive_config", arguments: {} }
+      params: authenticatedToolCall
     }, bearerToken({ jti: "obo-throttle-test" })), "OBO throttling");
   } finally {
     tokenFailure = null;
@@ -646,7 +743,7 @@ try {
       jsonrpc: "2.0",
       id: 9,
       method: "tools/call",
-      params: { name: "onedrive_config", arguments: {} }
+      params: authenticatedToolCall
     }, bearerToken({ jti: "runtime-configuration-test" })), "Runtime OAuth configuration failure");
   } finally {
     process.env.ONEDRIVE_MCP_OAUTH_ALLOWED_CLIENT_IDS = originalAllowedClientIds;
@@ -659,7 +756,7 @@ try {
       jsonrpc: "2.0",
       id: 10,
       method: "tools/call",
-      params: { name: "onedrive_config", arguments: {} }
+      params: authenticatedToolCall
     }, bearerToken({ jti: "invalid-client-test" }));
     assertServiceUnavailableResponse(unavailable, "OBO provider configuration failure");
   } finally {
@@ -670,10 +767,32 @@ try {
     jsonrpc: "2.0",
     id: 11,
     method: "tools/call",
-    params: { name: "onedrive_config", arguments: {} }
+    params: authenticatedToolCall
   }, bearerToken({ jti: "linked-http-call" }));
   assert(linked.result?.isError === false, "Linked OAuth tool call failed.", linked);
-  assert(JSON.parse(linked.result.content[0].text).clientIdConfigured === true, "Linked config result is malformed.", linked);
+  const linkedValue = JSON.parse(linked.result.content[0].text);
+  assert(linkedValue.kind === "excel" && linkedValue.operation === "setCell" && linkedValue.supported === true, "Linked focused capability result is malformed.", linked);
+
+  const tenantSecretMarker = "tenant-item-name-must-not-leak";
+  const failedTool = await mcpCall(baseUrl, {
+    jsonrpc: "2.0",
+    id: 12,
+    method: "tools/call",
+    params: {
+      name: "onedrive_office_inspect",
+      arguments: { kind: "word", itemId: tenantSecretMarker }
+    }
+  }, bearerToken({ jti: "health-diagnostic-redaction" }));
+  assert(failedTool.result?.isError === true, "Health redaction fixture did not produce a tool failure.", failedTool);
+  const healthAfterFailure = await fetch(`${baseUrl}/healthz`).then((response) => response.json());
+  const serializedHealthAfterFailure = JSON.stringify(healthAfterFailure);
+  assert(
+    healthAfterFailure.lastToolFailure?.code
+      && !serializedHealthAfterFailure.includes(tenantSecretMarker)
+      && !Object.hasOwn(healthAfterFailure.lastToolFailure, "message"),
+    "Unauthenticated health diagnostics exposed a tenant-specific tool failure message.",
+    healthAfterFailure
+  );
 
   console.log(JSON.stringify({
     ok: true,
@@ -690,6 +809,11 @@ try {
       onBehalfOfExchangeAndCache: true,
       resourceBoundFacadeTokenAndOboExchange: true,
       streamableHttpInitialize: true,
+      boundedJsonRpcBatch: true,
+      standaloneResourceReads: true,
+      resourceReadAdmissionAndRelease: true,
+      fullHttpProfileRejected: true,
+      healthDiagnosticsRedacted: true,
       oauthToolDescriptors: expectedToolCount,
       http401AndRuntimeChallenge: true,
       anonymousDiscoveryAndProtectedToolCalls: true,

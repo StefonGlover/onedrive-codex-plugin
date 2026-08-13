@@ -19,8 +19,45 @@ from typing import Any, Dict, Iterable, List
 from xml.etree import ElementTree as ET
 
 
+MAX_HELPER_ADDRESS_SPACE_BYTES = 512 * 1024 * 1024
+MAX_HELPER_FILE_BYTES = 2 * 1024 * 1024
+MAX_HELPER_CPU_SECONDS = 55
+
+
 class ExtractionError(Exception):
     pass
+
+
+def configure_process_limits(
+    address_space_bytes: int = MAX_HELPER_ADDRESS_SPACE_BYTES,
+    file_size_bytes: int = MAX_HELPER_FILE_BYTES,
+    cpu_seconds: int = MAX_HELPER_CPU_SECONDS,
+) -> None:
+    """Fail closed unless all mandatory limits protect this process and its children."""
+    try:
+        import resource
+    except ImportError as error:
+        raise ExtractionError("Required common-text resource limits are unavailable.") from error
+
+    required = ("RLIMIT_AS", "RLIMIT_CPU", "RLIMIT_FSIZE")
+    if any(not hasattr(resource, name) for name in required):
+        raise ExtractionError("Required common-text resource limits are unavailable.")
+
+    def cap(kind: int, maximum: int) -> None:
+        _soft, hard = resource.getrlimit(kind)
+        bounded = maximum if hard == resource.RLIM_INFINITY else min(hard, maximum)
+        if bounded < 1:
+            raise ValueError("invalid host limit")
+        resource.setrlimit(kind, (bounded, bounded))
+
+    try:
+        cap(resource.RLIMIT_AS, address_space_bytes)
+        cap(resource.RLIMIT_CPU, cpu_seconds)
+        cap(resource.RLIMIT_FSIZE, file_size_bytes)
+        if hasattr(resource, "RLIMIT_CORE"):
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (OSError, ValueError) as error:
+        raise ExtractionError("Required common-text resource limits could not be applied.") from error
 
 
 def read_request() -> Dict[str, Any]:
@@ -354,21 +391,26 @@ def extract_external(path: Path, kind: str, max_bytes: int) -> Dict[str, Any]:
         raise ExtractionError("Required extractor is unavailable for %s." % kind)
     with tempfile.TemporaryDirectory(prefix="onedrive-extract-", dir=str(path.parent)) as temporary:
         output = Path(temporary) / "output.txt"
+        error_output = Path(temporary) / "stderr.txt"
         args = command(executable, path, output)
         writes_output_file = kind in {"pdf", "image-ocr"}
         try:
-            if writes_output_file:
-                completed = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=55, check=False)
-            else:
-                with output.open("wb") as destination:
-                    completed = subprocess.run(args, stdout=destination, stderr=subprocess.PIPE, timeout=55, check=False)
+            with error_output.open("xb") as error_destination:
+                if writes_output_file:
+                    completed = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=error_destination, timeout=55, check=False)
+                else:
+                    with output.open("xb") as destination:
+                        completed = subprocess.run(args, stdout=destination, stderr=error_destination, timeout=55, check=False)
         except subprocess.TimeoutExpired as error:
             raise ExtractionError("%s extraction timed out." % kind) from error
         if completed.returncode != 0:
-            message = completed.stderr[:4096].decode("utf-8", errors="replace").strip()
+            with error_output.open("rb") as error_source:
+                message = error_source.read(4096).decode("utf-8", errors="replace").strip()
             raise ExtractionError("%s extraction failed: %s" % (kind, message or "unknown extractor error"))
         if not output.is_file():
             raise ExtractionError("%s extractor did not produce text." % kind)
+        if output.stat().st_size > MAX_HELPER_FILE_BYTES:
+            raise ExtractionError("%s extractor exceeded the bounded output-file limit." % kind)
         with output.open("rb") as source:
             payload = source.read(max_bytes + 1)
         result = bounded_text(payload, max_bytes)
@@ -400,6 +442,7 @@ def extract(path: Path, kind: str, max_bytes: int) -> Dict[str, Any]:
 
 def main() -> None:
     try:
+        configure_process_limits()
         request = read_request()
         if request.get("action") != "extract":
             raise ExtractionError("action must be extract.")

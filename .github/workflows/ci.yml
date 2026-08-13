@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ["20", "26"]
+        node: ["24", "26"]
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -26,7 +26,7 @@ jobs:
       - name: Install shell dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y zsh libreoffice-writer libreoffice-calc libreoffice-impress
+          sudo apt-get install -y zsh libreoffice-writer libreoffice-calc libreoffice-impress poppler-utils
           python3 -m pip install -r scripts/requirements-office-test.txt
 
       - name: Validate manifests and whitespace
@@ -47,11 +47,24 @@ jobs:
           node --check mcp/http-server.mjs
           node --check mcp/oauth.mjs
           node --check mcp/oauth-compat-server.mjs
+          node --check mcp/oauth-facade-token.mjs
+          node --check mcp/bounded-local-state.mjs
+          node --check mcp/heavyweight-subprocess-admission.mjs
+          node --check mcp/managed-artifact-quota.mjs
+          node --check mcp/materialized-resources.mjs
+          node --check mcp/resource-read-admission.mjs
           node --check scripts/mock-graph-test.mjs
+          node --check scripts/bounded-local-state-test.mjs
+          node --check scripts/heavyweight-subprocess-admission-test.mjs
+          node --check scripts/hosted-profile-boundary-test.mjs
+          node --check scripts/managed-artifact-quota-test.mjs
+          node --check scripts/materialized-resources-test.mjs
+          node --check scripts/resource-read-admission-test.mjs
           node --check scripts/oauth-http-test.mjs
           node --check scripts/oauth-compat-test.mjs
           node --check scripts/storage-root-permissions-test.mjs
           node --check scripts/run-chatgpt-oauth-tunnel.mjs
+          node --check scripts/run-chatgpt-tunnel.mjs
           node --check scripts/semantic-anchors-test.mjs
           node --check scripts/text-patch-test.mjs
           node --check scripts/prepackage-check.mjs
@@ -59,11 +72,15 @@ jobs:
           node --check scripts/benchmark.mjs
           node --check scripts/tool-contract.mjs
           node --check scripts/tool-profile-test.mjs
+          node --check scripts/skill-profile-test.mjs
           node --check scripts/chatgpt-golden-test.mjs
           node --check scripts/chatgpt-work-beta-test.mjs
           node --check scripts/install-versioned-cache.mjs
           python3 -m py_compile scripts/common-text.py
+          python3 -m py_compile scripts/common-text-limits-test.py
           python3 -m py_compile scripts/common-text-test.py
+          python3 -m py_compile scripts/pdftoppm-limited.py
+          python3 -m py_compile scripts/pdftoppm-limits-test.py
           python3 -m py_compile scripts/office-fixture-factory.py
           zsh -n scripts/configure.zsh
 
@@ -71,7 +88,9 @@ jobs:
         run: |
           node scripts/beta-test.mjs --self-check
           node scripts/benchmark.mjs --self-check
+          node scripts/hosted-profile-boundary-test.mjs
           node scripts/tool-profile-test.mjs
+          node scripts/skill-profile-test.mjs
           node scripts/chatgpt-golden-test.mjs
           node scripts/chatgpt-work-beta-test.mjs --self-check
           node scripts/install-versioned-cache.mjs --self-check
@@ -95,15 +114,21 @@ jobs:
       - name: Run mocked Microsoft Graph tests
         run: |
           python3 scripts/common-text-test.py
+          python3 scripts/common-text-limits-test.py
           python3 scripts/office-openxml-test.py
           python3 scripts/office-security-test.py
           SOFFICE="$(command -v soffice)" python3 scripts/office-real-fixture-test.py
           node scripts/semantic-anchors-test.mjs
           node scripts/text-patch-test.mjs
-          node scripts/oauth-http-test.mjs
           ONEDRIVE_TOOL_PROFILE=chatgpt node scripts/oauth-http-test.mjs
           node scripts/oauth-compat-test.mjs
           node scripts/storage-root-permissions-test.mjs
+          node scripts/bounded-local-state-test.mjs
+          node scripts/heavyweight-subprocess-admission-test.mjs
+          node scripts/managed-artifact-quota-test.mjs
+          node scripts/materialized-resources-test.mjs
+          node scripts/resource-read-admission-test.mjs
+          python3 scripts/pdftoppm-limits-test.py
           node scripts/mock-graph-test.mjs
 
       - name: Run prepackage guard

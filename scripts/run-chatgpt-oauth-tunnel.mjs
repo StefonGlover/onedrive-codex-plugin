@@ -17,8 +17,8 @@ const oauthCompatPort = process.env.ONEDRIVE_OAUTH_COMPAT_PORT || "3010";
 const oauthCompatHealthUrl = `http://127.0.0.1:${oauthCompatPort}/healthz`;
 let stopping = false;
 
-if (!["full", "chatgpt"].includes(toolProfile)) {
-  throw new Error("ONEDRIVE_TOOL_PROFILE must be full or chatgpt.");
+if (toolProfile !== "chatgpt") {
+  throw new Error("The OAuth HTTP tunnel requires ONEDRIVE_TOOL_PROFILE=chatgpt. Use the full profile only through trusted local stdio.");
 }
 
 function child(script, env = process.env) {

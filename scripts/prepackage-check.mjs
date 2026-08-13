@@ -78,7 +78,7 @@ const chatGptConnectionIdPattern = /^plugin_asdk_app_[0-9a-f]{32}$/;
 const expectedOfficeOperationKinds = {
   word: [
     "replaceText", "setParagraphText", "setParagraphStyle", "insertParagraph", "setTableCell",
-    "setContentControlText", "addHyperlink", "addComment", "insertTable", "insertImage", "replaceImage",
+    "setContentControlText", "addHyperlink", "addComment", "deleteComment", "insertTable", "insertImage", "replaceImage",
     "createContentControl", "deleteContentControl", "createBookmark", "deleteBookmark", "insertTableRow",
     "deleteTableRow", "insertTableColumn", "deleteTableColumn", "setHeaderFooterText", "setSectionProperties"
   ],
@@ -103,7 +103,7 @@ const officeOperationToolNames = {
   powerpoint: "onedrive_powerpoint_batch_update"
 };
 const requiredQaOfflineGates = [
-  "Node 20 and Node 26 syntax/self-checks",
+  "Node 24 and Node 26 syntax/self-checks",
   "Exact MCP contract",
   "Plugin manifest/version alignment",
   "Prepackage negative checks",
@@ -127,7 +127,13 @@ const requiredFiles = [
   "mcp/http-server.mjs",
   "mcp/oauth.mjs",
   "mcp/oauth-compat-server.mjs",
+  "mcp/oauth-facade-token.mjs",
   "mcp/auth-vault.mjs",
+  "mcp/bounded-local-state.mjs",
+  "mcp/heavyweight-subprocess-admission.mjs",
+  "mcp/managed-artifact-quota.mjs",
+  "mcp/materialized-resources.mjs",
+  "mcp/resource-read-admission.mjs",
   "mcp/semantic-anchors.mjs",
   "mcp/text-patch.mjs",
   "scripts/auth-vault-test.mjs",
@@ -137,16 +143,27 @@ const requiredFiles = [
   "scripts/install-versioned-cache.mjs",
   "scripts/requirements-office-test.txt",
   "scripts/mock-graph-test.mjs",
+  "scripts/bounded-local-state-test.mjs",
+  "scripts/heavyweight-subprocess-admission-test.mjs",
+  "scripts/hosted-profile-boundary-test.mjs",
+  "scripts/managed-artifact-quota-test.mjs",
+  "scripts/materialized-resources-test.mjs",
+  "scripts/resource-read-admission-test.mjs",
+  "scripts/pdftoppm-limited.py",
+  "scripts/pdftoppm-limits-test.py",
   "scripts/oauth-http-test.mjs",
   "scripts/oauth-compat-test.mjs",
   "scripts/storage-root-permissions-test.mjs",
   "scripts/run-chatgpt-oauth-tunnel.mjs",
+  "scripts/run-chatgpt-tunnel.mjs",
   "scripts/semantic-anchors-test.mjs",
   "scripts/text-patch-test.mjs",
   "scripts/tool-profile-test.mjs",
+  "scripts/skill-profile-test.mjs",
   "scripts/chatgpt-golden-test.mjs",
   "scripts/chatgpt-work-beta-test.mjs",
   "scripts/common-text.py",
+  "scripts/common-text-limits-test.py",
   "scripts/common-text-test.py",
   "scripts/container-healthcheck.mjs",
   "scripts/office-openxml.py",
@@ -161,6 +178,21 @@ const requiredFiles = [
   "deploy/synology/compose.oauth.example.yaml",
   "deploy/synology/README.md",
   "skills/onedrive/SKILL.md",
+  "skills/onedrive/agents/openai.yaml",
+  "skills/onedrive/references/tool-profiles.yaml",
+  "skills/onedrive/references/full-profile-maintenance.md",
+  "skills/onedrive-word/SKILL.md",
+  "skills/onedrive-word/agents/openai.yaml",
+  "skills/onedrive-word/references/word-operations.md",
+  "skills/onedrive-excel/SKILL.md",
+  "skills/onedrive-excel/agents/openai.yaml",
+  "skills/onedrive-excel/references/excel-operations.md",
+  "skills/onedrive-powerpoint/SKILL.md",
+  "skills/onedrive-powerpoint/agents/openai.yaml",
+  "skills/onedrive-powerpoint/references/powerpoint-operations.md",
+  "skills/onedrive-review/SKILL.md",
+  "skills/onedrive-review/agents/openai.yaml",
+  "skills/onedrive-review/references/evidence-and-limitations.md",
   "README.md",
   "qa-report.md",
   "qa-report.json",
@@ -517,9 +549,13 @@ function dockerOfficeRuntimeProblems(text) {
     "ONEDRIVE_OFFICE_PYTHON=/opt/onedrive-office/bin/python3",
     'CMD ["node", "/app/scripts/container-healthcheck.mjs"]'
   ];
-  return required
+  const issues = required
     .filter((entry) => !source.includes(entry))
     .map((entry) => `deploy/synology/Dockerfile must pin and health-check the Office runtime (${entry}).`);
+  if (!/^FROM node:24-bookworm-slim@sha256:[0-9a-f]{64}$/mu.test(source)) {
+    issues.push("deploy/synology/Dockerfile must pin the Node 24 Bookworm base to an exact SHA-256 manifest digest.");
+  }
+  return issues;
 }
 
 function checkDockerOfficeRuntime() {
@@ -844,6 +880,7 @@ if (selfCheck) {
     pinnedDockerOfficeRuntimeAccepted:
       dockerOfficeRuntimeProblems(
         [
+          `FROM node:24-bookworm-slim@sha256:${"a".repeat(64)}`,
           "python3-venv",
           "scripts/requirements-office-test.txt",
           "/opt/onedrive-office/bin/pip install --no-cache-dir --requirement",

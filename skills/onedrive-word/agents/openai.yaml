@@ -1,0 +1,4 @@
+interface:
+  display_name: "OneDrive Word"
+  short_description: "Create, inspect, and safely edit Word files"
+  default_prompt: "Use $onedrive-word to create or safely edit a Word document in OneDrive."

@@ -19,7 +19,7 @@ OPENXML_TOOL_NAMES = {
     "excel": "onedrive_excel_batch_update",
     "powerpoint": "onedrive_powerpoint_batch_update",
 }
-EXPECTED_OPENXML_OPERATION_COUNTS = {"word": 21, "excel": 33, "powerpoint": 25}
+EXPECTED_OPENXML_OPERATION_COUNTS = {"word": 22, "excel": 33, "powerpoint": 25}
 COVERED_OPENXML_OPERATIONS = {kind: set() for kind in OPENXML_TOOL_NAMES}
 RICH_REAL_FIXTURE_OPERATIONS = {
     "word": {"insertImage", "replaceImage", "createContentControl", "deleteContentControl", "createBookmark", "deleteBookmark", "insertTableRow", "deleteTableRow", "insertTableColumn", "deleteTableColumn", "setHeaderFooterText", "setSectionProperties"},
@@ -168,6 +168,8 @@ def main():
         docx = fixtures["word"]
         word = run_helper(docx, "word", searchText="Hello")
         checks["word"] = word["paragraphs"][0]["text"] == "Hello Word" and word["tableCount"] == 1 and word["contentControlCount"] == 1 and word["search"]["matchCount"] == 1
+        bounded_word = run_helper(docx, "word", maxTables=1, maxTableCells=1)
+        checks["wordInspectionBounds"] = sum(len(row) for row in bounded_word["tables"][0]["rows"]) == 1 and bounded_word["tableCount"] == 1
         edited_docx = root / "edited.docx"
         word_edit = run_helper(docx, "word", action="edit", outputPath=str(edited_docx), operations=[{"type": "replaceText", "find": "Hello Word", "replace": "Edited Word"}])
         edited_word = run_helper(edited_docx, "word")
@@ -184,13 +186,34 @@ def main():
             {"type": "insertTable", "afterParagraphIndex": 0, "rows": [["Name", "Value"], ["Alpha", "1"]], "style": "TableGrid"},
         ])
         rich_word = run_helper(rich_docx, "word")
-        checks["wordStructuredEdits"] = rich_word_edit["changeCount"] == 8 and rich_word["paragraphs"][0]["text"] == "Native Word OpenAI" and rich_word["paragraphs"][0]["style"] == "Title" and rich_word["tables"][0]["rows"][0] == ["Name", "Value"] and rich_word["tables"][1]["rows"][0][0] == "Table value" and rich_word["contentControls"][0]["text"] == "Contoso" and rich_word["comments"][0]["text"] == "Review this paragraph" and any(paragraph["text"] == "Inserted paragraph" for paragraph in rich_word["paragraphs"])
+        checks["wordStructuredEdits"] = rich_word_edit["changeCount"] == 8 and rich_word["paragraphs"][0]["text"] == "Native Word OpenAI" and rich_word["paragraphs"][0]["style"] == "Title" and rich_word["tables"][0]["rows"][0] == ["Name", "Value"] and rich_word["tables"][1]["rows"][0][0] == "Table value" and rich_word["contentControls"][0]["text"] == "Contoso" and rich_word["comments"][0]["text"] == "Review this paragraph" and rich_word["comments"][0]["paragraphIndex"] == 0 and rich_word["comments"][0]["anchors"][0]["paragraphText"] == "Native Word OpenAI" and any(paragraph["text"] == "Inserted paragraph" for paragraph in rich_word["paragraphs"])
         with zipfile.ZipFile(rich_docx, "r") as package:
             document_xml = package.read("word/document.xml").decode("utf-8")
             relationships_xml = package.read("word/_rels/document.xml.rels").decode("utf-8")
             content_types_xml = package.read("[Content_Types].xml").decode("utf-8")
             checks["wordHyperlinkRelationship"] = "https://openai.com/docs" in relationships_xml and 'TargetMode="External"' in relationships_xml and "hyperlink" in document_xml
             checks["wordCommentPackageParts"] = "word/comments.xml" in package.namelist() and "comments.xml" in relationships_xml and "/word/comments.xml" in content_types_xml and "commentRangeStart" in document_xml and "commentReference" in document_xml
+        comment_deleted_docx = root / "comment-deleted.docx"
+        delete_comment = run_helper(rich_docx, "word", action="edit", outputPath=str(comment_deleted_docx), operations=[
+            {"type": "deleteComment", "commentId": rich_word["comments"][0]["id"]},
+        ])
+        comment_deleted_word = run_helper(comment_deleted_docx, "word")
+        with zipfile.ZipFile(comment_deleted_docx, "r") as package:
+            comment_deleted_xml = package.read("word/document.xml").decode("utf-8")
+        checks["wordDeleteComment"] = (
+            delete_comment["changeCount"] == 1
+            and delete_comment["changes"][0]["removedMarkers"] == 3
+            and comment_deleted_word["commentCount"] == 0
+            and "commentRangeStart" not in comment_deleted_xml
+            and "commentRangeEnd" not in comment_deleted_xml
+            and "commentReference" not in comment_deleted_xml
+        )
+        wrong_comment_evidence = subprocess.run(
+            [sys.executable, str(HELPER)],
+            input=json.dumps({"action": "edit", "inputPath": str(rich_docx), "outputPath": str(root / "wrong-comment-evidence.docx"), "kind": "word", "operations": [{"type": "deleteComment", "commentId": rich_word["comments"][0]["id"], "expectedText": "changed evidence"}]}),
+            text=True, capture_output=True, check=False,
+        )
+        checks["wordDeleteCommentEvidenceGuard"] = wrong_comment_evidence.returncode != 0 and "comment text changed" in wrong_comment_evidence.stdout
         expanding_docx = root / "expanding.docx"
         expanding = run_helper(docx, "word", action="edit", outputPath=str(expanding_docx), operations=[{"type": "replaceText", "find": "o", "replace": "oo", "all": True}])
         checks["wordExpandingReplacementBounded"] = expanding["changeCount"] == 2
@@ -214,6 +237,12 @@ def main():
         checks["excel"] = excel["sheetCount"] == 1 and cells[0]["value"] == "Revenue" and excel["search"]["matchCount"] == 1 and excel["tableCount"] == 1 and excel["sheets"][0]["tables"][0]["displayName"] == "RevenueTable" and excel["chartCount"] == 1 and excel["sheets"][0]["charts"][0]["title"] == "Revenue Chart" and excel["pivotCount"] == 0
         selected_excel = run_helper(xlsx, "excel", sheetNames=["Data"], address="A1:A1")
         checks["excelSelectors"] = selected_excel["cellCount"] == 1 and selected_excel["sheets"][0]["cells"][0]["formula"] == "SUM(1,2)"
+        oversized_excel_range = subprocess.run(
+            [sys.executable, str(HELPER)],
+            input=json.dumps({"action": "inspect", "inputPath": str(xlsx), "kind": "excel", "address": "A1:XFD1048576", "maxCells": 10}),
+            text=True, capture_output=True, check=False,
+        )
+        checks["excelInspectionRangeBound"] = oversized_excel_range.returncode != 0 and "above maxCells 10" in oversized_excel_range.stdout
         edited_xlsx = root / "edited.xlsx"
         excel_edit = run_helper(xlsx, "excel", action="edit", outputPath=str(edited_xlsx), operations=[{"type": "setCell", "sheet": "Data", "address": "B2", "value": "Updated"}, {"type": "setFormula", "sheet": "Data", "address": "C2", "formula": "B2+1"}])
         edited_excel = run_helper(edited_xlsx, "excel", includeFormulaDependencies=True)
@@ -249,6 +278,31 @@ def main():
             explicit_recalc_change = next(change for change in rich_excel_edit["changes"] if change["operation"] == "recalculate")
             recalculation_safe = "fullCalcOnLoad=\"1\"" in workbook_xml and "forceFullCalc=\"1\"" in workbook_xml and "xl/calcChain.xml" not in edited_package.namelist() and "calcChain" not in relations_xml and formula_cell.find("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}v") is None and explicit_recalc_change["clearedFormulaCaches"] >= 1
         checks["excelRangeAndMetadataEdits"] = rich_excel_edit["changeCount"] == 14 and rich_excel["sheets"][0]["name"] == "Results" and rich_cells["B4"]["value"] == 4 and rich_cells["A3"]["styleIndex"] == 2 and rich_cells["A1"]["styleIndex"] == 3 and "$#,##0.00" in styles_xml and "conditionalFormatting" in sheet_xml and "dataValidation" in sheet_xml and "state=\"frozen\"" in sheet_xml and "width=\"18.0\"" in sheet_xml and recalculation_safe and any(entry["name"] == "InputBlock" for entry in rich_excel["definedNames"])
+
+        noted_xlsx = root / "noted.xlsx"
+        add_note = run_helper(xlsx, "excel", action="edit", outputPath=str(noted_xlsx), operations=[
+            {"type": "addNote", "sheet": "Data", "address": "B2", "text": "Check source evidence", "author": "Codex"},
+        ])
+        noted_excel = run_helper(noted_xlsx, "excel", searchText="source evidence")
+        checks["excelNotesInspect"] = (
+            add_note["changeCount"] == 1
+            and noted_excel["noteCount"] == 1
+            and noted_excel["sheets"][0]["notes"][0]["address"] == "B2"
+            and noted_excel["sheets"][0]["notes"][0]["author"] == "Codex"
+            and noted_excel["sheets"][0]["notes"][0]["text"] == "Check source evidence"
+            and noted_excel["search"]["matches"][0]["objectType"] == "note"
+        )
+        note_deleted_xlsx = root / "note-deleted.xlsx"
+        delete_note = run_helper(noted_xlsx, "excel", action="edit", outputPath=str(note_deleted_xlsx), operations=[
+            {"type": "deleteNote", "sheet": "Data", "address": "B2"},
+        ])
+        checks["excelDeleteNoteReadback"] = delete_note["changeCount"] == 1 and run_helper(note_deleted_xlsx, "excel")["noteCount"] == 0
+        wrong_note_evidence = subprocess.run(
+            [sys.executable, str(HELPER)],
+            input=json.dumps({"action": "edit", "inputPath": str(noted_xlsx), "outputPath": str(root / "wrong-note-evidence.xlsx"), "kind": "excel", "operations": [{"type": "deleteNote", "sheet": "Data", "address": "B2", "expectedText": "changed evidence"}]}),
+            text=True, capture_output=True, check=False,
+        )
+        checks["excelDeleteNoteEvidenceGuard"] = wrong_note_evidence.returncode != 0 and "note text changed" in wrong_note_evidence.stdout
 
         styled_xlsx = root / "styled-for-clear.xlsx"
         run_helper(xlsx, "excel", action="edit", outputPath=str(styled_xlsx), operations=[
@@ -558,6 +612,8 @@ def main():
         duplicated_pptx = root / "slides-duplicated.pptx"
         duplicate_edit = run_helper(pptx, "powerpoint", action="edit", outputPath=str(duplicated_pptx), operations=[{"type": "duplicateSlide", "slideIndex": 0}])
         duplicated_powerpoint = run_helper(duplicated_pptx, "powerpoint")
+        selected_duplicate_slide = run_helper(duplicated_pptx, "powerpoint", slideIndexes=[1], maxSlides=1)
+        checks["powerpointSelectorPreservesIndex"] = selected_duplicate_slide["slideCount"] == 1 and selected_duplicate_slide["slides"][0]["index"] == 1
         distinguished_pptx = root / "slides-distinguished.pptx"
         distinguish_edit = run_helper(duplicated_pptx, "powerpoint", action="edit", outputPath=str(distinguished_pptx), operations=[{"type": "setShapeText", "slideIndex": 1, "shapeId": "2", "text": "Duplicate copy"}])
         moved_pptx = root / "slides-moved.pptx"

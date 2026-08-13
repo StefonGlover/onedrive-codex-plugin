@@ -1,7 +1,7 @@
 {
   "name": "onedrive",
-  "version": "0.6.4+codex.20260809062901",
-  "description": "Search, create, edit, share, and recover personal OneDrive files with preview-and-confirm safeguards.",
+  "version": "0.6.4+codex.20260813025943",
+  "description": "Search, create, edit, review, share, and recover OneDrive files with preview-and-confirm safeguards.",
   "author": {
     "name": "Stefon Glover"
   },
@@ -15,8 +15,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "OneDrive",
-    "shortDescription": "Search, edit, share, and recover personal OneDrive files safely.",
-    "longDescription": "Use personal Microsoft OneDrive in ChatGPT Work to search and open files; create folders; upload, update, rename, copy, and move content; inspect and edit Word, Excel, and PowerPoint files; export PDF or text; manage links and permissions; and recover recycle-bin deletions. Consequential writes and sharing actions use preview-and-confirm safeguards plus post-action verification. Every user signs in with OAuth, and credentials and caches stay isolated by account.",
+    "shortDescription": "Search, edit, review, share, and recover OneDrive files safely.",
+    "longDescription": "Use Microsoft OneDrive in ChatGPT Work to search and open files; discover enterprise document libraries; create folders; upload, update, rename, copy, and move content; inspect, render, review, and edit Word, Excel, and PowerPoint files; export PDF or text; manage links and permissions; and recover recycle-bin deletions. Consequential writes and sharing actions use preview-and-confirm safeguards plus post-action verification. Every user signs in with OAuth, and credentials, resources, caches, and indexes stay isolated by account and drive.",
     "developerName": "Stefon Glover",
     "category": "Productivity",
     "capabilities": [
@@ -35,7 +35,7 @@
       "Local change watches"
     ],
     "defaultPrompt": [
-      "Run a OneDrive plugin health check.",
+      "Find the enterprise document libraries I can access in OneDrive.",
       "Find recent documents in OneDrive.",
       "Inspect and safely edit a Word, Excel, or PowerPoint file in OneDrive."
     ],

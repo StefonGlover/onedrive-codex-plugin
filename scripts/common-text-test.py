@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import platform
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,24 @@ def extract(path: Path, kind: str) -> dict:
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="onedrive-common-text-test-") as temporary:
         root = Path(temporary)
+
+        if platform.system() == "Darwin":
+            probe = root / "probe.rtf"
+            probe.write_text("{\\rtf1 bounded probe}", encoding="utf-8")
+            request = json.dumps({"action": "extract", "inputPath": str(probe), "kind": "rtf", "maxBytes": 1024})
+            completed = subprocess.run(
+                [sys.executable, str(HELPER)],
+                input=request.encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=10,
+            )
+            result = json.loads(completed.stdout.decode("utf-8"))
+            assert completed.returncode != 0 and result.get("ok") is False, result
+            assert "resource limits" in result.get("error", "").lower(), result
+            print(json.dumps({"ok": True, "tested": ["unsupportedResourceLimitsFailClosed", "linuxExtractionCoveredInCi"]}, indent=2))
+            return
 
         rtf = root / "notes.rtf"
         rtf.write_text("{\\rtf1\\ansi Budget total: \\b $1,234\\b0\\par Next line}", encoding="utf-8")

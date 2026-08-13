@@ -2,19 +2,23 @@
 
 import { createServer } from "node:http";
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, "..");
 const serverPath = join(pluginRoot, "mcp", "server.mjs");
 const officeTestPython = process.env.ONEDRIVE_OFFICE_TEST_PYTHON || process.env.ONEDRIVE_OFFICE_PYTHON || "python3";
+const commonTextLimitsUnsupported = process.platform === "darwin";
+const officeTestPythonUserSite = execFileSync(officeTestPython, ["-c", "import site; print(site.getusersitepackages())"], { encoding: "utf8" }).trim();
 const mockRunRoot = join(pluginRoot, "work", `mock-${process.pid}-${Date.now()}`);
 const mockHome = join(mockRunRoot, "home");
 const mockExportPdf = join(mockRunRoot, "mock-export.pdf");
 const mockExportText = join(mockRunRoot, "mock-export.txt");
 const mockDownloadWord = join(mockRunRoot, "mock-download-word.docx");
+const mockPdftoppm = join(mockRunRoot, "mock-pdftoppm.cjs");
 const hostileInheritedRoot = join(pluginRoot, "work", `hostile-env-${process.pid}-${Date.now()}`);
 const keepWork = process.argv.includes("--keep-work");
 function cleanupRunResidue() {
@@ -30,6 +34,21 @@ function cleanupRunResidue() {
 process.once("exit", cleanupRunResidue);
 rmSync(mockRunRoot, { recursive: true, force: true });
 mkdirSync(mockHome, { recursive: true });
+writeFileSync(mockPdftoppm, `#!/usr/bin/env python3
+import base64
+import resource
+import sys
+if resource.getrlimit(resource.RLIMIT_CPU) != (20, 20):
+    raise SystemExit(10)
+if resource.getrlimit(resource.RLIMIT_AS) != (805306368, 805306368):
+    raise SystemExit(11)
+if resource.getrlimit(resource.RLIMIT_FSIZE) != (8192, 8192):
+    raise SystemExit(12)
+output_prefix = sys.argv[-1]
+with open(output_prefix + ".png", "wb") as output_file:
+    output_file.write(base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="))
+`, "utf8");
+chmodSync(mockPdftoppm, 0o755);
 const officeFixtureDir = join(mockHome, "office-fixtures");
 execFileSync(officeTestPython, [join(pluginRoot, "scripts", "office-openxml-test.py"), `--emit-fixtures=${officeFixtureDir}`], {
   env: { ...process.env, PYTHONPYCACHEPREFIX: join(mockHome, "pycache") },
@@ -78,10 +97,20 @@ const largeChatgptTextBuffer = Buffer.from([
   ]).flat()
 ].join("\n"), "utf8");
 let officeWordPostMetadataFailuresRemaining = 0;
+let officeWordReportedSizeOverride = null;
 let failNextOfficeExcelPut = false;
 let officeMetadataRace = null;
 const officeVersions = { "office-word": 1, "office-excel": 1, "office-business": 1, "office-powerpoint": 1 };
 const mockAuthContextId = "mock-auth-context";
+function storageScopeId(authContextId = mockAuthContextId, driveId = "drive") {
+  return createHash("sha256").update(`${authContextId}:${driveId}`).digest("hex");
+}
+function scopedStateDirectory(root, authContextId = mockAuthContextId, driveId = "drive") {
+  return join(root, storageScopeId(authContextId, driveId));
+}
+function scopedStateFile(root, name, authContextId = mockAuthContextId, driveId = "drive") {
+  return join(scopedStateDirectory(root, authContextId, driveId), name);
+}
 const graphExcelRanges = new Map();
 const graphExcelCharts = new Map([["Chart 1", { id: "Chart 1", name: "Chart 1", type: "ColumnClustered", titleText: "", width: 300, height: 200, left: 0, top: 0 }]]);
 const graphExcelSheets = new Set(["Data"]);
@@ -101,17 +130,22 @@ let devicePollShouldSucceed = false;
 let driveResponseDelayMs = 0;
 let delayedAccountItemResponseMs = 0;
 let delayedRootNoteContentMs = 0;
+let delayedCommonContentMs = 0;
+let delayedOfficeContentMs = 0;
+let delayedChatgptUploadMs = 0;
 let missingPresetPath = null;
 let scanFolderDelayMs = 0;
 let scanFoldersInFlight = 0;
 let maxScanFoldersInFlight = 0;
 let chatgptExactIndexMissEnabled = false;
+let enterpriseAccountMode = false;
 let rootDeltaScenario = "empty";
 let deleteTargetRevision = 1;
 let restoredDeletedName = "restore-original.txt";
 const replacementRaceState = new Map();
 let versionTextBuffer = Buffer.from("alpha\ncurrent\n", "utf8");
 let versionTextRevision = 1;
+let versionContentDelayMs = 0;
 let workspaceDraftBuffer = Buffer.from("workspace base\n", "utf8");
 let workspaceSourceBuffer = Buffer.from("workspace base\n", "utf8");
 let workspaceSourceRevision = 1;
@@ -151,6 +185,7 @@ const connectorEnvironmentKeys = [
   "ONEDRIVE_MAX_INDEXED_FILE_SIZE",
   "ONEDRIVE_MAX_SCAN_DEPTH",
   "ONEDRIVE_OFFICE_PYTHON",
+  "ONEDRIVE_PDFTOPPM_PATH",
   "ONEDRIVE_SCOPES",
   "ONEDRIVE_STORAGE_ROOT",
   "ONEDRIVE_TENANT",
@@ -287,7 +322,7 @@ function mockServerEnvironment(overrides = {}, label = "server") {
     ONEDRIVE_GRAPH_BASE_URL: graphBaseUrl,
     ONEDRIVE_IDENTITY_BASE_URL: identityBaseUrl,
     ONEDRIVE_TEST_ACCESS_TOKEN: Object.hasOwn(overrides, "ONEDRIVE_TEST_ACCESS_TOKEN") ? String(overrides.ONEDRIVE_TEST_ACCESS_TOKEN ?? "") : "mock-token",
-    ONEDRIVE_TEST_AUTH_CONTEXT_ID: mockAuthContextId,
+    ONEDRIVE_TEST_AUTH_CONTEXT_ID: Object.hasOwn(overrides, "ONEDRIVE_TEST_AUTH_CONTEXT_ID") ? String(overrides.ONEDRIVE_TEST_AUTH_CONTEXT_ID ?? "") : mockAuthContextId,
     ONEDRIVE_TEST_CHATGPT_FILE_BASE_URL: `${new URL(graphBaseUrl).origin}/chatgpt-files`,
     ONEDRIVE_CLIENT_ID: Object.hasOwn(overrides, "ONEDRIVE_CLIENT_ID") ? String(overrides.ONEDRIVE_CLIENT_ID ?? "") : "mock-client-id"
   });
@@ -340,7 +375,11 @@ function createMcpClient(overrides = {}, label = "isolated") {
     } catch {
       // Keep plain text.
     }
-    return { isError: Boolean(response.result?.isError), value };
+    return {
+      isError: Boolean(response.result?.isError),
+      value,
+      structuredContent: response.result?.structuredContent
+    };
   };
   const close = async () => {
     processChild.stdin.end();
@@ -472,6 +511,8 @@ const graph = createServer(async (req, res) => {
   requests.push({ method: req.method, path, url: req.url, headers: req.headers });
 
   if (req.method === "GET" && ["/chatgpt-files/stable-preview", "/chatgpt-files/stable-live"].includes(path)) {
+    count("chatgpt-file-content-read");
+    if (delayedChatgptUploadMs) await new Promise((resolvePromise) => setTimeout(resolvePromise, delayedChatgptUploadMs));
     const body = Buffer.from("stable ChatGPT upload\n", "utf8");
     return binary(res, 200, body, {
       "Content-Type": "text/plain",
@@ -487,6 +528,39 @@ const graph = createServer(async (req, res) => {
   }
   if (req.method === "GET" && path === "/chatgpt-files/redirect-private") {
     return empty(res, 302, { Location: "https://127.0.0.1/private-file" });
+  }
+  if (req.method === "GET" && path === "/chatgpt-files/slow-drip-start") {
+    count("chatgpt-slow-drip-redirect");
+    setTimeout(() => {
+      if (!res.destroyed && !res.writableEnded) {
+        empty(res, 302, { Location: "/chatgpt-files/slow-drip-body" });
+      }
+    }, 160);
+    return;
+  }
+  if (req.method === "GET" && path === "/chatgpt-files/slow-drip-body") {
+    count("chatgpt-slow-drip-body");
+    res.writeHead(200, { "Content-Type": "text/plain", "Transfer-Encoding": "chunked" });
+    let chunks = 0;
+    const interval = setInterval(() => {
+      if (res.destroyed || res.writableEnded) {
+        clearInterval(interval);
+        return;
+      }
+      if (chunks >= 16) {
+        clearInterval(interval);
+        count("chatgpt-slow-drip-complete");
+        res.end();
+        return;
+      }
+      chunks += 1;
+      res.write("x");
+    }, 20);
+    res.once("close", () => {
+      clearInterval(interval);
+      count("chatgpt-slow-drip-close");
+    });
+    return;
   }
   if (req.method === "PUT" && path === "/v1.0/me/drive/root:/Uploads/chatgpt-stable.txt:/content") {
     const body = await readBufferBody(req);
@@ -507,7 +581,116 @@ const graph = createServer(async (req, res) => {
     const account = authorization.includes("device-access-") ? "b" : authorization.includes("refreshed-access-") ? "a" : "default";
     count(`drive-account-${account}`);
     if (driveResponseDelayMs && account !== "default") await new Promise((resolve) => setTimeout(resolve, driveResponseDelayMs));
-    return json(res, 200, { id: account === "default" ? "drive" : `drive-${account}`, driveType: "personal", name: account === "default" ? "Mock OneDrive" : `Mock OneDrive ${account}` });
+    return json(res, 200, {
+      id: account === "default" ? "drive" : `drive-${account}`,
+      driveType: enterpriseAccountMode ? "business" : "personal",
+      name: account === "default" ? "Mock OneDrive" : `Mock OneDrive ${account}`
+    });
+  }
+  if (req.method === "GET" && path === "/v1.0/me/drives") {
+    return json(res, 200, { value: [
+      { id: "CaseSensitiveDrive-01", name: "Team Documents", driveType: "documentLibrary", webUrl: "https://example.test/team-documents", quota: { state: "normal", total: 1000, used: 100, remaining: 900 } },
+      { id: "drive", name: "Mock OneDrive", driveType: "business", webUrl: "https://example.test/personal" }
+    ] });
+  }
+  if (req.method === "POST" && path === "/v1.0/search/query") {
+    const body = await readJsonBody(req);
+    graphBodies.push({ key: "enterprise-search", body });
+    return json(res, 200, { value: [{ hitsContainers: [{ moreResults: false, hits: [
+      {
+        hitId: "enterprise-item-1",
+        rank: 1,
+        summary: "<c0>Quarterly</c0> plan",
+        resource: item("enterprise-item-1", "Quarterly Plan Notes.txt", {
+          size: largeChatgptTextBuffer.length,
+          parentReference: { driveId: "CaseSensitiveDrive-01", siteId: "tenant,site,web", path: "/drives/CaseSensitiveDrive-01/root:/Plans" },
+          file: { mimeType: "text/plain" }
+        })
+      },
+      {
+        hitId: "remote-shortcut-container",
+        rank: 2,
+        summary: "Remote <c0>quarterly</c0> Word shortcut",
+        resource: {
+          id: "remote-shortcut-container",
+          name: "Shortcut to Remote Quarterly.docx",
+          parentReference: { driveId: "CaseSensitiveDrive-01", path: "/drives/CaseSensitiveDrive-01/root:/Shortcuts" },
+          remoteItem: item("remote-source-collision", "Remote Quarterly.docx", {
+            size: officeWordBuffer.length,
+            parentReference: { driveId: "SourceDrive-MixedCase", siteId: "tenant,source,web", path: "/drives/SourceDrive-MixedCase/root:/Shared" },
+            file: { mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+          })
+        }
+      }
+    ] }] }] });
+  }
+  if (req.method === "GET" && path === "/v1.0/drives/CaseSensitiveDrive-01/items/enterprise-item-1") {
+    return json(res, 200, item("enterprise-item-1", "Quarterly Plan Notes.txt", {
+      size: largeChatgptTextBuffer.length,
+      parentReference: { driveId: "CaseSensitiveDrive-01", siteId: "tenant,site,web", path: "/drives/CaseSensitiveDrive-01/root:/Plans" },
+      file: { mimeType: "text/plain" }
+    }));
+  }
+  if (req.method === "GET" && path === "/v1.0/drives/CaseSensitiveDrive-01/items/enterprise-item-1/content") {
+    count("enterprise-item-content-read");
+    return binary(res, 200, largeChatgptTextBuffer, { "Content-Type": "text/plain" });
+  }
+  const snapshotScopeMatch = path.match(/^\/v1\.0\/drives\/(SnapshotDrive-[0-9]+)\/items\/snapshot-item(?:\/(content))?$/u);
+  if (req.method === "GET" && snapshotScopeMatch) {
+    const driveId = snapshotScopeMatch[1];
+    count(`snapshot-scope-${driveId}-${snapshotScopeMatch[2] ? "content" : "metadata"}`);
+    if (snapshotScopeMatch[2]) {
+      const body = Buffer.from(Array.from({ length: 5000 }, (_, index) => `Snapshot ${driveId} line ${index}: bounded progressive enterprise content.`).join("\n"), "utf8");
+      return binary(res, 200, body, { "Content-Type": "text/plain", "Content-Length": String(body.length) });
+    }
+    return json(res, 200, item("snapshot-item", `${driveId}.txt`, {
+      size: 300000,
+      eTag: `etag-${driveId}`,
+      cTag: `ctag-${driveId}`,
+      parentReference: { driveId, path: `/drives/${driveId}/root:/Snapshots` },
+      file: { mimeType: "text/plain" }
+    }));
+  }
+  if (req.method === "GET" && path === "/v1.0/drives/SourceDrive-MixedCase/items/remote-source-collision") {
+    return json(res, 200, item("remote-source-collision", "Remote Quarterly.docx", {
+      size: officeWordBuffer.length,
+      parentReference: { driveId: "SourceDrive-MixedCase", siteId: "tenant,source,web", path: "/drives/SourceDrive-MixedCase/root:/Shared" },
+      file: { mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+    }));
+  }
+  if (req.method === "GET" && path === "/v1.0/drives/SourceDrive-MixedCase/items/remote-source-collision/content") {
+    count("remote-source-content-read");
+    return binary(res, 200, officeWordBuffer, { "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document" });
+  }
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/remote-shortcut-default") {
+    return json(res, 200, {
+      id: "remote-shortcut-default",
+      name: "Default-drive Shortcut.docx",
+      parentReference: { driveId: "drive", path: "/drive/root:/Shortcuts" },
+      remoteItem: item("remote-source-collision", "Remote Quarterly.docx", {
+        size: officeWordBuffer.length,
+        parentReference: { driveId: "SourceDrive-MixedCase", siteId: "tenant,source,web", path: "/drives/SourceDrive-MixedCase/root:/Shared" },
+        file: { mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+      })
+    });
+  }
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/remote-source-collision") {
+    count("remote-default-collision-metadata-read");
+    return json(res, 200, item("remote-source-collision", "Wrong Default Drive.txt", { file: { mimeType: "text/plain" } }));
+  }
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/remote-source-collision/content") {
+    count("remote-default-collision-content-read");
+    return text(res, 200, "wrong default-drive collision content\n");
+  }
+  if (req.method === "GET" && path === "/v1.0/drives/CaseSensitiveDrive-01/root/children") {
+    return json(res, 200, { value: [item("library-root-item", "Library Root.txt", {
+      parentReference: { driveId: "CaseSensitiveDrive-01", path: "/drives/CaseSensitiveDrive-01/root:" }
+    })] });
+  }
+  if (req.method === "GET" && path === "/v1.0/drives/CaseSensitiveDrive-01/items/library-folder/children") {
+    return json(res, 200, { value: [item("library-child-item", "Library Child.txt", {
+      parentReference: { id: "library-folder", driveId: "CaseSensitiveDrive-01", path: "/drives/CaseSensitiveDrive-01/root:/Folder" }
+    })] });
   }
   if (req.method === "GET" && path === "/v1.0/drives/business-drive") {
     return json(res, 200, { id: "business-drive", driveType: "business", name: "Mock Business Drive" });
@@ -604,10 +787,24 @@ const graph = createServer(async (req, res) => {
     return json(res, 200, item("root-note", "root-note.txt"));
   }
 
-  if (req.method === "GET" && path === "/v1.0/me/drive/items/root-note/content") {
+  if (req.method === "GET" && ["/v1.0/me/drive/items/root-note/content", "/v1.0/drives/drive/items/root-note/content"].includes(path)) {
     count("root-note-content-read");
     if (delayedRootNoteContentMs) await new Promise((resolve) => setTimeout(resolve, delayedRootNoteContentMs));
     return text(res, 200, "root note mock content\n");
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/oversized-stream") {
+    return json(res, 200, item("oversized-stream", "oversized-stream.bin", {
+      size: 8,
+      file: { mimeType: "application/octet-stream" }
+    }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/oversized-stream/content") {
+    res.writeHead(200, { "Content-Type": "application/octet-stream" });
+    res.write(Buffer.alloc(12, 0x41));
+    res.end(Buffer.alloc(12, 0x42));
+    return;
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/common-rtf") {
@@ -625,6 +822,8 @@ const graph = createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/common-rtf/content") {
+    count("common-rtf-content-read");
+    if (delayedCommonContentMs) await new Promise((resolvePromise) => setTimeout(resolvePromise, delayedCommonContentMs));
     return binary(res, 200, commonRtfBuffer, { "Content-Type": "application/rtf" });
   }
 
@@ -703,11 +902,15 @@ const graph = createServer(async (req, res) => {
     "office-business": { name: "business.xlsx", mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", get buffer() { return officeBusinessBuffer; }, set buffer(value) { officeBusinessBuffer = value; }, driveId: "business-drive" },
     "office-powerpoint": { name: "sample.pptx", mime: "application/vnd.openxmlformats-officedocument.presentationml.presentation", get buffer() { return officePowerPointBuffer; }, set buffer(value) { officePowerPointBuffer = value; } }
   };
-  const officeItemMatch = path.match(/^\/v1\.0\/me\/drive\/items\/(office-(?:word|excel|business|powerpoint))(?:\/content)?$/);
+  const officeItemMatch = path.match(/^\/v1\.0\/(?:me\/drive|drives\/business-drive)\/items\/(office-(?:word|excel|business|powerpoint))(?:\/content)?$/);
   if (officeItemMatch) {
     const id = officeItemMatch[1];
     const definition = officeDefinitions[id];
-    if (req.method === "GET" && path.endsWith("/content")) return binary(res, 200, definition.buffer, { "Content-Type": "application/octet-stream" });
+    if (req.method === "GET" && path.endsWith("/content")) {
+      count(`${id}-content-read`);
+      if (delayedOfficeContentMs) await new Promise((resolvePromise) => setTimeout(resolvePromise, delayedOfficeContentMs));
+      return binary(res, 200, definition.buffer, { "Content-Type": "application/octet-stream" });
+    }
     if (req.method === "PUT" && path.endsWith("/content")) {
       if (id === "office-excel" && failNextOfficeExcelPut) {
         failNextOfficeExcelPut = false;
@@ -731,7 +934,9 @@ const graph = createServer(async (req, res) => {
           officeMetadataRace.triggered = true;
         }
       }
-      return json(res, 200, officeItem(id, definition.name, definition.buffer, definition.mime, definition.driveId ? { parentReference: { driveId: definition.driveId, path: `/drives/${definition.driveId}/root:` } } : {}));
+      const metadata = officeItem(id, definition.name, definition.buffer, definition.mime, definition.driveId ? { parentReference: { driveId: definition.driveId, path: `/drives/${definition.driveId}/root:` } } : {});
+      if (id === "office-word" && officeWordReportedSizeOverride !== null) metadata.size = officeWordReportedSizeOverride;
+      return json(res, 200, metadata);
     }
   }
   if (req.method === "POST" && path === "/v1.0/drives/business-drive/items/office-business/workbook/createSession") {
@@ -1434,7 +1639,7 @@ const graph = createServer(async (req, res) => {
     }));
   }
 
-  if (req.method === "GET" && path === "/v1.0/me/drive/items/quarterly-report/content") {
+  if (req.method === "GET" && ["/v1.0/me/drive/items/quarterly-report/content", "/v1.0/drives/drive/items/quarterly-report/content"].includes(path)) {
     if (url.searchParams.get("format") === "pdf") {
       return binary(res, 200, Buffer.from("%PDF-1.7 mock export\n"), { "Content-Type": "application/pdf" });
     }
@@ -1966,8 +2171,15 @@ const graph = createServer(async (req, res) => {
     ] });
   }
   if (req.method === "GET" && path === "/v1.0/me/drive/items/version-text/content") return binary(res, 200, versionTextBuffer, { "Content-Type": "text/plain" });
-  if (req.method === "GET" && path === "/v1.0/me/drive/items/version-text/versions/1.0/content") return text(res, 200, "alpha\nold\n");
-  if (req.method === "GET" && path === "/v1.0/me/drive/items/version-text/versions/2.0/content") return text(res, 200, "alpha\ncurrent\n");
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/version-text/versions/1.0/content") {
+    count("version-comparison-content-read");
+    if (versionContentDelayMs > 0) await new Promise((resolvePromise) => setTimeout(resolvePromise, versionContentDelayMs));
+    return text(res, 200, "alpha\nold\n");
+  }
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/version-text/versions/2.0/content") {
+    count("version-comparison-content-read");
+    return text(res, 200, "alpha\ncurrent\n");
+  }
   if (req.method === "PUT" && path === "/v1.0/me/drive/items/version-text/content") {
     if (req.headers["if-match"] !== `etag-version-text-${versionTextRevision}`) return json(res, 412, { error: { code: "preconditionFailed", message: "stale patch" } });
     versionTextBuffer = await readBufferBody(req);
@@ -1979,6 +2191,24 @@ const graph = createServer(async (req, res) => {
     versionTextBuffer = Buffer.from("alpha\nold\n", "utf8");
     versionTextRevision += 1;
     return empty(res, 204);
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/dense-version-text") {
+    return json(res, 200, item("dense-version-text", "dense-versioned.txt", { size: 100_001 }));
+  }
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/dense-version-text/versions") {
+    return json(res, 200, { value: [
+      { id: "2.0", size: 100_001, lastModifiedDateTime: "2026-07-13T00:00:00Z" },
+      { id: "1.0", size: 100_001, lastModifiedDateTime: "2026-07-12T00:00:00Z" }
+    ] });
+  }
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/dense-version-text/versions/1.0/content") {
+    count("dense-version-content-read");
+    return binary(res, 200, Buffer.alloc(100_001, 0x0a), { "Content-Type": "text/plain" });
+  }
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/dense-version-text/versions/2.0/content") {
+    count("dense-version-content-read");
+    return binary(res, 200, Buffer.alloc(100_001, 0x0a), { "Content-Type": "text/plain" });
   }
 
   if (req.method === "GET" && path === "/v1.0/me/drive/items/workspace-source") {
@@ -2104,6 +2334,15 @@ await new Promise((resolve) => identity.listen(0, "127.0.0.1", resolve));
 const identityBaseUrl = `http://127.0.0.1:${identity.address().port}`;
 const mainStorageRoot = join(mockHome, ".codex", "onedrive-plugin");
 const mainCacheRoot = join(mainStorageRoot, "cache");
+const mainScopedCacheRoot = scopedStateDirectory(mainCacheRoot);
+const mainMetadataCachePath = join(mainScopedCacheRoot, "metadata-cache.json");
+const mainContentIndexPath = join(mainScopedCacheRoot, "content-index.json");
+const mainScopedAuditRoot = scopedStateDirectory(join(mainStorageRoot, "audit"));
+const mainAuditPath = join(mainScopedAuditRoot, "mutations.jsonl");
+const mainScopedBackupRoot = scopedStateDirectory(join(mainStorageRoot, "backups"));
+const mainScopedOfficeEditingRoot = scopedStateDirectory(join(mainStorageRoot, "office-editing"));
+const mainScopedChatgptUploadRoot = scopedStateDirectory(join(mainStorageRoot, "chatgpt-uploads"));
+const mainMaterializedResourceRoot = join(mainStorageRoot, "materialized-resources");
 const mainAdditionalSyncRoot = join(mockRunRoot, "synthetic-local-sync-root");
 
 seedHostileInheritedEnvironment();
@@ -2117,7 +2356,9 @@ const child = spawn(process.execPath, [serverPath], {
     ONEDRIVE_CACHE_ROOT: mainCacheRoot,
     ONEDRIVE_ADDITIONAL_LOCAL_SYNC_ROOTS: JSON.stringify([mainAdditionalSyncRoot]),
     ONEDRIVE_CLIENT_ID: "mock-client-id",
-    ONEDRIVE_TEST_ACCESS_TOKEN: "mock-token"
+    ONEDRIVE_PDFTOPPM_PATH: mockPdftoppm,
+    ONEDRIVE_TEST_ACCESS_TOKEN: "mock-token",
+    PYTHONPATH: [process.env.PYTHONPATH, officeTestPythonUserSite].filter(Boolean).join(":")
   }, "main"),
   stdio: ["pipe", "pipe", "pipe"]
 });
@@ -2202,9 +2443,8 @@ async function listTools() {
 }
 
 function auditEntries() {
-  const path = join(mockHome, ".codex", "onedrive-plugin", "audit", "mutations.jsonl");
   try {
-    return readFileSync(path, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    return readFileSync(mainAuditPath, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
   } catch {
     return [];
   }
@@ -2397,6 +2637,20 @@ try {
     return { versions: listed.value.count, comparison: compared.value.comparison.comparisonType, patchVerified: unified.value.verified, restoreVerified: restored.value.verified };
   });
 
+  await check("newline-dense text versions are refused before line-array expansion", async () => {
+    const beforeReads = counters.get("dense-version-content-read") || 0;
+    const compared = await tool("onedrive_compare_version", {
+      itemId: "dense-version-text",
+      versionId: "1.0",
+      compareToVersionId: "2.0",
+      maxChanges: 20
+    });
+    assert(compared.isError && /100000-line text comparison limit/iu.test(String(compared.value)), "dense text comparison should fail with a bounded line-limit error", compared);
+    const reads = (counters.get("dense-version-content-read") || 0) - beforeReads;
+    assert(reads === 1, "dense first version should be rejected before downloading a second dense body", { reads });
+    return { rejectedBeforeSplit: true, contentReads: reads };
+  });
+
   await check("managed workspaces preserve identity, detect draft edits, promote, clean up, and abandon safely", async () => {
     const created = await toolWithPreview("onedrive_workspace_create", {
       itemId: "workspace-source", expectedId: "workspace-source", expectedETag: "etag-workspace-source-1", dryRun: false, confirmed: true
@@ -2459,8 +2713,169 @@ try {
     assert(capabilities.value.runtime.helperAvailable === true, "Office Open XML helper should be available", capabilities.value);
     assert(capabilities.value.backends.openXml.readOnlyToolsReady === true, "Open XML read tools should report ready", capabilities.value);
     assert(capabilities.value.backends.openXml.operations.excel.includes("addTableRow") && capabilities.value.backends.openXml.operations.excel.includes("deleteTableRow") && capabilities.value.backends.openXml.operations.excel.includes("setTableTotals"), "Open XML table operations should be advertised", capabilities.value);
+    assert(capabilities.value.operationGuidance?.excel?.addTableRow?.canonicalExample?.values?.[0]?.length === 2, "Office capabilities should publish the canonical addTableRow row shape", capabilities.value);
     assert(capabilities.value.backends.graphExcel.availableForAccount === false, "mock personal drive should report Graph Excel unavailable", capabilities.value);
     return { checked: expected, runtime: capabilities.value.runtime.pythonVersion };
+  });
+
+  await check("parallel heavyweight inspect, extract, and edit calls stage and download only one operation", async () => {
+    const stagingDirectories = () => existsSync(mainScopedOfficeEditingRoot)
+      ? readdirSync(mainScopedOfficeEditingRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name)
+      : [];
+    const assertRetryableBusy = (result, label) => assert(
+      result.isError
+        && result.structuredContent?.error?.code === "resource_exhausted"
+        && result.structuredContent?.error?.retryable === true
+        && result.structuredContent?.error?.retryAfterSeconds === 1,
+      `${label} should fail fast with bounded retry metadata`,
+      result
+    );
+
+    const inspectBefore = counters.get("office-word-content-read") || 0;
+    delayedOfficeContentMs = 400;
+    let inspectResults;
+    try {
+      const pending = Promise.all(Array.from({ length: 16 }, () => tool("onedrive_office_inspect", {
+        kind: "word",
+        itemId: "office-word",
+        maxParagraphs: 10
+      })));
+      await waitForCounter("office-word-content-read", inspectBefore + 1);
+      assert(stagingDirectories().filter((name) => name.startsWith("inspect-")).length === 1, "parallel inspections must create exactly one staging directory", stagingDirectories());
+      inspectResults = await pending;
+    } finally {
+      delayedOfficeContentMs = 0;
+    }
+    assert(inspectResults.filter((entry) => !entry.isError).length === 1, "parallel inspections should admit exactly one operation", inspectResults);
+    inspectResults.filter((entry) => entry.isError).forEach((entry) => assertRetryableBusy(entry, "busy inspection"));
+    assert((counters.get("office-word-content-read") || 0) - inspectBefore === 1, "busy inspections must download zero Office bodies");
+    assert(stagingDirectories().filter((name) => name.startsWith("inspect-")).length === 0, "inspection staging must be removed after completion", stagingDirectories());
+
+    await tool("onedrive_content_index_clear");
+    await tool("onedrive_get_info", { itemId: "common-rtf" });
+    const commonBefore = counters.get("common-rtf-content-read") || 0;
+    delayedCommonContentMs = 400;
+    let extractResults;
+    try {
+      const pending = Promise.all(Array.from({ length: 16 }, () => tool("onedrive_content_index_refresh", {
+        itemId: "common-rtf",
+        maxFiles: 1,
+        maxBytesPerFile: 4096
+      })));
+      await waitForCounter("common-rtf-content-read", commonBefore + 1);
+      assert(stagingDirectories().filter((name) => name.startsWith("extract-")).length === 1, "parallel common extraction must create exactly one staging directory", stagingDirectories());
+      extractResults = await pending;
+    } finally {
+      delayedCommonContentMs = 0;
+    }
+    assert((counters.get("common-rtf-content-read") || 0) - commonBefore === 1, "busy common extractors must download zero bodies", extractResults);
+    const extractionBusy = extractResults.filter((entry) => entry.value?.failures?.some((failure) => /already in progress/iu.test(failure.error || "")));
+    assert(extractionBusy.length === 15, "parallel common extraction should reject fifteen operations before staging", extractResults);
+    assert(stagingDirectories().filter((name) => name.startsWith("extract-")).length === 0, "common extraction staging must be removed after completion", stagingDirectories());
+
+    const batchBefore = counters.get("office-word-content-read") || 0;
+    delayedOfficeContentMs = 400;
+    let batchResults;
+    try {
+      const pending = Promise.all(Array.from({ length: 16 }, () => tool("onedrive_word_batch_update", {
+        itemId: "office-word",
+        operations: [{ type: "replaceText", find: "Hello Word", replace: "Admission preview" }]
+      })));
+      await waitForCounter("office-word-content-read", batchBefore + 1);
+      assert(stagingDirectories().filter((name) => name.startsWith("edit-")).length === 1, "parallel Office edits must create exactly one staging directory", stagingDirectories());
+      batchResults = await pending;
+    } finally {
+      delayedOfficeContentMs = 0;
+    }
+    assert(batchResults.filter((entry) => !entry.isError).length === 1, "parallel Office edits should admit exactly one operation", batchResults);
+    batchResults.filter((entry) => entry.isError).forEach((entry) => assertRetryableBusy(entry, "busy Office edit"));
+    assert((counters.get("office-word-content-read") || 0) - batchBefore === 1, "busy Office edits must download zero package bodies");
+    assert(stagingDirectories().filter((name) => name.startsWith("edit-")).length === 0, "Office edit staging must be removed after completion", stagingDirectories());
+    return { inspectDownloads: 1, commonDownloads: 1, editDownloads: 1, rejectedBeforeStaging: 45 };
+  });
+
+  await check("focused Office capability lookup returns an exact schema and valid example without Graph", async () => {
+    const before = requests.length;
+    const exact = await tool("onedrive_office_capabilities", { kind: "excel", operation: "setCell" });
+    assert(!exact.isError && exact.value.supported === true, "exact Excel capability lookup should succeed", exact);
+    assert(exact.value.kind === "excel" && exact.value.operation === "setCell", "exact capability lookup should preserve the requested selector", exact.value);
+    assert(
+      exact.value.schema?.anyOf?.some((entry) => JSON.stringify(entry.required) === JSON.stringify(["type", "sheet", "address"]))
+        && exact.value.schema?.anyOf?.some((entry) => JSON.stringify(entry.required) === JSON.stringify(["type", "anchor"]))
+        && exact.value.schema?.properties?.type?.const === "setCell"
+        && exact.value.schema?.additionalProperties === false,
+      "exact capability lookup should return only the selected operation schema",
+      exact.value
+    );
+    assert(exact.value.example?.type === "setCell" && exact.value.example.sheet && exact.value.example.address, "exact capability lookup should synthesize a valid minimal example", exact.value);
+    const unsupported = await tool("onedrive_office_capabilities", { kind: "word", operation: "setCell" });
+    assert(!unsupported.isError && unsupported.value.supported === false && unsupported.value.availableOperations?.includes("deleteComment"), "unsupported operation lookup should return bounded alternatives", unsupported);
+    const missingKind = await tool("onedrive_office_capabilities", { operation: "setCell" });
+    assert(missingKind.isError, "operation without kind should fail closed", missingKind);
+    assert(requests.length === before, "exact or invalid capability selectors must not call Microsoft Graph", requests.slice(before));
+    return { operation: exact.value.operation, requiredAlternatives: exact.value.schema.anyOf.map((entry) => entry.required), graphCalls: 0 };
+  });
+
+  await check("focused Office inspection preserves stable revision identity, semantic anchors, and selector bounds", async () => {
+    const inspected = await tool("onedrive_office_inspect", {
+      kind: "word",
+      itemId: "office-word",
+      paragraphIndexes: [0],
+      maxParagraphs: 10,
+      maxTables: 5,
+      maxTableCells: 50
+    });
+    assert(!inspected.isError, "focused Word inspection should succeed", inspected);
+    assert(inspected.value.item?.id === "office-word" && inspected.value.item?.eTag === `etag-office-word-${officeVersions["office-word"]}`, "focused inspection should retain stable item ID and live eTag", inspected.value.item);
+    assert(inspected.value.content?.paragraphs?.length === 1 && inspected.value.content.paragraphs[0].index === 0, "paragraphIndexes should filter the bounded response", inspected.value);
+    assert(inspected.value.content.paragraphs[0].anchor?.kind === "paragraph" && inspected.value.content.paragraphs[0].anchor?.fingerprint, "focused inspection should return a semantic paragraph anchor", inspected.value.content.paragraphs[0]);
+
+    const beforeInvalid = requests.length;
+    const wrongKindSelector = await tool("onedrive_office_inspect", { kind: "word", itemId: "office-word", sheetNames: ["Data"] });
+    const aboveBound = await tool("onedrive_office_inspect", { kind: "word", itemId: "office-word", maxParagraphs: 501 });
+    assert(wrongKindSelector.isError && aboveBound.isError, "irrelevant or over-limit Office selectors must fail closed", { wrongKindSelector, aboveBound });
+    assert(requests.length === beforeInvalid, "invalid focused inspection selectors must be rejected before Graph", requests.slice(beforeInvalid));
+    return { item: inspected.value.item, anchor: inspected.value.content.paragraphs[0].anchor, graphCallsForInvalidSelectors: 0 };
+  });
+
+  await check("focused Office review lists and round-trips Word comments and Excel notes", async () => {
+    const savedWord = Buffer.from(officeWordBuffer);
+    const savedExcel = Buffer.from(officeExcelBuffer);
+    try {
+      const initialWord = await tool("onedrive_office_review", { kind: "word", operation: "list", itemId: "office-word" });
+      assert(!initialWord.isError && initialWord.value.entries?.every((entry) => entry.evidence?.paragraphIndex !== undefined), "Word review list should return evidence-anchored comments", initialWord);
+      const wordArgs = { kind: "word", operation: "add", itemId: "office-word", paragraphIndex: 0, text: "Focused review comment", author: "Codex", initials: "CX", dryRun: false, confirmed: true, expectedId: "office-word" };
+      const wordAdded = await toolWithPreview("onedrive_office_review", wordArgs);
+      officeWordPostMetadataFailuresRemaining = 0;
+      assert(!wordAdded.isError && wordAdded.value.changeCount === 1, "focused Word review add should commit from its preview proof", wordAdded);
+      const listedWord = await tool("onedrive_office_review", { kind: "word", operation: "list", itemId: "office-word" });
+      const addedComment = listedWord.value.entries?.find((entry) => entry.text === "Focused review comment");
+      assert(addedComment?.id && addedComment.evidence?.paragraphIndex === 0, "added Word comment should read back with exact evidence", listedWord);
+      const wordDeleted = await toolWithPreview("onedrive_office_review", { kind: "word", operation: "delete", itemId: "office-word", commentId: addedComment.id, expectedText: addedComment.text, expectedAuthor: addedComment.author, dryRun: false, confirmed: true, expectedId: "office-word" });
+      officeWordPostMetadataFailuresRemaining = 0;
+      assert(!wordDeleted.isError && wordDeleted.value.changeCount === 1, "focused Word review delete should commit through the same guarded path", wordDeleted);
+      const afterWordDelete = await tool("onedrive_office_review", { kind: "word", operation: "list", itemId: "office-word" });
+      assert(!afterWordDelete.value.entries?.some((entry) => entry.id === addedComment.id), "deleted Word comment must not remain in review readback", afterWordDelete);
+
+      const excelArgs = { kind: "excel", operation: "add", itemId: "office-excel", sheet: "Data", address: "A2", text: "Focused Excel note", author: "Codex", dryRun: false, confirmed: true, expectedId: "office-excel" };
+      const excelAdded = await toolWithPreview("onedrive_office_review", excelArgs);
+      assert(!excelAdded.isError && excelAdded.value.changeCount === 1, "focused Excel note add should commit from its preview proof", excelAdded);
+      const listedExcel = await tool("onedrive_office_review", { kind: "excel", operation: "list", itemId: "office-excel", sheet: "Data" });
+      const addedNote = listedExcel.value.entries?.find((entry) => entry.address === "A2" && entry.text === "Focused Excel note");
+      assert(addedNote?.evidence?.sheet === "Data" && addedNote.evidence.address === "A2", "added Excel note should read back with exact sheet and cell evidence", listedExcel);
+      const excelDeleted = await toolWithPreview("onedrive_office_review", { kind: "excel", operation: "delete", itemId: "office-excel", sheet: "Data", address: "A2", expectedText: addedNote.text, expectedAuthor: addedNote.author, dryRun: false, confirmed: true, expectedId: "office-excel" });
+      assert(!excelDeleted.isError && excelDeleted.value.changeCount === 1, "focused Excel note delete should commit through the guarded path", excelDeleted);
+      const afterExcelDelete = await tool("onedrive_office_review", { kind: "excel", operation: "list", itemId: "office-excel", sheet: "Data" });
+      assert(!afterExcelDelete.value.entries?.some((entry) => entry.address === "A2" && entry.text === "Focused Excel note"), "deleted Excel note must not remain in review readback", afterExcelDelete);
+      assert(listedWord.value.limitations?.word?.replies === false && listedExcel.value.limitations?.excel?.threadedComments === false, "review results should state unsupported comment semantics", { listedWord, listedExcel });
+      return { wordAddedAndDeleted: true, excelAddedAndDeleted: true, limitations: listedWord.value.limitations };
+    } finally {
+      officeWordBuffer = savedWord;
+      officeExcelBuffer = savedExcel;
+      officeVersions["office-word"] += 1;
+      officeVersions["office-excel"] += 1;
+      officeWordPostMetadataFailuresRemaining = 0;
+    }
   });
 
   await check("Office preview proofs are deterministic and remain bound to operations and source identity", async () => {
@@ -2655,10 +3070,80 @@ try {
       assert(requests.some((entry) => entry.method === "PUT" && entry.path === `/v1.0/me/drive/items/${id}/content`), "Office commit did not target the stable item ID", { id });
     }
     assert(wordLive.value.backup?.backupId, "Word live edit should create a managed backup manifest", wordLive);
-    const backupManifest = JSON.parse(readFileSync(join(mockHome, ".codex", "onedrive-plugin", "backups", `office-${wordLive.value.backup.backupId}.json`), "utf8"));
+    const backupManifest = JSON.parse(readFileSync(join(mainScopedBackupRoot, `office-${wordLive.value.backup.backupId}.json`), "utf8"));
     assert(backupManifest.version === 2 && backupManifest.scope?.authContextId === mockAuthContextId && backupManifest.scope?.driveId === "drive", "Office backup manifest should be scoped to the authentication context and drive", backupManifest);
     const backups = await tool("onedrive_office_backups", { itemId: "office-word" });
     assert(!backups.isError && backups.value.items.some((entry) => entry.backupId === wordLive.value.backup.backupId), "Managed Word backup should be listed", backups);
+
+    const focusedBackupList = await tool("onedrive_read_actions", {
+      actions: [{ operation: "officeBackups", itemId: "office-word", limit: 25 }]
+    });
+    const focusedListed = focusedBackupList.value.results?.[0];
+    assert(!focusedBackupList.isError && focusedListed?.isError === false
+      && focusedListed.value.items.some((entry) => entry.backupId === wordLive.value.backup.backupId), "focused backup listing should expose current-scope recovery metadata", focusedBackupList);
+    const deletionPreview = await tool("onedrive_preview_actions", {
+      actions: [{ operation: "deleteOfficeBackups", backupIds: [wordLive.value.backup.backupId] }]
+    });
+    const deletionProof = deletionPreview.value.results?.[0];
+    assert(!deletionPreview.isError && deletionProof?.isError === false && deletionProof.previewToken, "focused backup deletion should require an exact preview proof", deletionPreview);
+    const deletionCommit = await tool("onedrive_commit_actions", {
+      confirmed: true,
+      actions: [{ operation: "deleteOfficeBackups", backupIds: [wordLive.value.backup.backupId], previewToken: deletionProof.previewToken }]
+    });
+    assert(!deletionCommit.isError && deletionCommit.value.results?.[0]?.isError === false
+      && deletionCommit.value.results[0].result?.deletedBackupIds?.[0] === wordLive.value.backup.backupId, "focused backup deletion should remove only the previewed current-scope backup", deletionCommit);
+    const deletionReplay = await tool("onedrive_commit_actions", {
+      confirmed: true,
+      actions: [{ operation: "deleteOfficeBackups", backupIds: [wordLive.value.backup.backupId], previewToken: deletionProof.previewToken }]
+    });
+    assert(!deletionReplay.isError && deletionReplay.value.results?.[0]?.isError === true, "focused backup deletion proof must be single-use", deletionReplay);
+
+    const replacementPreview = await tool("onedrive_word_batch_update", { itemId: "office-word", operations: [{ type: "setParagraphText", paragraphIndex: 0, text: "Backup Comparison Word" }] });
+    const replacementLive = await tool("onedrive_word_batch_update", { itemId: "office-word", operations: [{ type: "setParagraphText", paragraphIndex: 0, text: "Backup Comparison Word" }], dryRun: false, confirmed: true, expectedId: "office-word", previewToken: replacementPreview.value.previewToken });
+    assert(!replacementLive.isError && replacementLive.value.backup?.backupId, "replacement comparison backup should be created after focused cleanup", replacementLive);
+    wordLive.value.backup = replacementLive.value.backup;
+
+    const heldBefore = counters.get("office-word-content-read") || 0;
+    delayedOfficeContentMs = 400;
+    let heldInspection;
+    try {
+      const pendingInspection = tool("onedrive_office_inspect", { kind: "word", itemId: "office-word", maxParagraphs: 10 });
+      await waitForCounter("office-word-content-read", heldBefore + 1);
+      const contentBeforeBusyBackups = counters.get("office-word-content-read") || 0;
+      const busyCompare = await tool("onedrive_office_compare_backup", { backupId: wordLive.value.backup.backupId });
+      const busyRestore = await tool("onedrive_office_restore_backup", { backupId: wordLive.value.backup.backupId });
+      for (const busy of [busyCompare, busyRestore]) {
+        assert(
+          busy.isError
+            && busy.structuredContent?.error?.code === "resource_exhausted"
+            && busy.structuredContent?.error?.retryable === true,
+          "backup compare/restore should fail retryably before staging while another operation is admitted",
+          busy
+        );
+      }
+      assert((counters.get("office-word-content-read") || 0) === contentBeforeBusyBackups, "busy backup operations must download zero current package bodies");
+      const busyStaging = existsSync(mainScopedOfficeEditingRoot)
+        ? readdirSync(mainScopedOfficeEditingRoot).filter((name) => /^(?:compare|restore)-/u.test(name))
+        : [];
+      assert(busyStaging.length === 0, "busy backup operations must create zero staging directories", busyStaging);
+      heldInspection = await pendingInspection;
+    } finally {
+      delayedOfficeContentMs = 0;
+    }
+    assert(heldInspection && !heldInspection.isError, "holding inspection should finish and release backup-operation admission", heldInspection);
+
+    officeWordReportedSizeOverride = 250 * 1024 * 1024 + 1;
+    try {
+      const contentBeforeOversized = counters.get("office-word-content-read") || 0;
+      const oversizedCompare = await tool("onedrive_office_compare_backup", { backupId: wordLive.value.backup.backupId });
+      const oversizedRestore = await tool("onedrive_office_restore_backup", { backupId: wordLive.value.backup.backupId });
+      assert(oversizedCompare.isError && /above the .*comparison limit/iu.test(String(oversizedCompare.value)), "oversized current backup comparison should be refused", oversizedCompare);
+      assert(oversizedRestore.isError && /above the .*restore limit/iu.test(String(oversizedRestore.value)), "oversized current backup restore should be refused", oversizedRestore);
+      assert((counters.get("office-word-content-read") || 0) === contentBeforeOversized, "oversized backup operations must download zero current package bodies");
+    } finally {
+      officeWordReportedSizeOverride = null;
+    }
+
     const comparison = await tool("onedrive_office_compare_backup", { backupId: wordLive.value.backup.backupId });
     assert(!comparison.isError && comparison.value.sameContent === false && comparison.value.semanticDiff.changeCount > 0, "Backup comparison should report the Word semantic change", comparison);
     const restorePreview = await tool("onedrive_office_restore_backup", { backupId: wordLive.value.backup.backupId });
@@ -2671,7 +3156,7 @@ try {
     assert(!restored.isError && restored.value.restoredBackupId === wordLive.value.backup.backupId && restored.value.rollbackBackup?.backupId && restored.value.remoteValidation?.package?.fingerprint === restored.value.backupValidation?.package?.fingerprint, "Office backup restore failed", restored);
     officeWordPostMetadataFailuresRemaining = 0;
     const restoredWord = await tool("onedrive_word_get_document", { itemId: "office-word" });
-    assert(!restoredWord.isError && restoredWord.value.paragraphs?.[0]?.text === "Hello Word", "Office backup restore did not restore original Word content", restoredWord);
+    assert(!restoredWord.isError && restoredWord.value.paragraphs?.[0]?.text === "Updated Word", "Office backup restore did not restore the selected backup content", restoredWord);
     return { wordChanges: wordLive.value.changeCount, excelChanges: excelLive.value.changeCount, powerpointChanges: pptLive.value.changeCount + nativePptLive.value.changeCount, restoredBackupId: restored.value.restoredBackupId };
   });
 
@@ -2716,9 +3201,24 @@ try {
     const beforePutCount = requests.filter((entry) => entry.method === "PUT" && entry.path.includes("/office-")).length;
     const live = await tool("onedrive_office_batch_transform", { items, dryRun: false, confirmed: true, previewToken: preview.value.previewToken });
     assert(!live.isError && live.value.partialState === false && live.value.completed.length === 3, "cross-file live transformation failed", live);
+    const serializedLive = JSON.stringify(live.value);
+    assert(!serializedLive.includes(mainStorageRoot) && !/\b(?:localPath|manifestPath|stagingPath|transactionRoot|backupPath|inputPath|outputPath)\b/u.test(serializedLive), "focused Office batch responses must omit local staging and backup paths", live.value);
     const afterPutCount = requests.filter((entry) => entry.method === "PUT" && entry.path.includes("/office-")).length;
     assert(afterPutCount - beforePutCount === 3, "cross-file transformation should commit each preflighted file exactly once", { beforePutCount, afterPutCount });
     return { itemCount: live.value.itemCount, totalChangeCount: live.value.totalChangeCount };
+  });
+
+  await check("Office batch transform normalizes addTableRow single-row shorthand", async () => {
+    const preview = await tool("onedrive_office_batch_transform", {
+      items: [{
+        itemId: "office-excel",
+        kind: "excel",
+        operations: [{ type: "addTableRow", table: "RevenueTable", values: ["Batch shorthand", 77] }]
+      }]
+    });
+    assert(!preview.isError && preview.value.preflightComplete === true && preview.value.itemCount === 1, "addTableRow shorthand should pass batch preflight", preview);
+    assert(preview.value.items?.[0]?.changes?.[0]?.operation === "addTableRow" && preview.value.items[0].changes[0].rowCount === 1, "addTableRow shorthand should normalize to exactly one row", preview.value);
+    return { normalizedRowCount: preview.value.items[0].changes[0].rowCount };
   });
 
   await check("cross-file Office batch fails closed when the first item changes after outer preflight", async () => {
@@ -3054,8 +3554,9 @@ process.exit(2);
 
       await authClient.tool("onedrive_cache_clear");
       await authClient.tool("onedrive_get_info", { itemId: "root-note" });
-      const metadataPath = join(authCacheRoot, "metadata-cache.json");
-      const metadataLockPath = join(authCacheRoot, "metadata-cache.lock");
+      let authStatus = await authClient.tool("onedrive_sync_status");
+      let metadataPath = authStatus.value.cachePath;
+      let metadataLockPath = join(dirname(metadataPath), "metadata-cache.lock");
       const metadataBeforeSwitch = JSON.parse(readFileSync(metadataPath, "utf8"));
       const metadataSwitchStart = await authClient.tool("onedrive_auth_device_start", { tenant: "consumers", forceReauth: true });
       assert(!metadataSwitchStart.isError, "metadata account switch should start", metadataSwitchStart);
@@ -3076,8 +3577,9 @@ process.exit(2);
       await authClient.tool("onedrive_get_info", { itemId: "root-note" });
       const seededIndex = await authClient.tool("onedrive_content_index_refresh", { itemId: "root-note", maxFiles: 1, maxBytesPerFile: 4096 });
       assert(!seededIndex.isError && seededIndex.value.indexed === 1, "content account-switch fixture should index one item", seededIndex);
-      const contentPath = join(authCacheRoot, "content-index.json");
-      const contentLockPath = join(authCacheRoot, "content-index.lock");
+      authStatus = await authClient.tool("onedrive_sync_status");
+      const contentPath = authStatus.value.contentIndexPath;
+      const contentLockPath = join(dirname(contentPath), "content-index.lock");
       const contentBeforeSwitch = JSON.parse(readFileSync(contentPath, "utf8"));
       const contentSwitchStart = await authClient.tool("onedrive_auth_device_start", { tenant: "consumers", forceReauth: true });
       assert(!contentSwitchStart.isError, "content-index account switch should start", contentSwitchStart);
@@ -3106,6 +3608,9 @@ process.exit(2);
       assert(staleGraphResult.isError && String(staleGraphResult.value).includes("authentication or storage scope changed"), "stale Graph response should not reach the new account cache", staleGraphResult);
       delayedAccountItemResponseMs = 0;
       await authClient.tool("onedrive_cache_clear");
+      authStatus = await authClient.tool("onedrive_sync_status");
+      metadataPath = authStatus.value.cachePath;
+      metadataLockPath = join(dirname(metadataPath), "metadata-cache.lock");
       const switchedCache = JSON.parse(readFileSync(metadataPath, "utf8"));
       assert(!switchedCache.itemsById["account-race-a"], "stale Graph item was published after the account switch", switchedCache.itemsById);
 
@@ -3236,8 +3741,10 @@ process.exit(2);
       driveResponseDelayMs = 0;
       delayedAccountItemResponseMs = 0;
       delayedRootNoteContentMs = 0;
-      rmSync(join(authCacheRoot, "metadata-cache.lock"), { force: true });
-      rmSync(join(authCacheRoot, "content-index.lock"), { force: true });
+      for (const entry of existsSync(authCacheRoot) ? readdirSync(authCacheRoot) : []) {
+        rmSync(join(authCacheRoot, entry, "metadata-cache.lock"), { force: true });
+        rmSync(join(authCacheRoot, entry, "content-index.lock"), { force: true });
+      }
       await authClient.close();
     }
   });
@@ -3407,7 +3914,7 @@ process.exit(2);
     return { listUrl: listRequest.url, searchUrl: searchRequest.url, searchAllUrl: searchAllRequest.url };
   });
 
-  await check("search normalizes negative sizes, MIME types, encoded paths, and drive ID casing", async () => {
+  await check("search normalizes negative sizes, MIME types, and encoded paths while preserving drive ID casing", async () => {
     await tool("onedrive_cache_clear");
     const result = await tool("onedrive_search", { query: "Metadata Normalization", format: "full" });
     assert(!result.isError, "metadata normalization search should succeed", result);
@@ -3415,7 +3922,7 @@ process.exit(2);
     assert(found.size === null, "negative folder/file size should normalize to null", found);
     assert(found.file?.mimeType === "text/markdown", "Markdown MIME should be normalized", found);
     assert(found.path === "/drive/root:/Encoded Folder", "Graph path should be decoded", found);
-    assert(found.driveId === "B8C89DB91F19C763", "drive ID casing should be normalized", found);
+    assert(found.driveId === "b8c89db91f19c763", "opaque drive ID casing must be preserved exactly", found);
     return found;
   });
 
@@ -3444,7 +3951,7 @@ process.exit(2);
     assert(result.value.count === 1 && result.value.truncated === true, "oversized page should be reported as truncated", result.value);
     assert(result.value.unsafePageTruncation === true, "unsafe page truncation should be explicit", result.value);
     assert(result.value.nextLink === null, "nextLink would skip the unaccepted page remainder", result.value);
-    const cache = JSON.parse(readFileSync(join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json"), "utf8"));
+    const cache = JSON.parse(readFileSync(mainMetadataCachePath, "utf8"));
     assert(Boolean(cache.itemsById["oversized-a"]) && !cache.itemsById["oversized-b"], "only accepted items should be cached", cache.itemsById);
     return { count: result.value.count, unsafePageTruncation: result.value.unsafePageTruncation };
   });
@@ -3563,8 +4070,9 @@ process.exit(2);
   await check("account-scoped content indexes fail closed on scope mismatch", async () => {
     const scopedHome = join(mockHome, "scope-mismatch-home");
     const scopedCacheRoot = join(scopedHome, ".codex", "onedrive-plugin", "cache");
-    mkdirSync(scopedCacheRoot, { recursive: true });
-    writeFileSync(join(scopedCacheRoot, "content-index.json"), JSON.stringify({
+    const mismatchedIndexPath = scopedStateFile(scopedCacheRoot, "content-index.json", mockAuthContextId, "drive");
+    mkdirSync(dirname(mismatchedIndexPath), { recursive: true });
+    writeFileSync(mismatchedIndexPath, JSON.stringify({
       version: 3,
       scope: { authContextId: "different-auth-context", driveId: "drive" },
       itemCount: 1,
@@ -3572,6 +4080,7 @@ process.exit(2);
         leaked: { item: item("leaked", "leaked.txt"), text: "cross account secret", normalizedText: "cross account secret", tokens: ["cross", "account", "secret"], source: "text-read" }
       }
     }));
+    chmodSync(mismatchedIndexPath, 0o666);
     const scopedClient = createMcpClient({
       HOME: scopedHome,
       ONEDRIVE_CLIENT_ID: "mock-client-id",
@@ -3585,10 +4094,65 @@ process.exit(2);
       await scopedClient.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "scope-mismatch", version: "1" } });
       const result = await scopedClient.tool("onedrive_content_search", { query: "cross account secret" });
       assert(!result.isError && result.value.items.length === 0 && result.value.itemCount === 0, "scope-mismatched index content must not be returned", result);
-      return { failClosed: true };
+      const fixtureMode = statSync(mismatchedIndexPath).mode & 0o777;
+      assert(fixtureMode === 0o600, "scope-mismatch fixture must be read and hardened at the actual scoped path", { mismatchedIndexPath, fixtureMode: fixtureMode.toString(8) });
+      return { failClosed: true, fixtureObserved: true, scopedPath: true };
     } finally {
       await scopedClient.close();
     }
+  });
+
+  await check("oversized preexisting content and metadata state fails closed before parsing", async () => {
+    const oversizedHome = join(mockHome, "oversized-local-state-home");
+    const oversizedCacheRoot = join(oversizedHome, ".codex", "onedrive-plugin", "cache");
+    const oversizedStorageRoot = join(oversizedHome, ".codex", "onedrive-plugin");
+    const scopedRoot = scopedStateDirectory(oversizedCacheRoot);
+    mkdirSync(scopedRoot, { recursive: true });
+    const oversizedContentPath = join(scopedRoot, "content-index.json");
+    const oversizedMetadataPath = join(scopedRoot, "metadata-cache.json");
+    const oversizedPadding = "x".repeat(16 * 1024 * 1024 + 1);
+    writeFileSync(oversizedContentPath, oversizedPadding, "utf8");
+    writeFileSync(oversizedMetadataPath, oversizedPadding, "utf8");
+    const oversizedClient = createMcpClient({
+      HOME: oversizedHome,
+      ONEDRIVE_CLIENT_ID: "mock-client-id",
+      ONEDRIVE_TEST_ACCESS_TOKEN: "mock-token",
+      ONEDRIVE_GRAPH_BASE_URL: graphBaseUrl,
+      ONEDRIVE_IDENTITY_BASE_URL: identityBaseUrl,
+      ONEDRIVE_STORAGE_ROOT: oversizedStorageRoot,
+      ONEDRIVE_CACHE_ROOT: oversizedCacheRoot
+    });
+    try {
+      await oversizedClient.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "oversized-local-state", version: "1" } });
+      const content = await oversizedClient.tool("onedrive_content_search", { query: "untrusted" });
+      const metadata = await oversizedClient.tool("onedrive_sync_status");
+      assert(!content.isError && content.value.itemCount === 0, "oversized content index must fail closed", content);
+      assert(!metadata.isError && metadata.value.itemCount === 0, "oversized metadata cache must fail closed", metadata);
+      return { contentFailClosed: true, metadataFailClosed: true, bytesPerFixture: Buffer.byteLength(oversizedPadding, "utf8") };
+    } finally {
+      await oversizedClient.close();
+    }
+  });
+
+  await check("all managed state roots use opaque per-authentication-and-drive directories", async () => {
+    const status = await tool("onedrive_sync_status");
+    assert(!status.isError, "scoped storage status should succeed", status);
+    const expectedScopeId = storageScopeId();
+    assert(status.value.scopeId === expectedScopeId && /^[0-9a-f]{64}$/u.test(status.value.scopeId), "scope directory ID must be an opaque SHA-256 digest", status.value);
+    const expectedPaths = {
+      cachePath: scopedStateFile(mainCacheRoot, "metadata-cache.json"),
+      contentIndexPath: scopedStateFile(mainCacheRoot, "content-index.json"),
+      downloadRoot: scopedStateDirectory(join(mainStorageRoot, "downloads")),
+      updateRoot: scopedStateDirectory(join(mainStorageRoot, "updates")),
+      backupRoot: scopedStateDirectory(join(mainStorageRoot, "backups"))
+    };
+    for (const [field, expected] of Object.entries(expectedPaths)) {
+      assert(resolve(status.value[field]) === resolve(expected), `${field} is not physically isolated under the current scope`, { actual: status.value[field], expected });
+      assert(!String(status.value[field]).includes(mockAuthContextId) && !String(status.value[field]).includes("drive:"), `${field} exposes raw scope material`, status.value[field]);
+    }
+    const otherScopePath = scopedStateFile(mainCacheRoot, "metadata-cache.json", "other-auth-context", "other-drive");
+    assert(resolve(otherScopePath) !== resolve(status.value.cachePath) && dirname(otherScopePath) !== dirname(status.value.cachePath), "different scopes must resolve to different physical directories", { current: status.value.cachePath, otherScopePath });
+    return { scopeId: status.value.scopeId, isolatedRoots: Object.keys(expectedPaths) };
   });
 
   await check("preset traversal is blocked before Graph", async () => {
@@ -4387,6 +4951,24 @@ process.exit(2);
     return { blocked: true, additionalRoot: mainAdditionalSyncRoot };
   });
 
+  await check("streaming downloads enforce maxBytes before publish and remove partial files", async () => {
+    const localPath = join(mockHome, "bounded-stream-download.bin");
+    const before = requests.length;
+    const result = await tool("onedrive_download", {
+      itemId: "oversized-stream",
+      localPath,
+      maxBytes: 16
+    });
+    assert(result.isError && /above the 16-byte limit/iu.test(String(result.value)), "oversized chunked content should fail at the in-stream byte boundary", result);
+    assert(!existsSync(localPath), "an oversized streamed body must not publish its destination", { localPath });
+    const partials = readdirSync(dirname(localPath)).filter((name) => name.startsWith(`${basename(localPath)}.part-`));
+    assert(partials.length === 0, "an oversized streamed body must remove its temporary partial file", partials);
+    const added = requests.slice(before);
+    const contentRequest = added.find((entry) => entry.path === "/v1.0/me/drive/items/oversized-stream/content");
+    assert(contentRequest?.headers?.["if-match"] === "etag-oversized-stream", "bounded downloads should revision-guard the content GET", contentRequest);
+    return { rejected: true, published: false, partials: partials.length, ifMatch: contentRequest.headers["if-match"] };
+  });
+
   await check("upload refuses local OneDrive sync source before local or Graph work", async () => {
     const before = requests.length;
     const result = await tool("onedrive_upload", {
@@ -4437,6 +5019,64 @@ process.exit(2);
       && addedRequests[0].method === "GET"
       && addedRequests[0].path === "/chatgpt-files/redirect-private", "private redirect target must be rejected before a network connection", addedRequests);
     return { redirectRevalidated: true, privateTargetRequests: 0 };
+  });
+
+  await check("ChatGPT file upload enforces one absolute redirect and body deadline and releases admission", async () => {
+    const origin = new URL(graphBaseUrl).origin;
+    const slowStorageRoot = join(mockRunRoot, "slow-drip-storage");
+    const deadlineClient = createMcpClient({
+      HOME: join(mockRunRoot, "slow-drip-home"),
+      ONEDRIVE_STORAGE_ROOT: slowStorageRoot,
+      ONEDRIVE_FETCH_TIMEOUT_MS: "400"
+    }, "slow-drip-deadline");
+    try {
+      await deadlineClient.request("initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "slow-drip-deadline", version: "1" }
+      });
+      const startedAt = Date.now();
+      const timedOut = await deadlineClient.tool("onedrive_upload_file", {
+        sourceFile: {
+          download_url: `${origin}/chatgpt-files/slow-drip-start`,
+          file_id: "slow-drip",
+          file_name: "slow-drip.txt",
+          mime_type: "text/plain"
+        },
+        remotePath: "Uploads/slow-drip.txt",
+        conflictBehavior: "fail"
+      });
+      const elapsed = Date.now() - startedAt;
+      assert(timedOut.isError
+        && timedOut.structuredContent?.error?.code === "deadline_exceeded"
+        && timedOut.structuredContent.error.retryable === true
+        && timedOut.structuredContent.error.retryAfterSeconds === 1,
+      "slow-drip ingress should return a stable retryable deadline error", timedOut);
+      assert(elapsed < 900, "the wall deadline should abort promptly instead of following per-hop timeouts", { elapsed });
+      assert((counters.get("chatgpt-slow-drip-body") || 0) === 1
+        && (counters.get("chatgpt-slow-drip-complete") || 0) === 0,
+      "the absolute deadline should interrupt an active slow-drip body", counters);
+      const stagedFiles = existsSync(slowStorageRoot)
+        ? snapshotTree(slowStorageRoot).filter((entry) => entry.type === "file" && entry.path.endsWith(".upload"))
+        : [];
+      assert(stagedFiles.length === 0, "timed-out ChatGPT ingress must delete its partial staging file", stagedFiles);
+
+      const retry = await deadlineClient.tool("onedrive_upload_file", {
+        sourceFile: {
+          download_url: `${origin}/chatgpt-files/stable-preview`,
+          file_id: "after-slow-drip",
+          file_name: "after-slow-drip.txt",
+          mime_type: "text/plain"
+        },
+        remotePath: "Uploads/after-slow-drip.txt",
+        conflictBehavior: "fail"
+      });
+      assert(!retry.isError && retry.value?.previewToken,
+        "a normal retry should be admitted immediately after slow-drip timeout cleanup", retry);
+      return { deadlineMs: 400, elapsedMs: elapsed, partialFiles: 0, leaseReleased: true };
+    } finally {
+      await deadlineClient.close();
+    }
   });
 
   await check("ChatGPT upload preview tokens bind stable content instead of transient host file IDs", async () => {
@@ -4490,6 +5130,61 @@ process.exit(2);
       changedContentRejected: true,
       stableContentUploaded: true
     };
+  });
+
+  await check("parallel focused ingress admits one staged upload and blocks export staging", async () => {
+    const origin = new URL(graphBaseUrl).origin;
+    const uploadArgs = {
+      sourceFile: {
+        download_url: `${origin}/chatgpt-files/stable-preview`,
+        file_id: "parallel-ingress-file",
+        file_name: "parallel-ingress.txt",
+        mime_type: "text/plain"
+      },
+      remotePath: "Uploads/parallel-ingress.txt",
+      conflictBehavior: "fail"
+    };
+    const exportPreview = await tool("onedrive_export_file", {
+      itemId: "quarterly-report",
+      format: "pdf",
+      remotePath: "Exports/busy-ingress.pdf"
+    });
+    assert(!exportPreview.isError && exportPreview.value.previewToken && exportPreview.value.source?.eTag, "export ingress contention preview failed", exportPreview);
+    const contentBefore = counters.get("chatgpt-file-content-read") || 0;
+    delayedChatgptUploadMs = 400;
+    let uploads;
+    try {
+      const pendingUploads = Promise.all(Array.from({ length: 16 }, () => tool("onedrive_upload_file", uploadArgs)));
+      await waitForCounter("chatgpt-file-content-read", contentBefore + 1);
+      assert((counters.get("chatgpt-file-content-read") || 0) - contentBefore === 1, "parallel focused upload ingress should admit exactly one source response", counters);
+      const exportRequestsBefore = requests.length;
+      const busyExport = await tool("onedrive_export_file", {
+        itemId: "quarterly-report",
+        format: "pdf",
+        remotePath: "Exports/busy-ingress.pdf",
+        dryRun: false,
+        confirmed: true,
+        expectedETag: exportPreview.value.source.eTag,
+        previewToken: exportPreview.value.previewToken
+      });
+      assert(busyExport.isError && busyExport.structuredContent?.error?.code === "resource_exhausted"
+        && busyExport.structuredContent.error.retryable === true, "focused export should fail retryably before staging while upload ingress is admitted", busyExport);
+      assert(!requests.slice(exportRequestsBefore).some((entry) => entry.path.includes("/quarterly-report/content")), "busy export must issue zero source-content downloads", requests.slice(exportRequestsBefore));
+      uploads = await pendingUploads;
+    } finally {
+      delayedChatgptUploadMs = 0;
+    }
+    const admitted = uploads.filter((entry) => !entry.isError);
+    const busy = uploads.filter((entry) => entry.isError);
+    assert(admitted.length === 1 && busy.length === 15, "parallel focused ingress should admit one upload and reject fifteen", uploads);
+    assert(busy.every((entry) => entry.structuredContent?.error?.code === "resource_exhausted"
+      && entry.structuredContent.error.retryable === true), "rejected focused ingress calls should include bounded retry metadata", busy);
+    assert((counters.get("chatgpt-file-content-read") || 0) - contentBefore === 1, "rejected focused uploads must issue zero source-file downloads", counters);
+    const remainingStaging = existsSync(mainScopedChatgptUploadRoot)
+      ? readdirSync(mainScopedChatgptUploadRoot).filter((name) => !name.startsWith("."))
+      : [];
+    assert(remainingStaging.length === 0, "admitted upload staging should be deleted after response completion", remainingStaging);
+    return { admitted: 1, retryable: 15, sourceDownloads: 1, exportDownloadsWhileBusy: 0 };
   });
 
   await check("public upload and write_text replacements require scoped previews and identity", async () => {
@@ -5038,7 +5733,7 @@ process.exit(2);
       const seeded = await tool("onedrive_get_info", { itemId });
       assert(!seeded.isError, `failed to seed ${itemId}`, seeded);
     }
-    const cacheFile = join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json");
+    const cacheFile = mainMetadataCachePath;
     const cachedPath = () => JSON.parse(readFileSync(cacheFile, "utf8")).itemsById["delta-child"]?.remotePath;
 
     const unchanged = await tool("onedrive_delta", { itemId: "delta-parent", maxItems: 10 });
@@ -5084,7 +5779,7 @@ process.exit(2);
 
     const renamed = await tool("onedrive_delta", { itemId: "delta-index-parent", maxItems: 10 });
     assert(!renamed.isError, "metadata-only delta rename should succeed", renamed);
-    let cache = JSON.parse(readFileSync(join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json"), "utf8"));
+    let cache = JSON.parse(readFileSync(mainMetadataCachePath, "utf8"));
     assert(cache.itemsById["delta-indexed"].remotePath === "Indexed/renamed-indexed-report.txt", "rename should repath cached metadata", cache.itemsById["delta-indexed"]);
     assert(cache.itemsById["delta-indexed"].cTag === "index-c1", "explicit unchanged cTag should be retained", cache.itemsById["delta-indexed"]);
     assert(cache.itemsById["delta-indexed"].file?.hashes === undefined, "changed eTag with omitted hashes must clear stale hashes", cache.itemsById["delta-indexed"]);
@@ -5093,7 +5788,7 @@ process.exit(2);
 
     const changed = await tool("onedrive_delta", { itemId: "delta-index-parent", maxItems: 10 });
     assert(!changed.isError, "second delta should succeed", changed);
-    cache = JSON.parse(readFileSync(join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json"), "utf8"));
+    cache = JSON.parse(readFileSync(mainMetadataCachePath, "utf8"));
     assert(cache.itemsById["delta-indexed"].cTag === undefined, "omitted cTag on changed eTag must not preserve old content proof", cache.itemsById["delta-indexed"]);
     const invalidated = await tool("onedrive_content_search", { query: "persistent indexed phrase" });
     assert(invalidated.value.items.length === 0, "omitted cTag with changed eTag should invalidate indexed content", invalidated.value);
@@ -5108,7 +5803,7 @@ process.exit(2);
     await tool("onedrive_content_index_refresh", { itemId: "victim-child", maxFiles: 1, maxBytesPerFile: 4096 });
     const replacement = await tool("onedrive_get_info", { itemId: "replacement-collision" });
     assert(!replacement.isError, "replacement path item should cache", replacement);
-    const cache = JSON.parse(readFileSync(join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json"), "utf8"));
+    const cache = JSON.parse(readFileSync(mainMetadataCachePath, "utf8"));
     assert(!cache.itemsById["victim-folder"] && !cache.itemsById["victim-child"], "displaced folder descendants should be removed", cache.itemsById);
     const search = await tool("onedrive_content_search", { query: "victim indexed phrase" });
     assert(search.value.items.length === 0, "displaced descendants should be removed from content index", search.value);
@@ -5117,7 +5812,7 @@ process.exit(2);
 
   await check("metadata and content caches preserve concurrent same-process and cross-process updates", async () => {
     await tool("onedrive_cache_clear");
-    const cacheFile = join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json");
+    const cacheFile = mainMetadataCachePath;
     const clearedCache = JSON.parse(readFileSync(cacheFile, "utf8"));
     assert(clearedCache.version === 4 && clearedCache.scope?.authContextId === mockAuthContextId && clearedCache.scope?.driveId === "drive", "cleared cache should use the account-scoped version", clearedCache);
     const sameProcess = await Promise.all([
@@ -5156,7 +5851,8 @@ process.exit(2);
         first.tool("onedrive_get_info", { itemId: "concurrent-a" }),
         second.tool("onedrive_get_info", { itemId: "concurrent-b" })
       ]);
-      const sharedCache = JSON.parse(readFileSync(join(sharedCacheRoot, "metadata-cache.json"), "utf8"));
+      const sharedScopedCacheRoot = scopedStateDirectory(sharedCacheRoot);
+      const sharedCache = JSON.parse(readFileSync(join(sharedScopedCacheRoot, "metadata-cache.json"), "utf8"));
       assert(sharedCache.itemsById["concurrent-a"] && sharedCache.itemsById["concurrent-b"], "cross-process metadata update was lost", sharedCache.itemsById);
 
       await first.tool("onedrive_content_index_clear");
@@ -5165,10 +5861,10 @@ process.exit(2);
         second.tool("onedrive_content_index_refresh", { itemId: "concurrent-b", maxFiles: 1, maxBytesPerFile: 4096 })
       ]);
       assert(contentResults.every((entry) => !entry.isError), "cross-process content refresh should succeed", contentResults);
-      const sharedIndex = JSON.parse(readFileSync(join(sharedCacheRoot, "content-index.json"), "utf8"));
+      const sharedIndex = JSON.parse(readFileSync(join(sharedScopedCacheRoot, "content-index.json"), "utf8"));
       assert(sharedIndex.entriesById["concurrent-a"] && sharedIndex.entriesById["concurrent-b"], "cross-process content-index update was lost", sharedIndex.entriesById);
-      JSON.parse(readFileSync(join(sharedCacheRoot, "metadata-cache.json"), "utf8"));
-      JSON.parse(readFileSync(join(sharedCacheRoot, "content-index.json"), "utf8"));
+      JSON.parse(readFileSync(join(sharedScopedCacheRoot, "metadata-cache.json"), "utf8"));
+      JSON.parse(readFileSync(join(sharedScopedCacheRoot, "content-index.json"), "utf8"));
       return { sameProcessItems: 2, crossProcessItems: 2, crossProcessIndexEntries: 2 };
     } finally {
       await Promise.all([first.close(), second.close()]);
@@ -5268,6 +5964,17 @@ process.exit(2);
     const info = await tool("onedrive_get_info", { itemId: "common-rtf" });
     assert(!info.isError, "common RTF metadata should seed for indexing", info);
     const refreshed = await tool("onedrive_content_index_refresh", { itemId: "common-rtf", maxFiles: 1, maxBytesPerFile: 4096 });
+    if (commonTextLimitsUnsupported) {
+      assert(
+        !refreshed.isError
+          && refreshed.value.indexed === 0
+          && refreshed.value.failed === 1
+          && /resource limits/iu.test(refreshed.value.failures?.[0]?.error || ""),
+        "a host without enforceable common-text limits must fail local indexing closed",
+        refreshed
+      );
+      return { indexed: 0, limitsFailClosed: true };
+    }
     assert(!refreshed.isError && refreshed.value.indexed === 1, "common RTF should be indexed by the bounded local extractor", refreshed);
     const searched = await tool("onedrive_content_search", { query: "Budget total", maxResults: 5 });
     assert(!searched.isError && searched.value.items?.[0]?.id === "common-rtf", "common RTF content should be searchable after indexing", searched);
@@ -5281,7 +5988,16 @@ process.exit(2);
     const reportInfo = await tool("onedrive_get_info", { itemId: "electrical-report" });
     assert(!emailInfo.isError && !reportInfo.isError, "electrical productivity fixtures should seed metadata", { emailInfo, reportInfo });
     const indexed = await tool("onedrive_content_index_refresh", { itemId: "electrical-invoice-email", maxFiles: 1, maxBytesPerFile: 16384 });
-    assert(!indexed.isError && indexed.value.indexed === 1, "RFC 822 email should be indexed by the bounded common extractor", indexed);
+    if (commonTextLimitsUnsupported) {
+      assert(
+        !indexed.isError && indexed.value.indexed === 0 && indexed.value.failed === 1
+          && /resource limits/iu.test(indexed.value.failures?.[0]?.error || ""),
+        "RFC 822 extraction must fail closed when common-text limits are unavailable",
+        indexed
+      );
+    } else {
+      assert(!indexed.isError && indexed.value.indexed === 1, "RFC 822 email should be indexed by the bounded common extractor", indexed);
+    }
     const fetched = await tool("fetch", { id: "electrical-invoice-email" });
     assert(!fetched.isError && fetched.value.text.includes("Subject: Invoice 605473749 - panel service"), "ChatGPT fetch should expose decoded email headers", fetched);
     assert(fetched.value.text.includes("Total paid: $425.00"), "ChatGPT fetch should decode the email body", fetched);
@@ -5382,13 +6098,24 @@ process.exit(2);
     const seeded = await tool("onedrive_get_info", { itemId: "home-electrical-inspection" });
     assert(!seeded.isError, "general inspection fixture should seed metadata", seeded);
     const indexed = await tool("onedrive_content_index_refresh", { itemId: "home-electrical-inspection", maxFiles: 1, maxBytesPerFile: 4096 });
-    assert(!indexed.isError && indexed.value.indexed === 1, "general inspection fixture should index", indexed);
+    if (commonTextLimitsUnsupported) {
+      assert(
+        !indexed.isError && indexed.value.indexed === 0 && indexed.value.failed === 1
+          && /resource limits/iu.test(indexed.value.failures?.[0]?.error || ""),
+        "general inspection extraction must fail closed when common-text limits are unavailable",
+        indexed
+      );
+    } else {
+      assert(!indexed.isError && indexed.value.indexed === 1, "general inspection fixture should index", indexed);
+    }
     const before = requests.length;
     const searched = await tool("search", { query: "the paperwork the electrician left after fixing the breaker" });
     assert(!searched.isError, "service-versus-inspection ranking search should succeed", searched);
     assert(searched.value.results?.[0]?.id === "hidden-electrical-invoice", "repair intent should rank the service invoice above a newer general inspection", searched);
     const added = requests.slice(before);
-    assert(!added.some((request) => decodeURIComponent(request.url).includes("/search(q='")), "indexed service ranking should not require Graph search", added);
+    if (!commonTextLimitsUnsupported) {
+      assert(!added.some((request) => decodeURIComponent(request.url).includes("/search(q='")), "indexed service ranking should not require Graph search", added);
+    }
     return { results: searched.value.results.map((entry) => entry.id), graphRequestsAdded: added.length };
   });
 
@@ -5476,7 +6203,17 @@ process.exit(2);
     assert(rootNote?.status === "found" && rootNote.id === "root-note", "combined opener should resolve the exact root note ID", rootNote);
     assert(rootNote?.text.includes("root note mock content"), "combined opener should return root note content", rootNote);
     assert(commonNotes?.status === "found" && commonNotes.id === "common-rtf", "combined opener should resolve the exact common-file ID", commonNotes);
-    assert(commonNotes?.metadata?.previewSource === "local-rtf" && commonNotes.text.includes("Budget total: $1,234"), "combined opener should use local common-file extraction", commonNotes);
+    if (commonTextLimitsUnsupported) {
+      assert(
+        commonNotes?.metadata?.previewSource === "graph-text-export"
+          && commonNotes.text.includes("$1,234")
+          && commonNotes.text.includes("\\rtf1"),
+        "combined opener must use only bounded Graph fallback when local extraction limits are unavailable",
+        commonNotes
+      );
+    } else {
+      assert(commonNotes?.metadata?.previewSource === "local-rtf" && commonNotes.text.includes("Budget total: $1,234"), "combined opener should use local common-file extraction", commonNotes);
+    }
     assert(Number.isInteger(opened.value.durationMs) && opened.value.durationMs >= 0, "combined opener should report server-side duration", opened.value);
     return { files: opened.value.files.map((entry) => ({ name: entry.name, status: entry.status, source: entry.metadata?.previewSource })), durationMs: opened.value.durationMs };
   });
@@ -5551,6 +6288,329 @@ process.exit(2);
       serverMs: timing.serverMs,
       metadataReconciledCount: read.value.metadataReconciledCount
     };
+  });
+
+  await check("focused recent and version composites list and compare in one bounded read", async () => {
+    const read = await tool("onedrive_read_actions", {
+      actions: [
+        { operation: "recent", limit: 5 },
+        { operation: "versions", itemId: "version-text", maxItems: 10 },
+        { operation: "compareVersion", itemId: "version-text", versionId: "1.0", compareToVersionId: "2.0", maxChanges: 20 }
+      ]
+    });
+    assert(!read.isError && read.value.results?.length === 3, "recent/version composite should return every bounded read", read);
+    const recentRead = read.value.results.find((entry) => entry.operation === "recent");
+    const versionsRead = read.value.results.find((entry) => entry.operation === "versions");
+    const compareRead = read.value.results.find((entry) => entry.operation === "compareVersion");
+    assert(recentRead?.isError === false && recentRead.value.items?.[0]?.id === "root-note", "focused recent read failed", recentRead);
+    assert(versionsRead?.isError === false && versionsRead.value.count === 2 && versionsRead.value.versions?.[1]?.id === "1.0", "focused version history read failed", versionsRead);
+    assert(compareRead?.isError === false && compareRead.value.leftVersionId === "1.0" && compareRead.value.rightVersionId === "2.0" && compareRead.value.comparison?.comparisonType === "text", "focused version comparison failed", compareRead);
+    return { recent: recentRead.value.items.length, versions: versionsRead.value.count, comparison: compareRead.value.comparison.comparisonType };
+  });
+
+  await check("focused parallel version comparisons admit one buffer operation before Graph content downloads", async () => {
+    const beforeContentReads = counters.get("version-comparison-content-read") || 0;
+    const workspaceCreateArgs = {
+      itemId: "workspace-source",
+      expectedId: "workspace-source",
+      expectedETag: `etag-workspace-source-${workspaceSourceRevision}`,
+      dryRun: false,
+      confirmed: true
+    };
+    const workspacePreviewToken = await previewTokenFor("onedrive_workspace_create", workspaceCreateArgs);
+    const beforeBusyWorkspaceRequests = requests.length;
+    versionContentDelayMs = 400;
+    let read;
+    let readPromise;
+    try {
+      readPromise = tool("onedrive_read_actions", {
+        actions: Array.from({ length: 10 }, () => ({
+          operation: "compareVersion",
+          itemId: "version-text",
+          versionId: "1.0",
+          compareToVersionId: "2.0",
+          maxChanges: 20
+        }))
+      });
+      await waitForCounter("version-comparison-content-read", beforeContentReads + 1);
+      const busyWorkspaceCreate = await tool("onedrive_workspace_create", {
+        ...workspaceCreateArgs,
+        previewToken: workspacePreviewToken
+      });
+      assert(
+        busyWorkspaceCreate.isError
+          && busyWorkspaceCreate.structuredContent?.error?.code === "resource_exhausted"
+          && busyWorkspaceCreate.structuredContent?.error?.retryable === true,
+        "workspace creation should fail retryably while comparison buffering is admitted",
+        busyWorkspaceCreate
+      );
+      const busyWorkspaceRequests = requests.slice(beforeBusyWorkspaceRequests);
+      assert(
+        !busyWorkspaceRequests.some((entry) => (
+          ["POST", "PUT", "DELETE"].includes(entry.method)
+          || entry.path === "/v1.0/me/drive/items/workspace-source/content"
+        )),
+        "busy workspace creation must perform zero Graph mutations and zero source-content downloads",
+        busyWorkspaceRequests
+      );
+      read = await readPromise;
+    } finally {
+      versionContentDelayMs = 0;
+      if (!read && readPromise) read = await readPromise;
+    }
+    assert(!read.isError && read.value.results?.length === 10, "parallel comparisons should return every bounded action result", read);
+    const completed = read.value.results.filter((entry) => entry.isError === false);
+    const busy = read.value.results.filter((entry) => entry.isError === true);
+    assert(completed.length === 1, "the global buffer gate should admit exactly one parallel comparison", read.value.results);
+    assert(
+      busy.length === 9
+        && busy.every((entry) => entry.errorCode === "resource_exhausted" && entry.retryable === true && entry.retryAfterSeconds === 1),
+      "busy comparisons should fail before buffering with bounded retry metadata",
+      busy
+    );
+    const contentReads = (counters.get("version-comparison-content-read") || 0) - beforeContentReads;
+    assert(contentReads === 2, "rejected comparisons must perform zero version-content downloads", { contentReads, results: read.value.results });
+    return { admitted: completed.length, rejectedBeforeDownload: busy.length, contentReads };
+  });
+
+  await check("focused version restore uses one native POST with stale and replay guards", async () => {
+    const previewed = await tool("onedrive_preview_actions", {
+      actions: [{ operation: "restoreVersion", itemId: "version-text", versionId: "1.0" }]
+    });
+    const preview = previewed.value.results?.[0];
+    assert(!previewed.isError && preview?.isError === false && preview.previewToken && preview.expectedETag, "focused restore preview should return a revision-bound proof", previewed);
+    const before = requests.length;
+    const stale = await tool("onedrive_commit_actions", {
+      confirmed: true,
+      actions: [{ operation: "restoreVersion", itemId: "version-text", versionId: "1.0", expectedETag: "stale-etag", previewToken: preview.previewToken }]
+    });
+    assert(!stale.isError && stale.value.results?.[0]?.isError === true && /expectedETag|fresh preview/iu.test(stale.value.results[0].error || ""), "focused restore should reject a stale eTag without consuming the valid proof", stale);
+    assert(!requests.slice(before).some((entry) => entry.method === "POST" && entry.path.endsWith("/restoreVersion")), "stale focused restore must not mutate Graph", requests.slice(before));
+
+    const committed = await tool("onedrive_commit_actions", {
+      confirmed: true,
+      actions: [{ operation: "restoreVersion", itemId: "version-text", versionId: "1.0", expectedETag: preview.expectedETag, previewToken: preview.previewToken }]
+    });
+    assert(!committed.isError && committed.value.results?.[0]?.isError === false && committed.value.results[0].verified === true, "focused restore commit should verify the native restore", committed);
+    const mutationRequests = requests.slice(before).filter((entry) => ["POST", "PUT"].includes(entry.method));
+    const restorePosts = mutationRequests.filter((entry) => entry.method === "POST" && entry.path === "/v1.0/me/drive/items/version-text/versions/1.0/restoreVersion");
+    assert(restorePosts.length === 1, "focused restore should issue exactly one native restoreVersion POST", mutationRequests);
+    assert(!mutationRequests.some((entry) => entry.method === "PUT" && entry.path === "/v1.0/me/drive/items/version-text/content"), "focused restore must not fall back to content PUT", mutationRequests);
+
+    const replayBefore = requests.length;
+    const replayed = await tool("onedrive_commit_actions", {
+      confirmed: true,
+      actions: [{ operation: "restoreVersion", itemId: "version-text", versionId: "1.0", expectedETag: preview.expectedETag, previewToken: preview.previewToken }]
+    });
+    assert(!replayed.isError && replayed.value.results?.[0]?.isError === true, "consumed focused restore proof must not be replayable", replayed);
+    assert(!requests.slice(replayBefore).some((entry) => entry.method === "POST" && entry.path.endsWith("/restoreVersion")), "restore proof replay must not reach the native mutation endpoint", requests.slice(replayBefore));
+    return { nativeRestorePosts: restorePosts.length, contentPuts: 0, staleRejected: true, replayRejected: true };
+  });
+
+  await check("focused enterprise discovery returns opaque exact-drive fetch IDs without default-drive state leakage", async () => {
+    enterpriseAccountMode = true;
+    const before = requests.length;
+    try {
+      const read = await tool("onedrive_read_actions", {
+        actions: [
+          { operation: "drives", limit: 10 },
+          { operation: "enterpriseSearch", query: "Quarterly plan", limit: 10 },
+          { operation: "libraryList", driveId: "CaseSensitiveDrive-01", limit: 10 },
+          { operation: "libraryList", driveId: "CaseSensitiveDrive-01", folderItemId: "library-folder", limit: 10 }
+        ]
+      });
+      assert(!read.isError && read.value.results?.every((entry) => entry.isError === false), "enterprise focused reads should all succeed", read);
+      const drives = read.value.results[0].value;
+      const searched = read.value.results[1].value;
+      const root = read.value.results[2].value;
+      const folderItems = read.value.results[3].value;
+      const remoteShortcut = searched.items.find((entry) => entry.itemId === "remote-source-collision");
+      const decodeEnterpriseId = (id) => JSON.parse(Buffer.from(String(id).slice("onedrive-drive-item:".length), "base64url").toString("utf8"));
+      assert(drives.drives?.[0]?.driveId === "CaseSensitiveDrive-01", "drive discovery must preserve opaque drive ID casing", drives);
+      assert(searched.items?.[0]?.driveId === "CaseSensitiveDrive-01" && searched.items[0].itemId === "enterprise-item-1", "enterprise search must return the exact driveId/itemId pair", searched);
+      assert(root.driveId === "CaseSensitiveDrive-01" && root.items?.[0]?.itemId === "library-root-item", "library root listing must remain bound to the selected drive", root);
+      assert(folderItems.driveId === "CaseSensitiveDrive-01" && folderItems.folderItemId === "library-folder" && folderItems.items?.[0]?.itemId === "library-child-item", "library folder listing must preserve both selectors", folderItems);
+      assert(remoteShortcut?.driveId === "SourceDrive-MixedCase" && remoteShortcut.name === "Remote Quarterly.docx", "remote-item search hits must unwrap to the exact source drive and item", searched);
+      for (const enterpriseItem of [searched.items[0], remoteShortcut, root.items[0], folderItems.items[0]]) {
+        assert(enterpriseItem.id?.startsWith("onedrive-drive-item:"), "enterprise results must expose an opaque fetch ID", enterpriseItem);
+        assert(JSON.stringify(decodeEnterpriseId(enterpriseItem.id)) === JSON.stringify({ v: 1, d: enterpriseItem.driveId, i: enterpriseItem.itemId }), "opaque enterprise IDs must bind the exact drive and item without changing case", enterpriseItem);
+      }
+      const added = requests.slice(before);
+      assert(added.some((entry) => entry.path === "/v1.0/me/drives"), "drive discovery should use /me/drives", added);
+      assert(added.some((entry) => entry.method === "POST" && entry.path === "/v1.0/search/query"), "enterprise discovery should use Microsoft Search", added);
+      assert(added.some((entry) => entry.path === "/v1.0/drives/CaseSensitiveDrive-01/root/children"), "library root should use the explicit drive ID", added);
+      assert(added.some((entry) => entry.path === "/v1.0/drives/CaseSensitiveDrive-01/items/library-folder/children"), "library folder should use the explicit drive and folder IDs", added);
+      assert(!added.some((entry) => decodeURIComponent(entry.url).includes("sharedWithMe")), "enterprise discovery must not use deprecated sharedWithMe", added);
+      const searchBody = graphBodies.findLast((entry) => entry.key === "enterprise-search")?.body;
+      assert(searchBody?.requests?.[0]?.entityTypes?.[0] === "driveItem" && searchBody.requests[0].query?.queryString === "Quarterly plan", "enterprise search should send a bounded driveItem query", searchBody);
+
+      const metadataBeforeFetch = existsSync(mainMetadataCachePath) ? readFileSync(mainMetadataCachePath, "utf8") : null;
+      const contentIndexBeforeFetch = existsSync(mainContentIndexPath) ? readFileSync(mainContentIndexPath, "utf8") : null;
+      const fetchBefore = requests.length;
+      const first = await tool("fetch", { id: searched.items[0].id });
+      assert(!first.isError && first.value.id === searched.items[0].id, "fetch must preserve the opaque enterprise source ID", first);
+      assert(first.value.metadata?.driveId === "CaseSensitiveDrive-01" && first.value.metadata?.rawItemId === "enterprise-item-1", "enterprise fetch metadata must preserve exact drive and raw item IDs", first.value);
+      assert(first.value.metadata?.progressive === "true" && first.value.metadata?.nextChunkId, "large enterprise fetch must return a progressive continuation", first.value.metadata);
+      const fetchAdded = requests.slice(fetchBefore);
+      assert(fetchAdded.some((entry) => entry.path === "/v1.0/drives/CaseSensitiveDrive-01/items/enterprise-item-1"), "enterprise fetch metadata must use the exact drive endpoint", fetchAdded);
+      assert(fetchAdded.some((entry) => entry.path === "/v1.0/drives/CaseSensitiveDrive-01/items/enterprise-item-1/content"), "enterprise fetch content must use the exact drive endpoint", fetchAdded);
+      assert(!fetchAdded.some((entry) => entry.path.startsWith("/v1.0/me/drive")), "enterprise fetch must not fall back to the default drive", fetchAdded);
+      const continuationPayload = JSON.parse(Buffer.from(first.value.metadata.nextChunkId.slice("onedrive-fetch-chunk:".length), "base64url").toString("utf8"));
+      assert(continuationPayload.i === searched.items[0].id, "progressive continuation must retain the opaque enterprise source reference", continuationPayload);
+
+      const continuationBefore = requests.length;
+      const second = await tool("fetch", { id: first.value.metadata.nextChunkId });
+      assert(!second.isError && second.value.metadata?.sourceItemId === searched.items[0].id, "enterprise continuation must remain bound to the original opaque source ID", second);
+      assert(!requests.slice(continuationBefore).some((entry) => entry.path.startsWith("/v1.0/me/drive")), "enterprise continuation must never read the default drive", requests.slice(continuationBefore));
+      assert((counters.get("enterprise-item-content-read") || 0) === 1, "in-memory enterprise continuation should not redownload content", counters);
+      assert((existsSync(mainMetadataCachePath) ? readFileSync(mainMetadataCachePath, "utf8") : null) === metadataBeforeFetch, "enterprise fetch must not contaminate the default-drive metadata cache");
+      assert((existsSync(mainContentIndexPath) ? readFileSync(mainContentIndexPath, "utf8") : null) === contentIndexBeforeFetch, "enterprise fetch must not contaminate the default-drive content index");
+
+      const snapshotContinuations = [];
+      for (let index = 0; index < 9; index += 1) {
+        const driveId = `SnapshotDrive-${index}`;
+        const id = `onedrive-drive-item:${Buffer.from(JSON.stringify({ v: 1, d: driveId, i: "snapshot-item" }), "utf8").toString("base64url")}`;
+        const fetched = await tool("fetch", { id });
+        assert(!fetched.isError && fetched.value.metadata?.nextChunkId, "snapshot scope fixture should return a progressive continuation", fetched);
+        snapshotContinuations.push(fetched.value.metadata.nextChunkId);
+      }
+      const newestScopeBefore = counters.get("snapshot-scope-SnapshotDrive-8-content") || 0;
+      const newestScopeContinuation = await tool("fetch", { id: snapshotContinuations[8] });
+      assert(!newestScopeContinuation.isError, "the newest of eight retained snapshot scopes should keep its continuation", newestScopeContinuation);
+      assert((counters.get("snapshot-scope-SnapshotDrive-8-content") || 0) === newestScopeBefore, "retained newest snapshot continuation should not redownload content", counters);
+      const oldestScopeBefore = counters.get("snapshot-scope-SnapshotDrive-0-content") || 0;
+      const oldestScopeContinuation = await tool("fetch", { id: snapshotContinuations[0] });
+      assert(!oldestScopeContinuation.isError, "an evicted oldest scope should safely rebuild its continuation snapshot", oldestScopeContinuation);
+      assert((counters.get("snapshot-scope-SnapshotDrive-0-content") || 0) === oldestScopeBefore + 1, "the ninth scope should evict the oldest snapshot scope while retaining only eight", counters);
+
+      const remoteBefore = requests.length;
+      const remoteFetched = await tool("fetch", { id: remoteShortcut.id });
+      assert(!remoteFetched.isError && remoteFetched.value.id === remoteShortcut.id && remoteFetched.value.text.includes("Hello Word"), "remote-item shortcut fetch must read the source Office package", remoteFetched);
+      const remoteInspected = await tool("onedrive_office_inspect", { kind: "word", driveId: remoteShortcut.driveId, itemId: remoteShortcut.itemId, maxParagraphs: 10 });
+      assert(!remoteInspected.isError && remoteInspected.value.item?.id === "remote-source-collision", "focused Office inspect must accept the exact unwrapped remote-item source", remoteInspected);
+      const remoteAdded = requests.slice(remoteBefore);
+      assert(remoteAdded.some((entry) => entry.path === "/v1.0/drives/SourceDrive-MixedCase/items/remote-source-collision/content"), "remote shortcut fetch/inspect must use the exact mixed-case source drive", remoteAdded);
+      assert(!remoteAdded.some((entry) => entry.path.startsWith("/v1.0/me/drive/items/remote-source-collision")), "remote shortcut fetch/inspect must never read the colliding default-drive item", remoteAdded);
+      assert((counters.get("remote-default-collision-metadata-read") || 0) === 0 && (counters.get("remote-default-collision-content-read") || 0) === 0, "default-drive collision endpoints must remain untouched", counters);
+
+      const defaultShortcutBefore = requests.length;
+      const defaultShortcut = await tool("fetch", { id: "remote-shortcut-default" });
+      assert(!defaultShortcut.isError && defaultShortcut.value.text.includes("Hello Word"), "a default-drive shortcut must fetch its resolved remote-item source", defaultShortcut);
+      const defaultShortcutAdded = requests.slice(defaultShortcutBefore);
+      assert(defaultShortcutAdded.some((entry) => entry.path === "/v1.0/me/drive/items/remote-shortcut-default"), "default-drive shortcut fetch must resolve the container metadata once", defaultShortcutAdded);
+      assert(defaultShortcutAdded.some((entry) => entry.path === "/v1.0/drives/SourceDrive-MixedCase/items/remote-source-collision/content"), "default-drive shortcut content must use the resolved source drive", defaultShortcutAdded);
+      assert(!defaultShortcutAdded.some((entry) => entry.path === "/v1.0/me/drive/items/remote-source-collision/content"), "default-drive shortcut content must not collide with an item sharing the source ID", defaultShortcutAdded);
+
+      const malformedRefs = [
+        `onedrive-drive-item:${Buffer.from(JSON.stringify({ v: 1, d: "CaseSensitiveDrive-01", i: "enterprise-item-1", extra: true }), "utf8").toString("base64url")}`,
+        `onedrive-drive-item:${Buffer.from(JSON.stringify({ v: 1, d: "D".repeat(1025), i: "enterprise-item-1" }), "utf8").toString("base64url")}`,
+        `onedrive-drive-item:${"A".repeat(4096)}`
+      ];
+      const malformedBefore = requests.length;
+      for (const id of malformedRefs) {
+        const malformed = await tool("fetch", { id });
+        assert(malformed.isError && /enterprise item reference/iu.test(String(malformed.value)), "malformed opaque enterprise references must fail closed", malformed);
+      }
+      assert(requests.length === malformedBefore, "malformed enterprise references must be rejected before any Graph request", requests.slice(malformedBefore));
+
+      const unsupportedBefore = requests.length;
+      const unsupported = await tool("onedrive_read_actions", {
+        actions: [{ operation: "getInfo", driveId: "CaseSensitiveDrive-01", itemId: "enterprise-item-1" }]
+      });
+      assert(!unsupported.isError && unsupported.value.results?.[0]?.isError === true && /does not support driveId/iu.test(unsupported.value.results[0].error || ""), "unsupported cross-drive selectors must fail closed", unsupported);
+      const malformedDrive = await tool("onedrive_read_actions", {
+        actions: [{ operation: "libraryList", driveId: "D".repeat(1025), limit: 1 }]
+      });
+      assert(!malformedDrive.isError && malformedDrive.value.results?.[0]?.isError === true && /drive ID is invalid/iu.test(malformedDrive.value.results[0].error || ""), "malformed library drive IDs must fail closed", malformedDrive);
+      assert(requests.length === unsupportedBefore, "unsupported or malformed drive selectors must be rejected before any Graph request", requests.slice(unsupportedBefore));
+      return { driveId: searched.items[0].driveId, graphPaths: added.map((entry) => entry.path), deprecatedSharedWithMeCalls: 0, exactDriveFetch: true, progressiveExactDrive: true, remoteShortcutExactDrive: true, defaultShortcutExactDrive: true, malformedRejected: malformedRefs.length, unsupportedSelectorsRejected: 2 };
+    } finally {
+      enterpriseAccountMode = false;
+    }
+  });
+
+  await check("parallel focused materialization admits one bounded Graph body and registration", async () => {
+    const countMaterializedFiles = (root) => {
+      if (!existsSync(root)) return 0;
+      let countFiles = 0;
+      for (const entry of readdirSync(root, { withFileTypes: true })) {
+        const path = join(root, entry.name);
+        if (entry.isDirectory()) countFiles += countMaterializedFiles(path);
+        else if (entry.isFile()) countFiles += 1;
+      }
+      return countFiles;
+    };
+    const contentBefore = counters.get("root-note-content-read") || 0;
+    const registrationsBefore = countMaterializedFiles(mainMaterializedResourceRoot);
+    delayedRootNoteContentMs = 400;
+    let results;
+    try {
+      const pendingMaterializations = Promise.all(Array.from({ length: 16 }, () => tool("onedrive_download_file", {
+        itemId: "root-note",
+        format: "original",
+        maxBytes: 1024
+      })));
+      await waitForCounter("root-note-content-read", contentBefore + 1);
+      results = await pendingMaterializations;
+    } finally {
+      delayedRootNoteContentMs = 0;
+    }
+    const admitted = results.filter((entry) => !entry.isError);
+    const rejected = results.filter((entry) => entry.isError);
+    assert(admitted.length === 1 && admitted[0].structuredContent?.resourceUri?.startsWith("onedrive-resource://"), "parallel materialization should register exactly one resource", results);
+    assert(rejected.length === 15 && rejected.every((entry) => entry.structuredContent?.error?.code === "resource_exhausted"
+      && entry.structuredContent?.error?.retryable === true
+      && entry.structuredContent?.error?.retryAfterSeconds === 1), "busy materializations should fail retryably before reading content", rejected);
+    assert((counters.get("root-note-content-read") || 0) - contentBefore === 1, "parallel materialization must issue exactly one Graph content read", counters);
+    assert(countMaterializedFiles(mainMaterializedResourceRoot) - registrationsBefore === 1, "parallel materialization must persist exactly one registered resource file", {
+      before: registrationsBefore,
+      after: countMaterializedFiles(mainMaterializedResourceRoot)
+    });
+    return { admitted: admitted.length, retryable: rejected.length, graphContentReads: 1, registrations: 1 };
+  });
+
+  await check("focused downloads expose scope-bound MCP resources and rendered image content", async () => {
+    const downloadRequestsBefore = requests.length;
+    const downloaded = await request("tools/call", { name: "onedrive_download_file", arguments: { itemId: "root-note", format: "original", maxBytes: 1024 } });
+    assert(!downloaded.error && downloaded.result?.isError !== true, "focused original materialization should succeed", downloaded);
+    const resourceLink = downloaded.result.content?.find((entry) => entry.type === "resource_link");
+    assert(resourceLink?.uri?.startsWith("onedrive-resource://") && resourceLink.name === "root-note.txt" && resourceLink.mimeType === "text/plain", "download should return a standard MCP resource_link", downloaded.result);
+    assert(!JSON.stringify(downloaded.result).includes(mainStorageRoot) && !JSON.stringify(downloaded.result).includes("localPath"), "materialized download must not disclose a local path", downloaded.result);
+    const revisionGuardedContent = requests.slice(downloadRequestsBefore).find((entry) => (
+      entry.method === "GET" && entry.url.includes("root-note") && entry.headers?.["if-match"]
+    ));
+    assert(revisionGuardedContent?.headers?.["if-match"] === "etag-root-note", "materialized bytes must be bound to the metadata revision with If-Match", revisionGuardedContent);
+    const read = await request("resources/read", { uri: resourceLink.uri });
+    assert(!read.error && read.result?.contents?.[0]?.mimeType === "text/plain", "same-scope resources/read should return the materialized blob", read);
+    assert(Buffer.from(read.result.contents[0].blob, "base64").toString("utf8") === "root note mock content\n", "materialized resource content should match the Graph original", read.result);
+
+    const otherScope = createMcpClient({ ONEDRIVE_TEST_AUTH_CONTEXT_ID: "other-auth-context" }, "materialized-other-scope");
+    try {
+      await otherScope.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "materialized-other-scope", version: "1" } });
+      const denied = await otherScope.request("resources/read", { uri: resourceLink.uri });
+      assert(denied.error && /not found|expired/iu.test(denied.error.message || ""), "another auth scope must not read the materialized resource", denied);
+    } finally {
+      await otherScope.close();
+    }
+
+    const rendered = await request("tools/call", { name: "onedrive_render_preview", arguments: { itemId: "quarterly-report", pages: [1, 3], dpi: 96, maxBytes: 4096 } });
+    if (process.platform === "darwin") {
+      assert(
+        !rendered.error
+          && rendered.result?.isError === true
+          && /resource limits/iu.test(rendered.result?.content?.[0]?.text || ""),
+        "a host without enforceable address-space limits must fail rendering closed",
+        rendered
+      );
+      return { resourceUri: resourceLink.uri, sameScopeReadable: true, crossScopeDenied: true, rendererLimitsFailClosed: true };
+    }
+    assert(!rendered.error && rendered.result?.isError !== true, "focused render preview should succeed through the fake bounded renderer", rendered);
+    const images = rendered.result.content?.filter((entry) => entry.type === "image") || [];
+    const renderedPdf = rendered.result.content?.find((entry) => entry.type === "resource_link");
+    assert(images.length === 2 && images.every((entry) => entry.mimeType === "image/png" && Buffer.from(entry.data, "base64").subarray(0, 8).toString("hex") === "89504e470d0a1a0a"), "render preview should return one standard PNG image block per selected page", rendered.result);
+    assert(rendered.result.structuredContent?.renderedPages?.join(",") === "1,3" && renderedPdf?.mimeType === "application/pdf", "render preview should retain selected-page metadata and its PDF resource", rendered.result);
+    assert(!JSON.stringify(rendered.result).includes(mainStorageRoot) && !JSON.stringify(rendered.result).includes("localPath"), "render preview must not disclose local staging paths", rendered.result);
+    return { resourceUri: resourceLink.uri, sameScopeReadable: true, crossScopeDenied: true, renderedPages: images.length };
   });
 
   await check("ChatGPT Work combined search uses ranked metadata-first discovery", async () => {
@@ -5678,7 +6738,7 @@ process.exit(2);
     await tool("onedrive_cache_clear");
     const seeded = await tool("onedrive_get_info", { itemId: "chatgpt-stale-cache" });
     assert(!seeded.isError, "stale ChatGPT cache fixture should seed metadata", seeded);
-    const cachePath = join(mainCacheRoot, "metadata-cache.json");
+    const cachePath = mainMetadataCachePath;
     const staleCache = JSON.parse(readFileSync(cachePath, "utf8"));
     staleCache.updatedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
     staleCache.testStalePadding = "stale-while-revalidate";
@@ -5710,7 +6770,7 @@ process.exit(2);
     assert(warm.value.text.includes("## Worksheet: Data") && warm.value.text.includes("A1\t\tformula=SUM(1,2)"), "warm Excel fetch should preserve worksheet and formula context without a stale cached result", warm.value.text);
     const warmAdded = requests.slice(beforeWarm);
     assert(!warmAdded.some((request) => request.path.endsWith("/content")), "warm Excel fetch should not redownload the workbook", { warmAdded });
-    const cachePath = join(mainCacheRoot, "metadata-cache.json");
+    const cachePath = mainMetadataCachePath;
     const staleCache = JSON.parse(readFileSync(cachePath, "utf8"));
     staleCache.updatedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
     staleCache.testStalePadding = "etag-revalidation";
@@ -5728,9 +6788,21 @@ process.exit(2);
     const before = requests.length;
     const fetched = await tool("fetch", { id: "common-rtf" });
     assert(!fetched.isError, "ChatGPT RTF fetch should succeed", fetched);
-    assert(["local-rtf", "content-index"].includes(fetched.value.metadata?.previewSource), "RTF fetch should use the bounded local extractor or its warmed content-index entry", fetched.value);
+    if (commonTextLimitsUnsupported) {
+      assert(
+        ["graph-text-export", "content-index"].includes(fetched.value.metadata?.previewSource),
+        "RTF fetch must avoid unsafe local extraction when resource limits are unavailable",
+        fetched.value
+      );
+    } else {
+      assert(["local-rtf", "content-index"].includes(fetched.value.metadata?.previewSource), "RTF fetch should use the bounded local extractor or its warmed content-index entry", fetched.value);
+    }
     assert(fetched.value.text.includes("Common file extraction"), "RTF text should be readable", fetched.value.text);
-    assert(fetched.value.text.includes("Budget total: $1,234"), "RTF extractor should preserve figures", fetched.value.text);
+    assert(
+      fetched.value.text.includes(commonTextLimitsUnsupported ? "$1,234" : "Budget total: $1,234"),
+      "RTF response should preserve figures",
+      fetched.value.text
+    );
     const added = requests.slice(before);
     assert(!added.some((request) => request.url.includes("format=text")), "supported local formats should not call Graph text export", { added });
     return { source: fetched.value.metadata.previewSource, text: fetched.value.text };
@@ -5782,7 +6854,7 @@ process.exit(2);
       confirmed: true
     });
     assert(!result.isError, "rename should succeed", result);
-    const cache = JSON.parse(readFileSync(join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json"), "utf8"));
+    const cache = JSON.parse(readFileSync(mainMetadataCachePath, "utf8"));
     assert(!Object.hasOwn(cache.pathsByLower, "delete-me.txt"), "old cache path key should be removed", cache.pathsByLower);
     assert(cache.pathsByLower["renamed-cache.txt"] === "delete-target", "new cache path key should be present", cache.pathsByLower);
     return { paths: cache.pathsByLower };
@@ -5792,7 +6864,7 @@ process.exit(2);
     await tool("onedrive_cache_clear");
     const scanResult = await tool("onedrive_scan", { itemId: "folder-a", maxItems: 10, maxFolders: 5, maxDepth: 1 });
     assert(!scanResult.isError, "scan should seed folder descendants", scanResult);
-    let cache = JSON.parse(readFileSync(join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json"), "utf8"));
+    let cache = JSON.parse(readFileSync(mainMetadataCachePath, "utf8"));
     assert(cache.pathsByLower["folder a/deep summary deck.pptx"] === "deep-deck", "expected descendant cache path before rename", cache.pathsByLower);
 
     const renamed = await toolWithPreview("onedrive_rename", {
@@ -5803,7 +6875,7 @@ process.exit(2);
       confirmed: true
     });
     assert(!renamed.isError, "folder rename should succeed", renamed);
-    cache = JSON.parse(readFileSync(join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json"), "utf8"));
+    cache = JSON.parse(readFileSync(mainMetadataCachePath, "utf8"));
     assert(!Object.hasOwn(cache.pathsByLower, "folder a/deep summary deck.pptx"), "folder rename should remove stale descendant cache path", cache.pathsByLower);
     assert(cache.pathsByLower["folder renamed"] === "folder-a", "folder rename should cache the renamed folder path", cache.pathsByLower);
     assert(cache.pathsByLower["folder renamed/deep summary deck.pptx"] === "deep-deck", "folder rename should preserve descendants at their new path", cache.pathsByLower);
@@ -5821,7 +6893,7 @@ process.exit(2);
       confirmed: true
     });
     assert(!moved.isError, "batch_move should succeed", moved);
-    const cache = JSON.parse(readFileSync(join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json"), "utf8"));
+    const cache = JSON.parse(readFileSync(mainMetadataCachePath, "utf8"));
     assert(!Object.hasOwn(cache.pathsByLower, "root-note.txt"), "batch_move should remove stale source cache path", cache.pathsByLower);
     assert(cache.pathsByLower["folder a/root-note.txt"] === "root-note", "batch_move should cache destination path", cache.pathsByLower);
     const content = await tool("onedrive_content_search", { query: "mock content", maxResults: 5 });
@@ -5929,7 +7001,7 @@ process.exit(2);
     assert(batched.value.summary.searchTermsExecuted === 2, "test should execute multiple search terms", batched.value.summary);
     assert(batched.value.summary.metadataCacheWrites === 1, "accepted live search results should persist in one cache write", batched.value.summary);
 
-    const cacheFile = join(mockHome, ".codex", "onedrive-plugin", "cache", "metadata-cache.json");
+    const cacheFile = mainMetadataCachePath;
     const validCache = readFileSync(cacheFile, "utf8");
     writeFileSync(cacheFile, "{invalid-cache-json");
     const liveOnly = await tool("onedrive_find", {
@@ -6217,19 +7289,30 @@ process.exit(2);
     return { count: entries.length, tools, auditExported: true };
   });
 
+  await check("mutation audit rotation enforces a bounded active and retained generation", async () => {
+    writeFileSync(mainAuditPath, Buffer.alloc(8 * 1024 * 1024 + 1, 0x41), { mode: 0o600 });
+    const result = await tool("onedrive_create_folder", { name: "Audit Rotation Trigger", conflictBehavior: "fail" });
+    assert(!result.isError, "audit rotation trigger mutation failed", result);
+    assert(statSync(mainAuditPath).size <= 8 * 1024 * 1024, "active audit log must remain below its hard cap", statSync(mainAuditPath));
+    assert(!existsSync(`${mainAuditPath}.1`), "an already-oversized legacy active log must not be retained as a rotated generation", {});
+    return { activeBytes: statSync(mainAuditPath).size, retainedOversizedGeneration: false };
+  });
+
   await check("plugin-managed OneDrive data is private on disk", async () => {
     const storage = join(mockHome, ".codex", "onedrive-plugin");
     const paths = {
       storage,
       cache: join(storage, "cache"),
       audit: join(storage, "audit"),
-      metadata: join(storage, "cache", "metadata-cache.json"),
-      contentIndex: join(storage, "cache", "content-index.json"),
-      auditLog: join(storage, "audit", "mutations.jsonl"),
+      scopedCache: mainScopedCacheRoot,
+      scopedAudit: mainScopedAuditRoot,
+      metadata: mainMetadataCachePath,
+      contentIndex: mainContentIndexPath,
+      auditLog: mainAuditPath,
       exportedPdf: mockExportPdf
     };
     const mode = (path) => statSync(path).mode & 0o777;
-    for (const path of [paths.storage, paths.cache, paths.audit]) {
+    for (const path of [paths.storage, paths.cache, paths.audit, paths.scopedCache, paths.scopedAudit]) {
       assert(mode(path) === 0o700, `private directory mode should be 0700: ${path}`, { path, mode: mode(path).toString(8) });
     }
     for (const path of [paths.metadata, paths.contentIndex, paths.auditLog, paths.exportedPdf]) {
@@ -6239,8 +7322,8 @@ process.exit(2);
   });
 
   await check("successful remote mutation reports local bookkeeping failure as a warning", async () => {
-    const auditDirectory = join(mockHome, ".codex", "onedrive-plugin", "audit");
-    const auditLogPath = join(auditDirectory, "mutations.jsonl");
+    const auditDirectory = mainScopedAuditRoot;
+    const auditLogPath = mainAuditPath;
     const previousAuditLog = readFileSync(auditLogPath);
     rmSync(auditDirectory, { recursive: true, force: true });
     writeFileSync(auditDirectory, "blocks audit directory creation", "utf8");
@@ -6280,9 +7363,9 @@ process.exit(2);
       capabilities
     });
     assert(resolve(status.value.storageRoot) === resolve(mainStorageRoot), "main server storage must remain under the per-run root", status.value);
-    assert(resolve(status.value.cachePath) === resolve(join(mainCacheRoot, "metadata-cache.json")), "main server cache must remain under the per-run root", status.value);
-    assert(resolve(status.value.contentIndexPath) === resolve(join(mainCacheRoot, "content-index.json")), "main server content index must remain under the per-run root", status.value);
-    assert(capabilities.value.runtime.pythonPath === officeTestPython, "Office probes must ignore an inherited Python override", capabilities.value.runtime);
+    assert(resolve(status.value.cachePath) === resolve(mainMetadataCachePath), "main server cache must remain in the current hashed scope directory", status.value);
+    assert(resolve(status.value.contentIndexPath) === resolve(mainContentIndexPath), "main server content index must remain in the current hashed scope directory", status.value);
+    assert(capabilities.value.runtime.pythonPath !== hostilePaths.officePython, "Office probes must ignore an inherited Python override", capabilities.value.runtime);
     assert(!existsSync(hostilePaths.officePythonExecuted), "inherited Office Python executable must never run", hostilePaths);
     const currentSnapshot = snapshotTree(hostileInheritedRoot);
     assert(JSON.stringify(currentSnapshot) === JSON.stringify(hostileInheritedSnapshot), "hostile inherited state roots were modified", {

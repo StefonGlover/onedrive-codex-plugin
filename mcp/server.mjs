@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync, spawn } from "node:child_process";
-import { createReadStream, createWriteStream, readFileSync } from "node:fs";
+import { constants, createReadStream, createWriteStream, readFileSync } from "node:fs";
 import { appendFile, chmod, copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename as renameFile, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, parse, relative, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -17,6 +17,23 @@ import { addSemanticAnchors, resolveSemanticOperations } from "./semantic-anchor
 import { applyTextPatch, boundedLineDiff, decodeTextBuffer } from "./text-patch.mjs";
 import { createAuthVault } from "./auth-vault.mjs";
 import { oauthChallenge, oauthSettings, toolSecuritySchemes } from "./oauth.mjs";
+import { createMaterializedResourceRegistry, renderPdfPages } from "./materialized-resources.mjs";
+import { createManagedArtifactQuota } from "./managed-artifact-quota.mjs";
+import {
+  assertReusableHeavyweightSubprocessLease,
+  heavyweightSubprocessAdmission,
+  heavyweightSubprocessBusyError
+} from "./heavyweight-subprocess-admission.mjs";
+import {
+  LOCAL_STATE_LIMITS,
+  boundContentIndex,
+  boundContentIndexEntry,
+  boundMetadataCache,
+  boundedJsonByteLength,
+  boundedUtf8Prefix,
+  createContentIndexAdmissionLedger,
+  scopedStateDirectoriesToEvict
+} from "./bounded-local-state.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, "..");
@@ -29,25 +46,32 @@ const localConfig = readLocalConfig();
 const storageRoot = resolve(process.env.ONEDRIVE_STORAGE_ROOT || localConfig.storageRoot || defaultStorageRoot);
 const downloadRoot = join(storageRoot, "downloads");
 const cacheRoot = resolve(process.env.ONEDRIVE_CACHE_ROOT || localConfig.cacheRoot || join(storageRoot, "cache"));
-const cachePath = join(cacheRoot, "metadata-cache.json");
-const contentIndexPath = join(cacheRoot, "content-index.json");
-const metadataCacheLockPath = join(cacheRoot, "metadata-cache.lock");
-const contentIndexLockPath = join(cacheRoot, "content-index.lock");
 const updateRoot = join(storageRoot, "updates");
 const backupRoot = join(storageRoot, "backups");
 const auditRoot = join(storageRoot, "audit");
-const auditPath = join(auditRoot, "mutations.jsonl");
-const auditLockPath = join(auditRoot, "mutations.lock");
 const officeEditingRoot = join(storageRoot, "office-editing");
 const chatgptUploadRoot = join(storageRoot, "chatgpt-uploads");
 const workspaceStateRoot = join(storageRoot, "workspaces");
 const managedWorkspaceRootName = "Codex Editing Drafts";
 const watchStateRoot = join(storageRoot, "watches");
+const materializedResourceRoot = join(storageRoot, "materialized-resources");
+const materializedMaxBytes = 25 * 1024 * 1024;
 const officeHelperPath = join(pluginRoot, "scripts", "office-openxml.py");
 const commonTextHelperPath = join(pluginRoot, "scripts", "common-text.py");
 const officePythonPath = process.env.ONEDRIVE_OFFICE_PYTHON || localConfig.officeEditing?.pythonPath || "/usr/bin/python3";
 const maxOfficePackageBytes = 250 * 1024 * 1024;
+const maxGraphDownloadBytes = 250 * 1024 * 1024;
+const maxComparisonVersionBytes = 64 * 1024 * 1024;
+const maxTextComparisonBytes = 8 * 1024 * 1024;
+const maxTextComparisonLines = 100_000;
 const maxCommonExtractionBytes = 100 * 1024 * 1024;
+const managedBackupMaxEntries = 128;
+const managedBackupMaxBytes = 2 * 1024 * 1024 * 1024;
+const managedBackupMaxEntriesPerScope = 64;
+const managedBackupMaxBytesPerScope = 1024 * 1024 * 1024;
+const managedBackupManifestAllowanceBytes = 64 * 1024;
+const auditLogMaxBytes = 8 * 1024 * 1024;
+const auditRecordMaxBytes = 64 * 1024;
 const localOneDriveSyncRoots = [
   { path: join(homedir(), "Library", "CloudStorage", "OneDrive"), prefix: false },
   { path: join(homedir(), "Library", "CloudStorage", "OneDrive-"), prefix: true },
@@ -68,6 +92,10 @@ const chatgptInitialFetchTextByteLimit = 32 * 1024;
 const chatgptFetchChunkByteLimit = 64 * 1024;
 const chatgptFetchSnapshotTtlMs = 10 * 60 * 1000;
 const chatgptFetchSnapshotMaxEntries = 32;
+const chatgptFetchSnapshotMaxScopes = 8;
+const enterpriseDriveItemIdPrefix = "onedrive-drive-item:";
+const enterpriseDriveItemIdMaxLength = 4096;
+const enterpriseDriveItemPartMaxLength = 1024;
 const chatgptStaleCacheMaxAgeSeconds = 24 * 60 * 60;
 const chatgptRevalidationCooldownMs = 30 * 1000;
 const chatgptFileBlockedIpv4Addresses = new BlockList();
@@ -149,6 +177,7 @@ const canonicalTextMimeTypes = new Map([
   [".yml", "application/yaml"]
 ]);
 const searchTombstoneTtlMs = 24 * 60 * 60 * 1000;
+const scopedCacheDirectoryPattern = /^[0-9a-f]{64}$/;
 const officeKinds = {
   excel: {
     label: "Excel",
@@ -192,32 +221,60 @@ let tokenRefreshPromise = null;
 let authGeneration = 0;
 let deviceLoginGeneration = 0;
 let storageScopeGeneration = 0;
-let metadataCacheMemory = null;
-let contentIndexMemory = null;
-let metadataCacheMemoryGeneration = null;
-let contentIndexMemoryGeneration = null;
-let metadataCacheLoadPromise = null;
-let contentIndexLoadPromise = null;
-let metadataCacheLoadGeneration = null;
-let contentIndexLoadGeneration = null;
-let metadataCacheFileVersion = null;
-let contentIndexFileVersion = null;
-let metadataMutationQueue = Promise.resolve();
-let contentIndexMutationQueue = Promise.resolve();
+const metadataRuntimeStates = new Map();
+const contentIndexRuntimeStates = new Map();
 let activeStorageScopePromise = null;
 let activeStorageScopeKey = null;
 let activeStorageScopeGeneration = null;
 const testAuthContextId = process.env.ONEDRIVE_TEST_AUTH_CONTEXT_ID || randomUUID();
 
-const previewTokens = new Map();
-const watchTimers = new Map();
+const previewTokensByScope = new Map();
+const watchTimersByScope = new Map();
 const excelSessionPool = new Map();
-const chatgptFetchSnapshots = new Map();
+const chatgptFetchSnapshotsByScope = new Map();
 const chatgptRevalidations = new Map();
 const chatgptRevalidationLastStartedAt = new Map();
 const chatgptCacheWarmStates = new Map();
-let watchesLoaded = false;
+const loadedWatchScopes = new Set();
+const materializedResourceBindings = new Map();
+const managedBackupQuota = createManagedArtifactQuota({
+  storageRoot,
+  categoryRoots: [backupRoot],
+  maxEntries: managedBackupMaxEntries,
+  maxBytes: managedBackupMaxBytes,
+  perScopeRoot: backupRoot,
+  maxEntriesPerScope: managedBackupMaxEntriesPerScope,
+  maxBytesPerScope: managedBackupMaxBytesPerScope,
+  quotaLabel: "Plugin-managed backup",
+  cleanupInstruction: "In the focused profile, list backups with onedrive_read_actions operation officeBackups, then preview and commit deleteOfficeBackups. Local full-profile clients may use onedrive_office_backups with deleteBackupIds and confirmed true."
+});
+let managedBackupReconciliationError = null;
+const managedBackupReconciliation = managedBackupQuota.reconcile().catch((error) => {
+  managedBackupReconciliationError = error;
+  return null;
+});
+let materializedResources = null;
+function materializedResourceRegistry() {
+  if (!materializedResources) {
+    materializedResources = createMaterializedResourceRegistry({
+      rootDir: materializedResourceRoot,
+      ttlMs: 10 * 60 * 1000,
+      maxEntriesPerScope: 32,
+      maxBytesPerScope: 32 * 1024 * 1024,
+      maxEntries: 32,
+      maxReadBytes: materializedMaxBytes,
+      maxTotalBytes: 128 * 1024 * 1024,
+      onRemove: ({ uri, scopeKey }) => {
+        const binding = materializedResourceBindings.get(uri);
+        if (binding?.scopeKey === scopeKey) materializedResourceBindings.delete(uri);
+      }
+    });
+  }
+  return materializedResources;
+}
 const previewTokenTtlMs = 15 * 60 * 1000;
+const previewTokenMaxScopes = 8;
+const previewTokenMaxPerScope = 512;
 const previewScopedTools = new Set([
   "onedrive_preview_actions", "onedrive_commit_actions", "onedrive_export_file",
   "onedrive_upload", "onedrive_upload_file", "onedrive_write_text", "onedrive_batch_delete", "onedrive_delete", "onedrive_permanent_delete",
@@ -225,7 +282,7 @@ const previewScopedTools = new Set([
   "onedrive_create_sharing_link", "onedrive_invite_permission", "onedrive_revoke_permission",
   "onedrive_batch_revoke_permissions", "onedrive_restore_deleted", "onedrive_word_batch_update",
   "onedrive_excel_batch_update", "onedrive_powerpoint_batch_update", "onedrive_office_batch_transform",
-  "onedrive_office_restore_backup", "onedrive_patch_text", "onedrive_restore_version",
+  "onedrive_office_restore_backup", "onedrive_office_review", "onedrive_download_file", "onedrive_render_preview", "onedrive_patch_text", "onedrive_restore_version",
   "onedrive_workspace_create", "onedrive_workspace_promote", "onedrive_workspace_abandon"
 ]);
 const partialBatchMutationWarning = "Batch live mutations are preflighted but not atomic; if a later item fails, earlier remote changes may already have taken effect.";
@@ -279,7 +336,31 @@ const previewTokenSchema = {
   type: "string",
   description: "Same-server action proof, not an auth credential; pass unchanged only to the matching OneDrive live call."
 };
+const localDownloadMaxBytesSchema = {
+  type: "integer",
+  minimum: 1,
+  maximum: maxGraphDownloadBytes,
+  default: maxGraphDownloadBytes,
+  description: "Hard byte cap enforced while streaming and before the temporary file is published."
+};
 const jsonScalarSchema = { anyOf: [{ type: "string" }, { type: "number" }, { type: "boolean" }, { type: "null" }] };
+const excelAddTableRowValuesSchema = {
+  anyOf: [
+    {
+      type: "array",
+      minItems: 1,
+      maxItems: 1000,
+      items: { type: "array", minItems: 1, maxItems: 16384, items: jsonScalarSchema }
+    },
+    {
+      type: "array",
+      minItems: 1,
+      maxItems: 16384,
+      items: jsonScalarSchema
+    }
+  ],
+  description: "Canonical form is a two-dimensional rows array, for example [[\"Applied\", \"Example Co\"]]. A one-dimensional single-row array is accepted and normalized before execution."
+};
 const strictCommand = (required, properties, anyOf) => ({ type: "object", required, properties, ...(anyOf ? { anyOf } : {}), additionalProperties: false });
 const structuredTextPatchOperationSchema = {
   anyOf: [
@@ -363,6 +444,7 @@ const wordOperationsSchema = {
     operationObject(["type", "text"], { type: { const: "setContentControlText" }, contentControlIndex: { type: "integer", minimum: 0 }, id: { type: "string" }, tag: { type: "string" }, text: { type: "string" }, part: { type: "string" } }),
     operationObject(["type", "paragraphIndex", "text", "url"], { type: { const: "addHyperlink" }, paragraphIndex: { type: "integer", minimum: 0 }, text: { type: "string", minLength: 1 }, url: { type: "string", minLength: 1 }, part: { type: "string" } }),
     operationObject(["type", "paragraphIndex", "text"], { type: { const: "addComment" }, paragraphIndex: { type: "integer", minimum: 0 }, text: { type: "string", minLength: 1 }, author: { type: "string", maxLength: 255 }, initials: { type: "string", maxLength: 16 } }),
+    operationObject(["type", "commentId", "expectedText"], { type: { const: "deleteComment" }, commentId: { type: "string", minLength: 1 }, expectedText: { type: "string" }, expectedAuthor: { type: "string" } }),
     operationObject(["type", "rows"], { type: { const: "insertTable" }, afterParagraphIndex: { type: "integer", minimum: 0 }, rows: { type: "array", minItems: 1, maxItems: 100, items: { type: "array", minItems: 1, maxItems: 50, items: { type: "string" } } }, style: { type: "string", minLength: 1 } })
     ,operationObject(["type", "paragraphIndex", "base64", "contentType"], { type: { const: "insertImage" }, paragraphIndex: { type: "integer", minimum: 0 }, base64: { type: "string", minLength: 1, maxLength: 36700160 }, contentType: { type: "string", enum: ["image/png", "image/jpeg", "image/gif", "image/bmp", "image/tiff"] }, width: { type: "integer", minimum: 1 }, height: { type: "integer", minimum: 1 }, altText: { type: "string" }, part: { type: "string" } })
     ,operationObject(["type", "imageIndex", "base64", "contentType"], { type: { const: "replaceImage" }, imageIndex: { type: "integer", minimum: 0 }, base64: { type: "string", minLength: 1, maxLength: 36700160 }, contentType: { type: "string", enum: ["image/png", "image/jpeg", "image/gif", "image/bmp", "image/tiff"] }, part: { type: "string" } })
@@ -391,7 +473,7 @@ const excelOperationsSchema = {
     operationObject(["type", "sheet", "address", "validationType"], { type: { const: "setDataValidation" }, ...excelBaseOperation, validationType: { type: "string", enum: ["whole", "decimal", "list", "date", "time", "textLength", "custom"] }, operator: { type: "string" }, formula1: { type: "string" }, formula2: { type: "string" }, allowBlank: { type: "boolean" } }),
     operationObject(["type", "sheet"], { type: { const: "freezePanes" }, sheet: { type: "string", minLength: 1 }, rows: { type: "integer", minimum: 0, maximum: 1048575 }, columns: { type: "integer", minimum: 0, maximum: 16383 } }),
     operationObject(["type", "sheet", "address", "width"], { type: { const: "setColumnWidth" }, ...excelBaseOperation, width: { type: "number", exclusiveMinimum: 0, maximum: 255 } }),
-    operationObject(["type", "table", "values"], { type: { const: "addTableRow" }, table: { type: "string", minLength: 1 }, index: { type: ["integer", "null"], minimum: 0 }, values: { type: "array", minItems: 1, maxItems: 1000, items: { type: "array", minItems: 1, maxItems: 16384 } } }),
+    operationObject(["type", "table", "values"], { type: { const: "addTableRow" }, table: { type: "string", minLength: 1 }, index: { type: ["integer", "null"], minimum: 0 }, values: excelAddTableRowValuesSchema }),
     operationObject(["type", "table", "index"], { type: { const: "deleteTableRow" }, table: { type: "string", minLength: 1 }, index: { type: "integer", minimum: 0 } }),
     operationObject(["type", "table", "enabled"], { type: { const: "setTableTotals" }, table: { type: "string", minLength: 1 }, enabled: { type: "boolean" }, columns: { type: "array", maxItems: 16384, items: operationObject(["column"], { column: { anyOf: [{ type: "string", minLength: 1 }, { type: "integer", minimum: 0 }] }, function: { type: "string", enum: ["average", "count", "countNums", "custom", "max", "min", "none", "stdDev", "sum", "var"] }, label: { type: "string" }, formula: { type: "string", minLength: 1 } }) } }),
     operationObject(["type", "sheet", "chartType", "sourceData"], { type: { const: "createChart" }, sheet: { type: "string", minLength: 1 }, chartType: { type: "string", enum: ["BarClustered", "ColumnClustered", "Line", "Pie"] }, sourceData: { type: "string", minLength: 1 }, seriesBy: { type: "string", enum: ["Auto", "Columns", "Rows"] }, name: { type: "string", minLength: 1 }, titleText: { type: "string" }, height: { type: "number", exclusiveMinimum: 0 }, width: { type: "number", exclusiveMinimum: 0 }, left: { type: "number", minimum: 0 }, top: { type: "number", minimum: 0 } }),
@@ -414,7 +496,7 @@ const excelOperationsSchema = {
     operationObject(["type", "sheet", "address"], { type: { const: "setAutoFilter" }, ...excelBaseOperation, column: { type: "integer", minimum: 0 }, criteria: { type: "string" }, clear: { type: "boolean" } }),
     operationObject(["type", "sheet", "address", "url"], { type: { const: "setHyperlink" }, ...excelBaseOperation, url: { type: "string", minLength: 1 }, display: { type: "string" } }),
     operationObject(["type", "sheet", "address", "text"], { type: { const: "addNote" }, ...excelBaseOperation, text: { type: "string" }, author: { type: "string" } }),
-    operationObject(["type", "sheet", "address"], { type: { const: "deleteNote" }, ...excelBaseOperation }),
+    operationObject(["type", "sheet", "address", "expectedText"], { type: { const: "deleteNote" }, ...excelBaseOperation, expectedText: { type: "string" }, expectedAuthor: { type: "string" } }),
     operationObject(["type", "sheet", "base64", "contentType", "fromAddress"], { type: { const: "insertImage" }, sheet: { type: "string", minLength: 1 }, base64: { type: "string", minLength: 1, maxLength: 36700160 }, contentType: { type: "string", enum: ["image/png", "image/jpeg"] }, fromAddress: { type: "string" }, toAddress: { type: "string" }, altText: { type: "string" } }),
     operationObject(["type", "sheet", "chart"], { type: { const: "formatChart" }, sheet: { type: "string", minLength: 1 }, chart: { type: "string", minLength: 1 }, titleText: { type: "string" }, legendPosition: { type: "string", enum: ["top", "bottom", "left", "right", "none"] }, style: { type: "integer", minimum: 1, maximum: 48 } }),
     operationObject(["type", "sheet", "enabled"], { type: { const: "setSheetProtection" }, sheet: { type: "string", minLength: 1 }, enabled: { type: "boolean" }, allowSelectLockedCells: { type: "boolean" }, allowSelectUnlockedCells: { type: "boolean" }, allowFormatCells: { type: "boolean" } }),
@@ -988,8 +1070,15 @@ const tools = [
   },
   {
     name: "onedrive_office_capabilities",
-    description: "Report available native Office editing backends, runtime health, account limitations, and supported Open XML formats.",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    description: "Report available native Office editing backends, or return the exact JSON Schema and a valid example for one Word, Excel, or PowerPoint operation.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["word", "excel", "powerpoint"] },
+        operation: { type: "string", minLength: 1 }
+      },
+      additionalProperties: false
+    }
   },
   {
     name: "onedrive_office_validate",
@@ -1112,6 +1201,7 @@ const tools = [
               operations: { anyOf: [wordOperationsSchema, excelOperationsSchema, powerpointOperationsSchema] },
               expectedName: { type: "string" },
               expectedId: { type: "string" },
+              expectedETag: { type: "string" },
               backend: { type: "string", enum: ["auto", "openxml", "graph"], default: "auto" },
               allowMacros: { type: "boolean", default: false }
             },
@@ -1135,7 +1225,16 @@ const tools = [
       properties: {
         itemId: { type: "string", minLength: 1 },
         kind: { type: "string", enum: ["word", "excel", "powerpoint"] },
-        limit: { type: "integer", minimum: 1, maximum: 500, default: 100 }
+        limit: { type: "integer", minimum: 1, maximum: 500, default: 100 },
+        deleteBackupIds: {
+          type: "array",
+          minItems: 1,
+          maxItems: 100,
+          uniqueItems: true,
+          items: { type: "string", pattern: "^[0-9a-fA-F-]{36}$" },
+          description: "Explicit managed Office backup IDs to delete from the current account-and-drive scope."
+        },
+        confirmed: { type: "boolean", default: false, description: "Must be true to delete the selected backup IDs." }
       },
       additionalProperties: false
     }
@@ -1232,6 +1331,7 @@ const tools = [
         ...pathTargetProperties,
         localPath: { type: "string", description: "Optional destination path. Defaults to ~/.codex/onedrive-plugin/downloads/<filename>." },
         overwrite: { type: "boolean", default: false },
+        maxBytes: localDownloadMaxBytesSchema,
         allowLocalOneDriveSyncPath: {
           type: "boolean",
           default: false,
@@ -1251,6 +1351,7 @@ const tools = [
         ...pathTargetProperties,
         localPath: { type: "string", description: "Optional destination path. Defaults to ~/.codex/onedrive-plugin/downloads/excel/<filename>." },
         overwrite: { type: "boolean", default: false },
+        maxBytes: localDownloadMaxBytesSchema,
         allowLocalOneDriveSyncPath: {
           type: "boolean",
           default: false,
@@ -1270,6 +1371,7 @@ const tools = [
         ...pathTargetProperties,
         localPath: { type: "string", description: "Optional destination path. Defaults to ~/.codex/onedrive-plugin/downloads/word/<filename>." },
         overwrite: { type: "boolean", default: false },
+        maxBytes: localDownloadMaxBytesSchema,
         allowLocalOneDriveSyncPath: {
           type: "boolean",
           default: false,
@@ -1289,6 +1391,7 @@ const tools = [
         ...pathTargetProperties,
         localPath: { type: "string", description: "Optional destination path. Defaults to ~/.codex/onedrive-plugin/downloads/powerpoint/<filename>." },
         overwrite: { type: "boolean", default: false },
+        maxBytes: localDownloadMaxBytesSchema,
         allowLocalOneDriveSyncPath: {
           type: "boolean",
           default: false,
@@ -1796,7 +1899,8 @@ const tools = [
             properties: {
               ...pathTargetProperties,
               localPath: { type: "string" },
-              overwrite: { type: "boolean" }
+              overwrite: { type: "boolean" },
+              maxBytes: localDownloadMaxBytesSchema
             },
             additionalProperties: false
           }
@@ -2212,16 +2316,18 @@ const chatgptCompatibilityTools = [
           maxItems: 10,
           items: {
             type: "object",
-            required: ["operation", "itemId"],
+            required: ["operation"],
             properties: {
-              operation: { type: "string", enum: ["rename", "move", "copy", "createSharingLink", "revokePermission"] },
+              operation: { type: "string", enum: ["rename", "move", "copy", "createSharingLink", "revokePermission", "restoreVersion", "deleteOfficeBackups"] },
               itemId: { type: "string", minLength: 1, description: "Opaque same-server OneDrive item ID, not an auth credential." },
               newName: { type: "string", minLength: 1 },
               destinationParentPath: { type: "string" },
               destinationParentItemId: { type: "string", minLength: 1 },
               linkType: { type: "string", enum: ["view", "edit", "embed"], default: "view" },
               scope: { type: "string", enum: ["anonymous", "organization", "users"], default: "anonymous" },
-              permissionId: { type: "string", minLength: 1, description: "Opaque same-server sharing-permission ID, not an auth credential." }
+              permissionId: { type: "string", minLength: 1, description: "Opaque same-server sharing-permission ID, not an auth credential." },
+              versionId: { type: "string", minLength: 1 },
+              backupIds: { type: "array", minItems: 1, maxItems: 100, uniqueItems: true, items: { type: "string", pattern: "^[0-9a-fA-F-]{36}$" } }
             },
             additionalProperties: false
           }
@@ -2245,12 +2351,14 @@ const chatgptCompatibilityTools = [
               operation: { type: "string" },
               itemId: { type: "string" },
               expectedId: { type: "string" },
+              expectedETag: { type: "string" },
               isError: { type: "boolean" },
               dryRun: { type: "boolean" },
               previewTokenPresent: { type: "boolean" },
               previewToken: { type: "string" },
               previewTokenExpiresAt: { type: "string" },
               summary: { type: "string" },
+              version: { type: "object", additionalProperties: true },
               error: { type: "string" },
               accessSummary: {
                 type: "object",
@@ -2277,7 +2385,7 @@ const chatgptCompatibilityTools = [
   {
     name: "onedrive_read_actions",
     title: "Read OneDrive in parallel",
-    description: "Run up to ten independent OneDrive list, search, item-info, or permission reads concurrently in one bounded call.",
+    description: "Run up to ten independent OneDrive, version-history, recent-file, or enterprise-library reads concurrently in one bounded call.",
     inputSchema: {
       type: "object",
       required: ["actions"],
@@ -2290,12 +2398,19 @@ const chatgptCompatibilityTools = [
             type: "object",
             required: ["operation"],
             properties: {
-              operation: { type: "string", enum: ["list", "search", "getInfo", "permissions"] },
+              operation: { type: "string", enum: ["list", "search", "getInfo", "permissions", "recent", "versions", "compareVersion", "drives", "enterpriseSearch", "libraryList", "officeBackups"] },
               query: { type: "string", minLength: 1 },
               path: { type: "string" },
               itemId: { type: "string", minLength: 1 },
+              driveId: { type: "string", minLength: 1 },
+              folderItemId: { type: "string", minLength: 1 },
+              versionId: { type: "string", minLength: 1 },
+              compareToVersionId: { type: "string", minLength: 1 },
+              maxItems: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+              maxChanges: { type: "integer", minimum: 1, maximum: 1000, default: 200 },
               limit: { type: "integer", minimum: 1, maximum: 200, default: 25 },
-              format: { type: "string", enum: ["compact", "full"], default: "compact" }
+              format: { type: "string", enum: ["compact", "full"], default: "compact" },
+              kind: { type: "string", enum: ["word", "excel", "powerpoint"] }
             },
             additionalProperties: false
           }
@@ -2334,18 +2449,21 @@ const chatgptCompatibilityTools = [
           maxItems: 10,
           items: {
             type: "object",
-            required: ["operation", "itemId", "previewToken"],
+            required: ["operation", "previewToken"],
             properties: {
-              operation: { type: "string", enum: ["rename", "move", "copy", "createSharingLink", "revokePermission"] },
+              operation: { type: "string", enum: ["rename", "move", "copy", "createSharingLink", "revokePermission", "restoreVersion", "deleteOfficeBackups"] },
               itemId: { type: "string", minLength: 1 },
               expectedName: { type: "string", minLength: 1 },
+              expectedETag: { type: "string", minLength: 1 },
               newName: { type: "string", minLength: 1 },
               destinationParentPath: { type: "string" },
               destinationParentItemId: { type: "string", minLength: 1 },
               linkType: { type: "string", enum: ["view", "edit", "embed"], default: "view" },
               scope: { type: "string", enum: ["anonymous", "organization", "users"], default: "anonymous" },
               permissionId: { type: "string", minLength: 1 },
-              previewToken: { type: "string", minLength: 1 }
+              versionId: { type: "string", minLength: 1 },
+              previewToken: { type: "string", minLength: 1 },
+              backupIds: { type: "array", minItems: 1, maxItems: 100, uniqueItems: true, items: { type: "string", pattern: "^[0-9a-fA-F-]{36}$" } }
             },
             additionalProperties: false
           }
@@ -2366,6 +2484,105 @@ const chatgptCompatibilityTools = [
           items: { type: "object", additionalProperties: true }
         },
         durationMs: { type: "integer", minimum: 0 }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_office_inspect",
+    title: "Inspect Office file",
+    description: "Read bounded, structured Word, Excel, or PowerPoint content with stable item identity, revision, coordinates, and semantic anchors.",
+    inputSchema: {
+      type: "object",
+      required: ["kind"],
+      anyOf: [{ required: ["itemId"] }, { required: ["path"] }],
+      properties: {
+        kind: { type: "string", enum: ["word", "excel", "powerpoint"] },
+        itemId: { type: "string", minLength: 1 },
+        path: { type: "string", minLength: 1 },
+        driveId: { type: "string", minLength: 1 },
+        paragraphIndexes: { type: "array", maxItems: 100, uniqueItems: true, items: { type: "integer", minimum: 0 } },
+        tableIndexes: { type: "array", maxItems: 50, uniqueItems: true, items: { type: "integer", minimum: 0 } },
+        paragraphStart: { type: "integer", minimum: 0, maximum: 1000000 },
+        includeHeadersFooters: { type: "boolean" },
+        maxParagraphs: { type: "integer", minimum: 1, maximum: 500 },
+        maxTables: { type: "integer", minimum: 1, maximum: 100 },
+        maxTableCells: { type: "integer", minimum: 1, maximum: 10000 },
+        sheetNames: { type: "array", maxItems: 25, uniqueItems: true, items: { type: "string", minLength: 1 } },
+        address: { type: "string", pattern: "^[A-Za-z]{1,3}[1-9][0-9]*(?::[A-Za-z]{1,3}[1-9][0-9]*)?$" },
+        maxCells: { type: "integer", minimum: 1, maximum: 5000 },
+        slideIndexes: { type: "array", maxItems: 100, uniqueItems: true, items: { type: "integer", minimum: 0 } },
+        shapeIds: { type: "array", maxItems: 200, uniqueItems: true, items: { type: ["string", "integer"] } },
+        maxSlides: { type: "integer", minimum: 1, maximum: 100 },
+        maxShapes: { type: "integer", minimum: 1, maximum: 2000 }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_office_review",
+    title: "Review Office file",
+    description: "List, preview, add, or delete evidence-anchored Word comments and Excel notes. Replies, resolution state, and PowerPoint comments are not supported.",
+    inputSchema: {
+      type: "object",
+      required: ["kind", "operation"],
+      anyOf: [{ required: ["itemId"] }, { required: ["path"] }],
+      properties: {
+        kind: { type: "string", enum: ["word", "excel"] },
+        operation: { type: "string", enum: ["list", "add", "delete"] },
+        itemId: { type: "string", minLength: 1 },
+        path: { type: "string", minLength: 1 },
+        paragraphIndex: { type: "integer", minimum: 0 },
+        commentId: { type: "string", minLength: 1 },
+        sheet: { type: "string", minLength: 1 },
+        address: { type: "string", pattern: "^[A-Za-z]{1,3}[1-9][0-9]*$" },
+        text: { type: "string", minLength: 1, maxLength: 10000 },
+        expectedText: { type: "string", maxLength: 10000 },
+        expectedAuthor: { type: "string", maxLength: 255 },
+        author: { type: "string", maxLength: 255 },
+        initials: { type: "string", maxLength: 16 },
+        anchor: { type: "object", additionalProperties: true },
+        dryRun: { type: "boolean", default: true },
+        confirmed: { type: "boolean", default: false },
+        expectedName: { type: "string", minLength: 1 },
+        expectedId: { type: "string", minLength: 1 },
+        expectedETag: { type: "string", minLength: 1 },
+        previewToken: { type: "string", minLength: 1 }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_download_file",
+    title: "Materialize OneDrive file",
+    description: "Materialize one bounded original file or Graph-rendered PDF as a short-lived, scope-bound MCP resource for local inspection.",
+    inputSchema: {
+      type: "object",
+      anyOf: [{ required: ["itemId"] }, { required: ["path"] }],
+      properties: {
+        itemId: { type: "string", minLength: 1 },
+        path: { type: "string", minLength: 1 },
+        driveId: { type: "string", minLength: 1 },
+        format: { type: "string", enum: ["original", "pdf"], default: "original" },
+        maxBytes: { type: "integer", minimum: 1, maximum: 26214400, default: 26214400 }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "onedrive_render_preview",
+    title: "Render OneDrive preview",
+    description: "Render up to eight bounded pages or slides through Graph PDF conversion and return standard MCP image content without exposing local paths.",
+    inputSchema: {
+      type: "object",
+      anyOf: [{ required: ["itemId"] }, { required: ["path"] }],
+      properties: {
+        itemId: { type: "string", minLength: 1 },
+        path: { type: "string", minLength: 1 },
+        driveId: { type: "string", minLength: 1 },
+        pages: { type: "array", minItems: 1, maxItems: 8, uniqueItems: true, items: { type: "integer", minimum: 1 }, default: [1] },
+        dpi: { type: "integer", minimum: 72, maximum: 150, default: 110 },
+        maxBytes: { type: "integer", minimum: 1, maximum: 26214400, default: 26214400 }
       },
       additionalProperties: false
     }
@@ -2481,11 +2698,13 @@ const readOnlyToolNames = new Set([
   "onedrive_content_search",
   "onedrive_office_search",
   "onedrive_office_capabilities",
+  "onedrive_office_inspect",
+  "onedrive_download_file",
+  "onedrive_render_preview",
   "onedrive_office_validate",
   "onedrive_word_get_document",
   "onedrive_excel_get_workbook",
   "onedrive_powerpoint_get_presentation",
-  "onedrive_office_backups",
   "onedrive_office_compare_backup",
   "onedrive_get_info",
   "onedrive_read_text",
@@ -2514,7 +2733,9 @@ const destructiveToolNames = new Set([
   "onedrive_excel_batch_update",
   "onedrive_powerpoint_batch_update",
   "onedrive_office_batch_transform",
+  "onedrive_office_review",
   "onedrive_office_restore_backup",
+  "onedrive_office_backups",
   "onedrive_download",
   "onedrive_download_excel",
   "onedrive_download_word",
@@ -2594,7 +2815,11 @@ const chatgptToolNames = new Set([
   "onedrive_read_actions",
   "onedrive_commit_actions",
   "onedrive_office_capabilities",
+  "onedrive_office_inspect",
   "onedrive_office_batch_transform",
+  "onedrive_office_review",
+  "onedrive_download_file",
+  "onedrive_render_preview",
   "onedrive_upload_file",
   "onedrive_export_file",
   "onedrive_write_text",
@@ -2637,12 +2862,12 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "OneDrive files ready"
   },
   onedrive_preview_actions: {
-    description: "Use this when the user wants to preview one or more independent rename, move, copy, sharing-link, or permission-revocation actions. Preview all actions once; this read-only batch returns same-server proofs for onedrive_commit_actions.",
+    description: "Use this when the user wants to preview one or more independent rename, move, copy, sharing-link, permission-revocation, or version-restore actions. Preview all actions once; this read-only batch returns same-server proofs for onedrive_commit_actions.",
     invoking: "Previewing OneDrive actions…",
     invoked: "OneDrive previews ready"
   },
   onedrive_read_actions: {
-    description: "Use this when a request needs one or more folder listings, descriptive searches, item-info reads, or permission inspections. Send all independent operations once so OneDrive can run them concurrently; use fetch only for selected readable content.",
+    description: "Use this for bounded folder listings, descriptive searches, item-info reads, permission inspections, recent files and versions, or enterprise drive/library discovery. Send independent operations once so OneDrive can run them concurrently; preserve driveId and itemId for read-only cross-library results.",
     invoking: "Reading OneDrive in parallel…",
     invoked: "OneDrive reads ready"
   },
@@ -2657,14 +2882,34 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "Folder listing ready"
   },
   onedrive_office_capabilities: {
-    description: "Use this when preparing to edit a Word, Excel, or PowerPoint file and the supported structured operations must be checked before the edit.",
+    description: "Use this before an unfamiliar Office edit. Pass kind plus operation for its exact schema and valid example, or omit both for backend/runtime availability.",
     invoking: "Checking Office capabilities…",
     invoked: "Office capabilities ready"
+  },
+  onedrive_office_inspect: {
+    description: "Use this to read bounded structured Word, Excel, or PowerPoint evidence before editing or review. Pass kind, an exact item target, and only the selectors needed; retain the returned stable ID, eTag, coordinates, and anchors.",
+    invoking: "Inspecting Office file…",
+    invoked: "Office inspection ready"
   },
   onedrive_office_batch_transform: {
     description: "Use this when the user wants structured edits across one or more Word, Excel, or PowerPoint files. Read each file with fetch first, check Office capabilities, and preview before confirmation. Excel value/formula edits clear stale formula caches and schedule full calculation when Excel opens; the plugin does not evaluate formulas server-side.",
     invoking: "Preparing Office changes…",
     invoked: "Office change result ready"
+  },
+  onedrive_office_review: {
+    description: "Use this to list or manage evidence-anchored Word comments and Excel notes. List first; add/delete are preview-gated and require exact coordinates or IDs. Replies, resolution state, and PowerPoint comments are unavailable.",
+    invoking: "Reviewing Office feedback…",
+    invoked: "Office review ready"
+  },
+  onedrive_download_file: {
+    description: "Use this when local QA needs a materialized original file or PDF. It returns a short-lived, account-and-drive-scoped MCP resource; never expose or invent a host file path.",
+    invoking: "Materializing OneDrive file…",
+    invoked: "OneDrive file ready"
+  },
+  onedrive_render_preview: {
+    description: "Use this for visual QA of bounded pages or slides. It converts through Microsoft Graph, renders selected pages, and returns standard MCP image content; keep page count and DPI minimal.",
+    invoking: "Rendering OneDrive preview…",
+    invoked: "OneDrive preview ready"
   },
   onedrive_upload_file: {
     description: "Use this when the user wants to upload a ChatGPT-provided file to OneDrive. Preview first; replacement requires the existing item's expected identity and explicit confirmation.",
@@ -2882,7 +3127,7 @@ function compactChatgptToolDescriptor(tool) {
     if (itemProperties) {
       itemProperties.path.description = "Office file path relative to OneDrive root.";
       itemProperties.itemId.description = "Opaque same-server OneDrive item ID; pass unchanged.";
-      itemProperties.operations.description = "Operation objects from onedrive_office_capabilities; full schemas are validated server-side.";
+      itemProperties.operations.description = "Operation objects from onedrive_office_capabilities; full schemas are validated server-side. Excel addTableRow requires table and values; canonical values are two-dimensional rows (for example [[\"Applied\", \"Example Co\"]]), while a one-dimensional single row is normalized safely.";
       itemProperties.expectedName.description = "Current file name; provide this or expectedId for a live action.";
       itemProperties.expectedId.description = "Current file ID; provide this or expectedName for a live action.";
     }
@@ -2903,16 +3148,24 @@ function selectedToolProfile(env = process.env) {
 }
 
 const toolProfile = selectedToolProfile();
+// Transports must validate the profile that was selected when this module was
+// evaluated. In particular, Streamable HTTP must never wrap the local-only
+// full profile, whose maintenance tools intentionally accept filesystem paths.
+export { toolProfile as activeToolProfile };
 const advertisedTools = toolProfile === "chatgpt"
   ? executableTools.filter((tool) => chatgptToolNames.has(tool.name)).map(compactChatgptToolDescriptor)
   : tools;
+const advertisedToolNames = new Set(advertisedTools.map((tool) => tool.name));
+const callableToolNames = toolProfile === "chatgpt"
+  ? advertisedToolNames
+  : new Set(executableTools.map((tool) => tool.name));
 const advertisedContractHash = createHash("sha256").update(JSON.stringify(advertisedTools)).digest("hex").slice(0, 12);
 const manifestServerVersion = pluginManifest.version || "0.1.0";
 const advertisedServerVersion = toolProfile === "chatgpt"
   ? `${manifestServerVersion}${manifestServerVersion.includes("+") ? "." : "+"}chatgpt.${advertisedContractHash}`
   : manifestServerVersion;
 const serverInstructions = toolProfile === "chatgpt"
-  ? "Use onedrive_read_actions once for folder listings, descriptive search, item info, permission inspection, or any combination of independent reads; pass the whole read intent as one bounded operations array, then fetch selected ids unchanged when readable content is needed. For rename/move/copy/sharing/revoke requests, use onedrive_preview_actions once for all independent actions; after user approval, pass those exact actions and proofs once to onedrive_commit_actions. Commit handles one or many actions, is ordered, guarded, non-atomic, stops on the first error by default, and returns verified stable results. Use onedrive_open_files once for exact filenames/content. Opaque item/permission ids and preview proofs are same-server identifiers, not credentials. Prefer user-visible paths plus expectedName; use opaque ids only without a path. Create folders directly with conflictBehavior fail. Dependent actions whose target changes must still be previewed and committed in dependency order because later proofs can become stale. For Office edits, fetch, check capabilities, then transform; use onedrive_export_file for a converted PDF or text copy saved in OneDrive."
+  ? "Use onedrive_read_actions once for bounded folder/search/info/permission reads, recent files, versions, enterprise drive/library discovery, or any combination of independent reads; pass the whole read intent as one bounded operations array, then fetch selected default-drive ids unchanged. Enterprise results remain read-only: preserve both driveId and itemId for focused inspect/download calls. For rename/move/copy/sharing/revoke/version-restore requests, use onedrive_preview_actions once for all actions, then after approval pass the exact actions and proofs once to onedrive_commit_actions. Commit is ordered, guarded, non-atomic, stops on the first error by default, and returns verified stable results. Use onedrive_open_files once for exact filenames/content. Opaque ids and preview proofs are same-server identifiers, not credentials. Prefer user-visible paths plus expectedName; use opaque ids only without a path. Create folders directly with conflictBehavior fail. Dependent actions must be previewed and committed in dependency order because later proofs can become stale. For Office work, inspect bounded structure, request the exact capability schema, then transform; list review evidence before changing comments or notes. Use download/render for visual QA. Use onedrive_export_file for a PDF or text copy saved in OneDrive."
   : "Use onedrive_find for normal OneDrive lookup and the matching structured read tool before an Office edit. Use onedrive_list only for direct folder listings. Keep results bounded. Locate an item before changing it. Mutations default to preview and require confirmation.";
 
 const toolByName = new Map(executableTools.map((tool) => [tool.name, tool]));
@@ -3076,10 +3329,42 @@ function validateSchemaValue(value, schema = {}, path = "$") {
   return { ok: details.length === 0, value: normalized, details };
 }
 
+function normalizeExcelAddTableRowOperations(operations) {
+  if (!Array.isArray(operations)) return operations;
+  return operations.map((operation) => {
+    if (
+      !operation
+      || operation.type !== "addTableRow"
+      || !Array.isArray(operation.values)
+      || operation.values.length === 0
+      || operation.values.some(Array.isArray)
+    ) {
+      return operation;
+    }
+    return { ...operation, values: [operation.values] };
+  });
+}
+
+function normalizeOfficeToolArguments(name, args = {}) {
+  if (name === "onedrive_excel_batch_update") {
+    return { ...args, operations: normalizeExcelAddTableRowOperations(args.operations) };
+  }
+  if (name === "onedrive_office_batch_transform" && Array.isArray(args.items)) {
+    return {
+      ...args,
+      items: args.items.map((item) => item?.kind === "excel"
+        ? { ...item, operations: normalizeExcelAddTableRowOperations(item.operations) }
+        : item)
+    };
+  }
+  return args;
+}
+
 function validateToolArguments(name, args = {}) {
   const tool = toolByName.get(name);
   if (!tool) return { ok: true, args };
-  const result = validateSchemaValue(args || {}, tool.inputSchema || { type: "object" }, "$");
+  const normalizedArgs = normalizeOfficeToolArguments(name, args || {});
+  const result = validateSchemaValue(normalizedArgs, tool.inputSchema || { type: "object" }, "$");
   if (result.ok) {
     const pairedFields = [
       ["relativePath", "preset"],
@@ -3165,20 +3450,20 @@ function invalidateActiveStorageScope() {
   activeStorageScopePromise = null;
   activeStorageScopeKey = null;
   activeStorageScopeGeneration = null;
-  metadataCacheMemory = null;
-  contentIndexMemory = null;
-  metadataCacheMemoryGeneration = null;
-  contentIndexMemoryGeneration = null;
-  metadataCacheLoadPromise = null;
-  contentIndexLoadPromise = null;
-  metadataCacheLoadGeneration = null;
-  contentIndexLoadGeneration = null;
-  metadataCacheFileVersion = null;
-  contentIndexFileVersion = null;
-  previewTokens.clear();
-  chatgptFetchSnapshots.clear();
+  metadataRuntimeStates.clear();
+  contentIndexRuntimeStates.clear();
+  previewTokensByScope.clear();
+  chatgptFetchSnapshotsByScope.clear();
   chatgptRevalidations.clear();
   chatgptRevalidationLastStartedAt.clear();
+  for (const timers of watchTimersByScope.values()) {
+    for (const timer of timers.values()) clearTimeout(timer);
+  }
+  watchTimersByScope.clear();
+  loadedWatchScopes.clear();
+  materializedResources?.close();
+  materializedResources = null;
+  materializedResourceBindings.clear();
 }
 
 function accountContextChangedError(operation = "OneDrive operation") {
@@ -3230,11 +3515,86 @@ function storageScopeKey(scope) {
   return scope?.authContextId && scope?.driveId ? `${scope.authContextId}:${scope.driveId}` : null;
 }
 
-function scopedStatePath(root, scope) {
+function storageScopeOpaqueId(scope) {
   const key = storageScopeKey(scope);
   if (!key) throw new Error("A complete authentication-context and drive scope is required for local state.");
-  const opaqueScope = createHash("sha256").update(key).digest("hex");
-  return join(root, `${opaqueScope}.json`);
+  return createHash("sha256").update(key).digest("hex");
+}
+
+function scopedStateDirectory(root, scope) {
+  const resolvedRoot = resolve(root);
+  const directory = resolve(resolvedRoot, storageScopeOpaqueId(scope));
+  if (dirname(directory) !== resolvedRoot) throw new Error("Refusing an unsafe OneDrive local-state scope path.");
+  return directory;
+}
+
+function scopedStatePath(root, scope, name = "state.json") {
+  if (basename(name) !== name || !name) throw new Error("Refusing an unsafe OneDrive local-state filename.");
+  return join(scopedStateDirectory(root, scope), name);
+}
+
+function scopedStoragePaths(scope) {
+  const scopedCacheRoot = scopedStateDirectory(cacheRoot, scope);
+  const scopedAuditRoot = scopedStateDirectory(auditRoot, scope);
+  return {
+    scopeId: storageScopeOpaqueId(scope),
+    cacheRoot: scopedCacheRoot,
+    cachePath: join(scopedCacheRoot, "metadata-cache.json"),
+    metadataCacheLockPath: join(scopedCacheRoot, "metadata-cache.lock"),
+    contentIndexPath: join(scopedCacheRoot, "content-index.json"),
+    contentIndexLockPath: join(scopedCacheRoot, "content-index.lock"),
+    auditRoot: scopedAuditRoot,
+    auditPath: join(scopedAuditRoot, "mutations.jsonl"),
+    auditLockPath: join(scopedAuditRoot, "mutations.lock"),
+    downloadRoot: scopedStateDirectory(downloadRoot, scope),
+    updateRoot: scopedStateDirectory(updateRoot, scope),
+    backupRoot: scopedStateDirectory(backupRoot, scope),
+    officeEditingRoot: scopedStateDirectory(officeEditingRoot, scope),
+    chatgptUploadRoot: scopedStateDirectory(chatgptUploadRoot, scope),
+    workspaceStatePath: scopedStatePath(workspaceStateRoot, scope),
+    watchStatePath: scopedStatePath(watchStateRoot, scope)
+  };
+}
+
+function createScopedRuntimeState() {
+  return {
+    memory: null,
+    memoryGeneration: null,
+    loadPromise: null,
+    loadGeneration: null,
+    fileVersion: null,
+    mutationQueue: Promise.resolve(),
+    pendingMutations: 0
+  };
+}
+
+function pruneScopedRuntimeStates(states) {
+  while (states.size >= LOCAL_STATE_LIMITS.runtimeScopes) {
+    const evictable = [...states.entries()].find(([, candidate]) => !candidate.loadPromise && !candidate.pendingMutations);
+    if (!evictable) {
+      const error = new Error("The bounded OneDrive local-state scope cache is busy. Retry after another request finishes.");
+      error.code = "RESOURCE_EXHAUSTED";
+      error.retryable = true;
+      throw error;
+    }
+    states.delete(evictable[0]);
+  }
+}
+
+function scopedRuntimeState(states, guard, operation = "OneDrive local-state operation") {
+  assertStorageScopeGuard(guard, operation);
+  const key = storageScopeKey(guard.scope);
+  let state = states.get(key);
+  if (!state) {
+    pruneScopedRuntimeStates(states);
+    state = createScopedRuntimeState();
+    states.set(key, state);
+  } else {
+    // Map order is the deterministic least-recently-used eviction order.
+    states.delete(key);
+    states.set(key, state);
+  }
+  return state;
 }
 
 function assertStorageScopeGuard(guard, operation = "OneDrive local-state operation") {
@@ -3258,6 +3618,36 @@ async function captureStorageScopeGuard(operation = "OneDrive local-state operat
   const generation = storageScopeGeneration;
   const scope = await activeStorageScope();
   return assertStorageScopeGuard({ generation, scope }, operation);
+}
+
+function assertRequestDriveScopeGuard(guard, operation = "OneDrive exact-drive local-state operation") {
+  assertToolAccountGeneration(operation);
+  if (!guard?.scope
+    || guard.authGeneration !== authGeneration
+    || guard.storageGeneration !== storageScopeGeneration
+    || currentAuthContextId() !== guard.scope.authContextId) {
+    throw accountContextChangedError(operation);
+  }
+  return guard;
+}
+
+async function captureRequestDriveScopeGuard(driveId, operation = "OneDrive exact-drive local-state operation") {
+  assertToolAccountGeneration(operation);
+  const authContextId = currentAuthContextId();
+  if (!authContextId) throw new Error("OneDrive authentication context is unavailable. Refusing to use account-scoped local state.");
+  const requestedDriveId = String(driveId || "").trim();
+  const resolvedDriveId = requestedDriveId || (await activeStorageScope()).driveId;
+  if (!resolvedDriveId) throw new Error("A source drive ID is required for drive-scoped local state.");
+  return assertRequestDriveScopeGuard({
+    authGeneration,
+    storageGeneration: storageScopeGeneration,
+    scope: { authContextId, driveId: resolvedDriveId }
+  }, operation);
+}
+
+async function currentScopedStoragePaths(operation = "OneDrive local-state path resolution") {
+  const guard = await captureStorageScopeGuard(operation);
+  return { guard, paths: scopedStoragePaths(guard.scope) };
 }
 
 async function activeStorageScope() {
@@ -3344,8 +3734,7 @@ function pluginSettings() {
   return {
     storageRoot,
     cacheRoot,
-    cachePath,
-    contentIndexPath,
+    scopedStateLayout: "sha256(authentication-context:drive-id)",
     maxScanDepth: intSetting(process.env.ONEDRIVE_MAX_SCAN_DEPTH ?? cfg.maxScanDepth, 25, 0, 50),
     maxIndexedFileSize: intSetting(process.env.ONEDRIVE_MAX_INDEXED_FILE_SIZE ?? indexing.maxFileSize ?? cfg.maxIndexedFileSize, defaultMaxIndexedFileSize, 1024, textFileLimit),
     supportedIndexedFileTypes: [...supportedIndexedFileTypes],
@@ -3603,18 +3992,58 @@ async function withFileLock(lockPath, fn, options = {}) {
   }
 }
 
-async function runSerialized(queueName, fn) {
-  const previous = queueName === "metadata" ? metadataMutationQueue : contentIndexMutationQueue;
+async function runSerialized(queueName, guard, fn) {
+  const states = queueName === "metadata" ? metadataRuntimeStates : contentIndexRuntimeStates;
+  const state = scopedRuntimeState(states, guard, `${queueName} serialization`);
+  state.pendingMutations += 1;
+  const previous = state.mutationQueue;
   let release;
   const current = new Promise((resolve) => { release = resolve; });
-  if (queueName === "metadata") metadataMutationQueue = previous.catch(() => null).then(() => current);
-  else contentIndexMutationQueue = previous.catch(() => null).then(() => current);
+  state.mutationQueue = previous.catch(() => null).then(() => current);
   await previous.catch(() => null);
   try {
     return await fn();
   } finally {
+    state.pendingMutations -= 1;
     release();
   }
+}
+
+async function enforceScopedCacheDirectoryQuota(currentScopeId) {
+  await ensurePrivateDirectory(cacheRoot);
+  await withFileLock(join(cacheRoot, ".scope-quota.lock"), async () => {
+    const candidates = [];
+    for (const name of await readdir(cacheRoot)) {
+      if (!scopedCacheDirectoryPattern.test(name) || name === currentScopeId) continue;
+      const path = join(cacheRoot, name);
+      try {
+        const metadata = await lstat(path);
+        if (!metadata.isDirectory() || metadata.isSymbolicLink()) continue;
+        candidates.push({ name, path, modifiedAt: metadata.mtimeMs });
+      } catch (error) {
+        if (error?.code !== "ENOENT") recordLocalWarning("scoped cache quota inspection", error);
+      }
+    }
+    for (const candidate of scopedStateDirectoriesToEvict(candidates, currentScopeId)) {
+      try {
+        const canonicalRoot = await realpath(cacheRoot);
+        const canonicalCandidate = await realpath(candidate.path);
+        if (dirname(canonicalCandidate) !== canonicalRoot || basename(canonicalCandidate) !== candidate.name) continue;
+        await rm(canonicalCandidate, { recursive: true, force: true });
+      } catch (error) {
+        if (error?.code !== "ENOENT") recordLocalWarning("scoped cache quota eviction", error);
+      }
+    }
+  });
+}
+
+async function boundedReadJsonFile(path, maximumBytes, label) {
+  const metadata = await lstat(path);
+  if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error(`${label} must be a regular private file.`);
+  if (metadata.size > maximumBytes) throw new Error(`${label} exceeds the ${maximumBytes}-byte local-state limit.`);
+  const serialized = await readFile(path, "utf8");
+  if (Buffer.byteLength(serialized, "utf8") > maximumBytes) throw new Error(`${label} exceeds the ${maximumBytes}-byte local-state limit.`);
+  return JSON.parse(serialized);
 }
 
 function normalizeMetadataCache(parsed = {}, scope = null) {
@@ -3639,13 +4068,15 @@ function normalizeMetadataCache(parsed = {}, scope = null) {
 async function readMetadataCacheFromDisk(existingGuard = null) {
   const guard = existingGuard || await captureStorageScopeGuard("metadata cache read");
   assertStorageScopeGuard(guard, "metadata cache read");
-  await ensurePrivateDirectory(cacheRoot);
+  const paths = scopedStoragePaths(guard.scope);
+  await enforceScopedCacheDirectoryQuota(paths.scopeId);
+  await ensurePrivateDirectory(paths.cacheRoot);
   try {
-    const parsed = JSON.parse(await readFile(cachePath, "utf8"));
-    await hardenPrivateFile(cachePath);
+    const parsed = await boundedReadJsonFile(paths.cachePath, LOCAL_STATE_LIMITS.metadataCache.serializedBytes, "OneDrive metadata cache");
+    await hardenPrivateFile(paths.cachePath);
     assertStorageScopeGuard(guard, "metadata cache read");
     if (parsed.version !== 4 || !storageScopesEqual(parsed.scope, guard.scope)) return emptyMetadataCache(guard.scope);
-    return normalizeMetadataCache(parsed, guard.scope);
+    return boundMetadataCache(normalizeMetadataCache(parsed, guard.scope), { scope: guard.scope }).cache;
   } catch (error) {
     if (error?.code === "ENOENT") {
       assertStorageScopeGuard(guard, "metadata cache read");
@@ -3657,60 +4088,62 @@ async function readMetadataCacheFromDisk(existingGuard = null) {
 
 async function loadMetadataCache() {
   const guard = await captureStorageScopeGuard("metadata cache load");
-  if (metadataCacheLoadPromise && metadataCacheLoadGeneration !== guard.generation) {
+  const state = scopedRuntimeState(metadataRuntimeStates, guard, "metadata cache load");
+  const paths = scopedStoragePaths(guard.scope);
+  if (state.loadPromise && state.loadGeneration !== guard.generation) {
     throw accountContextChangedError("metadata cache load");
   }
-  if (!metadataCacheLoadPromise) {
+  if (!state.loadPromise) {
     let loadPromise;
     loadPromise = (async () => {
       try {
         assertStorageScopeGuard(guard, "metadata cache load");
-        const diskVersion = await localFileVersion(cachePath);
+        const diskVersion = await localFileVersion(paths.cachePath);
         assertStorageScopeGuard(guard, "metadata cache load");
-        if (metadataCacheMemory
-          && metadataCacheMemoryGeneration === guard.generation
-          && storageScopesEqual(metadataCacheMemory.scope, guard.scope)
-          && diskVersion === metadataCacheFileVersion) return metadataCacheMemory;
+        if (state.memory
+          && state.memoryGeneration === guard.generation
+          && storageScopesEqual(state.memory.scope, guard.scope)
+          && diskVersion === state.fileVersion) return state.memory;
         let loaded = null;
-        await withFileLock(metadataCacheLockPath, async () => {
+        await withFileLock(paths.metadataCacheLockPath, async () => {
           assertStorageScopeGuard(guard, "metadata cache load");
-          const lockedVersion = await localFileVersion(cachePath);
+          const lockedVersion = await localFileVersion(paths.cachePath);
           assertStorageScopeGuard(guard, "metadata cache load");
-          if (metadataCacheMemory
-            && metadataCacheMemoryGeneration === guard.generation
-            && storageScopesEqual(metadataCacheMemory.scope, guard.scope)
-            && lockedVersion === metadataCacheFileVersion) {
-            loaded = metadataCacheMemory;
+          if (state.memory
+            && state.memoryGeneration === guard.generation
+            && storageScopesEqual(state.memory.scope, guard.scope)
+            && lockedVersion === state.fileVersion) {
+            loaded = state.memory;
             return;
           }
           loaded = await readMetadataCacheFromDisk(guard);
           assertStorageScopeGuard(guard, "metadata cache publication");
-          metadataCacheMemory = loaded;
-          metadataCacheMemoryGeneration = guard.generation;
-          metadataCacheFileVersion = await localFileVersion(cachePath);
+          state.memory = loaded;
+          state.memoryGeneration = guard.generation;
+          state.fileVersion = await localFileVersion(paths.cachePath);
         });
         assertStorageScopeGuard(guard, "metadata cache return");
-        return loaded || metadataCacheMemory;
+        return loaded || state.memory;
       } catch (error) {
         if (isAccountContextChangedError(error)) throw error;
         recordLocalWarning("metadata cache read", error);
         assertStorageScopeGuard(guard, "metadata cache fallback publication");
-        metadataCacheMemory = emptyMetadataCache(guard.scope);
-        metadataCacheMemoryGeneration = guard.generation;
-        metadataCacheFileVersion = null;
+        state.memory = emptyMetadataCache(guard.scope);
+        state.memoryGeneration = guard.generation;
+        state.fileVersion = null;
       } finally {
-        if (metadataCacheLoadPromise === loadPromise) {
-          metadataCacheLoadPromise = null;
-          metadataCacheLoadGeneration = null;
+        if (state.loadPromise === loadPromise) {
+          state.loadPromise = null;
+          state.loadGeneration = null;
         }
       }
       assertStorageScopeGuard(guard, "metadata cache return");
-      return metadataCacheMemory;
+      return state.memory;
     })();
-    metadataCacheLoadPromise = loadPromise;
-    metadataCacheLoadGeneration = guard.generation;
+    state.loadPromise = loadPromise;
+    state.loadGeneration = guard.generation;
   }
-  const result = await metadataCacheLoadPromise;
+  const result = await state.loadPromise;
   assertStorageScopeGuard(guard, "metadata cache return");
   if (!storageScopesEqual(result?.scope, guard.scope)) throw accountContextChangedError("metadata cache return");
   return result;
@@ -3723,24 +4156,34 @@ async function saveMetadataCache(cache, existingGuard = null) {
   if (cache.scope && !storageScopesEqual(cache.scope, guard.scope)) {
     throw new Error("Metadata cache scope changed during this operation. Refusing to persist cross-account state.");
   }
-  cache.version = 4;
-  cache.scope = guard.scope;
-  cache.updatedAt = new Date().toISOString();
-  cache.itemCount = Object.keys(cache.itemsById || {}).length;
-  await ensurePrivateDirectory(cacheRoot);
+  const preferredIds = Array.isArray(cache._preferredIds) ? cache._preferredIds : [];
+  const admitted = boundMetadataCache({
+    ...cache,
+    version: 4,
+    scope: guard.scope,
+    updatedAt: new Date().toISOString()
+  }, { scope: guard.scope, preferredIds }).cache;
+  const paths = scopedStoragePaths(guard.scope);
+  const state = scopedRuntimeState(metadataRuntimeStates, guard, "metadata cache write");
+  await enforceScopedCacheDirectoryQuota(paths.scopeId);
+  await ensurePrivateDirectory(paths.cacheRoot);
   assertStorageScopeGuard(guard, "metadata cache write");
-  await writePrivateFileAtomic(cachePath, JSON.stringify(cache), {
+  const serialized = JSON.stringify(admitted);
+  if (Buffer.byteLength(serialized, "utf8") > LOCAL_STATE_LIMITS.metadataCache.serializedBytes) {
+    throw new Error("Refusing to write an oversized OneDrive metadata cache.");
+  }
+  await writePrivateFileAtomic(paths.cachePath, serialized, {
     beforeCommit: async () => assertStorageScopeGuard(guard, "metadata cache commit")
   });
   assertStorageScopeGuard(guard, "metadata cache publication");
-  metadataCacheMemory = cache;
-  metadataCacheMemoryGeneration = guard.generation;
-  metadataCacheFileVersion = await localFileVersion(cachePath);
+  state.memory = admitted;
+  state.memoryGeneration = guard.generation;
+  state.fileVersion = await localFileVersion(paths.cachePath);
   assertStorageScopeGuard(guard, "metadata cache return");
   const store = toolCallContext.getStore();
   if (store) store.metadataCacheWrites = (store.metadataCacheWrites || 0) + 1;
   recordToolTiming("cacheMs", performance.now() - cacheStartedAt);
-  return cache;
+  return admitted;
 }
 
 async function withMetadataCacheBatch(fn) {
@@ -3966,6 +4409,8 @@ function resolveUnresolvedCachedPaths(cache) {
 
 async function cacheItems(items = [], metadata = {}, options = {}) {
   const guard = await captureStorageScopeGuard("metadata cache update");
+  const paths = scopedStoragePaths(guard.scope);
+  const state = scopedRuntimeState(metadataRuntimeStates, guard, "metadata cache update");
   const lockTimeoutMs = options.lockTimeoutMs ?? (toolProfile === "chatgpt" ? 0 : 10_000);
   const hasMetadata = metadata.deltaLink !== undefined
     || metadata.deltaNextLink !== undefined
@@ -3973,7 +4418,7 @@ async function cacheItems(items = [], metadata = {}, options = {}) {
     || metadata.scanRoot !== undefined
     || metadata.pathRoot !== undefined;
   if (!items.length && !hasMetadata) return await loadMetadataCache();
-  return await runSerialized("metadata", async () => await withFileLock(metadataCacheLockPath, async () => {
+  return await runSerialized("metadata", guard, async () => await withFileLock(paths.metadataCacheLockPath, async () => {
     assertStorageScopeGuard(guard, "metadata cache update");
     let cache;
     try {
@@ -3981,10 +4426,10 @@ async function cacheItems(items = [], metadata = {}, options = {}) {
     } catch (error) {
       if (isAccountContextChangedError(error)) throw error;
       recordLocalWarning("metadata cache read", error);
-      cache = metadataCacheMemory
-        && metadataCacheMemoryGeneration === guard.generation
-        && storageScopesEqual(metadataCacheMemory.scope, guard.scope)
-        ? metadataCacheMemory
+      cache = state.memory
+        && state.memoryGeneration === guard.generation
+        && storageScopesEqual(state.memory.scope, guard.scope)
+        ? state.memory
         : emptyMetadataCache(guard.scope);
     }
     if (metadata.pathRoot?.id) {
@@ -4013,25 +4458,28 @@ async function cacheItems(items = [], metadata = {}, options = {}) {
     if (metadata.deltaNextLink !== undefined) cache.deltaNextLink = metadata.deltaNextLink || null;
     if (metadata.deltaTarget !== undefined) cache.deltaTarget = metadata.deltaTarget || null;
     assertStorageScopeGuard(guard, "metadata cache update");
+    cache._preferredIds = items.map((item) => item?.id).filter(Boolean);
     return await saveMetadataCache(cache, guard);
   }, { timeoutMs: lockTimeoutMs }));
 }
 
 async function clearMetadataCache() {
   const guard = await captureStorageScopeGuard("metadata cache clear");
-  return await runSerialized("metadata", async () => await withFileLock(metadataCacheLockPath, async () => {
+  const paths = scopedStoragePaths(guard.scope);
+  const state = scopedRuntimeState(metadataRuntimeStates, guard, "metadata cache clear");
+  return await runSerialized("metadata", guard, async () => await withFileLock(paths.metadataCacheLockPath, async () => {
     assertStorageScopeGuard(guard, "metadata cache clear");
     const cleared = emptyMetadataCache(guard.scope);
-    metadataCacheLoadPromise = null;
-    metadataCacheLoadGeneration = null;
-    await ensurePrivateDirectory(cacheRoot);
-    await writePrivateFileAtomic(cachePath, JSON.stringify(cleared), {
+    state.loadPromise = null;
+    state.loadGeneration = null;
+    await ensurePrivateDirectory(paths.cacheRoot);
+    await writePrivateFileAtomic(paths.cachePath, JSON.stringify(cleared), {
       beforeCommit: async () => assertStorageScopeGuard(guard, "metadata cache clear commit")
     });
     assertStorageScopeGuard(guard, "metadata cache clear publication");
-    metadataCacheMemory = cleared;
-    metadataCacheMemoryGeneration = guard.generation;
-    metadataCacheFileVersion = await localFileVersion(cachePath);
+    state.memory = cleared;
+    state.memoryGeneration = guard.generation;
+    state.fileVersion = await localFileVersion(paths.cachePath);
     assertStorageScopeGuard(guard, "metadata cache clear return");
     return cleared;
   }));
@@ -4050,60 +4498,62 @@ function emptyContentIndex(scope = null) {
 
 async function loadContentIndex() {
   const guard = await captureStorageScopeGuard("content index load");
-  if (contentIndexLoadPromise && contentIndexLoadGeneration !== guard.generation) {
+  const paths = scopedStoragePaths(guard.scope);
+  const state = scopedRuntimeState(contentIndexRuntimeStates, guard, "content index load");
+  if (state.loadPromise && state.loadGeneration !== guard.generation) {
     throw accountContextChangedError("content index load");
   }
-  if (!contentIndexLoadPromise) {
+  if (!state.loadPromise) {
     let loadPromise;
     loadPromise = (async () => {
       try {
         assertStorageScopeGuard(guard, "content index load");
-        const diskVersion = await localFileVersion(contentIndexPath);
+        const diskVersion = await localFileVersion(paths.contentIndexPath);
         assertStorageScopeGuard(guard, "content index load");
-        if (contentIndexMemory
-          && contentIndexMemoryGeneration === guard.generation
-          && storageScopesEqual(contentIndexMemory.scope, guard.scope)
-          && diskVersion === contentIndexFileVersion) return contentIndexMemory;
+        if (state.memory
+          && state.memoryGeneration === guard.generation
+          && storageScopesEqual(state.memory.scope, guard.scope)
+          && diskVersion === state.fileVersion) return state.memory;
         let loaded = null;
-        await withFileLock(contentIndexLockPath, async () => {
+        await withFileLock(paths.contentIndexLockPath, async () => {
           assertStorageScopeGuard(guard, "content index load");
-          const lockedVersion = await localFileVersion(contentIndexPath);
+          const lockedVersion = await localFileVersion(paths.contentIndexPath);
           assertStorageScopeGuard(guard, "content index load");
-          if (contentIndexMemory
-            && contentIndexMemoryGeneration === guard.generation
-            && storageScopesEqual(contentIndexMemory.scope, guard.scope)
-            && lockedVersion === contentIndexFileVersion) {
-            loaded = contentIndexMemory;
+          if (state.memory
+            && state.memoryGeneration === guard.generation
+            && storageScopesEqual(state.memory.scope, guard.scope)
+            && lockedVersion === state.fileVersion) {
+            loaded = state.memory;
             return;
           }
           loaded = await readContentIndexFromDisk(guard);
           assertStorageScopeGuard(guard, "content index publication");
-          contentIndexMemory = loaded;
-          contentIndexMemoryGeneration = guard.generation;
-          contentIndexFileVersion = await localFileVersion(contentIndexPath);
+          state.memory = loaded;
+          state.memoryGeneration = guard.generation;
+          state.fileVersion = await localFileVersion(paths.contentIndexPath);
         });
         assertStorageScopeGuard(guard, "content index return");
-        return loaded || contentIndexMemory;
+        return loaded || state.memory;
       } catch (error) {
         if (isAccountContextChangedError(error)) throw error;
         recordLocalWarning("content index read", error);
         assertStorageScopeGuard(guard, "content index fallback publication");
-        contentIndexMemory = emptyContentIndex(guard.scope);
-        contentIndexMemoryGeneration = guard.generation;
-        contentIndexFileVersion = null;
+        state.memory = emptyContentIndex(guard.scope);
+        state.memoryGeneration = guard.generation;
+        state.fileVersion = null;
       } finally {
-        if (contentIndexLoadPromise === loadPromise) {
-          contentIndexLoadPromise = null;
-          contentIndexLoadGeneration = null;
+        if (state.loadPromise === loadPromise) {
+          state.loadPromise = null;
+          state.loadGeneration = null;
         }
       }
       assertStorageScopeGuard(guard, "content index return");
-      return contentIndexMemory;
+      return state.memory;
     })();
-    contentIndexLoadPromise = loadPromise;
-    contentIndexLoadGeneration = guard.generation;
+    state.loadPromise = loadPromise;
+    state.loadGeneration = guard.generation;
   }
-  const result = await contentIndexLoadPromise;
+  const result = await state.loadPromise;
   assertStorageScopeGuard(guard, "content index return");
   if (!storageScopesEqual(result?.scope, guard.scope)) throw accountContextChangedError("content index return");
   return result;
@@ -4112,19 +4562,21 @@ async function loadContentIndex() {
 async function readContentIndexFromDisk(existingGuard = null) {
   const guard = existingGuard || await captureStorageScopeGuard("content index read");
   assertStorageScopeGuard(guard, "content index read");
-  await ensurePrivateDirectory(cacheRoot);
+  const paths = scopedStoragePaths(guard.scope);
+  await enforceScopedCacheDirectoryQuota(paths.scopeId);
+  await ensurePrivateDirectory(paths.cacheRoot);
   try {
-    const parsed = JSON.parse(await readFile(contentIndexPath, "utf8"));
-    await hardenPrivateFile(contentIndexPath);
+    const parsed = await boundedReadJsonFile(paths.contentIndexPath, LOCAL_STATE_LIMITS.contentIndex.serializedBytes, "OneDrive content index");
+    await hardenPrivateFile(paths.contentIndexPath);
     assertStorageScopeGuard(guard, "content index read");
     if (parsed.version !== 3 || !storageScopesEqual(parsed.scope, guard.scope)) return emptyContentIndex(guard.scope);
-    return {
+    return boundContentIndex({
       ...emptyContentIndex(guard.scope),
       ...parsed,
       version: 3,
       scope: guard.scope,
       entriesById: parsed.entriesById || {}
-    };
+    }, { scope: guard.scope }).index;
   } catch (error) {
     if (error?.code === "ENOENT") {
       assertStorageScopeGuard(guard, "content index read");
@@ -4140,25 +4592,37 @@ async function writeContentIndex(index, existingGuard = null) {
   if (index.scope && !storageScopesEqual(index.scope, guard.scope)) {
     throw new Error("Content index scope changed during this operation. Refusing to persist cross-account state.");
   }
-  index.version = 3;
-  index.scope = guard.scope;
-  index.updatedAt = new Date().toISOString();
-  index.itemCount = Object.keys(index.entriesById || {}).length;
-  await ensurePrivateDirectory(cacheRoot);
-  await writePrivateFileAtomic(contentIndexPath, JSON.stringify(index), {
+  const preferredIds = Array.isArray(index._preferredIds) ? index._preferredIds : [];
+  const admitted = boundContentIndex({
+    ...index,
+    version: 3,
+    scope: guard.scope,
+    updatedAt: new Date().toISOString()
+  }, { scope: guard.scope, preferredIds }).index;
+  const paths = scopedStoragePaths(guard.scope);
+  const state = scopedRuntimeState(contentIndexRuntimeStates, guard, "content index write");
+  await enforceScopedCacheDirectoryQuota(paths.scopeId);
+  await ensurePrivateDirectory(paths.cacheRoot);
+  const serialized = JSON.stringify(admitted);
+  if (Buffer.byteLength(serialized, "utf8") > LOCAL_STATE_LIMITS.contentIndex.serializedBytes) {
+    throw new Error("Refusing to write an oversized OneDrive content index.");
+  }
+  await writePrivateFileAtomic(paths.contentIndexPath, serialized, {
     beforeCommit: async () => assertStorageScopeGuard(guard, "content index commit")
   });
   assertStorageScopeGuard(guard, "content index publication");
-  contentIndexMemory = index;
-  contentIndexMemoryGeneration = guard.generation;
-  contentIndexFileVersion = await localFileVersion(contentIndexPath);
+  state.memory = admitted;
+  state.memoryGeneration = guard.generation;
+  state.fileVersion = await localFileVersion(paths.contentIndexPath);
   assertStorageScopeGuard(guard, "content index return");
-  return index;
+  return admitted;
 }
 
 async function saveContentIndex(index, existingGuard = null) {
   const guard = existingGuard || await captureStorageScopeGuard("content index update");
-  return await runSerialized("content", async () => await withFileLock(contentIndexLockPath, async () => {
+  const paths = scopedStoragePaths(guard.scope);
+  const state = scopedRuntimeState(contentIndexRuntimeStates, guard, "content index update");
+  return await runSerialized("content", guard, async () => await withFileLock(paths.contentIndexLockPath, async () => {
     assertStorageScopeGuard(guard, "content index update");
     let latest;
     try {
@@ -4166,14 +4630,15 @@ async function saveContentIndex(index, existingGuard = null) {
     } catch (error) {
       if (isAccountContextChangedError(error)) throw error;
       recordLocalWarning("content index read", error);
-      latest = contentIndexMemory
-        && contentIndexMemoryGeneration === guard.generation
-        && storageScopesEqual(contentIndexMemory.scope, guard.scope)
-        ? contentIndexMemory
+      latest = state.memory
+        && state.memoryGeneration === guard.generation
+        && storageScopesEqual(state.memory.scope, guard.scope)
+        ? state.memory
         : emptyContentIndex(guard.scope);
     }
     const merged = {
       ...latest,
+      _preferredIds: Object.keys(index.entriesById || {}),
       entriesById: {
         ...(latest.entriesById || {}),
         ...(index.entriesById || {})
@@ -4186,19 +4651,21 @@ async function saveContentIndex(index, existingGuard = null) {
 
 async function clearContentIndex() {
   const guard = await captureStorageScopeGuard("content index clear");
-  return await runSerialized("content", async () => await withFileLock(contentIndexLockPath, async () => {
+  const paths = scopedStoragePaths(guard.scope);
+  const state = scopedRuntimeState(contentIndexRuntimeStates, guard, "content index clear");
+  return await runSerialized("content", guard, async () => await withFileLock(paths.contentIndexLockPath, async () => {
     assertStorageScopeGuard(guard, "content index clear");
     const cleared = emptyContentIndex(guard.scope);
-    contentIndexLoadPromise = null;
-    contentIndexLoadGeneration = null;
-    await ensurePrivateDirectory(cacheRoot);
-    await writePrivateFileAtomic(contentIndexPath, JSON.stringify(cleared), {
+    state.loadPromise = null;
+    state.loadGeneration = null;
+    await ensurePrivateDirectory(paths.cacheRoot);
+    await writePrivateFileAtomic(paths.contentIndexPath, JSON.stringify(cleared), {
       beforeCommit: async () => assertStorageScopeGuard(guard, "content index clear commit")
     });
     assertStorageScopeGuard(guard, "content index clear publication");
-    contentIndexMemory = cleared;
-    contentIndexMemoryGeneration = guard.generation;
-    contentIndexFileVersion = await localFileVersion(contentIndexPath);
+    state.memory = cleared;
+    state.memoryGeneration = guard.generation;
+    state.fileVersion = await localFileVersion(paths.contentIndexPath);
     assertStorageScopeGuard(guard, "content index clear return");
     return cleared;
   }));
@@ -4223,8 +4690,10 @@ function indexedItemMetadataChanged(left = {}, right = {}) {
 async function reconcileContentIndexWithMetadata(changes = [], existingGuard = null, options = {}) {
   if (!changes.length) return;
   const guard = existingGuard || await captureStorageScopeGuard("metadata/content index reconciliation");
+  const paths = scopedStoragePaths(guard.scope);
+  const state = scopedRuntimeState(contentIndexRuntimeStates, guard, "metadata/content index reconciliation");
   const lockTimeoutMs = options.lockTimeoutMs ?? (toolProfile === "chatgpt" ? 0 : 10_000);
-  await runSerialized("content", async () => await withFileLock(contentIndexLockPath, async () => {
+  await runSerialized("content", guard, async () => await withFileLock(paths.contentIndexLockPath, async () => {
     assertStorageScopeGuard(guard, "metadata/content index reconciliation");
     let index;
     try {
@@ -4232,10 +4701,10 @@ async function reconcileContentIndexWithMetadata(changes = [], existingGuard = n
     } catch (error) {
       if (isAccountContextChangedError(error)) throw error;
       recordLocalWarning("content index read", error);
-      index = contentIndexMemory
-        && contentIndexMemoryGeneration === guard.generation
-        && storageScopesEqual(contentIndexMemory.scope, guard.scope)
-        ? contentIndexMemory
+      index = state.memory
+        && state.memoryGeneration === guard.generation
+        && storageScopesEqual(state.memory.scope, guard.scope)
+        ? state.memory
         : emptyContentIndex(guard.scope);
     }
     let changed = false;
@@ -4264,8 +4733,8 @@ async function reconcileContentIndexWithMetadata(changes = [], existingGuard = n
     if (changed) {
       await writeContentIndex(index, guard);
     } else {
-      contentIndexMemory = index;
-      contentIndexMemoryGeneration = guard.generation;
+      state.memory = index;
+      state.memoryGeneration = guard.generation;
     }
   }, { timeoutMs: lockTimeoutMs }));
 }
@@ -4314,10 +4783,24 @@ function contentIndexableReason(item = {}, args = {}) {
 
 function officeIndexSegments(document, maxSegments = 50_000) {
   const segments = [];
+  let segmentBytes = 0;
+  let truncated = false;
   const add = (text, anchor) => {
-    const value = String(text ?? "").trim();
-    if (!value || segments.length >= maxSegments) return;
-    segments.push({ text: value, anchor });
+    if (segments.length >= Math.min(maxSegments, LOCAL_STATE_LIMITS.contentIndex.segmentsPerEntry)) {
+      truncated = true;
+      return;
+    }
+    const value = boundedUtf8Prefix(String(text ?? "").trim(), LOCAL_STATE_LIMITS.contentIndex.segmentTextBytes);
+    if (!value.value) return;
+    const candidate = { text: value.value, anchor };
+    const bytes = boundedJsonByteLength(candidate, LOCAL_STATE_LIMITS.contentIndex.entrySegmentBytes - segmentBytes);
+    if (bytes === null) {
+      truncated = true;
+      return;
+    }
+    segments.push(candidate);
+    segmentBytes += bytes;
+    truncated ||= value.truncated;
   };
   if (document.kind === "word") {
     for (const paragraph of document.paragraphs || []) add(paragraph.text, { type: "paragraph", part: paragraph.part, index: paragraph.index, style: paragraph.style || null });
@@ -4350,7 +4833,7 @@ function officeIndexSegments(document, maxSegments = 50_000) {
       add(slide.notes, { type: "notes", slideIndex: slide.index });
     }
   }
-  return { segments, truncated: segments.length >= maxSegments };
+  return { segments, truncated: truncated || segments.length >= maxSegments };
 }
 
 async function extractIndexText(item, args = {}) {
@@ -4393,7 +4876,7 @@ async function extractIndexText(item, args = {}) {
   const sourcePath = indexable.source === "graph-text-export"
     ? `${contentPath(target)}?${new URLSearchParams({ format: "text" }).toString()}`
     : contentPath(target);
-  const limited = await graphLimitedBuffer(sourcePath, maxBytes);
+  const limited = await graphLimitedBuffer(sourcePath, maxBytes, { expectedETag: item.eTag });
   if (indexable.source === "text-read") assertNoBinaryNulls(limited.buffer);
   return {
     text: limited.buffer.toString("utf8").replace(/\uFFFD$/u, ""),
@@ -4411,9 +4894,13 @@ function contentIndexTextFields(text = "") {
 }
 
 function contentIndexEntryFromExtracted(item, extracted = {}) {
-  const text = String(extracted.text ?? extracted.preview ?? "");
+  const boundedText = boundedUtf8Prefix(
+    extracted.text ?? extracted.preview ?? "",
+    LOCAL_STATE_LIMITS.contentIndex.entryTextBytes
+  );
+  const text = boundedText.value;
   const textFields = contentIndexTextFields(text);
-  return {
+  const candidate = {
     item,
     text,
     normalizedText: textFields.normalizedText,
@@ -4422,7 +4909,7 @@ function contentIndexEntryFromExtracted(item, extracted = {}) {
     source: extracted.source,
     bytesRead: extracted.bytesRead,
     textBytes: Buffer.byteLength(text, "utf8"),
-    truncated: Boolean(extracted.truncated),
+    truncated: Boolean(extracted.truncated || boundedText.truncated),
     segments: extracted.segments || [],
     structuredKind: extracted.structuredKind || null,
     eTag: item.eTag,
@@ -4430,6 +4917,9 @@ function contentIndexEntryFromExtracted(item, extracted = {}) {
     lastModifiedDateTime: item.lastModifiedDateTime,
     size: item.size
   };
+  const bounded = boundContentIndexEntry(item?.id, candidate);
+  if (!bounded) throw new Error("The extracted content-index entry exceeds the bounded local-state admission policy.");
+  return bounded;
 }
 
 function contentSearchContext(query) {
@@ -4509,6 +4999,7 @@ async function contentSearch(args = {}) {
   if (!query) throw new Error("query is required.");
   const maxResults = clampInteger(args.maxResults, 20, 1, 100);
   const index = await loadContentIndex();
+  const paths = scopedStoragePaths(index.scope);
   const context = contentSearchContext(query);
   const matches = [];
   let matched = 0;
@@ -4532,7 +5023,7 @@ async function contentSearch(args = {}) {
   }
   return {
     query,
-    indexPath: contentIndexPath,
+    indexPath: paths.contentIndexPath,
     itemCount: index.itemCount || 0,
     matched,
     returned: matches.length,
@@ -4615,6 +5106,8 @@ async function contentIndexRefresh(args = {}) {
   }
 
   const index = await loadContentIndex();
+  const admission = createContentIndexAdmissionLedger(index.scope);
+  const paths = scopedStoragePaths(index.scope);
   const eligibleItems = sourceItems
     .filter((item) => item?.id && !item.deleted)
     .filter((item) => contentIndexableReason(item, args).ok);
@@ -4623,11 +5116,13 @@ async function contentIndexRefresh(args = {}) {
       item,
       fresh: Boolean(args.force !== true && contentIndexEntryFresh(index.entriesById[item.id], item))
     }))
-    .sort((left, right) => Number(left.fresh) - Number(right.fresh))
+    .sort((left, right) => Number(left.fresh) - Number(right.fresh)
+      || String(right.item.lastModifiedDateTime || "").localeCompare(String(left.item.lastModifiedDateTime || ""))
+      || String(left.item.id).localeCompare(String(right.item.id)))
     .slice(0, maxFiles)
     .map((entry) => entry.item);
   const results = {
-    indexPath: contentIndexPath,
+    indexPath: paths.contentIndexPath,
     considered: sourceItems.length,
     eligible: eligibleItems.length,
     selected: candidates.length,
@@ -4636,38 +5131,59 @@ async function contentIndexRefresh(args = {}) {
     skipped: sourceItems.length - candidates.length,
     graphContentReadsAttempted: 0,
     failed: 0,
+    skippedByLocalStateBudget: 0,
     failures: []
   };
 
-  await mapWithConcurrency(candidates, clampInteger(args.concurrencyLimit, settings.concurrencyLimit, 1, 8), async (item) => {
+  const extractCandidate = async (item) => {
     const existing = index.entriesById[item.id];
     if (args.force !== true && contentIndexEntryFresh(existing, item)) {
-      index.entriesById[item.id] = { ...existing, item };
-      results.reused += 1;
+      const admitted = admission.admit(item.id, { ...existing, item });
+      if (admitted.accepted) results.reused += 1;
+      else results.skippedByLocalStateBudget += 1;
       return;
     }
     try {
       results.graphContentReadsAttempted += 1;
       const extracted = await extractIndexText(item, args);
-      index.entriesById[item.id] = contentIndexEntryFromExtracted(item, extracted);
-      results.indexed += 1;
+      const boundedEntry = contentIndexEntryFromExtracted(item, extracted);
+      const admitted = admission.admit(item.id, boundedEntry);
+      if (admitted.accepted) results.indexed += 1;
+      else results.skippedByLocalStateBudget += 1;
     } catch (error) {
       results.failed += 1;
       if (results.failures.length < 10) {
         results.failures.push({ id: item.id, name: item.name, error: safeToolErrorMessage(error) });
       }
     }
-  });
+  };
+  const heavyweightCandidates = [];
+  const lightweightCandidates = [];
+  for (const item of candidates) {
+    const source = contentIndexableReason(item, args).source || "";
+    (source === "office-openxml" || source.startsWith("local-") ? heavyweightCandidates : lightweightCandidates).push(item);
+  }
+  await Promise.all([
+    mapWithConcurrency(
+      lightweightCandidates,
+      clampInteger(args.concurrencyLimit, settings.concurrencyLimit, 1, 8),
+      extractCandidate
+    ),
+    mapWithConcurrency(heavyweightCandidates, 1, extractCandidate)
+  ]);
 
-  const updatedEntries = Object.fromEntries(
-    candidates
-      .filter((item) => index.entriesById[item.id])
-      .map((item) => [item.id, index.entriesById[item.id]])
-  );
+  const admissionSnapshot = admission.snapshot();
+  const updatedEntries = admissionSnapshot.index.entriesById;
   const persistedIndex = await saveContentIndex({ entriesById: updatedEntries });
   return {
     ...results,
     itemCount: persistedIndex.itemCount,
+    localStateBudget: {
+      pendingEntries: admissionSnapshot.pendingEntries,
+      pendingSerializedBytes: admissionSnapshot.pendingSerializedBytes,
+      pendingTextBytes: admissionSnapshot.pendingTextBytes,
+      pendingSegmentBytes: admissionSnapshot.pendingSegmentBytes
+    },
     durationMs: elapsedMs(startedAt),
     settings: {
       maxBytesPerFile: clampInteger(args.maxBytesPerFile, settings.maxIndexedFileSize, 1024, textFileLimit),
@@ -4709,17 +5225,19 @@ function unresolvedPathItems(cache) {
 async function syncStatus(args = {}) {
   const cache = await loadMetadataCache();
   const contentIndex = await loadContentIndex();
+  const paths = scopedStoragePaths(cache.scope);
   const settings = pluginSettings();
   const items = Object.values(cache.itemsById || {});
   const contentEntries = Object.values(contentIndex.entriesById || {});
   const unresolvedItems = unresolvedPathItems(cache);
   const cacheAgeSeconds = cache.updatedAt ? Math.max(0, Math.round((Date.now() - Date.parse(cache.updatedAt)) / 1000)) : null;
   return {
-    cachePath,
-    contentIndexPath,
-    downloadRoot,
-    updateRoot,
-    backupRoot,
+    scopeId: paths.scopeId,
+    cachePath: paths.cachePath,
+    contentIndexPath: paths.contentIndexPath,
+    downloadRoot: paths.downloadRoot,
+    updateRoot: paths.updateRoot,
+    backupRoot: paths.backupRoot,
     storageRoot,
     itemCount: items.length,
     updatedAt: cache.updatedAt,
@@ -5131,6 +5649,79 @@ function timeoutSignal(timeoutMs = fetchTimeoutMs()) {
   return controller.signal;
 }
 
+function chatgptFileDeadlineError(timeoutMs) {
+  const error = new Error(`ChatGPT file download timed out after ${timeoutMs}ms.`);
+  error.name = "TimeoutError";
+  error.code = "CHATGPT_FILE_DOWNLOAD_TIMEOUT";
+  error.retryable = true;
+  error.retryAfterSeconds = 1;
+  return error;
+}
+
+function chatgptFileAbortReason(signal) {
+  return signal?.reason instanceof Error
+    ? signal.reason
+    : chatgptFileDeadlineError(fetchTimeoutMs());
+}
+
+function throwIfChatgptFileAborted(signal) {
+  if (signal?.aborted) throw chatgptFileAbortReason(signal);
+}
+
+async function waitForChatgptFileRetry(delayMs, signal) {
+  throwIfChatgptFileAborted(signal);
+  if (!signal) {
+    await sleep(delayMs);
+    return;
+  }
+  await new Promise((resolvePromise, reject) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(chatgptFileAbortReason(signal));
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      resolvePromise();
+    }, delayMs);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+}
+
+async function withChatgptFileAbort(promise, signal) {
+  throwIfChatgptFileAborted(signal);
+  if (!signal) return await promise;
+  return await new Promise((resolvePromise, reject) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      reject(chatgptFileAbortReason(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+    Promise.resolve(promise).then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        resolvePromise(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      }
+    );
+  });
+}
+
 function retryDelayMs(response, attempt) {
   const retryAfter = response.headers.get("retry-after");
   if (retryAfter) {
@@ -5350,6 +5941,19 @@ async function graph(path, options = {}) {
 }
 
 async function graphDownloadToFile(path, target, options = {}) {
+  const maxBytes = Number(options.maxBytes);
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > maxGraphDownloadBytes) {
+    throw new Error(`A maxBytes limit from 1 through ${maxGraphDownloadBytes} is required for Microsoft Graph downloads.`);
+  }
+  const expectedETag = options.expectedETag === undefined ? null : String(options.expectedETag);
+  if (expectedETag !== null && (expectedETag.length < 1 || expectedETag.length > 2048 || /[\u0000-\u001f\u007f]/u.test(expectedETag))) {
+    throw new Error("The expected download revision is invalid.");
+  }
+  const tooLargeError = () => {
+    const error = new Error(`Microsoft Graph download content is above the ${maxBytes}-byte limit.`);
+    error.code = "CONTENT_TOO_LARGE";
+    return error;
+  };
   const accountContext = captureGraphAccountContext("Microsoft Graph download");
   const accessToken = await withToolTiming("authMs", async () => await getAccessToken());
   if (!accountContext.authContextId) accountContext.authContextId = currentAuthContextId();
@@ -5359,13 +5963,19 @@ async function graphDownloadToFile(path, target, options = {}) {
     method: "GET",
     headers: {
       Authorization: `Bearer ${accessToken}`,
-      ...(options.headers || {})
+      ...(options.headers || {}),
+      ...(expectedETag ? { "If-Match": expectedETag } : {})
     }
   }, { maxRetries: 3 }), "graphCalls");
   assertGraphAccountContext(accountContext, "Microsoft Graph download response");
   if (!response.ok) {
     const body = await parseResponseBody(response);
     throw microsoftGraphError(body, response);
+  }
+  const declaredBytes = contentLength(response);
+  if (declaredBytes !== null && declaredBytes > maxBytes) {
+    await response.body?.cancel?.().catch(() => {});
+    throw tooLargeError();
   }
   await mkdir(dirname(target), { recursive: true, mode: 0o700 });
   const temp = `${target}.part-${process.pid}-${randomUUID()}`;
@@ -5375,6 +5985,7 @@ async function graphDownloadToFile(path, target, options = {}) {
     if (response.body) {
       const counter = new TransformStream({
         transform(chunk, controller) {
+          if (chunk.byteLength > maxBytes - bytesWritten) throw tooLargeError();
           bytesWritten += chunk.byteLength;
           controller.enqueue(chunk);
         }
@@ -5382,6 +5993,7 @@ async function graphDownloadToFile(path, target, options = {}) {
       await pipeline(Readable.fromWeb(response.body.pipeThrough(counter)), createWriteStream(temp, { flags: "wx", mode: 0o600 }));
     } else {
       const buffer = Buffer.from(await response.arrayBuffer());
+      if (buffer.length > maxBytes) throw tooLargeError();
       bytesWritten = buffer.length;
       await writePrivateFile(temp, buffer);
     }
@@ -5399,6 +6011,15 @@ async function graphDownloadToFile(path, target, options = {}) {
   return { bytesWritten: bytesWritten || contentLength(response) || 0 };
 }
 
+async function ensureManagedBackupQuotaReady() {
+  await managedBackupReconciliation;
+  if (managedBackupReconciliationError) {
+    const error = new Error(`Plugin-managed backup storage could not be reconciled safely: ${safeToolErrorMessage(managedBackupReconciliationError)}`);
+    error.code = "MANAGED_ARTIFACT_QUOTA_UNAVAILABLE";
+    throw error;
+  }
+}
+
 async function graphLimitedBuffer(path, maxBytes, options = {}) {
   const accountContext = captureGraphAccountContext("Microsoft Graph bounded content read");
   const accessToken = await withToolTiming("authMs", async () => await getAccessToken());
@@ -5406,11 +6027,16 @@ async function graphLimitedBuffer(path, maxBytes, options = {}) {
   assertGraphAccountContext(accountContext, "Microsoft Graph bounded content read");
   const url = graphUrl(path);
   const limit = Math.max(1, maxBytes);
+  const expectedETag = options.expectedETag === undefined ? null : String(options.expectedETag);
+  if (expectedETag !== null && (expectedETag.length < 1 || expectedETag.length > 2048 || /[\u0000-\u001f\u007f]/u.test(expectedETag))) {
+    throw new Error("The expected bounded-content revision is invalid.");
+  }
   const response = await withToolTiming("graphMs", async () => await fetchWithRetry(url, {
     method: "GET",
     headers: {
       Authorization: `Bearer ${accessToken}`,
-      Range: `bytes=0-${limit}`
+      Range: `bytes=0-${limit}`,
+      ...(expectedETag ? { "If-Match": expectedETag } : {})
     }
   }, { maxRetries: 3 }), "graphCalls");
   assertGraphAccountContext(accountContext, "Microsoft Graph bounded content response");
@@ -5690,6 +6316,17 @@ function itemBase(args = {}) {
   return `/me/drive/root:/${encodeDrivePath(resolved.path)}:`;
 }
 
+function readOnlyItemBase(args = {}) {
+  if (!args.driveId) return itemBase(args);
+  const driveId = String(args.driveId);
+  if (!driveId || driveId.length > 1024 || /[\u0000-\u001f\u007f]/u.test(driveId)) throw new Error("driveId is invalid.");
+  const resolved = itemArgsWithResolvedPath(args);
+  const base = `/drives/${encodeURIComponent(driveId)}`;
+  if (resolved.itemId) return `${base}/items/${encodeURIComponent(resolved.itemId)}`;
+  if (!resolved.path || cleanPath(resolved.path) === "") return `${base}/root`;
+  return `${base}/root:/${encodeDrivePath(resolved.path)}:`;
+}
+
 function itemIdBase(itemId) {
   return `/me/drive/items/${encodeURIComponent(itemId)}`;
 }
@@ -5756,25 +6393,50 @@ function previewProofItemIds(value, key = "") {
   return [...ids];
 }
 
-function cleanupPreviewTokens(now = Date.now()) {
-  for (const [token, entry] of previewTokens.entries()) {
-    if (!entry || entry.expiresAt <= now) previewTokens.delete(token);
+function previewTokensForScopeKey(scopeKey) {
+  if (!scopeKey) return null;
+  let tokens = previewTokensByScope.get(scopeKey);
+  if (!tokens) {
+    while (previewTokensByScope.size >= previewTokenMaxScopes) {
+      const oldestScopeKey = previewTokensByScope.keys().next().value;
+      if (!oldestScopeKey) break;
+      previewTokensByScope.delete(oldestScopeKey);
+    }
+    tokens = new Map();
+    previewTokensByScope.set(scopeKey, tokens);
   }
+  return tokens;
+}
+
+function cleanupPreviewTokens(scopeKey, now = Date.now()) {
+  const tokens = previewTokensForScopeKey(scopeKey);
+  if (!tokens) return;
+  for (const [token, entry] of tokens.entries()) {
+    if (!entry || entry.expiresAt <= now) tokens.delete(token);
+  }
+  while (tokens.size >= previewTokenMaxPerScope) {
+    const oldestToken = tokens.keys().next().value;
+    if (!oldestToken) break;
+    tokens.delete(oldestToken);
+  }
+  if (!tokens.size) previewTokensByScope.delete(scopeKey);
 }
 
 function issuePreviewToken(tool, proof = {}) {
   assertToolAccountGeneration(`${tool} preview issuance`);
-  cleanupPreviewTokens();
   const scope = toolCallContext.getStore()?.storageScope;
   if (!scope?.authContextId || !scope?.driveId) {
     throw new Error("OneDrive storage scope is unavailable. Refusing to issue an unscoped preview token.");
   }
+  const scopeKey = storageScopeKey(scope);
+  cleanupPreviewTokens(scopeKey);
+  const tokens = previewTokensForScopeKey(scopeKey);
   const token = randomUUID();
   const expiresAt = Date.now() + previewTokenTtlMs;
-  previewTokens.set(token, {
+  tokens.set(token, {
     tool,
     proofHash: previewProofHash(tool, proof),
-    scopeKey: storageScopeKey(scope),
+    scopeKey,
     authGeneration,
     storageScopeGeneration,
     itemIds: previewProofItemIds(proof),
@@ -5796,11 +6458,12 @@ function previewWithToken(preview, tool, proof = {}) {
 
 function consumePreviewToken(tool, proof = {}, token) {
   assertToolAccountGeneration(`${tool} preview consumption`);
-  cleanupPreviewTokens();
   if (!token) return { ok: false, reason: "missing" };
-  const entry = previewTokens.get(token);
-  if (!entry) return { ok: false, reason: "not_found_or_expired" };
   const currentScopeKey = storageScopeKey(toolCallContext.getStore()?.storageScope);
+  cleanupPreviewTokens(currentScopeKey);
+  const tokens = previewTokensForScopeKey(currentScopeKey);
+  const entry = tokens?.get(token);
+  if (!entry) return { ok: false, reason: "not_found_or_expired" };
   if (!currentScopeKey
     || entry.scopeKey !== currentScopeKey
     || entry.authGeneration !== authGeneration
@@ -5810,7 +6473,7 @@ function consumePreviewToken(tool, proof = {}, token) {
   if (entry.tool !== tool || entry.proofHash !== previewProofHash(tool, proof)) {
     return { ok: false, reason: "mismatch" };
   }
-  previewTokens.delete(token);
+  tokens.delete(token);
   return { ok: true };
 }
 
@@ -5960,25 +6623,62 @@ async function writeMutationAudit(tool, entry) {
     graphRequestId: entry.graphRequestId || currentGraphRequestId({ mutation: true }) || currentGraphRequestId() || undefined
   });
   return await bestEffortLocalWrite("mutation audit write", async () => {
-    await withFileLock(auditLockPath, async () => {
-      await ensurePrivateDirectory(auditRoot);
-      await appendFile(auditPath, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
-      await hardenPrivateFile(auditPath);
+    const guard = await captureStorageScopeGuard("mutation audit write");
+    const paths = scopedStoragePaths(guard.scope);
+    await withFileLock(paths.auditLockPath, async () => {
+      assertStorageScopeGuard(guard, "mutation audit write");
+      await ensurePrivateDirectory(paths.auditRoot);
+      const serializedRecord = `${JSON.stringify(record)}\n`;
+      const recordBytes = Buffer.byteLength(serializedRecord, "utf8");
+      if (recordBytes > auditRecordMaxBytes) throw new Error("Mutation audit record exceeded the bounded record size.");
+      let currentBytes = 0;
+      try {
+        const auditInfo = await lstat(paths.auditPath);
+        if (!auditInfo.isFile() || auditInfo.isSymbolicLink() || auditInfo.nlink !== 1) throw new Error("Mutation audit storage is unsafe.");
+        currentBytes = auditInfo.size;
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      if (currentBytes + recordBytes > auditLogMaxBytes) {
+        // Retain a single bounded generation. Rotation renames the existing
+        // inode without buffering it in memory, then starts a new active log.
+        const rotatedPath = `${paths.auditPath}.1`;
+        await rm(rotatedPath, { force: true });
+        if (currentBytes > auditLogMaxBytes) {
+          // A legacy or externally enlarged active file is not retained as the
+          // rotated generation: doing so would bypass the aggregate hard cap.
+          await rm(paths.auditPath, { force: true });
+        } else if (currentBytes > 0) {
+          await renameFile(paths.auditPath, rotatedPath);
+          await hardenPrivateFile(rotatedPath);
+        }
+      }
+      await appendFile(paths.auditPath, serializedRecord, { encoding: "utf8", mode: 0o600 });
+      await hardenPrivateFile(paths.auditPath);
+      assertStorageScopeGuard(guard, "mutation audit write");
     });
     return record;
   });
 }
 
 async function auditRecent(args = {}) {
+  const guard = await captureStorageScopeGuard("mutation audit read");
+  const paths = scopedStoragePaths(guard.scope);
   let text = "";
-  await withFileLock(auditLockPath, async () => {
-    await ensurePrivateDirectory(auditRoot);
+  await withFileLock(paths.auditLockPath, async () => {
+    assertStorageScopeGuard(guard, "mutation audit read");
+    await ensurePrivateDirectory(paths.auditRoot);
     try {
-      text = await readFile(auditPath, "utf8");
-      await hardenPrivateFile(auditPath);
+      const [rotated, active] = await Promise.all([
+        readFile(`${paths.auditPath}.1`, "utf8").catch((error) => error.code === "ENOENT" ? "" : Promise.reject(error)),
+        readFile(paths.auditPath, "utf8").catch((error) => error.code === "ENOENT" ? "" : Promise.reject(error))
+      ]);
+      text = `${rotated}${active}`;
+      await hardenPrivateFile(paths.auditPath);
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
+    assertStorageScopeGuard(guard, "mutation audit read");
   });
   const limit = clampInteger(args.limit, 50, 1, 500);
   const since = args.since ? Date.parse(args.since) : null;
@@ -6012,7 +6712,8 @@ async function auditRecent(args = {}) {
   if (args.newestFirst !== false) entries.reverse();
   entries = entries.slice(0, limit);
   return {
-    auditPath,
+    scopeId: paths.scopeId,
+    auditPath: paths.auditPath,
     count: entries.length,
     filters: {
       tool: args.tool || null,
@@ -6027,8 +6728,10 @@ async function auditRecent(args = {}) {
 }
 
 async function auditExport(args = {}) {
+  const guard = await captureStorageScopeGuard("mutation audit export");
+  const paths = scopedStoragePaths(guard.scope);
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const preferredTarget = args.localPath ? resolve(args.localPath) : join(auditRoot, `export-${stamp}-${randomUUID()}.jsonl`);
+  const preferredTarget = args.localPath ? resolve(args.localPath) : join(paths.auditRoot, `export-${stamp}-${randomUUID()}.jsonl`);
   await assertNotLocalOneDriveSyncPathForWrite(preferredTarget, "Audit export", args);
   const reservation = await reserveLocalDestination(preferredTarget, {
     overwrite: args.overwrite === true,
@@ -6036,9 +6739,14 @@ async function auditExport(args = {}) {
   });
   const target = reservation.path;
   try {
-    await withFileLock(auditLockPath, async () => {
+    await withFileLock(paths.auditLockPath, async () => {
+      assertStorageScopeGuard(guard, "mutation audit export");
       try {
-        await copyFile(auditPath, target);
+        const [rotated, active] = await Promise.all([
+          readFile(`${paths.auditPath}.1`).catch((error) => error.code === "ENOENT" ? Buffer.alloc(0) : Promise.reject(error)),
+          readFile(paths.auditPath).catch((error) => error.code === "ENOENT" ? Buffer.alloc(0) : Promise.reject(error))
+        ]);
+        await writePrivateFile(target, Buffer.concat([rotated, active]));
       } catch (error) {
         if (error.code !== "ENOENT") throw error;
         await writePrivateFile(target, "");
@@ -6046,7 +6754,7 @@ async function auditExport(args = {}) {
     });
     await hardenPrivateFile(target);
     const written = await stat(target);
-    return { auditPath, localPath: target, bytesWritten: written.size };
+    return { scopeId: paths.scopeId, auditPath: paths.auditPath, localPath: target, bytesWritten: written.size };
   } catch (error) {
     if (reservation.reserved) await rm(target, { force: true });
     throw error;
@@ -6054,15 +6762,24 @@ async function auditExport(args = {}) {
 }
 
 async function auditClear(args = {}) {
+  const guard = await captureStorageScopeGuard("mutation audit clear");
+  const paths = scopedStoragePaths(guard.scope);
   if (args.confirmed !== true) {
     return {
       confirmed: false,
-      auditPath,
+      scopeId: paths.scopeId,
+      auditPath: paths.auditPath,
       requiredToClear: "Set confirmed: true after explicit user confirmation to clear the local mutation audit log."
     };
   }
-  await withFileLock(auditLockPath, async () => await rm(auditPath, { force: true }));
-  return { confirmed: true, auditPath, cleared: true };
+  await withFileLock(paths.auditLockPath, async () => {
+    assertStorageScopeGuard(guard, "mutation audit clear");
+    await Promise.all([
+      rm(paths.auditPath, { force: true }),
+      rm(`${paths.auditPath}.1`, { force: true })
+    ]);
+  });
+  return { confirmed: true, scopeId: paths.scopeId, auditPath: paths.auditPath, cleared: true };
 }
 
 function childrenPath(args = {}) {
@@ -6074,6 +6791,10 @@ function childrenPath(args = {}) {
 
 function contentPath(args = {}) {
   return `${itemBase(args)}/content`;
+}
+
+function readOnlyContentPath(args = {}) {
+  return `${readOnlyItemBase(args)}/content`;
 }
 
 function uploadPath(remotePath, conflictBehavior = "fail") {
@@ -6121,7 +6842,7 @@ function simplifyItem(item) {
     remotePath: itemRemotePath(source),
     path: source.parentReference?.path ? decodeGraphPath(source.parentReference.path) : source.parentReference?.path,
     parentId: source.parentReference?.id,
-    driveId: source.parentReference?.driveId ? String(source.parentReference.driveId).toUpperCase() : source.parentReference?.driveId,
+    driveId: source.parentReference?.driveId ? String(source.parentReference.driveId) : source.parentReference?.driveId,
     webUrl: source.webUrl,
     size: Number.isFinite(numericSize) && numericSize >= 0 ? numericSize : null,
     createdDateTime: source.createdDateTime,
@@ -8195,7 +8916,7 @@ function uniqueBatchLocalPath(destinationFolder, name, index, usedTargets) {
 async function batchDownload(args = {}) {
   const destinationFolder = args.destinationFolder ? resolve(args.destinationFolder) : null;
   if (destinationFolder) await assertNotLocalOneDriveSyncPathForWrite(destinationFolder, "Batch download", args);
-  const generatedDestinationFolder = destinationFolder || downloadRoot;
+  const generatedDestinationFolder = destinationFolder || (await currentScopedStoragePaths("batch download path resolution")).paths.downloadRoot;
   const plannedTargets = new Set();
   const results = [];
   for (const [index, item] of (args.items || []).entries()) {
@@ -8217,6 +8938,7 @@ async function batchDownload(args = {}) {
         itemId: info.id,
         localPath,
         overwrite: item.overwrite ?? args.overwrite,
+        maxBytes: item.maxBytes,
         allowLocalOneDriveSyncPath: args.allowLocalOneDriveSyncPath
       }));
     } catch (error) {
@@ -8355,6 +9077,16 @@ async function getRawInfo(args = {}) {
 
 async function getInfo(args = {}) {
   return formatDriveItem(await getRawInfo(args), args.format || "full");
+}
+
+async function getReadOnlyRawInfo(args = {}) {
+  if (!args.driveId) return await getRawInfo(args);
+  if (!args.itemId && args.path === undefined) throw new Error("An enterprise-library read requires driveId plus itemId or path.");
+  return await graph(readOnlyItemBase(args));
+}
+
+async function getReadOnlyInfo(args = {}) {
+  return formatDriveItem(await getReadOnlyRawInfo(args), args.format || "full");
 }
 
 function compactIdentity(identity) {
@@ -8567,7 +9299,7 @@ async function readText(args = {}) {
   if (info.size && info.size > maxBytes) {
     throw new Error(`File is ${info.size} bytes, above maxBytes ${maxBytes}. Use onedrive_download instead.`);
   }
-  const limited = await graphLimitedBuffer(contentPath(args), maxBytes);
+  const limited = await graphLimitedBuffer(contentPath(args), maxBytes, { expectedETag: info.eTag });
   if (limited.truncated) {
     throw new Error(`Downloaded content is above maxBytes ${maxBytes}. Use onedrive_download instead.`);
   }
@@ -8582,17 +9314,51 @@ async function download(args = {}) {
   return await downloadResolvedItem(info, args);
 }
 
-async function downloadResolvedItem(info, args = {}) {
-  const preferredTarget = args.localPath ? resolve(args.localPath) : join(downloadRoot, info.name || basename(cleanPath(args.path || args.itemId || "download")));
+async function downloadResolvedItem(info, args = {}, options = {}) {
+  const sourceDriveId = info.driveId || args.driveId;
+  const sourceGuard = args.localPath ? null : await captureRequestDriveScopeGuard(sourceDriveId, "download path resolution");
+  const scopedDownloads = args.localPath ? null : scopedStoragePaths(sourceGuard.scope).downloadRoot;
+  const preferredTarget = args.localPath ? resolve(args.localPath) : join(scopedDownloads, info.name || basename(cleanPath(args.path || args.itemId || "download")));
   await assertNotLocalOneDriveSyncPathForWrite(preferredTarget, "Download", args);
   const reservation = await reserveLocalDestination(preferredTarget, {
     overwrite: args.overwrite === true,
     allowAlternate: !args.localPath || args._allowAlternateLocalPath === true
   });
   const target = reservation.path;
-  const contentArgs = info.id ? { itemId: info.id } : args;
+  const contentArgs = info.id
+    ? { itemId: info.id, ...(sourceDriveId ? { driveId: sourceDriveId } : {}) }
+    : args;
   try {
-    const downloaded = await graphDownloadToFile(contentPath(contentArgs), target, { reserved: reservation.reserved });
+    const maxBytes = options.maxBytes ?? clampInteger(args.maxBytes, maxGraphDownloadBytes, 1, maxGraphDownloadBytes);
+    if (Number(info.size || 0) > maxBytes) {
+      throw new Error(`File is ${info.size} bytes, above the ${maxBytes}-byte download limit.`);
+    }
+    const performDownload = async () => await graphDownloadToFile(readOnlyContentPath(contentArgs), target, {
+      reserved: reservation.reserved,
+      maxBytes,
+      expectedETag: options.expectedETag ?? info.eTag
+    });
+    const downloaded = managedBackupQuota.managedRootForPath(target)
+      ? await (async () => {
+          await ensureManagedBackupQuotaReady();
+          let targetSize = 0;
+          let targetExists = false;
+          try {
+            const metadata = await lstat(target);
+            if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("Managed backup target is not a regular file.");
+            targetExists = true;
+            targetSize = metadata.size;
+          } catch (error) {
+            if (error.code !== "ENOENT") throw error;
+          }
+          return await managedBackupQuota.withReservation({
+            targetPaths: [target],
+            expectedEntries: targetExists ? 0 : 1,
+            expectedBytes: Math.max(0, maxBytes - targetSize)
+          }, performDownload);
+        })()
+      : await performDownload();
+    if (sourceGuard) assertRequestDriveScopeGuard(sourceGuard, "download completion");
     return { item: info, localPath: target, bytesWritten: downloaded.bytesWritten };
   } catch (error) {
     if (reservation.reserved) await rm(target, { force: true });
@@ -8623,24 +9389,37 @@ function commonExtractionKind(info = {}) {
   return null;
 }
 
-async function extractCommonDocumentText(info, args = {}) {
+async function extractCommonDocumentText(info, args = {}, options = {}) {
   if (info.folder) throw new Error(`Item is a folder, not an extractable document: ${info.name}`);
+  const sourceDriveId = info.driveId || args.driveId;
   const kind = commonExtractionKind(info);
   if (!kind) throw new Error(`No local text extractor is available for ${info.name || "this file"}.`);
   if (Number(info.size || 0) > maxCommonExtractionBytes) {
     throw new Error(`File is ${info.size} bytes, above the ${maxCommonExtractionBytes}-byte common-document extraction limit.`);
   }
-  const transactionRoot = join(officeEditingRoot, `extract-${randomUUID()}`);
-  await ensurePrivateDirectory(transactionRoot);
-  const localPath = join(transactionRoot, basename(info.name || `document${extname(info.name || "")}`));
+  const { lease: heavyweightAdmissionLease, owned: ownsHeavyweightAdmission } = heavyweightBufferLease(options);
+  let transactionRoot = null;
   try {
-    await downloadResolvedItem(info, { localPath, overwrite: false });
+    const stagingGuard = await captureRequestDriveScopeGuard(sourceDriveId, "document extraction staging");
+    transactionRoot = join(scopedStoragePaths(stagingGuard.scope).officeEditingRoot, `extract-${randomUUID()}`);
+    await ensurePrivateDirectory(transactionRoot);
+    const localPath = join(transactionRoot, basename(info.name || `document${extname(info.name || "")}`));
+    await downloadResolvedItem(
+      info,
+      { localPath, overwrite: false, ...(sourceDriveId ? { driveId: sourceDriveId } : {}) },
+      { maxBytes: maxCommonExtractionBytes, expectedETag: info.eTag }
+    );
     const extracted = await runCommonTextHelper({
       action: "extract",
       inputPath: localPath,
       kind,
       maxBytes: clampInteger(args.maxBytes, chatgptFetchTextByteLimit, 1, chatgptFetchTextByteLimit)
-    }, { timeoutMs: 60_000, maxOutputBytes: 2 * 1024 * 1024 });
+    }, {
+      timeoutMs: 60_000,
+      maxOutputBytes: 2 * 1024 * 1024,
+      _heavyweightAdmissionLease: heavyweightAdmissionLease
+    });
+    assertRequestDriveScopeGuard(stagingGuard, "document extraction completion");
     const limited = truncateUtf8(extracted.text || "", chatgptFetchTextByteLimit);
     return {
       item: info,
@@ -8652,7 +9431,11 @@ async function extractCommonDocumentText(info, args = {}) {
       extractor: extracted.extractor || null
     };
   } finally {
-    await rm(transactionRoot, { recursive: true, force: true });
+    try {
+      if (transactionRoot) await rm(transactionRoot, { recursive: true, force: true });
+    } finally {
+      if (ownsHeavyweightAdmission) heavyweightAdmissionLease.release();
+    }
   }
 }
 
@@ -8679,7 +9462,100 @@ function officeRuntimeStatus() {
   return { pythonAvailable, pythonVersion, pythonPath: officePythonPath, helperAvailable, helperPath: officeHelperPath, error };
 }
 
-async function officeCapabilities() {
+function publicOfficeRuntimeStatus(runtime = {}) {
+  return {
+    pythonAvailable: runtime.pythonAvailable === true,
+    pythonVersion: runtime.pythonVersion || null,
+    helperAvailable: runtime.helperAvailable === true,
+    error: runtime.error ? "The Office document runtime is unavailable or misconfigured." : null
+  };
+}
+
+const officeOperationSchemas = Object.freeze({
+  word: wordOperationsSchema,
+  excel: excelOperationsSchema,
+  powerpoint: powerpointOperationsSchema
+});
+
+function officeOperationVariants(kind) {
+  return officeOperationSchemas[kind]?.items?.anyOf || [];
+}
+
+function officeOperationNames(kind) {
+  return officeOperationVariants(kind)
+    .map((variant) => variant?.properties?.type?.const)
+    .filter((value) => typeof value === "string");
+}
+
+function officeExampleValue(property, schema = {}) {
+  if (schema.const !== undefined) return schema.const;
+  if (Array.isArray(schema.enum) && schema.enum.length) return schema.enum[0];
+  if (schema.anyOf?.length) return officeExampleValue(property, schema.anyOf[0]);
+  if (property === "part" && String(schema.pattern || "").includes("header|footer")) return "word/header1.xml";
+  const type = Array.isArray(schema.type) ? schema.type.find((entry) => entry !== "null") : schema.type;
+  if (type === "integer" || type === "number") {
+    if (["width", "height", "pageWidth", "pageHeight"].includes(property)) return Math.max(1, Number(schema.minimum ?? 1));
+    return Number(schema.minimum ?? (schema.exclusiveMinimum !== undefined ? schema.exclusiveMinimum + 1 : 0));
+  }
+  if (type === "boolean") return true;
+  if (type === "array") {
+    if (property === "shapeIds") return [1, 2];
+    if (property === "rows") return [["Value"]];
+    if (property === "values" && schema.items?.type === "array") return [["Value"]];
+    if (property === "values") return ["Value"];
+    if (property === "keys") return [{ column: 0 }];
+    return [officeExampleValue(property, schema.items || { type: "string" })];
+  }
+  if (type === "object") {
+    const required = schema.required || schema.anyOf?.[0]?.required || [];
+    return Object.fromEntries(required.map((key) => [key, officeExampleValue(key, schema.properties?.[key] || {})]));
+  }
+  const examples = {
+    address: "A1", afterHash: "hash", altText: "Description", author: "Reviewer", base64: "AA==",
+    chart: "Chart1", commentId: "0", contentType: "image/png", display: "Example", fillColor: "FFFF00",
+    find: "Example", formula: "=1", formula1: "1", formula2: "2", formatCode: "0.00",
+    name: "Example1", newName: "Example2", part: "word/document.xml", replace: "Updated",
+    sheet: "Sheet1", sourceData: "Sheet1!A1:B2", style: "Normal", table: "Table1",
+    text: "Example", titleText: "Example", url: "https://example.com"
+  };
+  return examples[property] ?? "Example";
+}
+
+function officeOperationExample(schema) {
+  const required = schema.required || schema.anyOf?.[0]?.required || [];
+  const example = Object.fromEntries(required.map((key) => [key, officeExampleValue(key, schema.properties?.[key] || {})]));
+  const validation = validateSchemaValue(example, schema, "$.example");
+  if (!validation.ok) {
+    throw new Error(`Could not synthesize a valid Office operation example: ${validation.details.map((entry) => `${entry.path} ${entry.message}`).join("; ")}`);
+  }
+  return validation.value;
+}
+
+async function officeCapabilities(args = {}) {
+  if (args.operation && !args.kind) throw new Error("operation requires kind for an exact Office capability lookup.");
+  if (args.kind && !officeOperationSchemas[args.kind]) throw new Error(`Unsupported Office kind: ${args.kind}.`);
+  if (args.kind && args.operation) {
+    const variant = officeOperationVariants(args.kind).find((entry) => entry?.properties?.type?.const === args.operation);
+    if (!variant) {
+      return {
+        kind: args.kind,
+        operation: args.operation,
+        supported: false,
+        availableOperations: officeOperationNames(args.kind)
+      };
+    }
+    const schema = JSON.parse(JSON.stringify(variant));
+    return {
+      kind: args.kind,
+      operation: args.operation,
+      supported: true,
+      schema,
+      example: officeOperationExample(schema),
+      backendNotes: args.kind === "excel"
+        ? "Open XML supports every listed operation; Graph Excel supports a documented subset for eligible business .xlsx workbooks."
+        : "The account-scoped Open XML backend applies this operation."
+    };
+  }
   const runtime = officeRuntimeStatus();
   let drive = null;
   let driveError = null;
@@ -8690,7 +9566,7 @@ async function officeCapabilities() {
   }
   const driveType = drive?.driveType || null;
   return {
-    runtime,
+    runtime: toolProfile === "chatgpt" ? publicOfficeRuntimeStatus(runtime) : runtime,
     account: {
       driveType,
       driveName: drive?.name || null,
@@ -8704,9 +9580,9 @@ async function officeCapabilities() {
         readOnlyToolsReady: true,
         mutationToolsReady: true,
         operations: {
-          word: ["replaceText", "setParagraphText", "setParagraphStyle", "insertParagraph", "insertTable", "setTableCell", "setContentControlText", "addHyperlink", "addComment", "insertImage", "replaceImage", "createContentControl", "deleteContentControl", "createBookmark", "deleteBookmark", "insertTableRow", "deleteTableRow", "insertTableColumn", "deleteTableColumn", "setHeaderFooterText", "setSectionProperties"],
-          excel: ["setCell", "setFormula", "setRange", "clearRange", "setStyle", "setNumberFormat", "addConditionalFormat", "setDataValidation", "freezePanes", "setColumnWidth", "renameSheet", "setDefinedName", "recalculate", "addTableRow", "deleteTableRow", "setTableTotals", "createChart", "updateChart", "addWorksheet", "deleteWorksheet", "addTable", "deleteTable", "mergeRange", "unmergeRange", "sortRange", "setAutoFilter", "setHyperlink", "addNote", "deleteNote", "insertImage", "formatChart", "setSheetProtection", "refreshPivot"],
-          powerpoint: ["replaceText", "setShapeText", "setShapeGeometry", "setTextStyle", "addTextBox", "deleteShape", "replaceImage", "setTableCell", "setNotes", "duplicateSlide", "deleteSlide", "moveSlide", "addSlide", "addImage", "cropImage", "addTable", "insertTableRow", "deleteTableRow", "insertTableColumn", "deleteTableColumn", "setShapeAltText", "setZOrder", "groupShapes", "ungroupShape", "applySlideLayout"]
+          ...Object.fromEntries(Object.keys(officeOperationSchemas)
+            .filter((kind) => !args.kind || kind === args.kind)
+            .map((kind) => [kind, officeOperationNames(kind)]))
         },
         notes: [
           "Encrypted and legacy binary Office files are refused.",
@@ -8723,6 +9599,18 @@ async function officeCapabilities() {
           ? "Microsoft Graph workbook APIs do not support OneDrive Consumer workbooks; use the Open XML backend."
           : "Graph workbook sessions will be used for supported business, SharePoint, or group-drive .xlsx files."
       }
+    },
+    operationGuidance: {
+      excel: {
+        addTableRow: {
+          required: ["type", "table", "values"],
+          optional: ["index"],
+          canonicalValuesShape: "Two-dimensional rows array; one row is still wrapped once, such as [[\"Applied\", \"Example Co\"]].",
+          singleRowShorthand: "A one-dimensional values array is accepted and normalized to one row before schema validation and execution.",
+          appendBehavior: "Omit index or pass null to append after the current final data row.",
+          canonicalExample: { type: "addTableRow", table: "SearchLogTable", values: [["Applied", "Example Co"]] }
+        }
+      }
     }
   };
 }
@@ -8738,6 +9626,20 @@ async function runPythonJsonHelper(helperPath, request, options = {}) {
   if (!runtime.pythonAvailable || !helperAvailable) {
     throw new Error(`Document extraction runtime is unavailable: ${runtime.error || "Python/helper not found"}`);
   }
+  let admission;
+  let ownsAdmission = false;
+  if (options._heavyweightAdmissionLease !== undefined) {
+    admission = assertReusableHeavyweightSubprocessLease(options._heavyweightAdmissionLease);
+  } else {
+    const admissionController = options.admissionController || heavyweightSubprocessAdmission;
+    if (!admissionController || typeof admissionController.acquire !== "function") {
+      throw new Error("Document extraction requires heavyweight-process admission.");
+    }
+    const admissionSubject = options.admissionSubject || currentAuthContextId() || "noauth-local-server";
+    admission = admissionController.acquire({ subject: admissionSubject, kind: "office" });
+    if (!admission.admitted) throw heavyweightSubprocessBusyError(admission);
+    ownsAdmission = true;
+  }
   const timeoutMs = clampInteger(options.timeoutMs, 60_000, 1000, 5 * 60_000);
   const maxOutputBytes = clampInteger(options.maxOutputBytes, 20 * 1024 * 1024, 1024, 50 * 1024 * 1024);
   // Python bytecode is disposable runtime state. Keep it off storageRoot,
@@ -8745,56 +9647,74 @@ async function runPythonJsonHelper(helperPath, request, options = {}) {
   const pythonCacheRoot = resolve(
     process.env.ONEDRIVE_OFFICE_PYCACHE_ROOT || join(tmpdir(), "onedrive-python-cache")
   );
-  await ensurePrivateDirectory(pythonCacheRoot);
-  return await new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(officePythonPath, [helperPath], {
-      cwd: pluginRoot,
-      stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, PYTHONPYCACHEPREFIX: pythonCacheRoot }
-    });
-    let stdout = Buffer.alloc(0);
-    let stderr = Buffer.alloc(0);
-    let settled = false;
-    let timer = null;
-    const finish = (error, value) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (error) rejectPromise(error);
-      else resolvePromise(value);
-    };
-    const appendBounded = (current, chunk, label) => {
-      const next = Buffer.concat([current, chunk]);
-      if (next.length > maxOutputBytes) {
+  let admissionBound = false;
+  try {
+    await ensurePrivateDirectory(pythonCacheRoot);
+    return await new Promise((resolvePromise, rejectPromise) => {
+      const child = spawn(officePythonPath, [helperPath], {
+        cwd: pluginRoot,
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, PYTHONPYCACHEPREFIX: pythonCacheRoot }
+      });
+      if (ownsAdmission) {
+        admission.releaseOnChildCompletion(child);
+        admissionBound = true;
+      }
+      let stdout = Buffer.alloc(0);
+      let stderr = Buffer.alloc(0);
+      let settled = false;
+      let pendingError = null;
+      let timer = null;
+      const finish = (error, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (error) rejectPromise(error);
+        else resolvePromise(value);
+      };
+      const terminateWithError = (error) => {
+        if (settled || pendingError) return;
+        pendingError = error;
         child.kill("SIGKILL");
-        finish(new Error(`Office helper ${label} exceeded ${maxOutputBytes} bytes.`));
-      }
-      return next;
-    };
-    child.stdout.on("data", (chunk) => { stdout = appendBounded(stdout, chunk, "stdout"); });
-    child.stderr.on("data", (chunk) => { stderr = appendBounded(stderr, chunk, "stderr"); });
-    child.on("error", (error) => finish(new Error(`Could not start Office helper: ${error.message}`)));
-    child.on("close", (code) => {
-      let parsed = null;
-      try {
-        parsed = JSON.parse(stdout.toString("utf8") || "{}");
-      } catch (error) {
-        finish(new Error(`Office helper returned invalid JSON: ${error.message}. ${stderr.toString("utf8").trim()}`));
-        return;
-      }
-      if (code !== 0 || parsed.ok !== true) {
-        finish(new Error(parsed.error || stderr.toString("utf8").trim() || `Office helper exited with code ${code}.`));
-        return;
-      }
-      finish(null, parsed.value);
+      };
+      const appendBounded = (current, chunk, label) => {
+        const next = Buffer.concat([current, chunk]);
+        if (next.length > maxOutputBytes) {
+          terminateWithError(new Error(`Office helper ${label} exceeded ${maxOutputBytes} bytes.`));
+        }
+        return next;
+      };
+      child.stdout.on("data", (chunk) => { stdout = appendBounded(stdout, chunk, "stdout"); });
+      child.stderr.on("data", (chunk) => { stderr = appendBounded(stderr, chunk, "stderr"); });
+      child.on("error", (error) => finish(new Error(`Could not start Office helper: ${error.message}`)));
+      child.on("close", (code) => {
+        if (pendingError) {
+          finish(pendingError);
+          return;
+        }
+        let parsed = null;
+        try {
+          parsed = JSON.parse(stdout.toString("utf8") || "{}");
+        } catch (error) {
+          finish(new Error(`Office helper returned invalid JSON: ${error.message}. ${stderr.toString("utf8").trim()}`));
+          return;
+        }
+        if (code !== 0 || parsed.ok !== true) {
+          finish(new Error(parsed.error || stderr.toString("utf8").trim() || `Office helper exited with code ${code}.`));
+          return;
+        }
+        finish(null, parsed.value);
+      });
+      timer = setTimeout(() => {
+        terminateWithError(new Error(`Office helper timed out after ${timeoutMs}ms.`));
+      }, timeoutMs);
+      child.stdin.on("error", (error) => terminateWithError(new Error(`Could not send request to Office helper: ${error.message}`)));
+      child.stdin.end(JSON.stringify(request));
     });
-    timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      finish(new Error(`Office helper timed out after ${timeoutMs}ms.`));
-    }, timeoutMs);
-    child.stdin.on("error", (error) => finish(new Error(`Could not send request to Office helper: ${error.message}`)));
-    child.stdin.end(JSON.stringify(request));
-  });
+  } catch (error) {
+    if (ownsAdmission && !admissionBound) admission.release();
+    throw error;
+  }
 }
 
 export async function runOfficeHelper(request, options = {}) {
@@ -8805,8 +9725,9 @@ async function runCommonTextHelper(request, options = {}) {
   return await runPythonJsonHelper(commonTextHelperPath, request, options);
 }
 
-async function inspectRemoteOfficePackage(args = {}, expectedKind = null, action = "inspect") {
-  const info = args._resolvedInfo || await getInfo(args);
+async function inspectRemoteOfficePackage(args = {}, expectedKind = null, action = "inspect", options = {}) {
+  const info = args._resolvedInfo || await getReadOnlyInfo(args);
+  const sourceDriveId = info.driveId || args.driveId;
   if (info.folder) throw new Error(`Item is a folder, not an Office document: ${info.name}`);
   const detectedKind = officePackageKindFromName(info.name);
   if (!detectedKind) {
@@ -8818,17 +9739,25 @@ async function inspectRemoteOfficePackage(args = {}, expectedKind = null, action
   if (Number(info.size || 0) > maxOfficePackageBytes) {
     throw new Error(`Office package is ${info.size} bytes, above the ${maxOfficePackageBytes}-byte inspection limit.`);
   }
-  const transactionRoot = join(officeEditingRoot, `inspect-${randomUUID()}`);
-  await ensurePrivateDirectory(transactionRoot);
-  const localPath = join(transactionRoot, basename(info.name));
+  const { lease: heavyweightAdmissionLease, owned: ownsHeavyweightAdmission } = heavyweightBufferLease(options);
+  let transactionRoot = null;
   try {
-    await downloadResolvedItem(info, { localPath, overwrite: false });
+    const stagingGuard = await captureRequestDriveScopeGuard(sourceDriveId, "Office inspection staging");
+    transactionRoot = join(scopedStoragePaths(stagingGuard.scope).officeEditingRoot, `inspect-${randomUUID()}`);
+    await ensurePrivateDirectory(transactionRoot);
+    const localPath = join(transactionRoot, basename(info.name));
+    await downloadResolvedItem(
+      info,
+      { localPath, overwrite: false, ...(sourceDriveId ? { driveId: sourceDriveId } : {}) },
+      { maxBytes: maxOfficePackageBytes, expectedETag: info.eTag }
+    );
     const value = await runOfficeHelper({
       ...args,
       action,
       inputPath: localPath,
       kind: expectedKind || args.expectedKind || detectedKind
-    });
+    }, { _heavyweightAdmissionLease: heavyweightAdmissionLease });
+    assertRequestDriveScopeGuard(stagingGuard, "Office inspection completion");
     return addSemanticAnchors(expectedKind || args.expectedKind || detectedKind, {
       item: info,
       backend: "openxml",
@@ -8836,7 +9765,343 @@ async function inspectRemoteOfficePackage(args = {}, expectedKind = null, action
       package: value.package ? { ...value.package, path: undefined } : undefined
     });
   } finally {
-    await rm(transactionRoot, { recursive: true, force: true });
+    try {
+      if (transactionRoot) await rm(transactionRoot, { recursive: true, force: true });
+    } finally {
+      if (ownsHeavyweightAdmission) heavyweightAdmissionLease.release();
+    }
+  }
+}
+
+function focusedOfficeInspection(result, args = {}) {
+  const kind = result.kind || args.kind;
+  const contentKeys = kind === "word"
+    ? ["paragraphs", "tables", "contentControls", "comments", "reviewFeatures", "matches"]
+    : kind === "excel"
+      ? ["sheets", "definedNames", "formulaDependencies", "reviewFeatures", "matches"]
+      : ["slides", "matches"];
+  const countKeys = kind === "word"
+    ? ["paragraphCount", "tableCount", "contentControlCount", "commentCount", "matchCount"]
+    : kind === "excel"
+      ? ["sheetCount", "cellCount", "tableCount", "chartCount", "pivotCount", "noteCount", "formulaDependencyCount", "matchCount"]
+      : ["slideCount", "matchCount"];
+  const content = Object.fromEntries(contentKeys.filter((key) => result[key] !== undefined).map((key) => [key, result[key]]));
+  if (kind === "word") {
+    if (Array.isArray(args.paragraphIndexes)) {
+      const selected = new Set(args.paragraphIndexes);
+      content.paragraphs = (content.paragraphs || []).filter((entry) => selected.has(entry.index));
+    }
+    if (Array.isArray(args.tableIndexes)) {
+      const selected = new Set(args.tableIndexes);
+      content.tables = (content.tables || []).filter((entry) => selected.has(entry.index));
+    }
+  }
+  const item = result.item || {};
+  return {
+    kind,
+    item: Object.fromEntries(["id", "name", "eTag", "cTag", "size", "lastModifiedDateTime", "webUrl", "driveId"]
+      .filter((key) => item[key] !== undefined)
+      .map((key) => [key, item[key]])),
+    selectors: {
+      ...(result.selectors || {}),
+      ...Object.fromEntries(["paragraphIndexes", "tableIndexes", "paragraphStart", "sheetNames", "address", "slideIndexes", "shapeIds"]
+        .filter((key) => args[key] !== undefined)
+        .map((key) => [key, args[key]]))
+    },
+    counts: Object.fromEntries(countKeys.filter((key) => result[key] !== undefined).map((key) => [key, result[key]])),
+    truncated: Boolean(result.truncated),
+    truncation: result.truncation || undefined,
+    content,
+    package: result.package,
+    backend: result.backend
+  };
+}
+
+async function officeInspect(args = {}) {
+  const irrelevant = args.kind === "word"
+    ? ["sheetNames", "address", "maxCells", "slideIndexes", "shapeIds", "maxSlides", "maxShapes"]
+    : args.kind === "excel"
+      ? ["paragraphIndexes", "tableIndexes", "paragraphStart", "maxParagraphs", "maxTables", "maxTableCells", "slideIndexes", "shapeIds", "maxSlides", "maxShapes"]
+      : ["paragraphIndexes", "tableIndexes", "paragraphStart", "maxParagraphs", "maxTables", "maxTableCells", "sheetNames", "address", "maxCells"];
+  const supplied = irrelevant.filter((key) => args[key] !== undefined);
+  if (supplied.length) throw new Error(`${args.kind} inspection does not accept selectors for another Office kind: ${supplied.join(", ")}.`);
+  return focusedOfficeInspection(await inspectRemoteOfficePackage(args, args.kind, "inspect"), args);
+}
+
+const officeReviewLimitations = Object.freeze({
+  word: { legacyAnchoredComments: true, replies: false, resolution: false, modernThreadedComments: false },
+  excel: { legacyCellNotes: true, threadedComments: false, replies: false },
+  powerpoint: { supported: false }
+});
+
+function wordReviewEntries(inspection) {
+  const paragraphs = new Map((inspection.content?.paragraphs || []).map((entry) => [entry.index, entry]));
+  return (inspection.content?.comments || []).map((comment) => {
+    const paragraph = paragraphs.get(comment.paragraphIndex);
+    return {
+      id: comment.id,
+      author: comment.author,
+      date: comment.date,
+      text: comment.text,
+      evidence: {
+        part: comment.part,
+        paragraphIndex: comment.paragraphIndex,
+        paragraphText: paragraph?.text || comment.anchors?.[0]?.paragraphText,
+        anchor: paragraph?.anchor
+      }
+    };
+  });
+}
+
+function excelReviewEntries(inspection) {
+  return (inspection.content?.sheets || []).flatMap((sheet) => {
+    const cells = new Map((sheet.cells || []).map((entry) => [String(entry.address).toUpperCase(), entry]));
+    return (sheet.notes || []).map((note) => ({
+      address: note.address,
+      author: note.author,
+      text: note.text,
+      evidence: { sheet: sheet.name, address: note.address, anchor: cells.get(String(note.address || "").toUpperCase())?.anchor }
+    }));
+  });
+}
+
+async function officeReview(args = {}) {
+  const limitations = officeReviewLimitations;
+  if (args.operation === "list") {
+    const inspection = await officeInspect({
+      kind: args.kind,
+      ...(args.itemId ? { itemId: args.itemId } : { path: args.path }),
+      ...(args.kind === "word" ? { maxParagraphs: 500 } : { sheetNames: args.sheet ? [args.sheet] : undefined, maxCells: 5000 })
+    });
+    const entries = args.kind === "word" ? wordReviewEntries(inspection) : excelReviewEntries(inspection);
+    return { kind: args.kind, operation: "list", item: inspection.item, count: entries.length, entries, limitations };
+  }
+  if (args.kind === "word") {
+    if (args.operation === "add" && args.paragraphIndex === undefined && !args.anchor) throw new Error("Word comment add requires paragraphIndex or anchor.");
+    if (args.operation === "delete" && !args.commentId) throw new Error("Word comment delete requires commentId.");
+  } else {
+    if (!args.sheet || !args.address) throw new Error("Excel note add/delete requires sheet and address.");
+  }
+  if (args.operation === "add" && !args.text) throw new Error(`${args.kind} review add requires text.`);
+  if (args.operation === "delete" && args.expectedText === undefined) throw new Error(`${args.kind} review delete requires expectedText from the latest review listing.`);
+  const operation = args.kind === "word"
+    ? args.operation === "add"
+      ? { type: "addComment", ...(args.anchor ? { anchor: args.anchor } : { paragraphIndex: args.paragraphIndex }), text: args.text, author: args.author, initials: args.initials }
+      : { type: "deleteComment", commentId: args.commentId, expectedText: args.expectedText, expectedAuthor: args.expectedAuthor }
+    : args.operation === "add"
+      ? { type: "addNote", sheet: args.sheet, address: args.address, text: args.text, author: args.author }
+      : { type: "deleteNote", sheet: args.sheet, address: args.address, expectedText: args.expectedText, expectedAuthor: args.expectedAuthor };
+  const cleanOperation = Object.fromEntries(Object.entries(operation).filter(([, value]) => value !== undefined));
+  const result = await officeBatchUpdate({
+    ...(args.itemId ? { itemId: args.itemId } : { path: args.path }),
+    operations: [cleanOperation],
+    dryRun: args.dryRun,
+    confirmed: args.confirmed,
+    expectedName: args.expectedName,
+    expectedId: args.expectedId,
+    expectedETag: args.expectedETag,
+    previewToken: args.previewToken,
+    createBackup: true,
+    verify: true,
+    ...(args.kind === "word" ? { trackedChanges: "refuse" } : { backend: "openxml" })
+  }, args.kind, "onedrive_office_review");
+  return { kind: args.kind, operation: args.operation, limitations, ...result };
+}
+
+function materializedUnavailableError() {
+  const error = new Error("The materialized resource was not found or has expired.");
+  error.code = "RESOURCE_NOT_FOUND";
+  return error;
+}
+
+async function materializedSourceScope(args = {}, info = {}) {
+  const authContextId = currentAuthContextId();
+  if (!authContextId) throw new Error("A complete authentication context is required for materialized resources.");
+  // A sharing/remote-item shortcut can resolve from a container drive to a
+  // different source drive. The resolved parentReference drive is therefore
+  // authoritative over the caller's container selector for bytes and scope.
+  let driveId = info.driveId || args.driveId;
+  if (!driveId) {
+    const active = await activeStorageScope();
+    if (active.authContextId !== authContextId) throw accountContextChangedError("Materialized-resource scope resolution");
+    driveId = active.driveId;
+  }
+  driveId = String(driveId || "");
+  if (!driveId || driveId.length > 1024 || /[\u0000-\u001f\u007f]/u.test(driveId)) {
+    throw new Error("The materialized resource source drive is invalid.");
+  }
+  const scope = { authContextId, driveId };
+  return {
+    authContextId,
+    driveId,
+    scopeKey: storageScopeKey(scope),
+    scopeId: storageScopeOpaqueId(scope)
+  };
+}
+
+function exactMaterializedBinding(uri) {
+  const binding = materializedResourceBindings.get(uri);
+  const authContextId = currentAuthContextId();
+  if (!binding || !authContextId || binding.authContextId !== authContextId) throw materializedUnavailableError();
+  if (binding.expiresAt <= Date.now()) {
+    materializedResourceBindings.delete(uri);
+    throw materializedUnavailableError();
+  }
+  return binding;
+}
+
+function materializedMimeType(info = {}, format = "original") {
+  if (format === "pdf") return "application/pdf";
+  return String(info.file?.mimeType || canonicalTextMimeTypes.get(extname(info.name || "").toLowerCase()) || "application/octet-stream")
+    .split(";", 1)[0]
+    .trim()
+    .toLowerCase();
+}
+
+function materializedName(info = {}, format = "original") {
+  const name = assertSafeItemName(info.name || "download");
+  return format === "pdf" && extname(name).toLowerCase() !== ".pdf" ? `${parse(name).name}.pdf` : name;
+}
+
+async function materializeDownload(args = {}, options = {}) {
+  // `args.format` selects the downloaded representation (original/PDF), not
+  // the metadata projection. Always retain the full metadata here so the
+  // subsequent content request can bind its bytes to the inspected eTag.
+  const info = await getReadOnlyInfo({ ...args, format: "full" });
+  if (info.folder) throw new Error("Folders cannot be materialized as files.");
+  const format = args.format || "original";
+  const maxBytes = clampInteger(args.maxBytes, materializedMaxBytes, 1, materializedMaxBytes);
+  if (format === "original" && Number(info.size || 0) > maxBytes) {
+    throw new Error(`File is ${info.size} bytes, above maxBytes ${maxBytes}.`);
+  }
+  const sourceScope = await materializedSourceScope(args, info);
+  // Resolve a path selector once, then download by the stable item identity we
+  // just inspected. This keeps the bytes bound to the returned item/eTag even
+  // if the item is renamed between metadata lookup and content retrieval.
+  let path = readOnlyContentPath({ itemId: info.id, driveId: sourceScope.driveId });
+  if (format === "pdf" && extname(info.name || "").toLowerCase() !== ".pdf") path += "?format=pdf";
+  const { lease: heavyweightAdmissionLease, owned: ownsHeavyweightAdmission } = heavyweightBufferLease(options);
+  let directory;
+  let registered = false;
+  try {
+    // Constructing the process-local registry sweeps unrecoverable files from
+    // a prior crashed process before this request creates any new staging.
+    const registry = materializedResourceRegistry();
+    const limited = await graphLimitedBuffer(path, maxBytes, { expectedETag: info.eTag });
+    if (limited.truncated) throw new Error(`Materialized content is above maxBytes ${maxBytes}.`);
+    if (format === "pdf" && limited.buffer.subarray(0, 5).toString("ascii") !== "%PDF-") {
+      throw new Error("Microsoft Graph did not return a valid PDF conversion.");
+    }
+    directory = join(materializedResourceRoot, sourceScope.scopeId, randomUUID());
+    await ensurePrivateDirectory(directory);
+    const name = materializedName(info, format);
+    const filePath = join(directory, name);
+    await writePrivateFile(filePath, limited.buffer);
+    const resource = registry.register({
+      scopeKey: sourceScope.scopeKey,
+      filePath,
+      name,
+      mimeType: materializedMimeType(info, format)
+    });
+    registered = true;
+    materializedResourceBindings.set(resource.uri, {
+      authContextId: sourceScope.authContextId,
+      scopeKey: sourceScope.scopeKey,
+      expiresAt: resource.expiresAt
+    });
+    const sha256 = createHash("sha256").update(limited.buffer).digest("hex");
+    return {
+      item: info,
+      format,
+      resource: { ...resource, size: resource.sizeBytes, description: "Ephemeral account-and-drive-scoped OneDrive materialization." },
+      sha256,
+      sourceScope
+    };
+  } finally {
+    try {
+      if (directory && !registered) await rm(directory, { recursive: true, force: true });
+    } finally {
+      if (ownsHeavyweightAdmission) heavyweightAdmissionLease.release();
+    }
+  }
+}
+
+function materializedToolResult(value) {
+  const resource = value.resource;
+  return {
+    content: [
+      { type: "text", text: JSON.stringify({ item: value.item, format: value.format, resource: { uri: resource.uri, name: resource.name, mimeType: resource.mimeType, size: resource.size, expiresAt: resource.expiresAt }, sha256: value.sha256 }) },
+      { type: "resource_link", uri: resource.uri, name: resource.name, mimeType: resource.mimeType, size: resource.size, description: resource.description }
+    ],
+    structuredContent: {
+      item: value.item,
+      format: value.format,
+      name: resource.name,
+      mimeType: resource.mimeType,
+      size: resource.size,
+      sha256: value.sha256,
+      resourceUri: resource.uri,
+      expiresAt: resource.expiresAt
+    },
+    isError: false
+  };
+}
+
+async function renderOneDrivePreview(args = {}) {
+  const heavyweightAdmissionLease = acquireHeavyweightBufferLease();
+  let stagingRoot;
+  try {
+    const pdf = await materializeDownload(
+      { ...args, format: "pdf" },
+      { _heavyweightAdmissionLease: heavyweightAdmissionLease }
+    );
+    const binding = exactMaterializedBinding(pdf.resource.uri);
+    if (binding.scopeKey !== pdf.sourceScope.scopeKey) throw materializedUnavailableError();
+    const pdfResource = materializedResourceRegistry().read({
+      scopeKey: binding.scopeKey,
+      uri: pdf.resource.uri,
+      maxBytes: materializedMaxBytes
+    });
+    stagingRoot = join(materializedResourceRoot, pdf.sourceScope.scopeId, `render-input-${randomUUID()}`);
+    await ensurePrivateDirectory(stagingRoot);
+    const pdfPath = join(stagingRoot, "preview.pdf");
+    await writePrivateFile(pdfPath, pdfResource.data);
+    const rendered = await renderPdfPages({
+      pdfPath,
+      pages: args.pages || [1],
+      dpi: args.dpi || 110,
+      outputRoot: join(materializedResourceRoot, pdf.sourceScope.scopeId, "renders"),
+      pdftoppmPath: process.env.ONEDRIVE_PDFTOPPM_PATH || "pdftoppm",
+      resourceLimiterPythonPath: officePythonPath,
+      admissionSubject: currentAuthContextId() || "noauth-local-server",
+      _heavyweightAdmissionLease: heavyweightAdmissionLease,
+      // Base64 expands by roughly one third; keep standard image blocks below
+      // the focused profile's independent one-megabyte response ceiling.
+      maxOutputBytes: Math.min(600 * 1024, clampInteger(args.maxBytes, materializedMaxBytes, 1, materializedMaxBytes))
+    });
+    const metadata = {
+      item: pdf.item,
+      requestedPages: args.pages || [1],
+      renderedPages: rendered.pages.map((entry) => entry.page),
+      dpi: args.dpi || 110,
+      pdfResourceUri: pdf.resource.uri,
+      truncated: false
+    };
+    return {
+      content: [
+        { type: "text", text: JSON.stringify(metadata) },
+        { type: "resource_link", uri: pdf.resource.uri, name: pdf.resource.name, mimeType: pdf.resource.mimeType, size: pdf.resource.size },
+        ...rendered.pages.map((entry) => ({ type: "image", data: entry.data.toString("base64"), mimeType: entry.mimeType, _meta: { pageNumber: entry.page } }))
+      ],
+      structuredContent: metadata,
+      isError: false
+    };
+  } finally {
+    try {
+      if (stagingRoot) await rm(stagingRoot, { recursive: true, force: true });
+    } finally {
+      heavyweightAdmissionLease.release();
+    }
   }
 }
 
@@ -9235,26 +10500,49 @@ function assertOfficeBackupId(backupId) {
   return value.toLowerCase();
 }
 
-function officeBackupManifestPath(backupId) {
-  return join(backupRoot, `office-${assertOfficeBackupId(backupId)}.json`);
+function officeBackupManifestPath(scopedBackupRoot, backupId) {
+  return join(scopedBackupRoot, `office-${assertOfficeBackupId(backupId)}.json`);
 }
 
-async function persistOfficeBackup(localPath, rawItem, kind, fingerprint, reason = "edit") {
-  await ensurePrivateDirectory(backupRoot);
+async function persistOfficeBackup(localPath, rawItem, kind, fingerprint, reason = "edit", options = {}) {
   const scope = await activeStorageScope();
+  const scopedBackupRoot = scopedStoragePaths(scope).backupRoot;
+  await ensurePrivateDirectory(scopedBackupRoot);
   const backupId = randomUUID();
   const fileName = `office-${backupId}-${basename(rawItem.name || `${kind}.bin`)}`;
-  const backupPath = join(backupRoot, fileName);
-  await copyFile(localPath, backupPath);
-  await chmod(backupPath, 0o600);
-  const manifest = { version: 2, scope, backupId, createdAt: new Date().toISOString(), reason, kind, fileName, bytes: (await stat(backupPath)).size, fingerprint: fingerprint || null, item: { id: rawItem.id, name: rawItem.name, remotePath: itemRemotePath(rawItem) || null, eTag: rawItem.eTag || null, cTag: rawItem.cTag || null, size: rawItem.size ?? null, lastModifiedDateTime: rawItem.lastModifiedDateTime || null } };
-  await writePrivateFileAtomic(officeBackupManifestPath(backupId), JSON.stringify(manifest));
-  return { backupId, createdAt: manifest.createdAt, kind, item: manifest.item, bytes: manifest.bytes, localPath: backupPath, reason };
+  const backupPath = join(scopedBackupRoot, fileName);
+  const manifestPath = officeBackupManifestPath(scopedBackupRoot, backupId);
+  const source = await lstat(localPath);
+  if (!source.isFile() || source.isSymbolicLink() || source.nlink !== 1 || source.size > maxOfficePackageBytes) {
+    throw new Error("Office backup source is missing, unsafe, or exceeds the Office size limit.");
+  }
+  await ensureManagedBackupQuotaReady();
+  return await managedBackupQuota.withReservation({
+    targetPaths: [backupPath, manifestPath],
+    expectedEntries: 2,
+    expectedBytes: source.size + managedBackupManifestAllowanceBytes,
+    reservation: options._managedBackupQuotaReservation
+  }, async () => {
+    try {
+      await copyFile(localPath, backupPath, constants.COPYFILE_EXCL);
+      await chmod(backupPath, 0o600);
+      const manifest = { version: 2, scope, backupId, createdAt: new Date().toISOString(), reason, kind, fileName, bytes: (await stat(backupPath)).size, fingerprint: fingerprint || null, item: { id: rawItem.id, name: rawItem.name, remotePath: itemRemotePath(rawItem) || null, eTag: rawItem.eTag || null, cTag: rawItem.cTag || null, size: rawItem.size ?? null, lastModifiedDateTime: rawItem.lastModifiedDateTime || null } };
+      const manifestJson = JSON.stringify(manifest);
+      if (Buffer.byteLength(manifestJson, "utf8") > managedBackupManifestAllowanceBytes) throw new Error("Office backup manifest exceeded its bounded allowance.");
+      await writePrivateFileAtomic(manifestPath, manifestJson);
+      return { backupId, createdAt: manifest.createdAt, kind, item: manifest.item, bytes: manifest.bytes, reason };
+    } catch (error) {
+      await Promise.allSettled([rm(backupPath, { force: true }), rm(manifestPath, { force: true })]);
+      throw error;
+    }
+  });
 }
 
 async function loadOfficeBackup(backupId) {
   const id = assertOfficeBackupId(backupId);
-  const manifestPath = officeBackupManifestPath(id);
+  const scope = await activeStorageScope();
+  const scopedBackupRoot = scopedStoragePaths(scope).backupRoot;
+  const manifestPath = officeBackupManifestPath(scopedBackupRoot, id);
   let manifest;
   try {
     const manifestInfo = await lstat(manifestPath);
@@ -9265,21 +10553,64 @@ async function loadOfficeBackup(backupId) {
   if (manifest.version !== 2 || !manifest.scope) {
     throw new Error(`Office backup ${id} uses a legacy unscoped manifest and cannot be used. Create a new backup under the current account.`);
   }
-  const scope = await activeStorageScope();
   if (!storageScopesEqual(manifest.scope, scope)) throw new Error(`Office backup ${id} belongs to a different OneDrive authentication context or drive.`);
   if (manifest.backupId !== id || !manifest.item?.id || !["word", "excel", "powerpoint"].includes(manifest.kind)) throw new Error(`Office backup ${id} has an invalid manifest.`);
   if (!manifest.fileName || basename(manifest.fileName) !== manifest.fileName || !manifest.fileName.startsWith(`office-${id}-`)) throw new Error(`Office backup ${id} has an unsafe file reference.`);
-  const localPath = join(backupRoot, manifest.fileName);
+  const localPath = join(scopedBackupRoot, manifest.fileName);
   const info = await lstat(localPath);
   if (!info.isFile() || info.isSymbolicLink() || info.size > maxOfficePackageBytes) throw new Error(`Office backup ${id} is missing, unsafe, or exceeds the Office size limit.`);
-  const [resolvedRoot, resolvedFile] = await Promise.all([realpath(backupRoot), realpath(localPath)]);
+  const [resolvedRoot, resolvedFile] = await Promise.all([realpath(scopedBackupRoot), realpath(localPath)]);
   if (dirname(resolvedFile) !== resolvedRoot) throw new Error(`Office backup ${id} resolves outside managed backup storage.`);
   return { manifest, localPath };
 }
 
 async function officeBackups(args = {}) {
-  await ensurePrivateDirectory(backupRoot);
-  const entries = await readdir(backupRoot, { withFileTypes: true });
+  const scopedBackupRoot = (await currentScopedStoragePaths("Office backup listing")).paths.backupRoot;
+  const currentScope = await activeStorageScope();
+  await ensurePrivateDirectory(scopedBackupRoot);
+  const deleteBackupIds = args.deleteBackupIds || [];
+  if (deleteBackupIds.length && args.confirmed !== true) {
+    return {
+      confirmed: false,
+      deleteBackupIds,
+      requiredToDelete: "Pass confirmed:true with the exact backup IDs after reviewing the Office backup list."
+    };
+  }
+  if (deleteBackupIds.length) {
+    await ensureManagedBackupQuotaReady();
+    const deletedBackupIds = await managedBackupQuota.withMaintenance(async () => {
+      const targets = [];
+      for (const rawBackupId of deleteBackupIds) {
+        const backupId = assertOfficeBackupId(rawBackupId);
+        const manifestPath = officeBackupManifestPath(scopedBackupRoot, backupId);
+        let manifest;
+        try {
+          const manifestInfo = await lstat(manifestPath);
+          if (!manifestInfo.isFile() || manifestInfo.isSymbolicLink() || manifestInfo.nlink !== 1) throw new Error("unsafe manifest");
+          manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+        } catch {
+          throw new Error(`Office backup ${backupId} was not found or its manifest is invalid.`);
+        }
+        if (manifest.version !== 2 || !storageScopesEqual(manifest.scope, currentScope)) {
+          throw new Error(`Office backup ${backupId} does not belong to the current account-and-drive scope.`);
+        }
+        if (manifest.backupId !== backupId || !manifest.fileName || basename(manifest.fileName) !== manifest.fileName || !manifest.fileName.startsWith(`office-${backupId}-`)) {
+          throw new Error(`Office backup ${backupId} has an unsafe file reference.`);
+        }
+        const backupPath = join(scopedBackupRoot, manifest.fileName);
+        const [rootPath, resolvedBackup] = await Promise.all([realpath(scopedBackupRoot), realpath(backupPath)]);
+        if (dirname(resolvedBackup) !== rootPath) throw new Error(`Office backup ${backupId} resolves outside managed backup storage.`);
+        targets.push({ backupId, backupPath, manifestPath });
+      }
+      for (const target of targets) {
+        await rm(target.backupPath, { force: true });
+        await rm(target.manifestPath, { force: true });
+      }
+      return targets.map((target) => target.backupId);
+    });
+    return { confirmed: true, deletedBackupIds, deleted: deletedBackupIds.length };
+  }
+  const entries = await readdir(scopedBackupRoot, { withFileTypes: true });
   const items = [];
   for (const entry of entries) {
     const match = entry.isFile() && entry.name.match(/^office-([0-9a-f-]{36})\.json$/i);
@@ -9296,44 +10627,132 @@ async function officeBackups(args = {}) {
   return { count: Math.min(items.length, limit), total: items.length, items: items.slice(0, limit), truncated: items.length > limit };
 }
 
-async function inspectLocalOffice(localPath, kind) {
-  return await runOfficeHelper({ action: "inspect", inputPath: localPath, kind, maxParagraphs: 10000, maxCells: 50000, maxSlides: 5000 });
+const officeBackupDeleteProofTool = "onedrive_delete_office_backups";
+
+async function officeBackupDeletionPreview(backupIds = [], issueToken = true) {
+  const uniqueIds = [...new Set(backupIds.map(assertOfficeBackupId))];
+  if (!uniqueIds.length || uniqueIds.length > 100 || uniqueIds.length !== backupIds.length) {
+    throw new Error("deleteOfficeBackups requires one through one hundred unique backup IDs.");
+  }
+  const backups = [];
+  for (const backupId of uniqueIds) {
+    const { manifest } = await loadOfficeBackup(backupId);
+    backups.push({
+      backupId,
+      createdAt: manifest.createdAt,
+      kind: manifest.kind,
+      bytes: manifest.bytes,
+      fingerprint: manifest.fingerprint,
+      item: manifest.item
+    });
+  }
+  const proof = { backups };
+  const preview = {
+    dryRun: true,
+    confirmed: false,
+    wouldDeleteBackupIds: uniqueIds,
+    backups
+  };
+  return { preview: issueToken ? previewWithToken(preview, officeBackupDeleteProofTool, proof) : preview, proof };
 }
 
-async function officeCompareBackup(args = {}) {
+async function commitOfficeBackupDeletion(backupIds = [], previewToken) {
+  const { preview, proof } = await officeBackupDeletionPreview(backupIds, false);
+  const required = previewTokenRequiredResult(
+    preview,
+    officeBackupDeleteProofTool,
+    proof,
+    previewToken,
+    "requiredToDelete"
+  );
+  if (required) return required;
+  const deleted = await officeBackups({ deleteBackupIds: backupIds, confirmed: true });
+  return {
+    dryRun: false,
+    confirmed: true,
+    operationId: mutationOperationId(officeBackupDeleteProofTool, previewToken),
+    deletedBackupIds: deleted.deletedBackupIds,
+    deleted: deleted.deleted,
+    verified: true
+  };
+}
+
+async function inspectLocalOffice(localPath, kind, heavyweightAdmissionLease) {
+  return await runOfficeHelper(
+    { action: "inspect", inputPath: localPath, kind, maxParagraphs: 10000, maxCells: 50000, maxSlides: 5000 },
+    { _heavyweightAdmissionLease: heavyweightAdmissionLease }
+  );
+}
+
+async function officeCompareBackup(args = {}, options = {}) {
   const { manifest, localPath } = await loadOfficeBackup(args.backupId);
   const current = await getRawInfo({ itemId: manifest.item.id });
   if (officePackageKindFromName(current.name) !== manifest.kind) throw new Error("Current remote item no longer has the backup's Office document kind.");
-  const transactionRoot = join(officeEditingRoot, `compare-${randomUUID()}`);
-  await ensurePrivateDirectory(transactionRoot);
-  const currentPath = join(transactionRoot, basename(current.name));
+  if (Number(current.size || 0) > maxOfficePackageBytes) {
+    throw new Error(`Current Office package is ${current.size} bytes, above the ${maxOfficePackageBytes}-byte comparison limit.`);
+  }
+  const { lease: heavyweightAdmissionLease, owned: ownsHeavyweightAdmission } = heavyweightBufferLease(options);
+  let transactionRoot = null;
   try {
-    await downloadResolvedItem(simplifyItem(current), { localPath: currentPath, overwrite: false });
-    const [backupInspection, currentInspection] = await Promise.all([inspectLocalOffice(localPath, manifest.kind), inspectLocalOffice(currentPath, manifest.kind)]);
+    transactionRoot = join((await currentScopedStoragePaths("Office backup comparison staging")).paths.officeEditingRoot, `compare-${randomUUID()}`);
+    await ensurePrivateDirectory(transactionRoot);
+    const currentPath = join(transactionRoot, basename(current.name));
+    await downloadResolvedItem(
+      simplifyItem(current),
+      { localPath: currentPath, overwrite: false },
+      { maxBytes: maxOfficePackageBytes, expectedETag: current.eTag }
+    );
+    const backupInspection = await inspectLocalOffice(localPath, manifest.kind, heavyweightAdmissionLease);
+    const currentInspection = await inspectLocalOffice(currentPath, manifest.kind, heavyweightAdmissionLease);
     return { backup: { backupId: manifest.backupId, createdAt: manifest.createdAt, kind: manifest.kind, bytes: manifest.bytes, fingerprint: backupInspection.package?.fingerprint, item: manifest.item }, current: { item: simplifyItem(current), fingerprint: currentInspection.package?.fingerprint }, sameContent: backupInspection.package?.fingerprint === currentInspection.package?.fingerprint, semanticDiff: compareOfficeInspections(manifest.kind, backupInspection, currentInspection, clampInteger(args.maxChanges, 100, 1, 500)) };
-  } finally { await rm(transactionRoot, { recursive: true, force: true }); }
+  } finally {
+    try {
+      if (transactionRoot) await rm(transactionRoot, { recursive: true, force: true });
+    } finally {
+      if (ownsHeavyweightAdmission) heavyweightAdmissionLease.release();
+    }
+  }
 }
 
 async function officeRestoreBackup(args = {}) {
   const { manifest, localPath } = await loadOfficeBackup(args.backupId);
   const current = await getRawInfo({ itemId: manifest.item.id });
-  const backupValidation = await runOfficeHelper({ action: "validate", inputPath: localPath, kind: manifest.kind });
-  const comparison = await officeCompareBackup({ backupId: manifest.backupId, maxChanges: 100 });
-  const preview = { dryRun: args.dryRun !== false, confirmed: args.confirmed === true, wouldRestore: { backupId: manifest.backupId, createdAt: manifest.createdAt, kind: manifest.kind, originalItem: manifest.item, currentItem: simplifyItem(current), backupFingerprint: backupValidation.package?.fingerprint }, sameContent: comparison.sameContent, semanticDiff: comparison.semanticDiff };
-  const proof = { backupId: manifest.backupId, itemId: current.id, currentETag: current.eTag, backupFingerprint: backupValidation.package?.fingerprint };
-  if (args.dryRun !== false) return previewWithToken(preview, "onedrive_office_restore_backup", proof);
-  if (args.confirmed !== true) return { ...preview, requiredToRestore: "Set dryRun: false and confirmed: true after reviewing the Office backup preview." };
-  if (!args.expectedId || args.expectedId !== current.id || args.expectedId !== manifest.item.id) return { ...preview, dryRun: false, requiredToRestore: "Provide expectedId matching the backup's original stable item ID." };
-  if (!args.expectedETag || args.expectedETag !== current.eTag) return { ...preview, dryRun: false, requiredToRestore: "Provide expectedETag matching the current remote item eTag." };
-  const tokenRequired = previewTokenRequiredResult(preview, "onedrive_office_restore_backup", proof, args.previewToken, "requiredToRestore");
-  if (tokenRequired) return tokenRequired;
-  const transactionRoot = join(officeEditingRoot, `restore-${randomUUID()}`);
-  await ensurePrivateDirectory(transactionRoot);
-  let rollbackBackup = null, verificationIncomplete = false, afterRaw = current;
+  if (Number(current.size || 0) > maxOfficePackageBytes) {
+    throw new Error(`Current Office package is ${current.size} bytes, above the ${maxOfficePackageBytes}-byte restore limit.`);
+  }
+  const heavyweightAdmissionLease = acquireHeavyweightBufferLease();
+  let transactionRoot = null;
+  let rollbackBackup = null;
   try {
+    const backupValidation = await runOfficeHelper(
+      { action: "validate", inputPath: localPath, kind: manifest.kind },
+      { _heavyweightAdmissionLease: heavyweightAdmissionLease }
+    );
+    const comparison = await officeCompareBackup(
+      { backupId: manifest.backupId, maxChanges: 100 },
+      { _heavyweightAdmissionLease: heavyweightAdmissionLease }
+    );
+    const preview = { dryRun: args.dryRun !== false, confirmed: args.confirmed === true, wouldRestore: { backupId: manifest.backupId, createdAt: manifest.createdAt, kind: manifest.kind, originalItem: manifest.item, currentItem: simplifyItem(current), backupFingerprint: backupValidation.package?.fingerprint }, sameContent: comparison.sameContent, semanticDiff: comparison.semanticDiff };
+    const proof = { backupId: manifest.backupId, itemId: current.id, currentETag: current.eTag, backupFingerprint: backupValidation.package?.fingerprint };
+    if (args.dryRun !== false) return previewWithToken(preview, "onedrive_office_restore_backup", proof);
+    if (args.confirmed !== true) return { ...preview, requiredToRestore: "Set dryRun: false and confirmed: true after reviewing the Office backup preview." };
+    if (!args.expectedId || args.expectedId !== current.id || args.expectedId !== manifest.item.id) return { ...preview, dryRun: false, requiredToRestore: "Provide expectedId matching the backup's original stable item ID." };
+    if (!args.expectedETag || args.expectedETag !== current.eTag) return { ...preview, dryRun: false, requiredToRestore: "Provide expectedETag matching the current remote item eTag." };
+    const tokenRequired = previewTokenRequiredResult(preview, "onedrive_office_restore_backup", proof, args.previewToken, "requiredToRestore");
+    if (tokenRequired) return tokenRequired;
+    transactionRoot = join((await currentScopedStoragePaths("Office backup restore staging")).paths.officeEditingRoot, `restore-${randomUUID()}`);
+    await ensurePrivateDirectory(transactionRoot);
+    let verificationIncomplete = false, afterRaw = current;
     const currentPath = join(transactionRoot, `current-${basename(current.name)}`);
-    await downloadResolvedItem(simplifyItem(current), { localPath: currentPath, overwrite: false });
-    const currentValidation = await runOfficeHelper({ action: "validate", inputPath: currentPath, kind: manifest.kind });
+    await downloadResolvedItem(
+      simplifyItem(current),
+      { localPath: currentPath, overwrite: false },
+      { maxBytes: maxOfficePackageBytes, expectedETag: current.eTag }
+    );
+    const currentValidation = await runOfficeHelper(
+      { action: "validate", inputPath: currentPath, kind: manifest.kind },
+      { _heavyweightAdmissionLease: heavyweightAdmissionLease }
+    );
     rollbackBackup = await persistOfficeBackup(currentPath, current, manifest.kind, currentValidation.package?.fingerprint, "pre-restore");
     const uploaded = await upload({ localPath, itemId: current.id, remotePath: itemRemotePath(current), conflictBehavior: "replace", ifMatch: current.eTag, auditTool: "onedrive_office_restore_backup", skipAudit: true });
     afterRaw = uploaded.item ? { ...current, ...uploaded.item } : current;
@@ -9342,8 +10761,15 @@ async function officeRestoreBackup(args = {}) {
     if (args.verify !== false) {
       try {
         const verifyPath = join(transactionRoot, `verify-${basename(current.name)}`);
-        await downloadResolvedItem(simplifyItem(afterRaw), { localPath: verifyPath, overwrite: false });
-        remoteValidation = await runOfficeHelper({ action: "validate", inputPath: verifyPath, kind: manifest.kind });
+        await downloadResolvedItem(
+          simplifyItem(afterRaw),
+          { localPath: verifyPath, overwrite: false },
+          { maxBytes: maxOfficePackageBytes, expectedETag: afterRaw.eTag }
+        );
+        remoteValidation = await runOfficeHelper(
+          { action: "validate", inputPath: verifyPath, kind: manifest.kind },
+          { _heavyweightAdmissionLease: heavyweightAdmissionLease }
+        );
         if (remoteValidation.package?.fingerprint !== backupValidation.package?.fingerprint) { verificationIncomplete = true; recordLocalWarning("Office backup restore fingerprint verification", new Error("Restored package fingerprint differs from the selected backup.")); }
       } catch (error) { verificationIncomplete = true; recordLocalWarning("Office backup restore validation", error); }
     }
@@ -9352,7 +10778,13 @@ async function officeRestoreBackup(args = {}) {
   } catch (error) {
     await writeMutationAudit("onedrive_office_restore_backup", { status: "failed", target: itemAuditSummary(current), backupId: manifest.backupId, rollbackBackupId: rollbackBackup?.backupId, error: safeErrorInfo(error) });
     throw error;
-  } finally { await rm(transactionRoot, { recursive: true, force: true }); }
+  } finally {
+    try {
+      if (transactionRoot) await rm(transactionRoot, { recursive: true, force: true });
+    } finally {
+      heavyweightAdmissionLease.release();
+    }
+  }
 }
 
 function trustedExcelSessionOperationUrl(value, label) {
@@ -9462,8 +10894,11 @@ async function closeAllExcelSessions() {
   await Promise.allSettled([...excelSessionPool.values()].map((entry) => closeExcelManagedSession(entry, true)));
 }
 
-async function officeBatchUpdate(args = {}, kind, toolName) {
+async function officeBatchUpdate(args = {}, kind, toolName, options = {}) {
   const rawItem = await getRawInfo(args);
+  if (rawItem.remoteItem) {
+    throw new Error("Office mutation of a remote-item shortcut or cross-library source is unsupported. Copy the file into the default OneDrive before editing it.");
+  }
   if (rawItem.folder) throw new Error(`Item is a folder, not an Office document: ${rawItem.name}`);
   assertExpectedItem(rawItem, args, `${kind} batch update`);
   const detectedKind = officePackageKindFromName(rawItem.name);
@@ -9489,14 +10924,22 @@ async function officeBatchUpdate(args = {}, kind, toolName) {
     };
   }
 
-  const transactionRoot = join(officeEditingRoot, `edit-${randomUUID()}`);
-  await ensurePrivateDirectory(transactionRoot);
-  const sourcePath = join(transactionRoot, `source-${basename(rawItem.name)}`);
-  const editedPath = join(transactionRoot, `edited-${basename(rawItem.name)}`);
+  const { lease: heavyweightAdmissionLease, owned: ownsHeavyweightAdmission } = heavyweightBufferLease(options);
+  let transactionRoot = null;
+  let sourcePath;
+  let editedPath;
   let editResult;
   let backup = null;
   try {
-    await downloadResolvedItem(simplifyItem(rawItem), { localPath: sourcePath, overwrite: false });
+    transactionRoot = join((await currentScopedStoragePaths("Office edit staging")).paths.officeEditingRoot, `edit-${randomUUID()}`);
+    await ensurePrivateDirectory(transactionRoot);
+    sourcePath = join(transactionRoot, `source-${basename(rawItem.name)}`);
+    editedPath = join(transactionRoot, `edited-${basename(rawItem.name)}`);
+    await downloadResolvedItem(
+      simplifyItem(rawItem),
+      { localPath: sourcePath, overwrite: false },
+      { maxBytes: maxOfficePackageBytes, expectedETag: rawItem.eTag }
+    );
     let resolvedOperations = args.operations;
     let anchorResolutions = [];
     if (args.operations.some((operation) => operation.anchor)) {
@@ -9507,7 +10950,7 @@ async function officeBatchUpdate(args = {}, kind, toolName) {
         maxParagraphs: 10000,
         maxCells: 50000,
         maxSlides: 5000
-      }));
+      }, { _heavyweightAdmissionLease: heavyweightAdmissionLease }));
       const resolution = resolveSemanticOperations(kind, currentInspection, args.operations, "unique");
       if (resolution.conflicts.length) {
         return {
@@ -9545,9 +10988,17 @@ async function officeBatchUpdate(args = {}, kind, toolName) {
         ...(kind === "word" ? { trackedChanges: args.trackedChanges || "refuse" } : {}),
         allowMacros: args.allowMacros === true,
         allowSignedPackage: args.allowSignedPackage === true
-      }, { timeoutMs: 120_000 });
+      }, { timeoutMs: 120_000, _heavyweightAdmissionLease: heavyweightAdmissionLease });
     } else {
-      editResult = { kind, changes: [], changeCount: 0, validation: await runOfficeHelper({ action: "validate", inputPath: sourcePath, kind }) };
+      editResult = {
+        kind,
+        changes: [],
+        changeCount: 0,
+        validation: await runOfficeHelper(
+          { action: "validate", inputPath: sourcePath, kind },
+          { _heavyweightAdmissionLease: heavyweightAdmissionLease }
+        )
+      };
     }
     if (graphOnlyChanges.length) {
       editResult.changes = [...(editResult.changes || []), ...graphOnlyChanges];
@@ -9584,8 +11035,18 @@ async function officeBatchUpdate(args = {}, kind, toolName) {
     if (tokenRequired) return tokenRequired;
 
     if (args.createBackup !== false) {
-      const sourceValidation = await runOfficeHelper({ action: "validate", inputPath: sourcePath, kind });
-      backup = await persistOfficeBackup(sourcePath, rawItem, kind, sourceValidation.package?.fingerprint, "edit");
+      const sourceValidation = await runOfficeHelper(
+        { action: "validate", inputPath: sourcePath, kind },
+        { _heavyweightAdmissionLease: heavyweightAdmissionLease }
+      );
+      backup = await persistOfficeBackup(
+        sourcePath,
+        rawItem,
+        kind,
+        sourceValidation.package?.fingerprint,
+        "edit",
+        { _managedBackupQuotaReservation: options._managedBackupQuotaReservation }
+      );
     }
 
     const uploaded = selectedBackend === "graph"
@@ -9618,8 +11079,15 @@ async function officeBatchUpdate(args = {}, kind, toolName) {
     if (args.verify !== false) {
       try {
         const verifyPath = join(transactionRoot, `verify-${basename(rawItem.name)}`);
-        await downloadResolvedItem(simplifyItem(afterRaw), { localPath: verifyPath, overwrite: false });
-        remoteValidation = await runOfficeHelper({ action: "validate", inputPath: verifyPath, kind });
+        await downloadResolvedItem(
+          simplifyItem(afterRaw),
+          { localPath: verifyPath, overwrite: false },
+          { maxBytes: maxOfficePackageBytes, expectedETag: afterRaw.eTag }
+        );
+        remoteValidation = await runOfficeHelper(
+          { action: "validate", inputPath: verifyPath, kind },
+          { _heavyweightAdmissionLease: heavyweightAdmissionLease }
+        );
         if (selectedBackend === "openxml" && remoteValidation.package?.fingerprint !== editResult.validation?.package?.fingerprint) {
           verificationIncomplete = true;
           toolCallContext.getStore()?.localWarnings?.push({ operation: "Office post-commit fingerprint verification", error: "Uploaded package fingerprint differs from the locally validated edit." });
@@ -9664,7 +11132,11 @@ async function officeBatchUpdate(args = {}, kind, toolName) {
     }
     throw error;
   } finally {
-    await rm(transactionRoot, { recursive: true, force: true });
+    try {
+      if (transactionRoot) await rm(transactionRoot, { recursive: true, force: true });
+    } finally {
+      if (ownsHeavyweightAdmission) heavyweightAdmissionLease.release();
+    }
   }
 }
 
@@ -9673,7 +11145,6 @@ function officeToolForKind(kind) {
 }
 
 async function officeBatchTransform(args = {}) {
-  const toolName = "onedrive_office_batch_transform";
   const requested = args.items || [];
   if (args.dryRun === false && args.confirmed !== true) {
     return { dryRun: false, confirmed: false, requiredToUpdate: "Set dryRun: false and confirmed: true after reviewing the complete cross-file Office preview." };
@@ -9682,6 +11153,16 @@ async function officeBatchTransform(args = {}) {
     const missingIdentity = requested.findIndex((item) => !hasExpectedIdentity(item));
     if (missingIdentity >= 0) return { dryRun: false, confirmed: true, requiredToUpdate: `Item ${missingIdentity} requires expectedName or expectedId.` };
   }
+  const heavyweightAdmissionLease = acquireHeavyweightBufferLease();
+  try {
+    return await officeBatchTransformAdmitted(args, requested, heavyweightAdmissionLease);
+  } finally {
+    heavyweightAdmissionLease.release();
+  }
+}
+
+async function officeBatchTransformAdmitted(args, requested, heavyweightAdmissionLease) {
+  const toolName = "onedrive_office_batch_transform";
 
   const preflight = [];
   for (const [index, item] of requested.entries()) {
@@ -9693,7 +11174,7 @@ async function officeBatchTransform(args = {}) {
         confirmed: false,
         createBackup: args.createBackup !== false,
         verify: args.verify !== false
-      }, item.kind, individualTool);
+      }, item.kind, individualTool, { _heavyweightAdmissionLease: heavyweightAdmissionLease });
       if (preview.noChanges) throw new Error(preview.requiredToUpdate || "No requested edits matched.");
       preflight.push({ index, request: item, individualTool, preview });
     } catch (error) {
@@ -9736,6 +11217,7 @@ async function officeBatchTransform(args = {}) {
   const tokenRequired = previewTokenRequiredResult(preview, toolName, proof, args.previewToken, "requiredToUpdate");
   if (tokenRequired) return tokenRequired;
 
+  const commitPreflight = async (managedBackupQuotaReservation = undefined) => {
   const completed = [];
   for (const entry of preflight) {
     try {
@@ -9746,7 +11228,10 @@ async function officeBatchTransform(args = {}) {
         previewToken: entry.preview.previewToken,
         createBackup: args.createBackup !== false,
         verify: args.verify !== false
-      }, entry.request.kind, entry.individualTool);
+      }, entry.request.kind, entry.individualTool, {
+        _heavyweightAdmissionLease: heavyweightAdmissionLease,
+        _managedBackupQuotaReservation: managedBackupQuotaReservation
+      });
       const requiredField = Object.entries(result || {}).find(([key, value]) => key.startsWith("requiredTo") && Boolean(value));
       const committed = Boolean(
         result
@@ -9833,6 +11318,21 @@ async function officeBatchTransform(args = {}) {
     totalChangeCount: preview.totalChangeCount,
     completed
   };
+  };
+
+  if (args.createBackup !== false) {
+    await ensureManagedBackupQuotaReady();
+    const scopedBackupRoot = (await currentScopedStoragePaths("Office batch backup quota")).paths.backupRoot;
+    const expectedBytes = preflight.reduce((sum, entry) => (
+      sum + Math.min(maxOfficePackageBytes, Math.max(0, Number(entry.preview.item?.size) || 0)) + managedBackupManifestAllowanceBytes
+    ), 0);
+    return await managedBackupQuota.withReservation({
+      targetPaths: [join(scopedBackupRoot, `.batch-reservation-${randomUUID()}`)],
+      expectedEntries: preflight.length * 2,
+      expectedBytes
+    }, async (reservation) => await commitPreflight(reservation));
+  }
+  return await commitPreflight();
 }
 
 function assertOfficeKind(info, kindName) {
@@ -9849,9 +11349,10 @@ function assertOfficeKind(info, kindName) {
 async function downloadOffice(args = {}, kindName) {
   const info = await getInfo(args);
   assertOfficeKind(info, kindName);
+  const scopedDownloads = args.localPath ? null : (await currentScopedStoragePaths("Office download path resolution")).paths.downloadRoot;
   return await downloadResolvedItem(info, {
     ...args,
-    localPath: args.localPath || join(downloadRoot, kindName, info.name || `${kindName}-download`),
+    localPath: args.localPath || join(scopedDownloads, kindName, info.name || `${kindName}-download`),
     overwrite: args.overwrite,
     _allowAlternateLocalPath: !args.localPath
   });
@@ -9872,9 +11373,10 @@ async function downloadExport(args = {}, formatName) {
   if (args.localPath) await assertNotLocalOneDriveSyncPathForWrite(resolve(args.localPath), "Export", args);
   const info = await getInfo(args);
   if (info.folder) throw new Error(`Item is a folder, not an exportable document: ${info.name}`);
+  const scopedDownloads = args.localPath ? null : (await currentScopedStoragePaths("export path resolution")).paths.downloadRoot;
   const preferredTarget = args.localPath
     ? resolve(args.localPath)
-    : join(downloadRoot, "export", exportFileName(info.name, format.extension));
+    : join(scopedDownloads, "export", exportFileName(info.name, format.extension));
   await assertNotLocalOneDriveSyncPathForWrite(preferredTarget, "Export", args);
   const reservation = await reserveLocalDestination(preferredTarget, {
     overwrite: args.overwrite === true,
@@ -9884,7 +11386,11 @@ async function downloadExport(args = {}, formatName) {
   const params = new URLSearchParams();
   params.set("format", format.graphFormat);
   try {
-    const downloaded = await graphDownloadToFile(`${contentPath(args)}?${params.toString()}`, target, { reserved: reservation.reserved });
+    const downloaded = await graphDownloadToFile(`${contentPath(args)}?${params.toString()}`, target, {
+      reserved: reservation.reserved,
+      maxBytes: maxGraphDownloadBytes,
+      expectedETag: info.eTag
+    });
     return {
       item: info,
       localPath: target,
@@ -9976,16 +11482,20 @@ async function exportFileToOneDrive(args = {}) {
   const tokenRequired = previewTokenRequiredResult(preview, "onedrive_export_file", proof, args.previewToken, "requiredToExport");
   if (tokenRequired) return tokenRequired;
 
-  await ensurePrivateDirectory(chatgptUploadRoot);
-  const tempPath = join(chatgptUploadRoot, `${randomUUID()}${format.extension}`);
-  const params = new URLSearchParams({ format: format.graphFormat });
+  const heavyweightAdmissionLease = acquireHeavyweightBufferLease();
+  let tempPath = null;
   try {
+    const scopedUploadRoot = (await currentScopedStoragePaths("remote export staging")).paths.chatgptUploadRoot;
+    await ensurePrivateDirectory(scopedUploadRoot);
+    tempPath = join(scopedUploadRoot, `${randomUUID()}${format.extension}`);
+    const params = new URLSearchParams({ format: format.graphFormat });
     let downloaded;
     let conversionSource = "microsoft-graph";
     try {
       downloaded = await graphDownloadToFile(
         `${itemIdBase(source.id)}/content?${params.toString()}`,
-        tempPath
+        tempPath,
+        { maxBytes: maxOfficePackageBytes, expectedETag: source.eTag }
       );
     } catch (graphError) {
       const officeKind = officePackageKindFromName(source.name);
@@ -10002,7 +11512,7 @@ async function exportFileToOneDrive(args = {}) {
         includeCharts: true,
         includePivots: true,
         strictRelationships: true
-      }, officeKind, "inspect");
+      }, officeKind, "inspect", { _heavyweightAdmissionLease: heavyweightAdmissionLease });
       const rendered = officePlainText(document, source.name || "Office document");
       if (rendered.truncated) {
         throw new Error("Plain-text export would be incomplete because the Office document exceeds the safe extraction limits.");
@@ -10070,7 +11580,11 @@ async function exportFileToOneDrive(args = {}) {
     });
     throw error;
   } finally {
-    await rm(tempPath, { force: true }).catch(() => null);
+    try {
+      if (tempPath) await rm(tempPath, { force: true }).catch(() => null);
+    } finally {
+      heavyweightAdmissionLease.release();
+    }
   }
 }
 
@@ -10085,15 +11599,19 @@ function truncateUtf8(text, maxBytes) {
 }
 
 async function preview(args = {}) {
-  const info = args._resolvedInfo || await getInfo(args);
+  const info = args._resolvedInfo || await getReadOnlyInfo(args);
   const maxBytes = clampInteger(args.maxBytes, 65536, 1, 1048576);
+  const sourceDriveId = info.driveId || args.driveId;
+  const remoteContentPath = sourceDriveId
+    ? readOnlyContentPath({ itemId: info.id, driveId: sourceDriveId })
+    : contentPath({ itemId: info.id });
   if (info.folder) return { item: info, preview: null, note: "Item is a folder; preview is only available for files." };
 
   if (args.preferExportText !== false && !isLikelyTextItem(info, args)) {
     try {
       const params = new URLSearchParams();
       params.set("format", "text");
-      const exported = await graphLimitedBuffer(`${contentPath(args)}?${params.toString()}`, maxBytes);
+      const exported = await graphLimitedBuffer(`${remoteContentPath}?${params.toString()}`, maxBytes, { expectedETag: info.eTag });
       const previewText = exported.buffer.toString("utf8").replace(/\uFFFD$/u, "");
       return { item: info, preview: previewText, bytes: Buffer.byteLength(previewText, "utf8"), bytesRead: exported.bytesRead, truncated: exported.truncated, source: "graph-text-export" };
     } catch (error) {
@@ -10102,7 +11620,7 @@ async function preview(args = {}) {
   }
 
   assertTextReadable(info, args);
-  const limited = await graphLimitedBuffer(contentPath(args), maxBytes);
+  const limited = await graphLimitedBuffer(remoteContentPath, maxBytes, { expectedETag: info.eTag });
   if (args.force !== true) assertNoBinaryNulls(limited.buffer);
   const previewText = limited.buffer.toString("utf8").replace(/\uFFFD$/u, "");
   return { item: info, preview: previewText, bytes: Buffer.byteLength(previewText, "utf8"), bytesRead: limited.bytesRead, truncated: limited.truncated, source: "text-read" };
@@ -10410,7 +11928,7 @@ async function warmContentIndexFromChatgptSnapshots(resolvedEntries = []) {
       bytesRead: snapshot.bytesRead,
       truncated: snapshot.truncated,
       structuredKind: snapshot.officeKind || null
-    });
+    }).entry;
   }
   const entries = Object.values(entriesById);
   if (!entries.length) return 0;
@@ -10772,6 +12290,46 @@ function chatgptFetchFingerprint(item = {}) {
   ].join("\0")).digest("hex").slice(0, 20);
 }
 
+function validateEnterpriseDriveItemPart(value, label) {
+  if (typeof value !== "string" || !value || value.length > enterpriseDriveItemPartMaxLength || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new Error(`The OneDrive enterprise ${label} is invalid.`);
+  }
+  return value;
+}
+
+function encodeEnterpriseDriveItemId(driveId, itemId) {
+  const payload = Buffer.from(JSON.stringify({
+    v: 1,
+    d: validateEnterpriseDriveItemPart(driveId, "drive ID"),
+    i: validateEnterpriseDriveItemPart(itemId, "item ID")
+  }), "utf8").toString("base64url");
+  const id = `${enterpriseDriveItemIdPrefix}${payload}`;
+  if (id.length > enterpriseDriveItemIdMaxLength) throw new Error("The OneDrive enterprise item reference is too long.");
+  return id;
+}
+
+function decodeEnterpriseDriveItemId(value) {
+  const id = String(value || "");
+  if (!id.startsWith(enterpriseDriveItemIdPrefix)) return null;
+  if (id.length > enterpriseDriveItemIdMaxLength) throw new Error("The OneDrive enterprise item reference is too long.");
+  const payload = id.slice(enterpriseDriveItemIdPrefix.length);
+  try {
+    if (!payload || !/^[A-Za-z0-9_-]+$/u.test(payload)) throw new Error("invalid encoding");
+    const decoded = Buffer.from(payload, "base64url");
+    if (decoded.toString("base64url") !== payload) throw new Error("non-canonical encoding");
+    const parsed = JSON.parse(decoded.toString("utf8"));
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") throw new Error("invalid payload");
+    const keys = Object.keys(parsed).sort();
+    if (keys.length !== 3 || keys[0] !== "d" || keys[1] !== "i" || keys[2] !== "v" || parsed.v !== 1) throw new Error("invalid fields");
+    return {
+      driveId: validateEnterpriseDriveItemPart(parsed.d, "drive ID"),
+      itemId: validateEnterpriseDriveItemPart(parsed.i, "item ID")
+    };
+  } catch {
+    throw new Error("The OneDrive enterprise item reference is invalid. Use the ID returned by enterpriseSearch or libraryList unchanged.");
+  }
+}
+
 function encodeChatgptFetchContinuation({ itemId, fingerprint, offset, part }) {
   const payload = Buffer.from(JSON.stringify({ v: 1, i: itemId, f: fingerprint, o: offset, p: part }), "utf8").toString("base64url");
   return `onedrive-fetch-chunk:${payload}`;
@@ -10780,11 +12338,11 @@ function encodeChatgptFetchContinuation({ itemId, fingerprint, offset, part }) {
 function decodeChatgptFetchContinuation(value) {
   const id = String(value || "");
   if (!id.startsWith("onedrive-fetch-chunk:")) return null;
-  if (id.length > 4096) throw new Error("The OneDrive fetch continuation ID is too long.");
+  if (id.length > 8192) throw new Error("The OneDrive fetch continuation ID is too long.");
   try {
     const parsed = JSON.parse(Buffer.from(id.slice("onedrive-fetch-chunk:".length), "base64url").toString("utf8"));
     if (parsed?.v !== 1
-      || typeof parsed.i !== "string" || !parsed.i || parsed.i.length > 1024
+      || typeof parsed.i !== "string" || !parsed.i || parsed.i.length > enterpriseDriveItemIdMaxLength
       || typeof parsed.f !== "string" || !/^[a-f0-9]{20}$/u.test(parsed.f)
       || !Number.isInteger(parsed.o) || parsed.o < 0 || parsed.o > chatgptFetchTextByteLimit
       || !Number.isInteger(parsed.p) || parsed.p < 1 || parsed.p > 100) {
@@ -10871,36 +12429,72 @@ function compactChatgptProgressiveText(text, maxBytes = chatgptInitialFetchTextB
   };
 }
 
-function pruneChatgptFetchSnapshots(now = Date.now()) {
-  for (const [key, entry] of chatgptFetchSnapshots) {
-    if (!entry || entry.expiresAt <= now) chatgptFetchSnapshots.delete(key);
+function pruneAllChatgptFetchSnapshots(now = Date.now()) {
+  for (const [scopeKey, snapshots] of chatgptFetchSnapshotsByScope) {
+    for (const [key, entry] of snapshots) {
+      if (!entry || entry.expiresAt <= now) snapshots.delete(key);
+    }
+    if (!snapshots.size) chatgptFetchSnapshotsByScope.delete(scopeKey);
   }
-  while (chatgptFetchSnapshots.size > chatgptFetchSnapshotMaxEntries) {
-    chatgptFetchSnapshots.delete(chatgptFetchSnapshots.keys().next().value);
+  while (chatgptFetchSnapshotsByScope.size > chatgptFetchSnapshotMaxScopes) {
+    chatgptFetchSnapshotsByScope.delete(chatgptFetchSnapshotsByScope.keys().next().value);
   }
 }
 
-function chatgptFetchSnapshotKey(scopeKey, itemId, fingerprint) {
-  return `${scopeKey}:${fingerprint}:${itemId}`;
+function chatgptFetchSnapshotsForScope(scopeKey, create = true) {
+  if (!scopeKey) return null;
+  let snapshots = chatgptFetchSnapshotsByScope.get(scopeKey);
+  if (!snapshots && create) {
+    pruneAllChatgptFetchSnapshots();
+    while (chatgptFetchSnapshotsByScope.size >= chatgptFetchSnapshotMaxScopes) {
+      chatgptFetchSnapshotsByScope.delete(chatgptFetchSnapshotsByScope.keys().next().value);
+    }
+    snapshots = new Map();
+    chatgptFetchSnapshotsByScope.set(scopeKey, snapshots);
+  } else if (snapshots) {
+    chatgptFetchSnapshotsByScope.delete(scopeKey);
+    chatgptFetchSnapshotsByScope.set(scopeKey, snapshots);
+  }
+  return snapshots;
+}
+
+function pruneChatgptFetchSnapshots(scopeKey, now = Date.now()) {
+  pruneAllChatgptFetchSnapshots(now);
+  const snapshots = chatgptFetchSnapshotsForScope(scopeKey, false);
+  if (!snapshots) return;
+  for (const [key, entry] of snapshots) {
+    if (!entry || entry.expiresAt <= now) snapshots.delete(key);
+  }
+  while (snapshots.size > chatgptFetchSnapshotMaxEntries) {
+    snapshots.delete(snapshots.keys().next().value);
+  }
+  if (!snapshots.size) chatgptFetchSnapshotsByScope.delete(scopeKey);
+}
+
+function chatgptFetchSnapshotKey(itemId, fingerprint) {
+  return `${fingerprint}:${itemId}`;
 }
 
 function rememberChatgptFetchSnapshot(scopeKey, snapshot) {
   if (!scopeKey || !snapshot?.item?.id) return;
-  pruneChatgptFetchSnapshots();
+  pruneChatgptFetchSnapshots(scopeKey);
+  const snapshots = chatgptFetchSnapshotsForScope(scopeKey);
   const fingerprint = chatgptFetchFingerprint(snapshot.item);
-  const key = chatgptFetchSnapshotKey(scopeKey, snapshot.item.id, fingerprint);
-  chatgptFetchSnapshots.delete(key);
-  chatgptFetchSnapshots.set(key, { ...snapshot, fingerprint, expiresAt: Date.now() + chatgptFetchSnapshotTtlMs });
-  pruneChatgptFetchSnapshots();
+  const sourceRef = String(snapshot.sourceRef || snapshot.item.id);
+  const key = chatgptFetchSnapshotKey(sourceRef, fingerprint);
+  snapshots.delete(key);
+  snapshots.set(key, { ...snapshot, sourceRef, fingerprint, expiresAt: Date.now() + chatgptFetchSnapshotTtlMs });
+  pruneChatgptFetchSnapshots(scopeKey);
 }
 
 function rememberedChatgptFetchSnapshot(scopeKey, continuation) {
-  pruneChatgptFetchSnapshots();
-  const key = chatgptFetchSnapshotKey(scopeKey, continuation.itemId, continuation.fingerprint);
-  const snapshot = chatgptFetchSnapshots.get(key) || null;
+  pruneChatgptFetchSnapshots(scopeKey);
+  const snapshots = chatgptFetchSnapshotsForScope(scopeKey, false);
+  const key = chatgptFetchSnapshotKey(continuation.itemId, continuation.fingerprint);
+  const snapshot = snapshots?.get(key) || null;
   if (snapshot) {
-    chatgptFetchSnapshots.delete(key);
-    chatgptFetchSnapshots.set(key, snapshot);
+    snapshots.delete(key);
+    snapshots.set(key, snapshot);
   }
   return snapshot;
 }
@@ -10918,22 +12512,20 @@ function chatgptIndexedSnapshot(indexed, item, source) {
   };
 }
 
-async function resolveChatgptFetchSnapshot(id, cache, contentIndex) {
-  const cached = cache.itemsById?.[id] || null;
-  const cacheFresh = metadataCacheFresh(cache);
-  const indexed = contentIndex.entriesById?.[id] || null;
-  if (cacheFresh && cached?.folder) {
-    return { cacheFresh, usedCachedMetadata: true, usedContentIndex: false, snapshot: { item: cached, preview: null, note: "This OneDrive item is a folder.", source: "metadata-cache", truncated: false } };
-  }
-  if (cacheFresh && cached && indexed && contentIndexEntryFresh(indexed, cached)) {
-    return { cacheFresh, usedCachedMetadata: true, usedContentIndex: true, snapshot: chatgptIndexedSnapshot(indexed, cached, "content-index") };
-  }
-  const info = cacheFresh && cached ? cached : await getInfo({ itemId: id });
+async function extractChatgptFetchSnapshot(info, source = {}) {
+  const itemId = String(source.itemId || info.id || "");
+  const driveId = info.driveId || source.driveId ? String(info.driveId || source.driveId) : null;
+  const sourceRef = String(source.sourceRef || itemId);
   if (info.folder) {
-    return { cacheFresh, usedCachedMetadata: Boolean(cacheFresh && cached), usedContentIndex: false, snapshot: { item: info, preview: null, note: "This OneDrive item is a folder.", source: "metadata", truncated: false } };
-  }
-  if (indexed && contentIndexEntryFresh(indexed, info)) {
-    return { cacheFresh, usedCachedMetadata: Boolean(cacheFresh && cached), usedContentIndex: true, snapshot: chatgptIndexedSnapshot(indexed, info, cacheFresh ? "content-index" : "content-index-validated") };
+    return {
+      item: info,
+      preview: null,
+      note: "This OneDrive item is a folder.",
+      source: "metadata",
+      truncated: false,
+      sourceRef,
+      ...(driveId ? { enterpriseDriveId: driveId } : {})
+    };
   }
   const officeKind = officePackageKindFromName(info.name);
   const commonKind = commonExtractionKind(info);
@@ -10941,7 +12533,8 @@ async function resolveChatgptFetchSnapshot(id, cache, contentIndex) {
   if (officeKind) {
     try {
       const document = await inspectRemoteOfficePackage({
-        itemId: id,
+        itemId,
+        ...(driveId ? { driveId } : {}),
         _resolvedInfo: info,
         maxParagraphs: 4000,
         maxCells: 15_000,
@@ -10963,19 +12556,55 @@ async function resolveChatgptFetchSnapshot(id, cache, contentIndex) {
         officeKind
       };
     } catch (error) {
-      snapshot = await preview({ itemId: id, _resolvedInfo: info, maxBytes: chatgptFetchTextByteLimit, preferExportText: true });
+      snapshot = await preview({ itemId, ...(driveId ? { driveId } : {}), _resolvedInfo: info, maxBytes: chatgptFetchTextByteLimit, preferExportText: true });
       if (!snapshot.preview) snapshot.exportError = `Open XML extraction failed: ${safeToolErrorMessage(error)}; ${snapshot.exportError || "Graph text export was unavailable."}`;
     }
   } else if (commonKind) {
     try {
-      snapshot = await extractCommonDocumentText(info, { maxBytes: chatgptFetchTextByteLimit });
+      snapshot = await extractCommonDocumentText(info, { maxBytes: chatgptFetchTextByteLimit, ...(driveId ? { driveId } : {}) });
     } catch (error) {
-      snapshot = await preview({ itemId: id, _resolvedInfo: info, maxBytes: chatgptFetchTextByteLimit, preferExportText: true });
+      snapshot = await preview({ itemId, ...(driveId ? { driveId } : {}), _resolvedInfo: info, maxBytes: chatgptFetchTextByteLimit, preferExportText: true });
       if (!snapshot.preview) snapshot.exportError = `Local ${commonKind} extraction failed: ${safeToolErrorMessage(error)}; ${snapshot.exportError || "Graph text export was unavailable."}`;
     }
   } else {
-    snapshot = await preview({ itemId: id, _resolvedInfo: info, maxBytes: chatgptFetchTextByteLimit, preferExportText: true });
+    snapshot = await preview({ itemId, ...(driveId ? { driveId } : {}), _resolvedInfo: info, maxBytes: chatgptFetchTextByteLimit, preferExportText: true });
   }
+  snapshot.sourceRef = sourceRef;
+  if (driveId) snapshot.enterpriseDriveId = driveId;
+  return snapshot;
+}
+
+async function resolveChatgptFetchSnapshot(id, cache, contentIndex) {
+  const enterpriseLocator = decodeEnterpriseDriveItemId(id);
+  if (enterpriseLocator) {
+    const info = {
+      ...await getReadOnlyInfo({ driveId: enterpriseLocator.driveId, itemId: enterpriseLocator.itemId }),
+      driveId: enterpriseLocator.driveId
+    };
+    const snapshot = await extractChatgptFetchSnapshot(info, {
+      itemId: enterpriseLocator.itemId,
+      driveId: enterpriseLocator.driveId,
+      sourceRef: id
+    });
+    return { cacheFresh: false, usedCachedMetadata: false, usedContentIndex: false, enterpriseLocator, snapshot };
+  }
+  const cached = cache.itemsById?.[id] || null;
+  const cacheFresh = metadataCacheFresh(cache);
+  const indexed = contentIndex.entriesById?.[id] || null;
+  if (cacheFresh && cached?.folder) {
+    return { cacheFresh, usedCachedMetadata: true, usedContentIndex: false, snapshot: { item: cached, preview: null, note: "This OneDrive item is a folder.", source: "metadata-cache", truncated: false } };
+  }
+  if (cacheFresh && cached && indexed && contentIndexEntryFresh(indexed, cached)) {
+    return { cacheFresh, usedCachedMetadata: true, usedContentIndex: true, snapshot: chatgptIndexedSnapshot(indexed, cached, "content-index") };
+  }
+  const info = cacheFresh && cached ? cached : await getInfo({ itemId: id });
+  if (info.folder) {
+    return { cacheFresh, usedCachedMetadata: Boolean(cacheFresh && cached), usedContentIndex: false, snapshot: { item: info, preview: null, note: "This OneDrive item is a folder.", source: "metadata", truncated: false } };
+  }
+  if (indexed && contentIndexEntryFresh(indexed, info)) {
+    return { cacheFresh, usedCachedMetadata: Boolean(cacheFresh && cached), usedContentIndex: true, snapshot: chatgptIndexedSnapshot(indexed, info, cacheFresh ? "content-index" : "content-index-validated") };
+  }
+  const snapshot = await extractChatgptFetchSnapshot(info, { itemId: id, sourceRef: id });
   return { cacheFresh, usedCachedMetadata: Boolean(cacheFresh && cached), usedContentIndex: false, snapshot };
 }
 
@@ -10999,8 +12628,21 @@ async function chatgptFetch(args = {}) {
   const startedAt = Date.now();
   const requestedId = String(args.id || "").trim();
   const continuation = decodeChatgptFetchContinuation(requestedId);
-  const [cache, contentIndex] = await Promise.all([loadMetadataCache(), loadContentIndex()]);
-  const scopeKey = storageScopeKey(cache.scope) || storageScopeKey(await activeStorageScope());
+  const enterpriseLocator = decodeEnterpriseDriveItemId(continuation?.itemId || requestedId);
+  let cache;
+  let contentIndex;
+  let scopeKey;
+  if (enterpriseLocator) {
+    const authContextId = currentAuthContextId();
+    if (!authContextId) throw new Error("OneDrive authentication context is unavailable for this enterprise item reference.");
+    const enterpriseScope = { authContextId, driveId: enterpriseLocator.driveId };
+    cache = emptyMetadataCache(enterpriseScope);
+    contentIndex = emptyContentIndex(enterpriseScope);
+    scopeKey = storageScopeKey(enterpriseScope);
+  } else {
+    [cache, contentIndex] = await Promise.all([loadMetadataCache(), loadContentIndex()]);
+    scopeKey = storageScopeKey(cache.scope) || storageScopeKey(await activeStorageScope());
+  }
   let resolved;
   let snapshot;
   let result;
@@ -11037,6 +12679,7 @@ async function chatgptFetch(args = {}) {
       metadata: chatgptFetchMetadata(snapshot, {
         progressive: true,
         sourceItemId: continuation.itemId,
+        ...(snapshot.enterpriseDriveId ? { driveId: snapshot.enterpriseDriveId, rawItemId: String(snapshot.item?.id || "") } : {}),
         chunkIndex: continuation.part,
         chunkCount,
         fullTextBytes: chunk.totalBytes,
@@ -11050,6 +12693,7 @@ async function chatgptFetch(args = {}) {
     resolved = await resolveChatgptFetchSnapshot(requestedId, cache, contentIndex);
     snapshot = resolved.snapshot;
     const item = snapshot.item || {};
+    const sourceRef = String(snapshot.sourceRef || item.id || requestedId);
     const fullText = item.folder
       ? String(snapshot.note || "This OneDrive item is a folder.")
       : String(snapshot.preview ?? snapshot.note ?? "");
@@ -11057,12 +12701,12 @@ async function chatgptFetch(args = {}) {
       : compactChatgptProgressiveText(fullText);
     const fingerprint = chatgptFetchFingerprint(item);
     const nextChunkId = compact.progressive
-      ? encodeChatgptFetchContinuation({ itemId: String(item.id || requestedId), fingerprint, offset: 0, part: 1 })
+      ? encodeChatgptFetchContinuation({ itemId: sourceRef, fingerprint, offset: 0, part: 1 })
       : "";
     if (compact.progressive) rememberChatgptFetchSnapshot(scopeKey, snapshot);
     const descriptor = chatgptItemDescriptor(item, requestedId);
     result = {
-      id: String(item.id || requestedId || ""),
+      id: sourceRef,
       title: String(item.name || requestedId || "OneDrive item"),
       text: compact.text,
       url: descriptor.webUrl,
@@ -11073,6 +12717,8 @@ async function chatgptFetch(args = {}) {
       type: descriptor.type,
       webUrl: descriptor.webUrl,
       metadata: chatgptFetchMetadata(snapshot, {
+        sourceItemId: sourceRef,
+        ...(snapshot.enterpriseDriveId ? { driveId: snapshot.enterpriseDriveId, rawItemId: String(item.id || "") } : {}),
         progressive: compact.progressive,
         fullTextBytes: compact.fullBytes,
         returnedTextBytes: Buffer.byteLength(compact.text, "utf8"),
@@ -11087,7 +12733,7 @@ async function chatgptFetch(args = {}) {
       })
     };
   }
-  const contentIndexEntriesWarmed = continuation || resolved?.usedContentIndex
+  const contentIndexEntriesWarmed = continuation || resolved?.usedContentIndex || snapshot.enterpriseDriveId
     ? 0
     : await bestEffortLocalWrite(
       "ChatGPT fetch content-index warm",
@@ -11256,6 +12902,8 @@ async function chatgptPermissionSummary(itemId) {
 
 function chatgptPreviewActionSummary(action) {
   switch (action.operation) {
+    case "deleteOfficeBackups":
+      return `Delete ${action.backupIds?.length || 0} explicitly selected managed Office backup(s) from the current account-and-drive scope.`;
     case "rename":
       return `Rename item ${action.itemId} to ${action.newName}.`;
     case "move":
@@ -11266,12 +12914,20 @@ function chatgptPreviewActionSummary(action) {
       return `Create a ${action.scope || "anonymous"} ${action.linkType || "view"} sharing link for item ${action.itemId}.`;
     case "revokePermission":
       return `Revoke permission ${action.permissionId} from item ${action.itemId}.`;
+    case "restoreVersion":
+      return `Restore version ${action.versionId} of item ${action.itemId} as a new current version.`;
     default:
       return `Preview ${action.operation} for item ${action.itemId}.`;
   }
 }
 
 function validateChatgptPreviewAction(action, index) {
+  if (action.operation !== "deleteOfficeBackups" && !action.itemId) {
+    throw new Error(`Preview action ${index} ${action.operation} requires itemId.`);
+  }
+  if (action.operation === "deleteOfficeBackups" && (!Array.isArray(action.backupIds) || action.backupIds.length < 1)) {
+    throw new Error(`Preview action ${index} deleteOfficeBackups requires backupIds.`);
+  }
   if (action.operation === "rename" && !action.newName) {
     throw new Error(`Preview action ${index} rename requires newName.`);
   }
@@ -11283,6 +12939,9 @@ function validateChatgptPreviewAction(action, index) {
   if (action.operation === "revokePermission" && !action.permissionId) {
     throw new Error(`Preview action ${index} revokePermission requires permissionId.`);
   }
+  if (action.operation === "restoreVersion" && !action.versionId) {
+    throw new Error(`Preview action ${index} restoreVersion requires versionId.`);
+  }
 }
 
 async function chatgptPreviewAction(action, index) {
@@ -11292,7 +12951,9 @@ async function chatgptPreviewAction(action, index) {
     let preview;
     let accessSummary;
     let accessSummaryError;
-    if (action.operation === "rename") {
+    if (action.operation === "deleteOfficeBackups") {
+      ({ preview } = await officeBackupDeletionPreview(action.backupIds));
+    } else if (action.operation === "rename") {
       preview = await rename({ itemId: action.itemId, newName: action.newName, dryRun: true, confirmed: false });
     } else if (action.operation === "move") {
       preview = await moveItem({
@@ -11344,6 +13005,8 @@ async function chatgptPreviewAction(action, index) {
           || `Permission ${action.permissionId} is not revocable. Choose a direct sharing permission instead.`
         );
       }
+    } else if (action.operation === "restoreVersion") {
+      preview = await restoreVersion({ itemId: action.itemId, versionId: action.versionId, dryRun: true, confirmed: false });
     } else {
       throw new Error(`Unsupported preview operation: ${action.operation}.`);
     }
@@ -11351,13 +13014,15 @@ async function chatgptPreviewAction(action, index) {
     return {
       index,
       operation: action.operation,
-      itemId: action.itemId,
-      expectedId: action.itemId,
+      itemId: action.itemId || "managed-office-backups",
+      expectedId: action.itemId || "managed-office-backups",
       isError: false,
       dryRun: true,
       previewTokenPresent: Boolean(previewToken),
       ...(previewToken ? { previewToken } : {}),
       ...(preview?.previewTokenExpiresAt ? { previewTokenExpiresAt: String(preview.previewTokenExpiresAt) } : {}),
+      ...(preview?.item?.eTag ? { expectedETag: String(preview.item.eTag) } : {}),
+      ...(preview?.version ? { version: preview.version } : {}),
       summary: chatgptPreviewActionSummary(action),
       ...(accessSummary ? { accessSummary } : {}),
       ...(accessSummaryError ? { accessSummaryError } : {}),
@@ -11397,15 +13062,26 @@ async function chatgptPreviewActions(args = {}) {
 }
 
 function validateChatgptReadAction(action, index) {
+  if (action.driveId && action.operation !== "libraryList") {
+    throw new Error(`Read action ${index} ${action.operation} does not support driveId. Use enterpriseSearch or libraryList to obtain an opaque ID, then pass that ID unchanged to fetch.`);
+  }
+  if (action.folderItemId && action.operation !== "libraryList") {
+    throw new Error(`Read action ${index} ${action.operation} does not support folderItemId.`);
+  }
   if (action.operation === "search" && !String(action.query || "").trim()) {
     throw new Error(`Read action ${index} search requires query.`);
   }
-  if (["getInfo", "permissions"].includes(action.operation) && !action.itemId && action.path === undefined) {
+  if (["getInfo", "permissions", "versions", "compareVersion"].includes(action.operation) && !action.itemId && action.path === undefined) {
     throw new Error(`Read action ${index} ${action.operation} requires itemId or path.`);
   }
   if (action.itemId && action.path !== undefined) {
     throw new Error(`Read action ${index} must use only one item selector.`);
   }
+  if (action.operation === "recent" && (action.itemId || action.path !== undefined)) throw new Error(`Read action ${index} recent does not accept an item target.`);
+  if (action.operation === "compareVersion" && !action.versionId) throw new Error(`Read action ${index} compareVersion requires versionId.`);
+  if (action.operation === "libraryList" && !action.driveId) throw new Error(`Read action ${index} libraryList requires driveId.`);
+  if (action.operation === "enterpriseSearch" && !String(action.query || "").trim()) throw new Error(`Read action ${index} enterpriseSearch requires query.`);
+  if (action.operation === "officeBackups" && action.path !== undefined) throw new Error(`Read action ${index} officeBackups accepts itemId only as an optional filter.`);
 }
 
 async function chatgptReadAction(action, index) {
@@ -11414,7 +13090,9 @@ async function chatgptReadAction(action, index) {
     validateChatgptReadAction(action, index);
     const target = action.itemId ? { itemId: action.itemId } : { path: action.path || "" };
     let value;
-    if (action.operation === "list") {
+    if (action.operation === "officeBackups") {
+      value = await officeBackups({ itemId: action.itemId, kind: action.kind, limit: action.limit || 25 });
+    } else if (action.operation === "list") {
       value = await list({ ...target, limit: action.limit || 25, format: action.format || "compact" });
     } else if (action.operation === "search") {
       const ranked = await chatgptSearch({ query: action.query }, { includeDiagnostics: true });
@@ -11430,16 +13108,34 @@ async function chatgptReadAction(action, index) {
       value = { item: await getInfo({ ...target, format: action.format || "compact" }) };
     } else if (action.operation === "permissions") {
       value = await permissions({ ...target, format: action.format || "compact" });
+    } else if (action.operation === "recent") {
+      value = await recent({ limit: action.limit || 25, format: action.format || "compact" });
+    } else if (action.operation === "versions") {
+      value = await versions({ ...target, maxItems: action.maxItems || action.limit || 50 });
+    } else if (action.operation === "compareVersion") {
+      value = await compareVersion({ ...target, versionId: action.versionId, compareToVersionId: action.compareToVersionId, maxChanges: action.maxChanges });
+    } else if (action.operation === "drives") {
+      value = await listAccessibleDrives(action);
+    } else if (action.operation === "enterpriseSearch") {
+      value = await enterpriseDriveSearch(action);
+    } else if (action.operation === "libraryList") {
+      value = await libraryList(action);
     } else {
       throw new Error(`Unsupported read operation: ${action.operation}.`);
     }
     return { index, operation: action.operation, isError: false, value, durationMs: elapsedMs(startedAt) };
   } catch (error) {
+    const structuredError = structuredToolError(error).error;
     return {
       index,
       operation: action.operation,
       isError: true,
       error: safeToolErrorMessage(error),
+      errorCode: structuredError.code,
+      ...(structuredError.retryable === true ? {
+        retryable: true,
+        retryAfterSeconds: structuredError.retryAfterSeconds
+      } : {}),
       durationMs: elapsedMs(startedAt)
     };
   }
@@ -11602,7 +13298,7 @@ function compactVerifiedMutationItem(item, verified = undefined, contentFingerpr
 function chatgptMutationSummary(operation, value = {}) {
   const item = value.renamed || value.moved || value.item || value.verifiedItem || null;
   const verified = value.verified === true
-    || (["createSharingLink", "revokePermission"].includes(operation) && value.verificationIncomplete !== true)
+    || (["createSharingLink", "revokePermission", "restoreVersion"].includes(operation) && value.verificationIncomplete !== true)
     || (operation === "copy" && value.verifiedItem && value.monitor?.succeeded === true);
   return {
     operationId: value.operationId,
@@ -11636,6 +13332,7 @@ function chatgptMutationSummary(operation, value = {}) {
 function validateChatgptCommitAction(action, index) {
   validateChatgptPreviewAction(action, index);
   if (!action.previewToken) throw new Error(`Commit action ${index} requires previewToken.`);
+  if (action.operation === "restoreVersion" && !action.expectedETag) throw new Error(`Commit action ${index} restoreVersion requires expectedETag.`);
 }
 
 async function chatgptCommitAction(action, index, options = {}) {
@@ -11646,12 +13343,15 @@ async function chatgptCommitAction(action, index, options = {}) {
       itemId: action.itemId,
       expectedId: action.itemId,
       ...(action.expectedName ? { expectedName: action.expectedName } : {}),
+      ...(action.expectedETag ? { expectedETag: action.expectedETag } : {}),
       dryRun: false,
       confirmed: true,
       previewToken: action.previewToken
     };
     let value;
-    if (action.operation === "rename") {
+    if (action.operation === "deleteOfficeBackups") {
+      value = await commitOfficeBackupDeletion(action.backupIds, action.previewToken);
+    } else if (action.operation === "rename") {
       value = await rename({ ...common, newName: action.newName });
     } else if (action.operation === "move") {
       value = await moveItem({
@@ -11682,6 +13382,8 @@ async function chatgptCommitAction(action, index, options = {}) {
         permissionId: action.permissionId,
         includePermissions: true
       });
+    } else if (action.operation === "restoreVersion") {
+      value = await restoreVersion({ ...common, versionId: action.versionId });
     } else {
       throw new Error(`Unsupported commit operation: ${action.operation}.`);
     }
@@ -11691,7 +13393,14 @@ async function chatgptCommitAction(action, index, options = {}) {
         ? requirement
         : `The ${action.operation} action was not committed because its preview proof was rejected.`);
     }
-    const result = chatgptMutationSummary(action.operation, value);
+    const result = action.operation === "deleteOfficeBackups"
+      ? {
+          operationId: value.operationId,
+          verified: value.verified === true,
+          deletedBackupIds: value.deletedBackupIds,
+          deleted: value.deleted
+        }
+      : chatgptMutationSummary(action.operation, value);
     return {
       index,
       operation: action.operation,
@@ -11815,13 +13524,14 @@ async function updateFile(args = {}) {
   const remote = assertSafeRemotePath(args.remotePath, "remotePath");
   if (!remote) throw new Error("remotePath is required.");
   const scope = await activeStorageScope();
+  const scopedPaths = scopedStoragePaths(scope);
 
   if (args.mode === "checkout") {
     if (args.localPath) await assertNotLocalOneDriveSyncPathForWrite(resolve(args.localPath), "Checkout", args);
     if (args.manifestPath) await assertNotLocalOneDriveSyncPathForWrite(resolve(args.manifestPath), "Checkout manifest", args);
     const info = await getInfo(args.itemId ? { itemId: args.itemId } : { path: remote });
     if (info.folder) throw new Error(`Cannot checkout a folder: ${info.name}`);
-    const localPath = args.localPath ? resolve(args.localPath) : join(updateRoot, info.name || basename(remote));
+    const localPath = args.localPath ? resolve(args.localPath) : join(scopedPaths.updateRoot, info.name || basename(remote));
     await assertNotLocalOneDriveSyncPathForWrite(localPath, "Checkout", args);
     const manifestPath = updateManifestPath(localPath, args.manifestPath);
     await assertNotLocalOneDriveSyncPathForWrite(manifestPath, "Checkout manifest", args);
@@ -11853,7 +13563,7 @@ async function updateFile(args = {}) {
   }
 
   if (args.mode !== "commit") throw new Error("mode must be checkout or commit.");
-  const localPath = resolve(args.localPath || join(updateRoot, basename(remote)));
+  const localPath = resolve(args.localPath || join(scopedPaths.updateRoot, basename(remote)));
   await assertNotLocalOneDriveSyncPathForRead(localPath, "Commit", args);
   const manifestPath = updateManifestPath(localPath, args.manifestPath);
   let manifest = null;
@@ -11897,7 +13607,7 @@ async function updateFile(args = {}) {
   let backup = null;
   if (args.createBackup !== false) {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const backupPath = join(backupRoot, `${stamp}-${randomUUID()}-${basename(remote)}`);
+    const backupPath = join(scopedPaths.backupRoot, `${stamp}-${randomUUID()}-${basename(remote)}`);
     backup = await download({ path: remote, localPath: backupPath, overwrite: false });
   }
 
@@ -11942,6 +13652,108 @@ async function recent(args = {}) {
   const result = await graph(`/me/drive/recent?${params.toString()}`);
   await bestEffortLocalWrite("metadata cache update", async () => await cacheItems(result.value || []));
   return { items: (result.value || []).map((item) => formatDriveItem(item, args.format)), count: (result.value || []).length };
+}
+
+async function listAccessibleDrives(args = {}) {
+  const limit = clampInteger(args.limit, 25, 1, 200);
+  const result = await graph(`/me/drives?$select=id,name,driveType,webUrl,quota,system&$top=${limit}`);
+  const drives = (result.value || []).slice(0, limit).map((drive) => ({
+    id: drive.id,
+    driveId: drive.id,
+    name: drive.name,
+    driveType: drive.driveType,
+    webUrl: drive.webUrl,
+    quota: drive.quota ? { state: drive.quota.state, total: drive.quota.total, used: drive.quota.used, remaining: drive.quota.remaining } : undefined,
+    system: drive.system
+  }));
+  return { drives, count: drives.length, nextLink: result["@odata.nextLink"] || null };
+}
+
+async function enterpriseDriveSearch(args = {}) {
+  const drive = await graph("/me/drive?$select=id,driveType");
+  if (drive?.driveType === "personal") {
+    throw new Error("Enterprise search requires a Microsoft work or school account and tenant-consented Files.Read.All or Sites.Read.All access.");
+  }
+  const limit = clampInteger(args.limit, 25, 1, 50);
+  let result;
+  try {
+    result = await graph("/search/query", {
+      method: "POST",
+      body: JSON.stringify({
+        requests: [{
+          entityTypes: ["driveItem"],
+          query: { queryString: String(args.query) },
+          from: 0,
+          size: limit,
+          fields: ["id", "name", "webUrl", "size", "createdDateTime", "lastModifiedDateTime", "parentReference", "file", "folder"]
+        }]
+      }),
+      maxRetries: 0
+    });
+  } catch (error) {
+    if ([400, 403].includes(error?.graphStatus)) {
+      throw new Error("Enterprise search is unavailable for this account or tenant consent. It requires a work/school account plus Files.Read.All or Sites.Read.All consent.");
+    }
+    throw error;
+  }
+  const containers = (result.value || []).flatMap((entry) => entry.hitsContainers || []);
+  const items = containers.flatMap((container) => container.hits || []).slice(0, limit).flatMap((hit) => {
+    const resource = hit.resource || {};
+    const resolved = simplifyItem(resource);
+    const itemId = resolved?.id || hit.hitId;
+    const driveId = resolved?.driveId;
+    if (typeof itemId !== "string" || !itemId || typeof driveId !== "string" || !driveId) return [];
+    return [{
+      id: encodeEnterpriseDriveItemId(driveId, itemId),
+      rank: hit.rank,
+      summary: String(hit.summary || "").replace(/<\/?c\d+>/giu, ""),
+      itemId,
+      driveId,
+      name: resolved.name,
+      webUrl: resolved.webUrl,
+      size: resolved.size,
+      createdDateTime: resolved.createdDateTime,
+      lastModifiedDateTime: resolved.lastModifiedDateTime,
+      siteId: (resource.remoteItem || resource).parentReference?.siteId,
+      type: resolved.folder ? "folder" : resolved.file ? "file" : "item"
+    }];
+  });
+  return {
+    items,
+    count: items.length,
+    moreResults: containers.some((entry) => entry.moreResults === true),
+    note: "Pass a result's opaque id unchanged to fetch. Cross-library mutations remain unsupported."
+  };
+}
+
+async function libraryList(args = {}) {
+  const limit = clampInteger(args.limit, 25, 1, 200);
+  const driveId = validateEnterpriseDriveItemPart(args.driveId, "drive ID");
+  const base = `/drives/${encodeURIComponent(driveId)}`;
+  const path = args.folderItemId
+    ? `${base}/items/${encodeURIComponent(String(args.folderItemId))}/children`
+    : `${base}/root/children`;
+  const separator = path.includes("?") ? "&" : "?";
+  const result = await graph(`${path}${separator}$top=${limit}&$select=${encodeURIComponent(defaultSelect)}`);
+  const items = (result.value || []).slice(0, limit).flatMap((item) => {
+    const resolved = simplifyItem(item);
+    const sourceDriveId = resolved?.driveId || driveId;
+    if (!resolved?.id) return [];
+    return [{
+      ...formatSimplifiedItem(resolved, args.format || "compact"),
+      id: encodeEnterpriseDriveItemId(sourceDriveId, resolved.id),
+      driveId: sourceDriveId,
+      itemId: resolved.id
+    }];
+  });
+  return {
+    driveId,
+    folderItemId: args.folderItemId || null,
+    items,
+    count: items.length,
+    nextLink: result["@odata.nextLink"] || null,
+    mutationsSupported: false
+  };
 }
 
 async function largeFiles(args = {}) {
@@ -12197,7 +14009,15 @@ function pinnedChatgptFileLookup(target, addresses) {
   };
 }
 
-function nodeHttpsResponse(response) {
+function nodeHttpsResponse(response, signal = undefined) {
+  if (signal) {
+    const onAbort = () => response.destroy(chatgptFileAbortReason(signal));
+    if (signal.aborted) onAbort();
+    else {
+      signal.addEventListener("abort", onAbort, { once: true });
+      response.once("close", () => signal.removeEventListener("abort", onAbort));
+    }
+  }
   const headers = {
     get(name) {
       const value = response.headers[String(name || "").toLowerCase()];
@@ -12226,8 +14046,11 @@ function nodeHttpsResponse(response) {
   };
 }
 
-async function requestPublicChatgptFile(target, timeoutMs = fetchTimeoutMs()) {
-  const addresses = await resolvePublicChatgptFileTarget(target);
+async function requestPublicChatgptFile(target, options = {}) {
+  const timeoutMs = options.timeoutMs ?? fetchTimeoutMs();
+  const signal = options.signal;
+  const addresses = await withChatgptFileAbort(resolvePublicChatgptFileTarget(target), signal);
+  throwIfChatgptFileAborted(signal);
   return await new Promise((resolvePromise, reject) => {
     const request = httpsRequest({
       protocol: "https:",
@@ -12241,8 +14064,9 @@ async function requestPublicChatgptFile(target, timeoutMs = fetchTimeoutMs()) {
         "User-Agent": "OneDrive-ChatGPT-File-Downloader/1"
       },
       lookup: pinnedChatgptFileLookup(target, addresses),
-      servername: target.hostname
-    }, (response) => resolvePromise(nodeHttpsResponse(response)));
+      servername: target.hostname,
+      ...(signal ? { signal } : {})
+    }, (response) => resolvePromise(nodeHttpsResponse(response, signal)));
     request.setTimeout(timeoutMs, () => {
       const error = new Error(`ChatGPT file download timed out after ${timeoutMs}ms.`);
       error.name = "TimeoutError";
@@ -12267,23 +14091,25 @@ async function discardChatgptFileResponse(response) {
 }
 
 async function fetchChatgptFileWithRetry(target, options = {}) {
-  if (isTestChatgptFileUrl(target)) {
-    return await fetchWithRetry(target.toString(), { method: "GET", redirect: "manual" }, options);
-  }
   const maxRetries = options.maxRetries ?? 2;
   const timeoutMs = options.timeoutMs ?? fetchTimeoutMs();
+  const signal = options.signal;
   for (let attempt = 0; ; attempt += 1) {
+    throwIfChatgptFileAborted(signal);
     let response;
     try {
-      response = await requestPublicChatgptFile(target, timeoutMs);
+      response = isTestChatgptFileUrl(target)
+        ? await fetchWithRetry(target.toString(), { method: "GET", redirect: "manual", ...(signal ? { signal } : {}) }, { maxRetries: 0, timeoutMs })
+        : await requestPublicChatgptFile(target, { timeoutMs, signal });
     } catch (error) {
+      if (signal?.aborted) throw chatgptFileAbortReason(signal);
       if (attempt >= maxRetries || String(error?.message || "").includes("untrusted URL")) throw error;
-      await sleep(Math.min(1000 * 2 ** attempt, 8000));
+      await waitForChatgptFileRetry(Math.min(1000 * 2 ** attempt, 8000), signal);
       continue;
     }
     if (!shouldRetryResponse(response) || attempt >= maxRetries) return response;
     await discardChatgptFileResponse(response);
-    await sleep(retryDelayMs(response, attempt));
+    await waitForChatgptFileRetry(retryDelayMs(response, attempt), signal);
   }
 }
 
@@ -12294,38 +14120,51 @@ async function sha256LocalFile(localPath) {
 }
 
 async function downloadChatgptFile(sourceFile = {}) {
-  await ensurePrivateDirectory(chatgptUploadRoot);
-  const targetPath = join(chatgptUploadRoot, `${randomUUID()}.upload`);
-  let current = trustedChatgptFileUrl(sourceFile.download_url);
+  const timeoutMs = fetchTimeoutMs();
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(chatgptFileDeadlineError(timeoutMs)), timeoutMs);
+  deadline.unref?.();
+  let targetPath;
   let response;
-  for (let redirects = 0; redirects <= 3; redirects += 1) {
-    response = await fetchChatgptFileWithRetry(current, { maxRetries: 2 });
-    if (![301, 302, 303, 307, 308].includes(response.status)) break;
-    const location = response.headers.get("location");
-    if (!location) throw new Error("ChatGPT file download redirected without a Location header.");
-    if (redirects === 3) throw new Error("ChatGPT file download exceeded the redirect limit.");
-    await discardChatgptFileResponse(response);
-    current = trustedChatgptFileUrl(new URL(location, current).toString());
-  }
-  if (!response?.ok) {
-    await discardChatgptFileResponse(response);
-    throw new Error(`ChatGPT file download failed with HTTP ${response?.status || "unknown"}.`);
-  }
-  const declaredBytes = contentLength(response);
-  if (declaredBytes !== null && declaredBytes > simpleUploadLimit) {
-    await discardChatgptFileResponse(response);
-    throw new Error(`ChatGPT file is larger than the ${simpleUploadLimit}-byte safe upload limit.`);
-  }
-  const contentEncoding = String(response.headers.get("content-encoding") || "").trim().toLowerCase();
-  if (contentEncoding && contentEncoding !== "identity") {
-    await discardChatgptFileResponse(response);
-    throw new Error(`ChatGPT file download used unsupported content encoding: ${contentEncoding}.`);
-  }
-  let bytesWritten = 0;
   try {
+    const scopedUploadRoot = (await currentScopedStoragePaths("ChatGPT upload staging")).paths.chatgptUploadRoot;
+    await ensurePrivateDirectory(scopedUploadRoot);
+    targetPath = join(scopedUploadRoot, `${randomUUID()}.upload`);
+    let current = trustedChatgptFileUrl(sourceFile.download_url);
+    for (let redirects = 0; redirects <= 3; redirects += 1) {
+      throwIfChatgptFileAborted(controller.signal);
+      response = await fetchChatgptFileWithRetry(current, { maxRetries: 2, timeoutMs, signal: controller.signal });
+      if (![301, 302, 303, 307, 308].includes(response.status)) break;
+      const location = response.headers.get("location");
+      if (!location) throw new Error("ChatGPT file download redirected without a Location header.");
+      if (redirects === 3) throw new Error("ChatGPT file download exceeded the redirect limit.");
+      await discardChatgptFileResponse(response);
+      response = undefined;
+      current = trustedChatgptFileUrl(new URL(location, current).toString());
+    }
+    if (!response?.ok) {
+      const status = response?.status || "unknown";
+      await discardChatgptFileResponse(response);
+      response = undefined;
+      throw new Error(`ChatGPT file download failed with HTTP ${status}.`);
+    }
+    const declaredBytes = contentLength(response);
+    if (declaredBytes !== null && declaredBytes > simpleUploadLimit) {
+      await discardChatgptFileResponse(response);
+      response = undefined;
+      throw new Error(`ChatGPT file is larger than the ${simpleUploadLimit}-byte safe upload limit.`);
+    }
+    const contentEncoding = String(response.headers.get("content-encoding") || "").trim().toLowerCase();
+    if (contentEncoding && contentEncoding !== "identity") {
+      await discardChatgptFileResponse(response);
+      response = undefined;
+      throw new Error(`ChatGPT file download used unsupported content encoding: ${contentEncoding}.`);
+    }
+    let bytesWritten = 0;
     if (response.body) {
       const boundedBody = async function* () {
         for await (const chunk of response.body) {
+          throwIfChatgptFileAborted(controller.signal);
           const buffer = Buffer.from(chunk);
           bytesWritten += buffer.byteLength;
           if (bytesWritten > simpleUploadLimit) {
@@ -12334,9 +14173,10 @@ async function downloadChatgptFile(sourceFile = {}) {
           yield buffer;
         }
       };
-      await pipeline(boundedBody(), createWriteStream(targetPath, { flags: "wx", mode: 0o600 }));
+      await pipeline(boundedBody(), createWriteStream(targetPath, { flags: "wx", mode: 0o600 }), { signal: controller.signal });
     } else {
       const buffer = Buffer.from(await response.arrayBuffer());
+      throwIfChatgptFileAborted(controller.signal);
       if (buffer.length > simpleUploadLimit) throw new Error(`ChatGPT file exceeded the ${simpleUploadLimit}-byte safe upload limit.`);
       bytesWritten = buffer.length;
       await writePrivateFile(targetPath, buffer);
@@ -12344,8 +14184,16 @@ async function downloadChatgptFile(sourceFile = {}) {
     await hardenPrivateFile(targetPath);
     return { localPath: targetPath, bytes: bytesWritten };
   } catch (error) {
-    await rm(targetPath, { force: true }).catch(() => null);
+    if (response?.body && controller.signal.aborted && typeof response.body.destroy === "function") {
+      response.body.destroy(chatgptFileAbortReason(controller.signal));
+    } else if (response?.body) {
+      await discardChatgptFileResponse(response).catch(() => null);
+    }
+    if (targetPath) await rm(targetPath, { force: true }).catch(() => null);
+    if (controller.signal.aborted) throw chatgptFileAbortReason(controller.signal);
     throw error;
+  } finally {
+    clearTimeout(deadline);
   }
 }
 
@@ -12353,8 +14201,10 @@ async function uploadChatgptFile(args = {}) {
   const destinationPath = assertSafeRemotePath(args.remotePath, "remotePath");
   if (!destinationPath) throw new Error("remotePath must include a filename.");
   const conflictBehavior = args.conflictBehavior || "fail";
-  const downloaded = await downloadChatgptFile(args.sourceFile);
+  const heavyweightAdmissionLease = acquireHeavyweightBufferLease();
+  let downloaded = null;
   try {
+    downloaded = await downloadChatgptFile(args.sourceFile);
     const source = {
       fileName: String(args.sourceFile?.file_name || basename(destinationPath)),
       mimeType: String(args.sourceFile?.mime_type || ""),
@@ -12403,7 +14253,11 @@ async function uploadChatgptFile(args = {}) {
       sourceFile: source
     };
   } finally {
-    await rm(downloaded.localPath, { force: true }).catch(() => null);
+    try {
+      if (downloaded?.localPath) await rm(downloaded.localPath, { force: true }).catch(() => null);
+    } finally {
+      heavyweightAdmissionLease.release();
+    }
   }
 }
 
@@ -12758,18 +14612,40 @@ async function readVersionContent(rawItem, versionId = null, maxBytes = maxOffic
   const path = versionId === null
     ? contentPath({ itemId: rawItem.id })
     : driveItemVersionPath(rawItem.id, versionId, "/content");
-  const result = await graphLimitedBuffer(path, maxBytes);
+  const result = await graphLimitedBuffer(path, maxBytes, versionId === null ? { expectedETag: rawItem.eTag } : {});
   if (result.truncated) throw new Error(`Version content is above the ${maxBytes}-byte comparison limit.`);
   return result.buffer;
 }
 
-async function inspectOfficeBuffer(kind, buffer, name, label) {
-  const transactionRoot = join(officeEditingRoot, `version-${randomUUID()}`);
+function acquireHeavyweightBufferLease() {
+  const admission = heavyweightSubprocessAdmission.acquire({
+    subject: currentAuthContextId() || "noauth-local-server",
+    kind: "buffer"
+  });
+  if (!admission.admitted) throw heavyweightSubprocessBusyError(admission);
+  return admission;
+}
+
+function heavyweightBufferLease(options = {}) {
+  if (options._heavyweightAdmissionLease !== undefined) {
+    return {
+      lease: assertReusableHeavyweightSubprocessLease(options._heavyweightAdmissionLease),
+      owned: false
+    };
+  }
+  return { lease: acquireHeavyweightBufferLease(), owned: true };
+}
+
+async function inspectOfficeBuffer(kind, buffer, name, label, heavyweightAdmissionLease) {
+  const transactionRoot = join((await currentScopedStoragePaths("Office version inspection staging")).paths.officeEditingRoot, `version-${randomUUID()}`);
   await ensurePrivateDirectory(transactionRoot);
   const localPath = join(transactionRoot, assertSafeItemName(name || `document${kind === "word" ? ".docx" : kind === "excel" ? ".xlsx" : ".pptx"}`));
   try {
     await writePrivateFile(localPath, buffer);
-    return await runOfficeHelper({ action: "inspect", inputPath: localPath, kind, maxParagraphs: 10000, maxCells: 50000, maxSlides: 5000 });
+    return await runOfficeHelper(
+      { action: "inspect", inputPath: localPath, kind, maxParagraphs: 10000, maxCells: 50000, maxSlides: 5000 },
+      { _heavyweightAdmissionLease: heavyweightAdmissionLease }
+    );
   } catch (error) {
     throw new Error(`Could not inspect ${label}: ${safeToolErrorMessage(error)}`);
   } finally {
@@ -12781,16 +14657,51 @@ function binaryFingerprint(buffer) {
   return { bytes: buffer.length, sha256: createHash("sha256").update(buffer).digest("hex") };
 }
 
-async function compareItemContents(rawItem, leftBuffer, rightBuffer, labels = {}, maxChanges = 200) {
+function comparisonContentLimit(rawItem) {
+  return isLikelyTextItem(rawItem, { path: rawItem.name }) ? maxTextComparisonBytes : maxComparisonVersionBytes;
+}
+
+function assertBoundedTextComparison(buffer, label) {
+  if (buffer.length > maxTextComparisonBytes) {
+    throw new Error(`${label} is above the ${maxTextComparisonBytes}-byte text comparison limit.`);
+  }
+  const utf16LittleEndian = buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xfe;
+  const utf16BigEndian = buffer.length >= 2 && buffer[0] === 0xfe && buffer[1] === 0xff;
+  const step = utf16LittleEndian || utf16BigEndian ? 2 : 1;
+  const start = step === 2 ? 2 : 0;
+  let lines = 1;
+  let previousWasCarriageReturn = false;
+  for (let index = start; index + step - 1 < buffer.length; index += step) {
+    const value = step === 1
+      ? buffer[index]
+      : utf16LittleEndian
+        ? buffer[index] | (buffer[index + 1] << 8)
+        : (buffer[index] << 8) | buffer[index + 1];
+    if (value === 0x0d) {
+      lines += 1;
+      previousWasCarriageReturn = true;
+    } else if (value === 0x0a) {
+      if (!previousWasCarriageReturn) lines += 1;
+      previousWasCarriageReturn = false;
+    } else {
+      previousWasCarriageReturn = false;
+    }
+    if (lines > maxTextComparisonLines) {
+      throw new Error(`${label} is above the ${maxTextComparisonLines}-line text comparison limit.`);
+    }
+  }
+}
+
+async function compareItemContents(rawItem, leftBuffer, rightBuffer, labels = {}, maxChanges = 200, heavyweightAdmissionLease) {
   const kind = officePackageKindFromName(rawItem.name);
   if (kind) {
-    const [left, right] = await Promise.all([
-      inspectOfficeBuffer(kind, leftBuffer, rawItem.name, labels.left || "left version"),
-      inspectOfficeBuffer(kind, rightBuffer, rawItem.name, labels.right || "right version")
-    ]);
+    const left = await inspectOfficeBuffer(kind, leftBuffer, rawItem.name, labels.left || "left version", heavyweightAdmissionLease);
+    const right = await inspectOfficeBuffer(kind, rightBuffer, rawItem.name, labels.right || "right version", heavyweightAdmissionLease);
     return { comparisonType: "office-semantic", ...compareOfficeInspections(kind, left, right, maxChanges) };
   }
   if (isLikelyTextItem(rawItem, { path: rawItem.name })) {
+    assertBoundedTextComparison(leftBuffer, labels.left || "left version");
+    assertBoundedTextComparison(rightBuffer, labels.right || "right version");
     const left = decodeTextBuffer(leftBuffer);
     const right = decodeTextBuffer(rightBuffer);
     return {
@@ -12814,19 +14725,27 @@ async function compareVersion(args = {}) {
   if (args.compareToVersionId && !versions.some((entry) => String(entry.id) === String(args.compareToVersionId))) {
     throw new Error(`Version ${args.compareToVersionId} was not found for ${rawItem.name}.`);
   }
-  const [left, right] = await Promise.all([
-    readVersionContent(rawItem, args.versionId),
-    readVersionContent(rawItem, args.compareToVersionId || null)
-  ]);
-  return {
-    item: simplifyItem(rawItem),
-    leftVersionId: args.versionId,
-    rightVersionId: args.compareToVersionId || "current",
-    comparison: await compareItemContents(rawItem, left, right, {
-      left: `version ${args.versionId}`,
-      right: args.compareToVersionId ? `version ${args.compareToVersionId}` : "current version"
-    }, clampInteger(args.maxChanges, 200, 1, 1000))
-  };
+  const heavyweightAdmissionLease = acquireHeavyweightBufferLease();
+  try {
+    const maxBytes = comparisonContentLimit(rawItem);
+    const left = await readVersionContent(rawItem, args.versionId, maxBytes);
+    if (maxBytes === maxTextComparisonBytes) assertBoundedTextComparison(left, `version ${args.versionId}`);
+    const right = await readVersionContent(rawItem, args.compareToVersionId || null, maxBytes);
+    if (maxBytes === maxTextComparisonBytes) {
+      assertBoundedTextComparison(right, args.compareToVersionId ? `version ${args.compareToVersionId}` : "current version");
+    }
+    return {
+      item: simplifyItem(rawItem),
+      leftVersionId: args.versionId,
+      rightVersionId: args.compareToVersionId || "current",
+      comparison: await compareItemContents(rawItem, left, right, {
+        left: `version ${args.versionId}`,
+        right: args.compareToVersionId ? `version ${args.compareToVersionId}` : "current version"
+      }, clampInteger(args.maxChanges, 200, 1, 1000), heavyweightAdmissionLease)
+    };
+  } finally {
+    heavyweightAdmissionLease.release();
+  }
 }
 
 async function restoreVersion(args = {}) {
@@ -12857,7 +14776,14 @@ async function restoreVersion(args = {}) {
     const after = await getRawInfo({ itemId: rawItem.id, cacheResults: false });
     if (after.eTag === rawItem.eTag) throw new Error("Graph accepted the restore but the current eTag did not change; restore verification failed.");
     await writeMutationAudit("onedrive_restore_version", { status: "success", target: itemAuditSummary(rawItem), before: itemAuditSummary(rawItem), after: itemAuditSummary(after), versionId: String(target.id) });
-    return { dryRun: false, confirmed: true, restoredVersionId: String(target.id), item: simplifyItem(after), verified: true };
+    return {
+      dryRun: false,
+      confirmed: true,
+      operationId: mutationOperationId("onedrive_restore_version", args.previewToken),
+      restoredVersionId: String(target.id),
+      item: simplifyItem(after),
+      verified: true
+    };
   } catch (error) {
     await writeMutationAudit("onedrive_restore_version", { status: "failed", target: itemAuditSummary(rawItem), versionId: String(target.id), error: safeErrorInfo(error) });
     throw error;
@@ -12933,9 +14859,13 @@ function emptyWorkspaceState(scope) {
 }
 
 async function loadWorkspaceState() {
-  const scope = await activeStorageScope();
+  const guard = await captureStorageScopeGuard("workspace state read");
+  const scope = guard.scope;
+  const statePath = scopedStoragePaths(scope).workspaceStatePath;
   try {
-    const state = JSON.parse(await readFile(scopedStatePath(workspaceStateRoot, scope), "utf8"));
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    await hardenPrivateFile(statePath);
+    assertStorageScopeGuard(guard, "workspace state read");
     if (state?.version !== 1 || !storageScopesEqual(state.scope, scope) || !state.workspaces || typeof state.workspaces !== "object") {
       return emptyWorkspaceState(scope);
     }
@@ -12947,11 +14877,13 @@ async function loadWorkspaceState() {
 }
 
 async function saveWorkspaceState(state) {
-  const scope = await activeStorageScope();
+  const guard = await captureStorageScopeGuard("workspace state write");
+  const scope = guard.scope;
   if (!storageScopesEqual(state.scope, scope)) throw new Error("Workspace state scope changed; refusing to persist it.");
   state.updatedAt = new Date().toISOString();
-  await ensurePrivateDirectory(workspaceStateRoot);
-  await writePrivateFileAtomic(scopedStatePath(workspaceStateRoot, scope), `${JSON.stringify(state, null, 2)}\n`);
+  await writePrivateFileAtomic(scopedStoragePaths(scope).workspaceStatePath, `${JSON.stringify(state, null, 2)}\n`, {
+    beforeCommit: async () => assertStorageScopeGuard(guard, "workspace state commit")
+  });
 }
 
 function assertOpaqueId(candidate, label) {
@@ -13021,6 +14953,7 @@ async function workspaceCreate(args = {}) {
   if (args.expectedETag !== source.eTag) throw new Error("Workspace creation expectedETag no longer matches the source. Run a fresh preview.");
   const tokenRequired = previewTokenRequiredResult(preview, "onedrive_workspace_create", proof, args.previewToken, "requiredToCreate");
   if (tokenRequired) return tokenRequired;
+  const heavyweightAdmissionLease = acquireHeavyweightBufferLease();
   let workspaceFolder = null;
   try {
     const managedRoot = await ensureOwnerOnlyWorkspaceRoot();
@@ -13029,7 +14962,7 @@ async function workspaceCreate(args = {}) {
       method: "POST",
       body: JSON.stringify({ name: workspaceId, folder: {}, "@microsoft.graph.conflictBehavior": "fail" })
     });
-    const sourceBytes = await readVersionContent(source, null, maxOfficePackageBytes);
+    const sourceBytes = await readVersionContent(source, null, maxComparisonVersionBytes);
     const draft = await graph(`${itemIdBase(workspaceFolder.id)}:/${encodeURIComponent(source.name)}:/content?@microsoft.graph.conflictBehavior=fail`, {
       method: "PUT",
       body: sourceBytes,
@@ -13056,63 +14989,89 @@ async function workspaceCreate(args = {}) {
     if (workspaceFolder?.id) await graph(itemIdBase(workspaceFolder.id), { method: "DELETE", maxRetries: 0 }).catch(() => null);
     await writeMutationAudit("onedrive_workspace_create", { status: "failed", target: itemAuditSummary(source), error: safeErrorInfo(error) });
     throw error;
+  } finally {
+    heavyweightAdmissionLease.release();
   }
 }
 
-async function workspaceStatus(args = {}) {
+async function workspaceStatus(args = {}, options = {}) {
   const { manifest } = await workspaceManifest(args.workspaceId);
-  const [source, draft] = await Promise.all([
-    getRawInfo({ itemId: manifest.source.id, cacheResults: false }),
-    getRawInfo({ itemId: manifest.draft.id, cacheResults: false })
-  ]);
-  const sourceDrift = source.eTag !== manifest.source.eTag;
-  const draftDrift = draft.eTag !== manifest.draft.eTag;
-  const [sourceBytes, draftBytes] = await Promise.all([
-    readVersionContent(source, null, maxOfficePackageBytes),
-    readVersionContent(draft, null, maxOfficePackageBytes)
-  ]);
-  const comparison = await compareItemContents(source, sourceBytes, draftBytes, { left: "source", right: "draft" }, clampInteger(args.maxChanges, 200, 1, 1000));
-  return {
-    workspaceId: manifest.workspaceId,
-    status: sourceDrift || manifest.stale ? "conflicted" : draftDrift ? "edited" : "ready",
-    source: simplifyItem(source),
-    draft: simplifyItem(draft),
-    sourceDrift,
-    draftDrift,
-    markedStale: manifest.stale === true,
-    promotionReady: !sourceDrift && manifest.stale !== true,
-    comparison
-  };
+  const ownsHeavyweightAdmission = options._heavyweightAdmissionLease === undefined;
+  const heavyweightAdmissionLease = ownsHeavyweightAdmission
+    ? acquireHeavyweightBufferLease()
+    : assertReusableHeavyweightSubprocessLease(options._heavyweightAdmissionLease);
+  try {
+    const [source, draft] = await Promise.all([
+      getRawInfo({ itemId: manifest.source.id, cacheResults: false }),
+      getRawInfo({ itemId: manifest.draft.id, cacheResults: false })
+    ]);
+    const sourceDrift = source.eTag !== manifest.source.eTag;
+    const draftDrift = draft.eTag !== manifest.draft.eTag;
+    const maxBytes = comparisonContentLimit(source);
+    const sourceBytes = await readVersionContent(source, null, maxBytes);
+    if (maxBytes === maxTextComparisonBytes) assertBoundedTextComparison(sourceBytes, "source");
+    const draftBytes = await readVersionContent(draft, null, maxBytes);
+    if (maxBytes === maxTextComparisonBytes) assertBoundedTextComparison(draftBytes, "draft");
+    const comparison = await compareItemContents(
+      source,
+      sourceBytes,
+      draftBytes,
+      { left: "source", right: "draft" },
+      clampInteger(args.maxChanges, 200, 1, 1000),
+      heavyweightAdmissionLease
+    );
+    return {
+      workspaceId: manifest.workspaceId,
+      status: sourceDrift || manifest.stale ? "conflicted" : draftDrift ? "edited" : "ready",
+      source: simplifyItem(source),
+      draft: simplifyItem(draft),
+      sourceDrift,
+      draftDrift,
+      markedStale: manifest.stale === true,
+      promotionReady: !sourceDrift && manifest.stale !== true,
+      comparison
+    };
+  } finally {
+    if (ownsHeavyweightAdmission) heavyweightAdmissionLease.release();
+  }
 }
 
 async function workspacePromote(args = {}) {
   const { state, id, manifest } = await workspaceManifest(args.workspaceId);
-  const status = await workspaceStatus({ workspaceId: id, maxChanges: 300 });
-  const proof = { workspaceId: id, sourceId: status.source.id, sourceETag: status.source.eTag, draftId: status.draft.id, draftETag: status.draft.eTag };
-  const preview = { dryRun: true, confirmed: false, ...status, action: "promote draft to the original stable item ID" };
-  if (args.dryRun !== false) return previewWithToken(preview, "onedrive_workspace_promote", proof);
-  if (args.confirmed !== true || args.expectedId !== status.source.id || !args.expectedETag) {
-    return { ...preview, dryRun: false, confirmed: args.confirmed === true, requiredToPromote: "Pass confirmed:true, the exact source expectedId, expectedETag, and the matching previewToken." };
-  }
-  if (args.expectedETag !== status.source.eTag || !status.promotionReady) throw new Error("Workspace source drifted or was marked stale. Run a fresh status/preview; promotion is blocked.");
-  const tokenRequired = previewTokenRequiredResult(preview, "onedrive_workspace_promote", proof, args.previewToken, "requiredToPromote");
-  if (tokenRequired) return tokenRequired;
+  const heavyweightAdmissionLease = acquireHeavyweightBufferLease();
   try {
-    const draftRaw = await getRawInfo({ itemId: manifest.draft.id, cacheResults: false });
-    const draftBytes = await readVersionContent(draftRaw, null, maxOfficePackageBytes);
-    const result = await graph(`${itemIdBase(manifest.source.id)}/content`, {
-      method: "PUT", body: draftBytes, headers: { "Content-Type": draftRaw.file?.mimeType || "application/octet-stream", "If-Match": status.source.eTag }, maxRetries: 0
-    });
-    const verify = await readVersionContent(result, null, maxOfficePackageBytes);
-    if (binaryFingerprint(verify).sha256 !== binaryFingerprint(draftBytes).sha256) throw new Error("Workspace promotion post-commit verification failed.");
-    await graph(itemIdBase(manifest.folderId), { method: "DELETE", maxRetries: 0 });
-    delete state.workspaces[id];
-    await saveWorkspaceState(state);
-    await writeMutationAudit("onedrive_workspace_promote", { status: "success", target: itemAuditSummary(status.source), after: itemAuditSummary(result), workspaceId: id, draftId: manifest.draft.id });
-    return { dryRun: false, confirmed: true, workspaceId: id, promoted: true, cleanedUp: true, item: simplifyItem(result), verified: true };
-  } catch (error) {
-    await writeMutationAudit("onedrive_workspace_promote", { status: "failed", target: itemAuditSummary(status.source), workspaceId: id, draftRetained: true, error: safeErrorInfo(error) });
-    throw error;
+    const status = await workspaceStatus(
+      { workspaceId: id, maxChanges: 300 },
+      { _heavyweightAdmissionLease: heavyweightAdmissionLease }
+    );
+    const proof = { workspaceId: id, sourceId: status.source.id, sourceETag: status.source.eTag, draftId: status.draft.id, draftETag: status.draft.eTag };
+    const preview = { dryRun: true, confirmed: false, ...status, action: "promote draft to the original stable item ID" };
+    if (args.dryRun !== false) return previewWithToken(preview, "onedrive_workspace_promote", proof);
+    if (args.confirmed !== true || args.expectedId !== status.source.id || !args.expectedETag) {
+      return { ...preview, dryRun: false, confirmed: args.confirmed === true, requiredToPromote: "Pass confirmed:true, the exact source expectedId, expectedETag, and the matching previewToken." };
+    }
+    if (args.expectedETag !== status.source.eTag || !status.promotionReady) throw new Error("Workspace source drifted or was marked stale. Run a fresh status/preview; promotion is blocked.");
+    const tokenRequired = previewTokenRequiredResult(preview, "onedrive_workspace_promote", proof, args.previewToken, "requiredToPromote");
+    if (tokenRequired) return tokenRequired;
+    try {
+      const draftRaw = await getRawInfo({ itemId: manifest.draft.id, cacheResults: false });
+      const draftBytes = await readVersionContent(draftRaw, null, maxComparisonVersionBytes);
+      const result = await graph(`${itemIdBase(manifest.source.id)}/content`, {
+        method: "PUT", body: draftBytes, headers: { "Content-Type": draftRaw.file?.mimeType || "application/octet-stream", "If-Match": status.source.eTag }, maxRetries: 0
+      });
+      const verify = await readVersionContent(result, null, maxComparisonVersionBytes);
+      if (binaryFingerprint(verify).sha256 !== binaryFingerprint(draftBytes).sha256) throw new Error("Workspace promotion post-commit verification failed.");
+      await graph(itemIdBase(manifest.folderId), { method: "DELETE", maxRetries: 0 });
+      delete state.workspaces[id];
+      await saveWorkspaceState(state);
+      await writeMutationAudit("onedrive_workspace_promote", { status: "success", target: itemAuditSummary(status.source), after: itemAuditSummary(result), workspaceId: id, draftId: manifest.draft.id });
+      return { dryRun: false, confirmed: true, workspaceId: id, promoted: true, cleanedUp: true, item: simplifyItem(result), verified: true };
+    } catch (error) {
+      await writeMutationAudit("onedrive_workspace_promote", { status: "failed", target: itemAuditSummary(status.source), workspaceId: id, draftRetained: true, error: safeErrorInfo(error) });
+      throw error;
+    }
+  } finally {
+    heavyweightAdmissionLease.release();
   }
 }
 
@@ -13143,9 +15102,13 @@ function emptyWatchState(scope) {
 }
 
 async function loadWatchState() {
-  const scope = await activeStorageScope();
+  const guard = await captureStorageScopeGuard("watch state read");
+  const scope = guard.scope;
+  const statePath = scopedStoragePaths(scope).watchStatePath;
   try {
-    const state = JSON.parse(await readFile(scopedStatePath(watchStateRoot, scope), "utf8"));
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    await hardenPrivateFile(statePath);
+    assertStorageScopeGuard(guard, "watch state read");
     if (state?.version !== 1 || !storageScopesEqual(state.scope, scope) || !state.watches || typeof state.watches !== "object") return emptyWatchState(scope);
     return state;
   } catch (error) {
@@ -13155,24 +15118,38 @@ async function loadWatchState() {
 }
 
 async function saveWatchState(state) {
-  const scope = await activeStorageScope();
+  const guard = await captureStorageScopeGuard("watch state write");
+  const scope = guard.scope;
   if (!storageScopesEqual(state.scope, scope)) throw new Error("Watch state scope changed; refusing to persist it.");
   state.updatedAt = new Date().toISOString();
-  await ensurePrivateDirectory(watchStateRoot);
-  await writePrivateFileAtomic(scopedStatePath(watchStateRoot, scope), `${JSON.stringify(state, null, 2)}\n`);
+  await writePrivateFileAtomic(scopedStoragePaths(scope).watchStatePath, `${JSON.stringify(state, null, 2)}\n`, {
+    beforeCommit: async () => assertStorageScopeGuard(guard, "watch state commit")
+  });
 }
 
-function scheduleWatch(watch) {
-  const existing = watchTimers.get(watch.watchId);
+function watchTimersForScope(scope) {
+  const key = storageScopeKey(scope);
+  if (!key) throw new Error("A complete scope is required for watch timers.");
+  let timers = watchTimersByScope.get(key);
+  if (!timers) {
+    timers = new Map();
+    watchTimersByScope.set(key, timers);
+  }
+  return timers;
+}
+
+function scheduleWatch(watch, scope) {
+  const timers = watchTimersForScope(scope);
+  const existing = timers.get(watch.watchId);
   if (existing) clearTimeout(existing);
   if (watch.status !== "active" || Date.parse(watch.expiresAt) <= Date.now()) return;
   const delayMs = Math.max(1000, Number(watch.nextPollAt ? Date.parse(watch.nextPollAt) - Date.now() : watch.intervalSeconds * 1000));
   const timer = setTimeout(() => {
-    watchTimers.delete(watch.watchId);
+    timers.delete(watch.watchId);
     pollWatch(watch.watchId).catch((error) => recordLocalWarning(`watch ${watch.watchId} poll`, error));
   }, delayMs);
   timer.unref?.();
-  watchTimers.set(watch.watchId, timer);
+  timers.set(watch.watchId, timer);
 }
 
 async function markWorkspacesStale(changedIds) {
@@ -13194,10 +15171,12 @@ async function markWorkspacesStale(changedIds) {
 
 function invalidatePreviewTokensForItems(changedIds) {
   const changed = new Set(changedIds);
+  const scopeKey = storageScopeKey(toolCallContext.getStore()?.storageScope);
+  const tokens = previewTokensForScopeKey(scopeKey);
   let invalidated = 0;
-  for (const [token, entry] of previewTokens) {
+  for (const [token, entry] of tokens || []) {
     if ((entry.itemIds || []).some((id) => changed.has(id))) {
-      previewTokens.delete(token);
+      tokens.delete(token);
       invalidated += 1;
     }
   }
@@ -13248,7 +15227,7 @@ async function pollWatch(watchId) {
       await markWorkspacesStale(changedIds);
     }
     await saveWatchState(state);
-    scheduleWatch(watch);
+    scheduleWatch(watch, state.scope);
   } catch (error) {
     watch.consecutiveErrors = Number(watch.consecutiveErrors || 0) + 1;
     watch.lastError = { at: new Date().toISOString(), message: safeToolErrorMessage(error), graphStatus: error.graphStatus || null };
@@ -13259,16 +15238,17 @@ async function pollWatch(watchId) {
       watch.terminalReason = error.graphStatus === 410 ? "delta_cursor_expired" : "authentication_or_permission_error";
     }
     await saveWatchState(state);
-    if (watch.status === "active") scheduleWatch(watch);
+    if (watch.status === "active") scheduleWatch(watch, state.scope);
   }
 }
 
 async function ensureWatchesLoaded() {
-  if (watchesLoaded) return;
   const state = await loadWatchState();
-  watchesLoaded = true;
+  const key = storageScopeKey(state.scope);
+  if (loadedWatchScopes.has(key)) return;
+  loadedWatchScopes.add(key);
   for (const watch of Object.values(state.watches)) {
-    if (watch.status === "active" && Date.parse(watch.expiresAt) > Date.now()) scheduleWatch(watch);
+    if (watch.status === "active" && Date.parse(watch.expiresAt) > Date.now()) scheduleWatch(watch, state.scope);
   }
 }
 
@@ -13306,7 +15286,7 @@ async function watchStart(args = {}) {
   const state = await loadWatchState();
   state.watches[watchId] = watch;
   await saveWatchState(state);
-  scheduleWatch(watch);
+  scheduleWatch(watch, state.scope);
   return { watch: { ...watch, deltaLink: undefined }, baselineItemCount: baseline.count, defaultIntervalSeconds: 30, loopbackOnly: true };
 }
 
@@ -13330,9 +15310,10 @@ async function watchStop(args = {}) {
   const state = await loadWatchState();
   const watch = state.watches[watchId];
   if (!watch) throw new Error(`Watch ${watchId} was not found in the current OneDrive account and drive scope.`);
-  const timer = watchTimers.get(watchId);
+  const timers = watchTimersForScope(state.scope);
+  const timer = timers.get(watchId);
   if (timer) clearTimeout(timer);
-  watchTimers.delete(watchId);
+  timers.delete(watchId);
   watch.status = "stopped";
   watch.stoppedAt = new Date().toISOString();
   watch.nextPollAt = null;
@@ -14712,7 +16693,11 @@ function structuredToolError(error, tool = undefined) {
   const message = safeToolErrorMessage(error);
   const graphStatus = Number.isInteger(error?.graphStatus) ? error.graphStatus : undefined;
   let code = "internal_error";
-  if (graphStatus === 400) code = "invalid_argument";
+  if (error?.code === "HEAVYWEIGHT_SUBPROCESS_BUSY") code = "resource_exhausted";
+  else if (error?.code === "CHATGPT_FILE_DOWNLOAD_TIMEOUT") code = "deadline_exceeded";
+  else if (error?.code === "MANAGED_ARTIFACT_QUOTA_EXCEEDED") code = "failed_precondition";
+  else if (error?.code === "MANAGED_ARTIFACT_QUOTA_UNAVAILABLE" || error?.code === "MANAGED_ARTIFACT_QUOTA_BUSY") code = "service_unavailable";
+  else if (graphStatus === 400) code = "invalid_argument";
   else if (graphStatus === 401) code = "unauthenticated";
   else if (graphStatus === 403) code = "permission_denied";
   else if (graphStatus === 404) code = "not_found";
@@ -14727,6 +16712,10 @@ function structuredToolError(error, tool = undefined) {
       message,
       ...(tool ? { tool } : {}),
       ...(graphStatus === undefined ? {} : { graphStatus }),
+      ...(error?.retryable === true ? {
+        retryable: true,
+        retryAfterSeconds: clampInteger(error.retryAfterSeconds, 1, 1, 60)
+      } : {}),
       ...(error?.graphRequestId ? { graphRequestId: redactAuditText(error.graphRequestId) } : {})
     }
   };
@@ -14735,6 +16724,38 @@ function structuredToolError(error, tool = undefined) {
 function toolErrorResult(error, tool = undefined) {
   const structuredContent = structuredToolError(error, tool);
   return textResult(structuredContent.error.message, true, structuredContent);
+}
+
+const focusedPrivatePathFields = new Set([
+  "localPath", "manifestPath", "stagingPath", "transactionRoot", "backupPath", "inputPath", "outputPath",
+  "pythonPath", "helperPath", "storagePath", "cachePath", "auditPath", "downloadPath", "updatePath"
+]);
+
+function omitFocusedPrivatePaths(value) {
+  if (Array.isArray(value)) return value.map(omitFocusedPrivatePaths);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key, entry]) => (
+      !focusedPrivatePathFields.has(key)
+      && !(typeof entry === "string" && (entry === storageRoot || entry.startsWith(`${storageRoot}/`)))
+    ))
+    .map(([key, entry]) => [key, omitFocusedPrivatePaths(entry)]));
+}
+
+function sanitizeFocusedToolResult(result) {
+  const sanitized = omitFocusedPrivatePaths(result);
+  if (!Array.isArray(sanitized?.content)) return sanitized;
+  return {
+    ...sanitized,
+    content: sanitized.content.map((entry) => {
+      if (entry?.type !== "text" || typeof entry.text !== "string") return entry;
+      try {
+        return { ...entry, text: JSON.stringify(omitFocusedPrivatePaths(JSON.parse(entry.text))) };
+      } catch {
+        return entry;
+      }
+    })
+  };
 }
 
 function resultMessage(id, result) {
@@ -14899,7 +16920,19 @@ async function callTool(name, args = {}) {
     case "onedrive_content_index_clear":
       return textResult(await clearContentIndex());
     case "onedrive_office_capabilities":
-      return textResult(await officeCapabilities());
+      return textResult(await officeCapabilities(args));
+    case "onedrive_office_inspect": {
+      const value = await officeInspect(args);
+      return textResult(value, false, value);
+    }
+    case "onedrive_office_review": {
+      const value = await officeReview(args);
+      return textResult(value, false, value);
+    }
+    case "onedrive_download_file":
+      return materializedToolResult(await materializeDownload(args));
+    case "onedrive_render_preview":
+      return await renderOneDrivePreview(args);
     case "onedrive_office_validate":
       return textResult(await inspectRemoteOfficePackage(args, args.expectedKind || null, "validate"));
     case "onedrive_word_get_document":
@@ -15040,13 +17073,13 @@ export async function processMcpMessage(message, requestAuth = null) {
       }
       return resultMessage(id, {
         protocolVersion: supportedProtocolVersions.has(requestedProtocolVersion) ? requestedProtocolVersion : "2024-11-05",
-        capabilities: { tools: {} },
+        capabilities: { tools: {}, resources: { subscribe: false, listChanged: false } },
         instructions: serverInstructions,
         serverInfo: {
           name: "onedrive",
           title: "OneDrive",
           version: advertisedServerVersion,
-          description: "Search, read, organize, share, and safely edit files in your personal OneDrive.",
+          description: "Search, read, organize, review, share, and safely edit OneDrive files and enterprise document-library content.",
           icons: [{
             src: chatgptIconDataUri,
             mimeType: "image/png",
@@ -15061,8 +17094,54 @@ export async function processMcpMessage(message, requestAuth = null) {
       }
       return resultMessage(id, { tools: advertisedTools });
     }
+    if (method === "resources/list") {
+      return resultMessage(id, { resources: [] });
+    }
+    if (method === "resources/read") {
+      if (oauthSettings().mode === "oauth" && requestAuth?.authMode === "oauth_server_error") return resultMessage(id, oauthUnavailableResult());
+      if (oauthSettings().mode === "oauth" && requestAuth?.authMode !== "oauth") return resultMessage(id, oauthRequiredResult(requestAuth?.error));
+      const callContext = {
+        toolName: "resources/read",
+        localWarnings: [],
+        authGeneration,
+        storageScopeGeneration,
+        ...(requestAuth || {})
+      };
+      try {
+        const value = await toolCallContext.run(callContext, async () => {
+          if (!params.uri) throw new Error("resources/read requires uri.");
+          const binding = exactMaterializedBinding(params.uri);
+          try {
+            const resource = materializedResourceRegistry().read({
+              scopeKey: binding.scopeKey,
+              uri: params.uri,
+              maxBytes: materializedMaxBytes
+            });
+            return { contents: [{ uri: resource.uri, mimeType: resource.mimeType, blob: resource.data.toString("base64") }] };
+          } catch (error) {
+            if (error?.code !== "RESOURCE_NOT_FOUND") throw error;
+            materializedResourceBindings.delete(params.uri);
+            throw materializedUnavailableError();
+          }
+        });
+        return resultMessage(id, value);
+      } catch (error) {
+        return errorMessage(id, -32002, safeToolErrorMessage(error));
+      }
+    }
     if (method === "tools/call") {
       const toolStartedAt = performance.now();
+      if (!callableToolNames.has(params.name)) {
+        const description = `Tool ${String(params.name || "(missing)")} is not available in the active ${toolProfile} tool profile.`;
+        return resultMessage(id, textResult(description, true, {
+          error: {
+            code: "tool_not_available_in_profile",
+            message: description,
+            tool: params.name || null,
+            profile: toolProfile
+          }
+        }));
+      }
       if (oauthSettings().mode === "oauth" && requestAuth?.authMode === "oauth_server_error") {
         return resultMessage(id, oauthUnavailableResult());
       }
@@ -15101,7 +17180,7 @@ export async function processMcpMessage(message, requestAuth = null) {
           ]).has(params.name)) {
             scheduleChatgptCacheWarm();
           }
-          return value;
+          return chatgptToolNames.has(params.name) ? sanitizeFocusedToolResult(value) : value;
         } catch (error) {
           return toolErrorResult(error, params.name);
         }
@@ -15133,8 +17212,13 @@ export async function processMcpMessage(message, requestAuth = null) {
 }
 
 export async function shutdownOneDriveServer() {
-  for (const timer of watchTimers.values()) clearTimeout(timer);
+  for (const timers of watchTimersByScope.values()) {
+    for (const timer of timers.values()) clearTimeout(timer);
+  }
   await closeAllExcelSessions().catch(() => null);
+  materializedResources?.close();
+  materializedResources = null;
+  materializedResourceBindings.clear();
 }
 
 function startStdioServer() {

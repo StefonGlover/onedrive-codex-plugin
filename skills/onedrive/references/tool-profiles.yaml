@@ -1,0 +1,54 @@
+schema_version: 1
+chatgpt_focused:
+  tools:
+    - fetch
+    - onedrive_open_files
+    - onedrive_preview_actions
+    - onedrive_read_actions
+    - onedrive_commit_actions
+    - onedrive_office_capabilities
+    - onedrive_office_inspect
+    - onedrive_office_batch_transform
+    - onedrive_office_review
+    - onedrive_download_file
+    - onedrive_render_preview
+    - onedrive_upload_file
+    - onedrive_export_file
+    - onedrive_write_text
+    - onedrive_patch_text
+    - onedrive_create_folder
+    - onedrive_invite_permission
+    - onedrive_delete
+    - onedrive_restore_deleted
+  onedrive_read_actions_operations:
+    - list
+    - search
+    - getInfo
+    - permissions
+    - recent
+    - versions
+    - compareVersion
+    - drives
+    - enterpriseSearch
+    - libraryList
+    - officeBackups
+  onedrive_preview_actions_operations:
+    - rename
+    - move
+    - copy
+    - createSharingLink
+    - revokePermission
+    - restoreVersion
+    - deleteOfficeBackups
+  onedrive_commit_actions_operations:
+    - rename
+    - move
+    - copy
+    - createSharingLink
+    - revokePermission
+    - restoreVersion
+    - deleteOfficeBackups
+full:
+  includes_chatgpt_focused: true
+  inventory: runtime_tools_list
+  conditional_reference: full-profile-maintenance.md

@@ -7,14 +7,16 @@ The DSM project directory has this layout:
 ```text
 onedrive-chatgpt/
   compose.yaml
-  app/       # packaged plugin source
+  app/       # packaged plugin source; set ONEDRIVE_APP_CONTEXT=./app before build
   data/      # persistent cache, backups, audit, and encrypted Microsoft token
   runtime/   # owner-only tunnel.env, auth-vault.key, and OAuth client secrets
 ```
 
+The base Compose file no longer pins an old release directory. Set `ONEDRIVE_APP_CONTEXT` to the exact packaged source directory and `ONEDRIVE_IMAGE` to an immutable release tag (or digest-qualified image reference) for each deployment; keep both values in the release evidence.
+
 `runtime/tunnel.env` contains the tunnel runtime API key as `CONTROL_PLANE_API_KEY=...`. `runtime/auth-vault.key` contains a base64-encoded 32-byte encryption key. Neither file belongs in source control or a plugin package.
 
-The entrypoint restricts runtime credentials to mode `0600`, copies them into a private in-memory runtime directory, creates owner-only persistent directories, creates an HTTP-target tunnel profile, and drops from root to the unprivileged `node` account before starting the service. Persistent device-code tokens and the public facade's upstream refresh tokens are encrypted with AES-256-GCM and written atomically under `data/auth`; Work refresh tokens are never stored in plaintext or returned to ChatGPT.
+The entrypoint restricts runtime credentials to mode `0600`, copies them into a private in-memory runtime directory, creates owner-only persistent directories, creates an HTTP-target tunnel profile, and drops from root to the unprivileged `node` account before starting the service. Compose bounds the service at 2 GiB, two CPUs, 256 processes, and a 512 MiB `/tmp`; the Office helper also applies Linux CPU/address-space/file-size limits, and PDF rendering has an unconditional 4096-pixel raster-dimension cap. Persistent device-code tokens and the public facade's upstream refresh tokens are encrypted with AES-256-GCM and written atomically under `data/auth`; Work refresh tokens are never stored in plaintext or returned to ChatGPT.
 
 After the project is healthy, run `onedrive_auth_device_start`, complete Microsoft device-code login, then run `onedrive_auth_device_poll`. Re-run a read-only health check and ChatGPT smoke test before stopping the previous tunnel client.
 

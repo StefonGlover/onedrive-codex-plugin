@@ -18,10 +18,14 @@ const expectedTools = [
   "onedrive_invite_permission",
   "onedrive_office_batch_transform",
   "onedrive_office_capabilities",
+  "onedrive_office_inspect",
+  "onedrive_office_review",
   "onedrive_open_files",
   "onedrive_patch_text",
   "onedrive_preview_actions",
   "onedrive_read_actions",
+  "onedrive_download_file",
+  "onedrive_render_preview",
   "onedrive_restore_deleted",
   "onedrive_upload_file",
   "onedrive_write_text"
@@ -120,7 +124,7 @@ if (selfCheck) {
     invalidRunIdRejected: (() => { try { parseRunId("unsafe/run"); return false; } catch { return true; } })(),
     exactTitleMatcher: exactTitle("Example_File.docx")({ title: "Example File.docx" }) === true,
     qualityMetrics: fixture.mrrAt10 === 1 && fixture.exactAtOne === 1 && fixture.unrelatedTopFive === 0,
-    exactWorkToolCount: expectedTools.length === 15
+    exactWorkToolCount: expectedTools.length === 19
   };
   const ok = Object.values(checks).every(Boolean);
   console.log(JSON.stringify({ ok, checks }, null, 2));
@@ -236,7 +240,7 @@ try {
 
   const listed = await request("tools/list");
   const names = (listed.tools || []).map((tool) => tool.name).sort();
-  check("tools/list matches the exact reviewed 15-tool Work surface", JSON.stringify(names) === JSON.stringify(expectedTools), { expected: expectedTools, actual: names });
+  check("tools/list matches the exact reviewed 19-tool Work surface", JSON.stringify(names) === JSON.stringify(expectedTools), { expected: expectedTools, actual: names });
 
   const read = await callTool("onedrive_read_actions", {
     actions: [

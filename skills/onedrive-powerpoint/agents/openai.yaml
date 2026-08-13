@@ -1,0 +1,4 @@
+interface:
+  display_name: "OneDrive PowerPoint"
+  short_description: "Create, inspect, and safely edit slide decks"
+  default_prompt: "Use $onedrive-powerpoint to create or safely edit a presentation in OneDrive."

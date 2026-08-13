@@ -1,12 +1,12 @@
 services:
   onedrive-chatgpt:
     build:
-      context: ./app-0.5.1-nas32-20260725
+      context: ${ONEDRIVE_APP_CONTEXT:-./app}
       dockerfile: deploy/synology/Dockerfile
       args:
         TUNNEL_CLIENT_VERSION: "0.0.10"
         TARGETARCH: "amd64"
-    image: onedrive-chatgpt-nas:0.5.1-nas32
+    image: ${ONEDRIVE_IMAGE:-onedrive-chatgpt-nas:0.6.4}
     container_name: onedrive-chatgpt
     restart: unless-stopped
     logging:
@@ -43,3 +43,4 @@ services:
       - /run/onedrive-runtime:size=1m,mode=0700
     pids_limit: 256
     mem_limit: 2g
+    cpus: "2.0"

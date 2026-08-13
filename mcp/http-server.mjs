@@ -11,12 +11,43 @@ import {
   protectedResourceMetadata,
   validateOAuthConfiguration
 } from "./oauth.mjs";
-import { processMcpMessage, shutdownOneDriveServer } from "./server.mjs";
+import {
+  createResourceReadAdmissionController,
+  holdResourceReadUntilResponseDeadline
+} from "./resource-read-admission.mjs";
+import { activeToolProfile, processMcpMessage, shutdownOneDriveServer } from "./server.mjs";
 
 const maxRequestBytes = 1024 * 1024;
+const maxBatchMessages = 16;
+const maxJsonResponseBytes = 40 * 1024 * 1024;
+const defaultResourceReadResponseDeadlineMs = 60_000;
+const hostedLoopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
 let lastAuthFailure = null;
 let lastToolFailure = null;
 let lastToolCall = null;
+const defaultResourceReadAdmission = createResourceReadAdmissionController();
+
+function validateHostedToolProfile(env = process.env) {
+  const requestedProfile = String(env.ONEDRIVE_TOOL_PROFILE || "").trim().toLowerCase();
+  if (requestedProfile !== "chatgpt" || activeToolProfile !== "chatgpt") {
+    throw new Error(
+      "OneDrive Streamable HTTP requires ONEDRIVE_TOOL_PROFILE=chatgpt. "
+      + "The full profile is restricted to trusted local stdio because it exposes local filesystem maintenance tools."
+    );
+  }
+}
+
+function hostedHttpHost(env = process.env) {
+  const requestedHost = String(env.ONEDRIVE_MCP_HTTP_HOST ?? "").trim().toLowerCase();
+  const host = requestedHost || "127.0.0.1";
+  if (!hostedLoopbackHosts.has(host)) {
+    throw new Error(
+      "ONEDRIVE_MCP_HTTP_HOST must be a canonical loopback host: 127.0.0.1, ::1, or localhost. "
+      + "Wildcard, LAN, and other hostname bindings are refused."
+    );
+  }
+  return host;
+}
 
 function authFailureDiagnostic(authMode, error) {
   return {
@@ -24,8 +55,7 @@ function authFailureDiagnostic(authMode, error) {
     authMode,
     name: error?.name || "Error",
     code: error?.code || "server_error",
-    status: Number.isInteger(error?.status) ? error.status : 500,
-    message: String(error?.message || "OAuth authorization failed.").slice(0, 1024)
+    status: Number.isInteger(error?.status) ? error.status : 500
   };
 }
 
@@ -46,7 +76,6 @@ function recordToolDiagnostic(messages, results) {
         at: new Date().toISOString(),
         tool: toolName,
         code: String(error.code || "tool_error").slice(0, 128),
-        message: String(error.message || toolResult?.content?.[0]?.text || "Tool call failed.").slice(0, 1024),
         ...(Number.isInteger(error.graphStatus) ? { graphStatus: error.graphStatus } : {})
       };
     } else {
@@ -56,7 +85,7 @@ function recordToolDiagnostic(messages, results) {
 }
 
 function listenAddress(env = process.env) {
-  const host = String(env.ONEDRIVE_MCP_HTTP_HOST || "127.0.0.1").trim();
+  const host = hostedHttpHost(env);
   const port = Number(env.ONEDRIVE_MCP_HTTP_PORT || 3001);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error("ONEDRIVE_MCP_HTTP_PORT must be an integer from 1 to 65535.");
@@ -79,7 +108,27 @@ function setCommonHeaders(response) {
 function sendJson(response, status, payload, extraHeaders = {}) {
   setCommonHeaders(response);
   for (const [name, value] of Object.entries(extraHeaders)) response.setHeader(name, value);
-  const body = `${JSON.stringify(payload)}\n`;
+  let serialized;
+  try {
+    serialized = JSON.stringify(payload);
+    if (typeof serialized !== "string") throw new Error("JSON serialization returned no value.");
+  } catch {
+    status = 500;
+    serialized = JSON.stringify({
+      jsonrpc: "2.0",
+      id: null,
+      error: { code: -32603, message: "The MCP response could not be serialized safely." }
+    });
+  }
+  let body = `${serialized}\n`;
+  if (Buffer.byteLength(body) > maxJsonResponseBytes) {
+    status = 500;
+    body = `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: null,
+      error: { code: -32003, message: `The MCP JSON response exceeds the ${maxJsonResponseBytes}-byte limit.` }
+    })}\n`;
+  }
   response.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": Buffer.byteLength(body)
@@ -128,7 +177,7 @@ function isToolCall(message) {
 }
 
 function requiresOAuth(message) {
-  return message?.method === "tools/list" || isToolCall(message);
+  return ["tools/list", "resources/list", "resources/read"].includes(message?.method) || isToolCall(message);
 }
 
 async function requestAuthorization(request, messages) {
@@ -163,18 +212,54 @@ async function requestAuthorization(request, messages) {
   }
 }
 
-async function handleMcp(request, response) {
+function resourceReadAdmissionSubject(auth = {}) {
+  if (typeof auth.authContextId === "string" && auth.authContextId) return auth.authContextId;
+  if (auth.authMode === "noauth") return "noauth-local-server";
+  return null;
+}
+
+function resourceReadResponseDeadlineMs(env = process.env) {
+  const value = Number(env.ONEDRIVE_MCP_RESOURCE_RESPONSE_TIMEOUT_MS || defaultResourceReadResponseDeadlineMs);
+  if (!Number.isSafeInteger(value) || value < 1_000 || value > 300_000) {
+    throw new Error("ONEDRIVE_MCP_RESOURCE_RESPONSE_TIMEOUT_MS must be an integer from 1000 through 300000.");
+  }
+  return value;
+}
+
+async function handleMcp(
+  request,
+  response,
+  resourceReadAdmission = defaultResourceReadAdmission,
+  resourceReadResponseTimeoutMs = defaultResourceReadResponseDeadlineMs
+) {
   if (request.method !== "POST") {
     sendText(response, 405, "Method Not Allowed\n", { Allow: "POST, OPTIONS" });
     return;
   }
   const payload = await readJsonBody(request);
+  const isBatch = Array.isArray(payload);
   const messages = Array.isArray(payload) ? payload : [payload];
+  if (isBatch && messages.length > maxBatchMessages) {
+    sendJson(response, 400, {
+      jsonrpc: "2.0",
+      id: null,
+      error: { code: -32600, message: `JSON-RPC batches support at most ${maxBatchMessages} messages.` }
+    });
+    return;
+  }
   if (!messages.length || messages.some((message) => !message || typeof message !== "object" || message.jsonrpc !== "2.0")) {
     sendJson(response, 400, {
       jsonrpc: "2.0",
       id: null,
       error: { code: -32600, message: "Invalid JSON-RPC 2.0 request." }
+    });
+    return;
+  }
+  if (isBatch && messages.length > 1 && messages.some((message) => message.method === "resources/read")) {
+    sendJson(response, 400, {
+      jsonrpc: "2.0",
+      id: null,
+      error: { code: -32600, message: "resources/read must be sent as a standalone JSON-RPC message." }
     });
     return;
   }
@@ -196,6 +281,43 @@ async function handleMcp(request, response) {
     });
     return;
   }
+  if (messages.length === 1 && messages[0].method === "resources/read" && auth?.authMode !== "oauth_server_error") {
+    const subject = resourceReadAdmissionSubject(auth);
+    if (!subject) {
+      sendJson(response, 503, {
+        jsonrpc: "2.0",
+        id: messages[0].id ?? null,
+        error: { code: -32005, message: "Resource reads are unavailable without an isolated authentication context." }
+      });
+      return;
+    }
+    const lease = resourceReadAdmission.acquire(subject);
+    if (!lease.admitted) {
+      sendJson(response, 429, {
+        jsonrpc: "2.0",
+        id: messages[0].id ?? null,
+        error: {
+          code: -32004,
+          message: "A large OneDrive resource response is already in progress. Retry shortly.",
+          data: {
+            retryable: true,
+            retryAfterSeconds: lease.retryAfterSeconds
+          }
+        }
+      }, { "Retry-After": String(lease.retryAfterSeconds) });
+      return;
+    }
+    try {
+      holdResourceReadUntilResponseDeadline({
+        lease,
+        response,
+        deadlineMs: resourceReadResponseTimeoutMs
+      });
+    } catch (error) {
+      lease.release();
+      throw error;
+    }
+  }
   const results = (await Promise.all(messages.map((message) => processMcpMessage(message, auth)))).filter(Boolean);
   recordToolDiagnostic(messages, results);
   if (!results.length) {
@@ -211,8 +333,14 @@ async function handleMcp(request, response) {
   sendJson(response, 200, Array.isArray(payload) ? results : results[0]);
 }
 
-export function createOneDriveHttpServer(env = process.env) {
+export function createOneDriveHttpServer(env = process.env, { resourceReadAdmission = defaultResourceReadAdmission } = {}) {
+  validateHostedToolProfile(env);
+  hostedHttpHost(env);
   validateOAuthConfiguration(env);
+  if (!resourceReadAdmission || typeof resourceReadAdmission.acquire !== "function") {
+    throw new Error("createOneDriveHttpServer requires a resource-read admission controller.");
+  }
+  const resourceReadResponseTimeoutMs = resourceReadResponseDeadlineMs(env);
   const resourceMetadata = protectedResourceMetadata(env);
   const resourceMetadataRoutes = new Set();
   if (resourceMetadata) {
@@ -250,7 +378,7 @@ export function createOneDriveHttpServer(env = process.env) {
         return;
       }
       if (url.pathname === "/mcp") {
-        await handleMcp(request, response);
+        await handleMcp(request, response, resourceReadAdmission, resourceReadResponseTimeoutMs);
         return;
       }
       sendText(response, 404, "Not Found\n");
