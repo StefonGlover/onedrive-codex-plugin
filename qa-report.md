@@ -2,12 +2,12 @@
 
 Decision: Pending — 2026-08-13 parity release committed and offline-qualified; NAS and ChatGPT cutover still pending
 Date: 2026-08-13
-Generated: 2026-08-13T05:55:23Z
-Tested source base commit: `e9ab58642f867491d3f6de970ffbbe8310c357ca`
+Generated: 2026-08-13T06:00:51Z
+Tested source base commit: `63843da2a9554a9d5268d15a331cacecfdf0ea74`
 Plugin version: `0.6.4+codex.20260813025943`
 Focused source server version: `0.6.4+codex.20260813025943.chatgpt.37923d62a462`
 Tool contract: 84 exact tool names; 19 focused ChatGPT tools
-Packaged-content digest: `65ecd33602b79b505bb3dabc65c84d81d05ba1a0bf0b1c64a349af37eb9867b9`
+Packaged-content digest: `c83f6eed44c7165c2c1ca35d212e2647619034f8facb451858c0fbcb4d54a1ac`
 Server SHA-256: `736166a0faa24550b09668af55b491bf893c1facbde966ab3964f83854627537`
 
 ## 2026-08-13 release candidate
