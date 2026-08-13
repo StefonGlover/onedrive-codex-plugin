@@ -82,7 +82,7 @@ control_plane:
   tunnel_id: "$ONEDRIVE_TUNNEL_ID"
   api_key: "env:CONTROL_PLANE_API_KEY"
 health:
-  listen_addr: "0.0.0.0:8765"
+  listen_addr: "127.0.0.1:8765"
 admin_ui:
   open_browser: false
 log:
