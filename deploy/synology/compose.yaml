@@ -43,4 +43,3 @@ services:
       - /run/onedrive-runtime:size=1m,mode=0700
     pids_limit: 256
     mem_limit: 2g
-    cpus: "2.0"
