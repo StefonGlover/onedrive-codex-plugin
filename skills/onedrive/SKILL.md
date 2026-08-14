@@ -10,7 +10,7 @@ Operate on the signed-in user's remote OneDrive through the plugin. Do not inspe
 ## Route the request
 
 - Use `onedrive_read_actions` for batched discovery and metadata reads. Use `search` for descriptive lookup; use `list` for a known folder; use `recent`, `versions`, or `compareVersion` for timeline evidence.
-- Use `onedrive_open_files` once for up to five exact filenames or known root-relative file paths. Prefer a known path for deeply nested files; it resolves directly, while filename-only index misses share one bounded traversal. Use `fetch` for a selected search result and pass its opaque `id` unchanged.
+- Use `onedrive_open_files` once for up to five exact filenames, known root-relative file paths, or observed HTTPS OneDrive/SharePoint file links. Pass exactly one of `names` or `urls`. Prefer a known path or observed link for deeply nested files; each resolves directly, while filename-only index misses share one bounded traversal. Never synthesize a link. Use `fetch` for a selected search result and pass its opaque `id` unchanged.
 - Use `$onedrive-word`, `$onedrive-excel`, or `$onedrive-powerpoint` for format-aware Office creation or editing.
 - Use `$onedrive-review` for comments, notes, versions, visual review, or evidence-backed feedback.
 - Use `onedrive_write_text` or `onedrive_patch_text` for text/code files. Preview replacements and patches before any live write.

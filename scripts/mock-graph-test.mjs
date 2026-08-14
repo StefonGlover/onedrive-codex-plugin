@@ -593,6 +593,47 @@ const graph = createServer(async (req, res) => {
       { id: "drive", name: "Mock OneDrive", driveType: "business", webUrl: "https://example.test/personal" }
     ] });
   }
+  const shareItemMatch = path.match(/^\/v1\.0\/shares\/([^/]+)\/driveItem$/u);
+  if (req.method === "GET" && shareItemMatch) {
+    const shareId = decodeURIComponent(shareItemMatch[1]);
+    let sourceUrl = "";
+    try {
+      if (!shareId.startsWith("u!")) throw new Error("unexpected share prefix");
+      sourceUrl = Buffer.from(shareId.slice(2), "base64url").toString("utf8");
+    } catch {
+      return json(res, 400, { error: { code: "invalidRequest", message: "invalid mock share id" } });
+    }
+    count("share-drive-item-read");
+    if (sourceUrl === "https://1drv.ms/u/s!mock-personal-link") {
+      return json(res, 200, item("root-note", "root-note.txt", {
+        webUrl: "https://onedrive.live.com/?id=root-note",
+        parentReference: { driveId: "drive", path: "/drives/drive/root:" }
+      }));
+    }
+    if (sourceUrl === "https://contoso.sharepoint.com/:w:/r/sites/Finance/Shared%20Documents/Linked%20Notes.txt?d=abc") {
+      return json(res, 200, item("sharepoint-link-note", "Linked Notes.txt", {
+        webUrl: "https://contoso.sharepoint.com/sites/Finance/Shared%20Documents/Linked%20Notes.txt",
+        parentReference: { driveId: "SharePointDrive-MixedCase", path: "/drives/SharePointDrive-MixedCase/root:/Shared Documents" }
+      }));
+    }
+    return json(res, 404, { error: { code: "itemNotFound", message: "mock share link not found" } });
+  }
+  if (req.method === "GET" && path === "/v1.0/drives/drive/items/root-note") {
+    return json(res, 200, item("root-note", "root-note.txt", {
+      webUrl: "https://onedrive.live.com/?id=root-note",
+      parentReference: { driveId: "drive", path: "/drives/drive/root:" }
+    }));
+  }
+  if (req.method === "GET" && path === "/v1.0/drives/SharePointDrive-MixedCase/items/sharepoint-link-note") {
+    return json(res, 200, item("sharepoint-link-note", "Linked Notes.txt", {
+      webUrl: "https://contoso.sharepoint.com/sites/Finance/Shared%20Documents/Linked%20Notes.txt",
+      parentReference: { driveId: "SharePointDrive-MixedCase", path: "/drives/SharePointDrive-MixedCase/root:/Shared Documents" }
+    }));
+  }
+  if (req.method === "GET" && path === "/v1.0/drives/SharePointDrive-MixedCase/items/sharepoint-link-note/content") {
+    count("sharepoint-link-content-read");
+    return text(res, 200, "sharepoint linked notes content\n");
+  }
   if (req.method === "POST" && path === "/v1.0/search/query") {
     const body = await readJsonBody(req);
     graphBodies.push({ key: "enterprise-search", body });
@@ -6245,6 +6286,40 @@ process.exit(2);
     assert(!unsafe.isError && unsafe.value.files?.[0]?.status === "error", "unsafe nested path should fail as a controlled per-file error", unsafe);
     assert(requests.length === beforeUnsafe, "unsafe nested path must fail before Graph without falling back to search", requests.slice(beforeUnsafe));
     return { status: result.status, directMetadataReads: 1, searchCalls: 0, folderScans: 0, unsafePathFailedBeforeGraph: true };
+  });
+
+  await check("ChatGPT exact-file opener resolves OneDrive and SharePoint links on their exact source drives", async () => {
+    const oneDriveUrl = "https://1drv.ms/u/s!mock-personal-link";
+    const sharePointUrl = "https://contoso.sharepoint.com/:w:/r/sites/Finance/Shared%20Documents/Linked%20Notes.txt?d=abc#ignored-fragment";
+    const before = requests.length;
+    const opened = await tool("onedrive_open_files", { urls: [oneDriveUrl, sharePointUrl] });
+    assert(!opened.isError, "link opener should succeed", opened);
+    assert(opened.value.files?.length === 2 && opened.value.files.every((entry) => entry.status === "found" && entry.inputType === "url"), "link opener should return two URL results", opened.value.files);
+    assert(opened.value.files[0].title === "root-note.txt" && opened.value.files[0].text.includes("root note mock content"), "OneDrive link content mismatch", opened.value.files[0]);
+    assert(opened.value.files[0].url === "https://onedrive.live.com/?id=root-note", "OneDrive link must return the provider-observed webUrl", opened.value.files[0]);
+    assert(opened.value.files[1].title === "Linked Notes.txt" && opened.value.files[1].text.includes("sharepoint linked notes content"), "SharePoint link content mismatch", opened.value.files[1]);
+    assert(opened.value.files[1].url === "https://contoso.sharepoint.com/sites/Finance/Shared%20Documents/Linked%20Notes.txt", "SharePoint link must return the provider-observed webUrl", opened.value.files[1]);
+    const added = requests.slice(before);
+    assert(added.filter((request) => request.path.startsWith("/v1.0/shares/")).length === 2, "each observed link should use one Graph share resolution", added);
+    assert(added.some((request) => request.path === "/v1.0/drives/drive/items/root-note/content"), "OneDrive link should fetch from its resolved drive", added);
+    assert(added.some((request) => request.path === "/v1.0/drives/SharePointDrive-MixedCase/items/sharepoint-link-note/content"), "SharePoint link should fetch from its exact case-preserved drive", added);
+    assert(!added.some((request) => decodeURIComponent(request.url).includes("/search(q='")), "link opening must not fall back to search", added);
+    assert(!added.some((request) => request.path === "/v1.0/me/drive/items/root/children"), "link opening must not traverse the default drive", added);
+    assert(!JSON.stringify(opened.value).includes("mock-personal-link") && !JSON.stringify(opened.value).includes("d=abc"), "link opener must not echo access-bearing input links", opened.value);
+    return { files: 2, shareResolutions: 2, exactDriveReads: 2, searchCalls: 0, folderScans: 0 };
+  });
+
+  await check("ChatGPT link opener rejects untrusted links and mixed selector modes before Graph", async () => {
+    const beforeUntrusted = requests.length;
+    const untrusted = await tool("onedrive_open_files", { urls: ["https://evil.example/onedrive/private-token"] });
+    assert(!untrusted.isError && untrusted.value.files?.[0]?.status === "error", "untrusted link should be a controlled per-link error", untrusted);
+    assert(!JSON.stringify(untrusted.value).includes("private-token"), "untrusted link errors must not echo the input link", untrusted.value);
+    assert(requests.length === beforeUntrusted, "untrusted link must fail before Graph", requests.slice(beforeUntrusted));
+    const beforeMixed = requests.length;
+    const mixed = await tool("onedrive_open_files", { names: ["root-note.txt"], urls: ["https://1drv.ms/u/s!mock-personal-link"] });
+    assert(mixed.isError && String(mixed.value || mixed.content?.[0]?.text || "").includes("exactly one of names or urls"), "mixed selector modes must fail clearly", mixed);
+    assert(requests.length === beforeMixed, "mixed selector modes must fail before Graph", requests.slice(beforeMixed));
+    return { untrustedFailedBeforeGraph: true, mixedSelectorsFailedBeforeGraph: true };
   });
 
   await check("ChatGPT exact-file opener shares one nested traversal across filename misses", async () => {

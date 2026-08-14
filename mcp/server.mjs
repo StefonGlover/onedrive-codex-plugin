@@ -93,6 +93,16 @@ const chatgptFetchChunkByteLimit = 64 * 1024;
 const chatgptFetchSnapshotTtlMs = 10 * 60 * 1000;
 const chatgptFetchSnapshotMaxEntries = 32;
 const chatgptFetchSnapshotMaxScopes = 8;
+const chatgptOpenUrlMaxLength = 4096;
+const chatgptOpenUrlExactHosts = new Set(["1drv.ms", "onedrive.live.com"]);
+const chatgptOpenUrlHostSuffixes = [
+  ".sharepoint.com",
+  ".sharepoint.us",
+  ".sharepoint.de",
+  ".sharepoint.cn",
+  ".sharepoint-mil.us",
+  ".sharepoint-df.com"
+];
 const enterpriseDriveItemIdPrefix = "onedrive-drive-item:";
 const enterpriseDriveItemIdMaxLength = 4096;
 const enterpriseDriveItemPartMaxLength = 1024;
@@ -2247,10 +2257,9 @@ const chatgptCompatibilityTools = [
   {
     name: "onedrive_open_files",
     title: "Open exact OneDrive files",
-    description: "Read one or more exact OneDrive filenames or known root-relative file paths in one bounded call.",
+    description: "Read one or more exact OneDrive filenames, known root-relative file paths, or validated OneDrive/SharePoint links in one bounded call. Provide exactly one of names or urls.",
     inputSchema: {
       type: "object",
-      required: ["names"],
       properties: {
         names: {
           type: "array",
@@ -2259,6 +2268,14 @@ const chatgptCompatibilityTools = [
           uniqueItems: true,
           items: { type: "string", minLength: 1 },
           description: "Exact filenames, including extensions, or known root-relative OneDrive file paths to locate and read."
+        },
+        urls: {
+          type: "array",
+          minItems: 1,
+          maxItems: 5,
+          uniqueItems: true,
+          items: { type: "string", minLength: 1, maxLength: chatgptOpenUrlMaxLength },
+          description: "Observed HTTPS OneDrive or SharePoint file links to resolve and read. Do not synthesize links."
         }
       },
       additionalProperties: false
@@ -2281,6 +2298,7 @@ const chatgptCompatibilityTools = [
               text: { type: "string" },
               url: { type: "string" },
               metadata: { type: "object", additionalProperties: { type: "string" } },
+              inputType: { type: "string", enum: ["name", "path", "url"] },
               error: { type: "string" },
               candidates: {
                 type: "array",
@@ -2857,7 +2875,7 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "OneDrive item ready"
   },
   onedrive_open_files: {
-    description: "Use this when the user provides one or more exact filenames or known root-relative OneDrive paths and wants their contents in one read-only call. Known paths resolve directly; filename index misses share one bounded live folder scan across the batch. Use search then fetch for discovery, partial names, or ambiguous results.",
+    description: "Use this when the user provides exact filenames, known root-relative OneDrive paths, or observed OneDrive/SharePoint file links and wants their contents in one read-only call. Pass exactly one of names or urls, with at most five values. Known paths and links resolve directly; filename index misses share one bounded live folder scan across the batch. Use search then fetch for discovery, partial names, or ambiguous results.",
     invoking: "Opening OneDrive files…",
     invoked: "OneDrive files ready"
   },
@@ -3165,7 +3183,7 @@ const advertisedServerVersion = toolProfile === "chatgpt"
   ? `${manifestServerVersion}${manifestServerVersion.includes("+") ? "." : "+"}chatgpt.${advertisedContractHash}`
   : manifestServerVersion;
 const serverInstructions = toolProfile === "chatgpt"
-  ? "Use onedrive_read_actions once for bounded folder/search/info/permission reads, recent files, versions, enterprise drive/library discovery, or any combination of independent reads; pass the whole read intent as one bounded operations array, then fetch selected default-drive ids unchanged. Enterprise results remain read-only: preserve both driveId and itemId for focused inspect/download calls. For rename/move/copy/sharing/revoke/version-restore requests, use onedrive_preview_actions once for all actions, then after approval pass the exact actions and proofs once to onedrive_commit_actions. Commit is ordered, guarded, non-atomic, stops on the first error by default, and returns verified stable results. Use onedrive_open_files once for exact filenames/content. Opaque ids and preview proofs are same-server identifiers, not credentials. Prefer user-visible paths plus expectedName; use opaque ids only without a path. Create folders directly with conflictBehavior fail. Dependent actions must be previewed and committed in dependency order because later proofs can become stale. For Office work, inspect bounded structure, request the exact capability schema, then transform; list review evidence before changing comments or notes. Use download/render for visual QA. Use onedrive_export_file for a PDF or text copy saved in OneDrive."
+  ? "Use onedrive_read_actions once for bounded folder/search/info/permission, recent, version, or enterprise reads; pass the whole read intent as one bounded operations array, then fetch returned default-drive ids unchanged. Keep enterprise results read-only and preserve driveId plus itemId for inspect/download. For rename/move/copy/share/revoke/version-restore, use onedrive_preview_actions once, then after approval pass exact actions and proofs once to onedrive_commit_actions. Commit is ordered, guarded, non-atomic, stops on first error, and returns verified stable results. Use onedrive_open_files once for exact filenames, known root-relative paths, or observed OneDrive/SharePoint links; pass exactly one of names or urls. Opaque ids and proofs are same-server identifiers, not credentials. Prefer user-visible paths plus expectedName; use ids only without a path. Create folders directly with conflictBehavior fail. Preview and commit dependent actions in dependency order because proofs can become stale. For Office work, inspect bounded structure, request the exact capability schema, then transform; list review evidence before changing comments or notes. Use download/render for visual QA. Use onedrive_export_file for a PDF or text copy saved in OneDrive."
   : "Use onedrive_find for normal OneDrive lookup and the matching structured read tool before an Office edit. Use onedrive_list only for direct folder listings. Keep results bounded. Locate an item before changing it. Mutations default to preview and require confirmation.";
 
 const toolByName = new Map(executableTools.map((tool) => [tool.name, tool]));
@@ -12878,12 +12896,76 @@ async function chatgptExactFilenameBatchFallback(requestedNames = []) {
   return { matchesByKey, scanSummary: scanned.summary || null };
 }
 
+function normalizeChatgptOpenUrl(value) {
+  const input = String(value || "").trim();
+  if (!input || input.length > chatgptOpenUrlMaxLength) {
+    throw new Error("The OneDrive or SharePoint link is invalid or too long.");
+  }
+  let parsed;
+  try {
+    parsed = new URL(input);
+  } catch {
+    throw new Error("The file link must be a valid HTTPS OneDrive or SharePoint URL.");
+  }
+  const hostname = parsed.hostname.toLowerCase().replace(/\.$/u, "");
+  const trustedHost = chatgptOpenUrlExactHosts.has(hostname)
+    || chatgptOpenUrlHostSuffixes.some((suffix) => hostname.endsWith(suffix) && hostname.length > suffix.length);
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password || !trustedHost) {
+    throw new Error("The file link must use HTTPS on an official OneDrive or SharePoint host.");
+  }
+  if (parsed.port && parsed.port !== "443") {
+    throw new Error("The OneDrive or SharePoint link cannot use a custom port.");
+  }
+  parsed.hash = "";
+  return parsed.toString();
+}
+
+function graphShareIdForUrl(url) {
+  return `u!${Buffer.from(url, "utf8").toString("base64url")}`;
+}
+
+async function resolveChatgptOpenUrl(value) {
+  const url = normalizeChatgptOpenUrl(value);
+  const shareId = graphShareIdForUrl(url);
+  const raw = await graph(`/shares/${shareId}/driveItem?$select=${encodeURIComponent(defaultSelect)}`);
+  const simplified = simplifyItem(raw);
+  if (!simplified?.id) throw new Error("Microsoft Graph did not return a stable item ID for this file link.");
+  if (simplified.folder) throw new Error("The OneDrive or SharePoint link resolves to a folder, not a file.");
+  const sourceId = simplified.driveId
+    ? encodeEnterpriseDriveItemId(simplified.driveId, simplified.id)
+    : String(simplified.id);
+  return { simplified, sourceId };
+}
+
 async function chatgptOpenFiles(args = {}) {
   const startedAt = Date.now();
-  const names = args.names || [];
-  const lookups = await mapWithConcurrency(names, 3, async (name) => {
-    const requestedName = String(name || "").trim();
+  const hasNames = Array.isArray(args.names);
+  const hasUrls = Array.isArray(args.urls);
+  if (hasNames === hasUrls) throw new Error("Provide exactly one of names or urls to onedrive_open_files.");
+  const inputs = hasUrls ? args.urls : args.names;
+  const lookups = await mapWithConcurrency(inputs, 3, async (input, inputIndex) => {
+    const requestedName = String(input || "").trim();
     const fileStartedAt = Date.now();
+    if (hasUrls) {
+      try {
+        const resolved = await resolveChatgptOpenUrl(requestedName);
+        return {
+          name: resolved.simplified.name || `OneDrive or SharePoint link ${inputIndex + 1}`,
+          startedAt: fileStartedAt,
+          lookupMode: "url",
+          exact: [{ ...chatgptSearchResult(resolved.simplified), id: resolved.sourceId }],
+          candidates: []
+        };
+      } catch (error) {
+        return {
+          name: `OneDrive or SharePoint link ${inputIndex + 1}`,
+          startedAt: fileStartedAt,
+          lookupMode: "url",
+          error: safeToolErrorMessage(error),
+          errorCode: error?.graphStatus === 404 ? "not_found" : "error"
+        };
+      }
+    }
     const pathLike = requestedName.includes("/");
     try {
       const directPath = chatgptExactRemotePath(requestedName);
@@ -12934,8 +13016,8 @@ async function chatgptOpenFiles(args = {}) {
     const duration = () => elapsedMs(lookup.startedAt);
     if (lookup.error) {
       return lookup.errorCode === "not_found"
-        ? { name: lookup.name, status: "not_found", candidates: [], durationMs: duration() }
-        : { name: lookup.name, status: "error", error: lookup.error, durationMs: duration() };
+        ? { name: lookup.name, status: "not_found", inputType: lookup.lookupMode === "url" ? "url" : lookup.lookupMode === "direct-path" ? "path" : "name", candidates: [], durationMs: duration() }
+        : { name: lookup.name, status: "error", inputType: lookup.lookupMode === "url" ? "url" : lookup.lookupMode === "direct-path" ? "path" : "name", error: lookup.error, durationMs: duration() };
     }
     const searchedExact = lookup.exact || (lookup.searched?.results || [])
       .filter((candidate) => exactFilenameKey(candidate.title) === exactFilenameKey(lookup.name));
@@ -12946,6 +13028,7 @@ async function chatgptOpenFiles(args = {}) {
       return {
         name: lookup.name,
         status: "not_found",
+        inputType: lookup.lookupMode === "url" ? "url" : lookup.lookupMode === "direct-path" ? "path" : "name",
         candidates: (lookup.searched?.results || []).slice(0, 3),
         durationMs: duration()
       };
@@ -12954,6 +13037,7 @@ async function chatgptOpenFiles(args = {}) {
       return {
         name: lookup.name,
         status: "ambiguous",
+        inputType: lookup.lookupMode === "url" ? "url" : lookup.lookupMode === "direct-path" ? "path" : "name",
         candidates: exact.slice(0, 3),
         durationMs: duration()
       };
@@ -12963,6 +13047,7 @@ async function chatgptOpenFiles(args = {}) {
       return {
         name: lookup.name,
         status: "found",
+        inputType: lookup.lookupMode === "url" ? "url" : lookup.lookupMode === "direct-path" ? "path" : "name",
         id: fetched.id,
         title: fetched.title,
         text: fetched.text,
@@ -12974,6 +13059,7 @@ async function chatgptOpenFiles(args = {}) {
       return {
         name: lookup.name,
         status: "error",
+        inputType: lookup.lookupMode === "url" ? "url" : lookup.lookupMode === "direct-path" ? "path" : "name",
         error: safeToolErrorMessage(error),
         durationMs: duration()
       };
@@ -12984,12 +13070,13 @@ async function chatgptOpenFiles(args = {}) {
     console.error(JSON.stringify({
       event: "onedrive-chatgpt-open-files",
       durationMs: result.durationMs,
-      requested: names.length,
+      requested: inputs.length,
       found: files.filter((file) => file.status === "found").length,
       ambiguous: files.filter((file) => file.status === "ambiguous").length,
       notFound: files.filter((file) => file.status === "not_found").length,
       errors: files.filter((file) => file.status === "error").length,
       directPathLookups: lookups.filter((entry) => entry.lookupMode === "direct-path").length,
+      urlLookups: lookups.filter((entry) => entry.lookupMode === "url").length,
       sharedFallbackNames: unresolvedNames.length,
       sharedFallbackFoldersVisited: fallback.scanSummary?.foldersVisited || 0,
       sharedFallbackItemsScanned: fallback.scanSummary?.itemsScanned || 0

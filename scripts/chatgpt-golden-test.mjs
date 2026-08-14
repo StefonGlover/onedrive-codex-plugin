@@ -13,7 +13,7 @@ function assert(condition, message, details = undefined) {
 
 const goldenPrompts = [
   { prompt: "Read the budget workbook you found", tool: "fetch", cues: ["read", "returned by onedrive_read_actions"] },
-  { prompt: "Open 2026 Family Budgeting.xlsx and Annual Report.pdf", tool: "onedrive_open_files", cues: ["exact filenames", "one read-only call"] },
+  { prompt: "Open 2026 Family Budgeting.xlsx and this OneDrive link", tool: "onedrive_open_files", cues: ["exact filenames", "onedrive/sharepoint", "urls", "one read-only call"] },
   { prompt: "Preview renaming this workbook, copying it, and creating a view link", tool: "onedrive_preview_actions", cues: ["preview", "read-only batch", "onedrive_commit_actions"] },
   { prompt: "List the root and search for insurance while checking this folder's permissions", tool: "onedrive_read_actions", cues: ["folder listings", "descriptive searches", "permission inspections", "concurrently"] },
   { prompt: "I approve all three previewed actions; apply them", tool: "onedrive_commit_actions", cues: ["approves one or more actions", "stops on the first error", "partial completion"] },

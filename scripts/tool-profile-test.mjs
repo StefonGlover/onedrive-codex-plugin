@@ -333,6 +333,10 @@ try {
   }
   assert("itemId" in fetchResultSchema, "fetch must expose the stable source item ID when id is a progressive continuation.", fetchResultSchema);
   assert(chatgpt.compatibility.fetch?.annotations?.readOnlyHint === true, "fetch must remain read-only.", chatgpt.compatibility);
+  const openFilesSchema = chatgpt.compatibility.onedrive_open_files?.inputSchema;
+  assert(openFilesSchema?.properties?.names?.maxItems === 5 && openFilesSchema?.properties?.urls?.maxItems === 5, "Exact-file opening must expose bounded name/path and OneDrive/SharePoint URL modes.", openFilesSchema);
+  assert(openFilesSchema?.properties?.urls?.items?.maxLength === 4096 && openFilesSchema?.additionalProperties === false, "Link opening must keep a bounded strict URL input contract.", openFilesSchema);
+  assert(chatgpt.compatibility.onedrive_open_files?.description?.includes("exactly one of names or urls"), "Exact-file opening must explain its mutually exclusive selector modes.", chatgpt.compatibility.onedrive_open_files);
   assert(chatgpt.compatibility.onedrive_open_files?.annotations?.readOnlyHint === true && chatgpt.compatibility.onedrive_preview_actions?.annotations?.readOnlyHint === true && chatgpt.compatibility.onedrive_read_actions?.annotations?.readOnlyHint === true, "Combined reads and action previews must be advertised as read-only.", chatgpt.compatibility);
   for (const name of ["onedrive_office_inspect", "onedrive_download_file", "onedrive_render_preview"]) {
     const annotations = chatgpt.compatibility[name]?.annotations;
