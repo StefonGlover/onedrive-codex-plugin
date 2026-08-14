@@ -1,14 +1,14 @@
 {
   "schemaVersion": 2,
-  "decision": "Pass — NAS60 nested-folder optimization, the refreshed ChatGPT 19-action OAuth app, both full live Microsoft Graph matrices, installed-cache parity, and zero-residue cleanup passed",
+  "decision": "Pending — direct OneDrive/SharePoint link opening passed offline validation; immutable NAS61 deployment, ChatGPT refresh, and new-version live matrices remain pending",
   "date": "2026-08-14",
-  "generatedAt": "2026-08-14T21:02:00Z",
+  "generatedAt": "2026-08-14T22:08:00Z",
   "source": {
-    "commit": "89281afb6d74fab35edd470ba50b74b98df3cc0c",
-    "pluginVersion": "0.6.4+codex.20260813025943",
-    "serverVersion": "0.6.4+codex.20260813025943.chatgpt.fd16f4230688",
-    "serverSha256": "1e82d65f417fca38daef6a95b7a1f85c8e403576756f7f7ff12a626d28e0a2ab",
-    "contentDigest": "a85b93fd8102a9350e841ccdb2186937798a6de433d3739e2c98ae8374ed1197",
+    "commit": "5853e60b087d88e795a522cf90534836cdc41975",
+    "pluginVersion": "0.6.4+codex.20260814215809",
+    "serverVersion": "0.6.4+codex.20260814215809.chatgpt.381b2980cf1e",
+    "serverSha256": "3960272b1f55e5c95331e0cdaaaee43b8e2cec8d659b87bb3c66aa8bab107dcd",
+    "contentDigest": "1738c58bc5819e4c6e6b73af54eab5ce50dbbbb8cfa48968596f96c7dcf59809",
     "workingTree": "Release code is committed at the recorded commit; changes after that commit are limited to QA evidence."
   },
   "contract": {
@@ -31,13 +31,13 @@
     { "name": "Office Open XML operations", "status": "pass", "wordOperations": 22, "excelOperations": 33, "powerPointOperations": 25 },
     { "name": "Office security corpus", "status": "pass" },
     { "name": "Genuine package reopening", "status": "pass" },
-    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 208 },
-    { "name": "Read-only OneDrive doctor and tenant checks", "status": "pass" },
-    { "name": "Cleanup preview", "status": "pass" },
+    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 210 },
+    { "name": "Read-only OneDrive doctor and tenant checks", "status": "pending" },
+    { "name": "Cleanup preview", "status": "pending" },
     { "name": "Whitespace", "status": "pass" }
   ],
   "liveRuns": {
-    "source": {
+    "sourcePreviousRelease": {
       "status": "pass",
       "surface": "Current source full 84-tool profile against connected personal OneDrive",
       "runId": "codex-beta-nas60-source2-20260814",
@@ -60,7 +60,7 @@
       "localWorkCleaned": true,
       "remoteMutations": "isolated disposable fixtures only"
     },
-    "installed": {
+    "installedPreviousRelease": {
       "status": "pass",
       "surface": "Installed versioned-cache full 84-tool profile against connected personal OneDrive",
       "runId": "codex-beta-nas60-installed-20260814",
@@ -82,6 +82,14 @@
       "cleanupVerified": true,
       "localWorkCleaned": true,
       "remoteMutations": "isolated disposable fixtures only"
+    },
+    "source": {
+      "status": "pending",
+      "surface": "Current source full 84-tool profile against connected personal OneDrive"
+    },
+    "installed": {
+      "status": "pending",
+      "surface": "Installed versioned-cache full 84-tool profile against connected personal OneDrive"
     },
     "chatgptWorkRankedSearch": {
       "status": "pass",
@@ -333,29 +341,21 @@
     }
   },
   "installedBuild": {
-    "status": "pass",
-    "version": "0.6.4+codex.20260813025943",
-    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.4+codex.20260813025943",
+    "status": "pending",
+    "version": "0.6.4+codex.20260814215809",
+    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.4+codex.20260814215809",
     "oldCacheOverwritten": false
   },
   "sourceCacheParity": {
-    "status": "pass",
-    "filesChecked": 92,
-    "bytes": "pass",
-    "modes": "pass",
-    "types": "pass",
-    "symlinkTargets": "pass",
-    "serverSha256Matched": true
+    "status": "pending",
+    "filesChecked": 0,
+    "bytes": "pending",
+    "modes": "pending",
+    "types": "pending",
+    "symlinkTargets": "pending",
+    "serverSha256Matched": false
   },
-  "cleanup": {
-    "status": "pass",
-    "auditRunId": "codex-beta-nas60-cleanup-audit-20260814",
-    "report": "work/qa-artifacts/live-codex-beta-20260814-nas60-cleanup-audit.json",
-    "remoteTestRootsRemaining": 0,
-    "permissionsRemaining": 0,
-    "anonymousLinksRemaining": 0,
-    "isolatedLocalResidue": false
-  },
+  "cleanup": null,
   "deployment": {
     "status": "pass",
     "platform": "Synology DS923+ Container Manager",
