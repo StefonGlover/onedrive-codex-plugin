@@ -1394,7 +1394,7 @@ try {
     { type: "sortRange", sheet: "Data", address: "D2:E3", keys: [{ column: 1, descending: true }], hasHeaders: false },
     { type: "setAutoFilter", sheet: "Data", address: "D1:E3" },
     { type: "setHyperlink", sheet: "Data", address: "J1", url: "https://openai.com", display: "OpenAI" },
-    { type: "addNote", sheet: "Data", address: "K1", text: `Beta note ${unique}`, author: "Codex" }, { type: "deleteNote", sheet: "Data", address: "K1" },
+    { type: "addNote", sheet: "Data", address: "K1", text: `Beta note ${unique}`, author: "Codex" }, { type: "deleteNote", sheet: "Data", address: "K1", expectedText: `Beta note ${unique}` },
     { type: "insertImage", sheet: "Data", fromAddress: "N1", base64: imageBase64, contentType: "image/png", altText: "Beta image" },
     { type: "formatChart", sheet: "Data", chart: "0", titleText: "Formatted beta chart", legendPosition: "bottom", style: 10 },
     { type: "setSheetProtection", sheet: "Data", enabled: true, allowSelectUnlockedCells: true },
