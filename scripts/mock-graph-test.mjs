@@ -2486,11 +2486,14 @@ async function tool(name, args = {}) {
   try {
     value = JSON.parse(text);
   } catch {
-    // Keep plain text.
+    if (name === "onedrive_open_files" && !response.result?.isError && response.result?.structuredContent !== undefined) {
+      value = response.result.structuredContent;
+    }
   }
   return {
     isError: Boolean(response.result?.isError),
     value,
+    contentText: text,
     structuredContent: response.result?.structuredContent,
     meta: response.result?._meta
   };
@@ -6277,6 +6280,7 @@ process.exit(2);
     const result = opened.value.files?.[0];
     assert(result?.status === "found" && result.id === "nested-index-miss-b", "known nested path should resolve the exact item", result);
     assert(result.text.includes("nested notes content"), "known nested path should return file contents", result);
+    assert(opened.contentText === result.displayLink && /^\[Nested Folder Notes\.txt\]\(<https:\/\//.test(opened.contentText), "known-path content should render only the resolved filename as hyperlink text", opened.contentText);
     const added = requests.slice(before);
     assert(added.filter((request) => decodeURIComponent(request.url).includes("/search(q='")).length === 0, "known nested path must bypass Graph search", added);
     assert(!added.some((request) => request.path === "/v1.0/me/drive/items/root/children"), "known nested path must bypass recursive traversal", added);
@@ -6297,8 +6301,11 @@ process.exit(2);
     assert(opened.value.files?.length === 2 && opened.value.files.every((entry) => entry.status === "found" && entry.inputType === "url"), "link opener should return two URL results", opened.value.files);
     assert(opened.value.files[0].title === "root-note.txt" && opened.value.files[0].text.includes("root note mock content"), "OneDrive link content mismatch", opened.value.files[0]);
     assert(opened.value.files[0].url === "https://onedrive.live.com/?id=root-note", "OneDrive link must return the provider-observed webUrl", opened.value.files[0]);
+    assert(opened.value.files[0].displayLink === "[root-note.txt](<https://onedrive.live.com/?id=root-note>)", "OneDrive result should provide filename-only hyperlink Markdown", opened.value.files[0]);
     assert(opened.value.files[1].title === "Linked Notes.txt" && opened.value.files[1].text.includes("sharepoint linked notes content"), "SharePoint link content mismatch", opened.value.files[1]);
     assert(opened.value.files[1].url === "https://contoso.sharepoint.com/sites/Finance/Shared%20Documents/Linked%20Notes.txt", "SharePoint link must return the provider-observed webUrl", opened.value.files[1]);
+    assert(opened.value.files[1].displayLink === "[Linked Notes.txt](<https://contoso.sharepoint.com/sites/Finance/Shared%20Documents/Linked%20Notes.txt>)", "SharePoint result should provide filename-only hyperlink Markdown", opened.value.files[1]);
+    assert(opened.contentText === `${opened.value.files[0].displayLink}\n${opened.value.files[1].displayLink}`, "model-visible content should contain only filename hyperlinks", opened.contentText);
     const added = requests.slice(before);
     assert(added.filter((request) => request.path.startsWith("/v1.0/shares/")).length === 2, "each observed link should use one Graph share resolution", added);
     assert(added.some((request) => request.path === "/v1.0/drives/drive/items/root-note/content"), "OneDrive link should fetch from its resolved drive", added);

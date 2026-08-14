@@ -2297,6 +2297,10 @@ const chatgptCompatibilityTools = [
               title: { type: "string" },
               text: { type: "string" },
               url: { type: "string" },
+              displayLink: {
+                type: "string",
+                description: "Markdown link whose visible text is only the resolved filename. Prefer this when presenting the file to the user."
+              },
               metadata: { type: "object", additionalProperties: { type: "string" } },
               inputType: { type: "string", enum: ["name", "path", "url"] },
               error: { type: "string" },
@@ -2875,7 +2879,7 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "OneDrive item ready"
   },
   onedrive_open_files: {
-    description: "Use this when the user provides exact filenames, known root-relative OneDrive paths, or observed OneDrive/SharePoint file links and wants their contents in one read-only call. Pass exactly one of names or urls, with at most five values. Known paths and links resolve directly; filename index misses share one bounded live folder scan across the batch. Use search then fetch for discovery, partial names, or ambiguous results.",
+    description: "Use this when the user provides exact filenames, known root-relative OneDrive paths, or observed OneDrive/SharePoint file links and wants their contents in one read-only call. Pass exactly one of names or urls, with at most five values. Known paths and links resolve directly; filename index misses share one bounded live folder scan across the batch. Present each returned URL as the resolved filename hyperlink from displayLink; never show the bare URL. Use search then fetch for discovery, partial names, or ambiguous results.",
     invoking: "Opening OneDrive files…",
     invoked: "OneDrive files ready"
   },
@@ -3183,7 +3187,7 @@ const advertisedServerVersion = toolProfile === "chatgpt"
   ? `${manifestServerVersion}${manifestServerVersion.includes("+") ? "." : "+"}chatgpt.${advertisedContractHash}`
   : manifestServerVersion;
 const serverInstructions = toolProfile === "chatgpt"
-  ? "Use onedrive_read_actions once for bounded folder/search/info/permission, recent, version, or enterprise reads; pass the whole read intent as one bounded operations array, then fetch returned default-drive ids unchanged. Keep enterprise results read-only and preserve driveId plus itemId for inspect/download. For rename/move/copy/share/revoke/version-restore, use onedrive_preview_actions once, then after approval pass exact actions and proofs once to onedrive_commit_actions. Commit is ordered, guarded, non-atomic, stops on first error, and returns verified stable results. Use onedrive_open_files once for exact filenames, known root-relative paths, or observed OneDrive/SharePoint links; pass exactly one of names or urls. Opaque ids and proofs are same-server identifiers, not credentials. Prefer user-visible paths plus expectedName; use ids only without a path. Create folders directly with conflictBehavior fail. Preview and commit dependent actions in dependency order because proofs can become stale. For Office work, inspect bounded structure, request the exact capability schema, then transform; list review evidence before changing comments or notes. Use download/render for visual QA. Use onedrive_export_file for a PDF or text copy saved in OneDrive."
+  ? "Use onedrive_read_actions once for bounded folder/search/info/permission, recent, version, or enterprise reads; pass the whole read intent as one bounded operations array, then fetch returned default-drive ids unchanged. Keep enterprise results read-only and preserve driveId plus itemId for inspect/download. For rename/move/copy/share/revoke/version-restore, use onedrive_preview_actions once, then after approval pass exact actions and proofs once to onedrive_commit_actions. Commit is ordered, guarded, non-atomic, stops on first error, and returns verified stable results. Use onedrive_open_files once for exact filenames, known root-relative paths, or observed OneDrive/SharePoint links; pass exactly one of names or urls, and present returned links with only the resolved filename as hyperlink text. Opaque ids and proofs are same-server identifiers, not credentials. Prefer user-visible paths plus expectedName; use ids only without a path. Create folders directly with conflictBehavior fail. Preview and commit dependent actions in dependency order because proofs can become stale. For Office work, inspect bounded structure, request the exact capability schema, then transform; list review evidence before changing comments or notes. Use download/render for visual QA. Use onedrive_export_file for a PDF or text copy saved in OneDrive."
   : "Use onedrive_find for normal OneDrive lookup and the matching structured read tool before an Office edit. Use onedrive_list only for direct folder listings. Keep results bounded. Locate an item before changing it. Mutations default to preview and require confirmation.";
 
 const toolByName = new Map(executableTools.map((tool) => [tool.name, tool]));
@@ -12937,6 +12941,36 @@ async function resolveChatgptOpenUrl(value) {
   return { simplified, sourceId };
 }
 
+function markdownFilenameText(value) {
+  return String(value || "OneDrive file")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\\/g, "\\\\")
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]")
+    .trim() || "OneDrive file";
+}
+
+function markdownWebLink(title, value) {
+  const label = markdownFilenameText(title);
+  try {
+    const url = new URL(String(value || ""));
+    if (url.protocol !== "https:" && url.protocol !== "http:") return label;
+    const destination = url.toString().replace(/>/g, "%3E");
+    return `[${label}](<${destination}>)`;
+  } catch {
+    return label;
+  }
+}
+
+function chatgptOpenFilesMarkdown(result = {}) {
+  return (result.files || []).map((file) => {
+    if (file.status === "found") return file.displayLink || markdownWebLink(file.title || file.name, file.url);
+    if (file.status === "not_found") return `${markdownFilenameText(file.name)} — not found`;
+    if (file.status === "ambiguous") return `${markdownFilenameText(file.name)} — ambiguous`;
+    return `${markdownFilenameText(file.name)} — ${String(file.error || "unable to open")}`;
+  }).join("\n");
+}
+
 async function chatgptOpenFiles(args = {}) {
   const startedAt = Date.now();
   const hasNames = Array.isArray(args.names);
@@ -13052,6 +13086,7 @@ async function chatgptOpenFiles(args = {}) {
         title: fetched.title,
         text: fetched.text,
         url: fetched.url,
+        displayLink: markdownWebLink(fetched.title || lookup.name, fetched.url),
         metadata: fetched.metadata,
         durationMs: duration()
       };
@@ -17020,7 +17055,7 @@ async function callTool(name, args = {}) {
     }
     case "onedrive_open_files": {
       const value = await chatgptOpenFiles(args);
-      return textResult(value, false, value);
+      return textResult(chatgptOpenFilesMarkdown(value), false, value);
     }
     case "onedrive_preview_actions": {
       const value = await chatgptPreviewActions(args);

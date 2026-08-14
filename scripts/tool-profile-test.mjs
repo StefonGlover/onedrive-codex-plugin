@@ -334,9 +334,12 @@ try {
   assert("itemId" in fetchResultSchema, "fetch must expose the stable source item ID when id is a progressive continuation.", fetchResultSchema);
   assert(chatgpt.compatibility.fetch?.annotations?.readOnlyHint === true, "fetch must remain read-only.", chatgpt.compatibility);
   const openFilesSchema = chatgpt.compatibility.onedrive_open_files?.inputSchema;
+  const openFilesOutputSchema = chatgpt.compatibility.onedrive_open_files?.outputSchema;
   assert(openFilesSchema?.properties?.names?.maxItems === 5 && openFilesSchema?.properties?.urls?.maxItems === 5, "Exact-file opening must expose bounded name/path and OneDrive/SharePoint URL modes.", openFilesSchema);
   assert(openFilesSchema?.properties?.urls?.items?.maxLength === 4096 && openFilesSchema?.additionalProperties === false, "Link opening must keep a bounded strict URL input contract.", openFilesSchema);
   assert(chatgpt.compatibility.onedrive_open_files?.description?.includes("exactly one of names or urls"), "Exact-file opening must explain its mutually exclusive selector modes.", chatgpt.compatibility.onedrive_open_files);
+  assert(openFilesOutputSchema?.properties?.files?.items?.properties?.displayLink?.type === "string", "Exact-file opening must expose a filename-only Markdown hyperlink field.", openFilesOutputSchema);
+  assert(chatgpt.compatibility.onedrive_open_files?.description?.includes("never show the bare URL"), "Exact-file opening must tell the model to present only filename hyperlink text.", chatgpt.compatibility.onedrive_open_files);
   assert(chatgpt.compatibility.onedrive_open_files?.annotations?.readOnlyHint === true && chatgpt.compatibility.onedrive_preview_actions?.annotations?.readOnlyHint === true && chatgpt.compatibility.onedrive_read_actions?.annotations?.readOnlyHint === true, "Combined reads and action previews must be advertised as read-only.", chatgpt.compatibility);
   for (const name of ["onedrive_office_inspect", "onedrive_download_file", "onedrive_render_preview"]) {
     const annotations = chatgpt.compatibility[name]?.annotations;
@@ -356,7 +359,7 @@ try {
   assert(chatgpt.officeCapabilitiesBytes <= 2048, "ChatGPT Office capability descriptor must remain compact.", chatgpt);
   assert(chatgpt.officeTransformBytes <= 4096, "ChatGPT Office transform descriptor must remain compact.", chatgpt);
   assert(chatgpt.instructions.length > 0 && chatgpt.instructions.length <= 1400, "Server instructions must be present and bounded.", chatgpt.instructions);
-  assert(chatgpt.instructions.includes("onedrive_open_files once") && !chatgpt.instructions.includes("matching structured read tool"), "ChatGPT server instructions must use the combined exact-file read path.", chatgpt.instructions);
+  assert(chatgpt.instructions.includes("onedrive_open_files once") && chatgpt.instructions.includes("resolved filename as hyperlink text") && !chatgpt.instructions.includes("matching structured read tool"), "ChatGPT server instructions must use the combined exact-file read path and filename-only hyperlink presentation.", chatgpt.instructions);
   assert(chatgpt.instructions.includes("onedrive_preview_actions once") && chatgpt.instructions.includes("onedrive_commit_actions"), "ChatGPT server instructions must route previewed batches through the guarded commit path.", chatgpt.instructions);
   assert(chatgpt.instructions.includes("whole read intent") && chatgpt.instructions.includes("one bounded operations array"), "ChatGPT instructions must keep independent reads in one combined call.", chatgpt.instructions);
   assert(chatgpt.instructions.includes("Create folders directly") && chatgpt.instructions.includes("conflictBehavior fail"), "ChatGPT instructions must match the direct create-folder schema.", chatgpt.instructions);

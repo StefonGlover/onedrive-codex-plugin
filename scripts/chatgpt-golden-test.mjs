@@ -13,7 +13,7 @@ function assert(condition, message, details = undefined) {
 
 const goldenPrompts = [
   { prompt: "Read the budget workbook you found", tool: "fetch", cues: ["read", "returned by onedrive_read_actions"] },
-  { prompt: "Open 2026 Family Budgeting.xlsx and this OneDrive link", tool: "onedrive_open_files", cues: ["exact filenames", "onedrive/sharepoint", "urls", "one read-only call"] },
+  { prompt: "Open 2026 Family Budgeting.xlsx and this OneDrive link", tool: "onedrive_open_files", cues: ["exact filenames", "onedrive/sharepoint", "urls", "one read-only call", "never show the bare url"] },
   { prompt: "Preview renaming this workbook, copying it, and creating a view link", tool: "onedrive_preview_actions", cues: ["preview", "read-only batch", "onedrive_commit_actions"] },
   { prompt: "List the root and search for insurance while checking this folder's permissions", tool: "onedrive_read_actions", cues: ["folder listings", "descriptive searches", "permission inspections", "concurrently"] },
   { prompt: "I approve all three previewed actions; apply them", tool: "onedrive_commit_actions", cues: ["approves one or more actions", "stops on the first error", "partial completion"] },
@@ -63,6 +63,7 @@ try {
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
   assert(tools.length === goldenPrompts.length, "Golden prompt coverage must match the complete focused ChatGPT tool surface.", { tools: tools.map((tool) => tool.name), prompts: goldenPrompts.map((entry) => entry.tool) });
   assert(initialized.result.instructions.includes("onedrive_open_files once"), "ChatGPT instructions must describe the combined exact-file read sequence.", initialized.result.instructions);
+  assert(initialized.result.instructions.includes("resolved filename as hyperlink text"), "ChatGPT instructions must require filename-only hyperlink presentation.", initialized.result.instructions);
   assert(initialized.result.instructions.includes("onedrive_preview_actions once") && initialized.result.instructions.includes("onedrive_commit_actions"), "ChatGPT instructions must describe the guarded batch preview/commit sequence.", initialized.result.instructions);
   assert(initialized.result.instructions.includes("dependency order") && initialized.result.instructions.includes("proofs can become stale"), "ChatGPT instructions must prevent stale guards in dependent mutation sequences.", initialized.result.instructions);
   assert(initialized.result.instructions.includes("Create folders directly"), "ChatGPT instructions must match the create-folder contract.", initialized.result.instructions);

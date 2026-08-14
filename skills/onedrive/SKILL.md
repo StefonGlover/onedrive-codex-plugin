@@ -10,7 +10,7 @@ Operate on the signed-in user's remote OneDrive through the plugin. Do not inspe
 ## Route the request
 
 - Use `onedrive_read_actions` for batched discovery and metadata reads. Use `search` for descriptive lookup; use `list` for a known folder; use `recent`, `versions`, or `compareVersion` for timeline evidence.
-- Use `onedrive_open_files` once for up to five exact filenames, known root-relative file paths, or observed HTTPS OneDrive/SharePoint file links. Pass exactly one of `names` or `urls`. Prefer a known path or observed link for deeply nested files; each resolves directly, while filename-only index misses share one bounded traversal. Never synthesize a link. Use `fetch` for a selected search result and pass its opaque `id` unchanged.
+- Use `onedrive_open_files` once for up to five exact filenames, known root-relative file paths, or observed HTTPS OneDrive/SharePoint file links. Pass exactly one of `names` or `urls`. Prefer a known path or observed link for deeply nested files; each resolves directly, while filename-only index misses share one bounded traversal. Present `displayLink` as returned so the visible hyperlink text is only the resolved filename; never print the bare URL or synthesize a link. Use `fetch` for a selected search result and pass its opaque `id` unchanged.
 - Use `$onedrive-word`, `$onedrive-excel`, or `$onedrive-powerpoint` for format-aware Office creation or editing.
 - Use `$onedrive-review` for comments, notes, versions, visual review, or evidence-backed feedback.
 - Use `onedrive_write_text` or `onedrive_patch_text` for text/code files. Preview replacements and patches before any live write.
@@ -25,7 +25,7 @@ Operate on the signed-in user's remote OneDrive through the plugin. Do not inspe
 4. Pass the preview token and expected identity back unchanged to the live call. Do not reuse a proof for a different target or operation.
 5. Read or inspect the result again. Treat partial completion and verification warnings as real; never repeat a successful remote mutation merely to repair local follow-up state.
 
-Return a link only when the provider response contains `webUrl`. Never synthesize or guess a OneDrive or SharePoint URL.
+Return a link only when the provider response contains `webUrl`. Render it as `[resolved filename](webUrl)` so only the filename is visible. Never synthesize or guess a OneDrive or SharePoint URL.
 
 ## Work across enterprise libraries
 
