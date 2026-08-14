@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "decision": "Pending — direct OneDrive/SharePoint link opening passed offline validation; immutable NAS61 deployment, ChatGPT refresh, and new-version live matrices remain pending",
+  "decision": "Pass — NAS61 deployed healthy, the existing ChatGPT app refreshed in place, direct OneDrive-link opening passed live UI beta, and both full live matrices completed with exact cleanup",
   "date": "2026-08-14",
-  "generatedAt": "2026-08-14T22:08:00Z",
+  "generatedAt": "2026-08-14T22:28:00Z",
   "source": {
     "commit": "5853e60b087d88e795a522cf90534836cdc41975",
     "pluginVersion": "0.6.4+codex.20260814215809",
@@ -17,8 +17,8 @@
     "fullToolCount": 84,
     "fullBytes": 344300,
     "chatgptToolCount": 19,
-    "chatgptBytes": 34677,
-    "chatgptOauthBytes": 37375,
+    "chatgptBytes": 34942,
+    "chatgptOauthBytes": 37640,
     "reductionPercent": 89.9,
     "goldenPrompts": 19,
     "ambiguityPairs": 15
@@ -32,8 +32,8 @@
     { "name": "Office security corpus", "status": "pass" },
     { "name": "Genuine package reopening", "status": "pass" },
     { "name": "Mock Microsoft Graph", "status": "pass", "checks": 210 },
-    { "name": "Read-only OneDrive doctor and tenant checks", "status": "pending" },
-    { "name": "Cleanup preview", "status": "pending" },
+    { "name": "Read-only OneDrive doctor and tenant checks", "status": "pass" },
+    { "name": "Cleanup preview", "status": "pass" },
     { "name": "Whitespace", "status": "pass" }
   ],
   "liveRuns": {
@@ -84,12 +84,40 @@
       "remoteMutations": "isolated disposable fixtures only"
     },
     "source": {
-      "status": "pending",
-      "surface": "Current source full 84-tool profile against connected personal OneDrive"
+      "status": "pass",
+      "surface": "Current source full 84-tool profile against connected personal OneDrive",
+      "runId": "codex-beta-nas61-source-20260814",
+      "folderName": "Codex OneDrive Plugin Beta Test codex-beta-nas61-source-20260814",
+      "runtimeMs": 248496,
+      "report": "work/qa-artifacts/codex-beta-nas61-source-20260814.json",
+      "toolCoverage": {
+        "contract": 84,
+        "exercised": 83,
+        "blocked": 1,
+        "blockedTools": ["onedrive_auth_device_poll"]
+      },
+      "checkSummary": { "pass": 97, "fail": 0, "blocked": 9, "total": 106 },
+      "cleanupVerified": true,
+      "localWorkCleaned": true,
+      "remoteMutations": "isolated disposable fixtures only"
     },
     "installed": {
-      "status": "pending",
-      "surface": "Installed versioned-cache full 84-tool profile against connected personal OneDrive"
+      "status": "pass",
+      "surface": "Installed versioned-cache full 84-tool profile against connected personal OneDrive",
+      "runId": "codex-beta-nas61-installed-20260814",
+      "folderName": "Codex OneDrive Plugin Beta Test codex-beta-nas61-installed-20260814",
+      "runtimeMs": 284234,
+      "report": "work/qa-artifacts/codex-beta-nas61-installed-20260814.json",
+      "toolCoverage": {
+        "contract": 84,
+        "exercised": 83,
+        "blocked": 1,
+        "blockedTools": ["onedrive_auth_device_poll"]
+      },
+      "checkSummary": { "pass": 97, "fail": 0, "blocked": 9, "total": 106 },
+      "cleanupVerified": true,
+      "localWorkCleaned": true,
+      "remoteMutations": "isolated disposable fixtures only"
     },
     "chatgptWorkRankedSearch": {
       "status": "pass",
@@ -199,6 +227,42 @@
         "sharedFallbackTraversal": true
       },
       "fullLiveMatrixCompleted": false
+    },
+    "nas61LinkOpenCanary": {
+      "status": "pass",
+      "surface": "Synology NAS61 production deployment and refreshed ChatGPT OneDrive OAuth app",
+      "validatedAt": "2026-08-14T22:20:00Z",
+      "connectionId": "plugin_asdk_app_6a6995abb030819187d50d7080d4ae95",
+      "url": "https://glovernas.tail5dbbc4.ts.net/mcp",
+      "authorization": "OAuth",
+      "refreshResult": "Actions refreshed.",
+      "actionCount": 19,
+      "conversation": "https://chatgpt.com/c/6a7f939f-1ee4-83ea-96a1-d83172d0a3d0",
+      "readOnly": true,
+      "remoteMutations": 0,
+      "readOnlyProbes": [
+        {
+          "tool": "onedrive_open_files",
+          "selector": "known nested root-relative path",
+          "status": "pass",
+          "stableIdentityMatched": true,
+          "providerWebUrlReturned": true
+        },
+        {
+          "tool": "onedrive_open_files",
+          "selector": "observed OneDrive URL",
+          "status": "pass",
+          "classifiedInputType": "url",
+          "stableIdentityMatched": true
+        },
+        {
+          "tool": "onedrive_open_files",
+          "selector": "untrusted HTTPS URL",
+          "status": "pass",
+          "rejectedAsUntrusted": true
+        }
+      ],
+      "fullLiveMatrixCompleted": true
     },
     "chatgptWorkRankedUi": {
       "status": "pass",
@@ -341,36 +405,48 @@
     }
   },
   "installedBuild": {
-    "status": "pending",
+    "status": "pass",
     "version": "0.6.4+codex.20260814215809",
     "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.4+codex.20260814215809",
     "oldCacheOverwritten": false
   },
   "sourceCacheParity": {
-    "status": "pending",
-    "filesChecked": 0,
-    "bytes": "pending",
-    "modes": "pending",
-    "types": "pending",
-    "symlinkTargets": "pending",
-    "serverSha256Matched": false
+    "status": "pass",
+    "filesChecked": 92,
+    "bytes": "pass",
+    "modes": "pass",
+    "types": "pass",
+    "symlinkTargets": "pass",
+    "serverSha256Matched": true
   },
-  "cleanup": null,
+  "cleanup": {
+    "status": "pass",
+    "runId": "codex-beta-nas61-cleanup-20260814",
+    "staleDays": 0,
+    "candidateCount": 0,
+    "deletedCount": 0,
+    "activeBetaRootsRemaining": 0,
+    "localWorkCleaned": true,
+    "remoteTestRootsRemaining": 0,
+    "permissionsRemaining": 0,
+    "anonymousLinksRemaining": 0,
+    "isolatedLocalResidue": false
+  },
   "deployment": {
     "status": "pass",
     "platform": "Synology DS923+ Container Manager",
     "project": "onedrive-chatgpt",
     "projectId": "6ade094d-9ebe-46ef-83cb-f9bb443c8300",
-    "deployedAt": "2026-08-14T20:28:58Z",
-    "image": "onedrive-chatgpt-nas:0.6.4-nas60-nested-folders-20260814",
+    "deployedAt": "2026-08-14T22:12:33Z",
+    "image": "onedrive-chatgpt-nas:0.6.4-nas61-link-open-20260814",
     "imageTagRetainedByDsm": false,
-    "imageId": "sha256:4d7e7e8a066bcaa255e6ae96675205468c7f784697e53fe35d111acc4e07eafb",
-    "containerId": "b65cdceb7421c6fb1438cd527ce11619645420a5b20cc00244c0e7b4fab0cf98",
-    "sourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas60-nested-folders-20260814",
-    "buildContextCommit": "19029bff8ee6a525b695e3b7c808b91334696442",
+    "imageId": "sha256:06c4392e2f41fa87a26eef592dbb425ed47e02bc8e0eb9160734a038c0e2879d",
+    "containerId": "1e0862a470b3fe4e391dd3bfbc601101f339e95c15b57f111ae0091524e1c90e",
+    "sourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas61-link-open-20260814",
+    "buildContextCommit": "5853e60b087d88e795a522cf90534836cdc41975",
     "packageFiles": 92,
     "stagedFilesIncludingManifest": 93,
-    "releaseManifestSha256": "fecbd001a89c5a41e3c0053e0d5f48c9527ca7aaf0dbb22f7faffb984f7ef98e",
+    "releaseManifestSha256": "89fc9cdabb96601455c9db68e0231f86bafdcb4756e40dd752cf7092eae339ff",
     "containerState": "running",
     "containerHealth": "healthy",
     "healthFailingStreak": 0,
@@ -384,12 +460,12 @@
     "oauthAuthorizationServerMetadata": "pass",
     "oauthProtectedResourceMetadata": "pass",
     "mcpProtocolVersion": "2025-06-18",
-    "advertisedServerVersion": "0.6.4+codex.20260813025943.chatgpt.eb2ef5cc3116",
-    "serverSha256": "1e82d65f417fca38daef6a95b7a1f85c8e403576756f7f7ff12a626d28e0a2ab",
-    "rollbackSourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas59-parity-20260813-healthfix",
-    "rollbackImage": "onedrive-chatgpt-nas:0.6.4-nas59-parity-20260813",
-    "rollbackImageId": "sha256:0faf833f518e9361127bb95c07c9225934ea0665330f0c1f91a4b9b07f21bff7",
-    "sourceIdentityNote": "All 92 source files plus the release manifest were uploaded to a new immutable NAS60 directory and individually verified by MD5 and size. The live production-OAuth contract suffix exactly matches the same source under the deployed OAuth scope; the noauth source suffix differs because security schemes are part of the advertised contract hash."
+    "advertisedServerVersion": "0.6.4+codex.20260814215809.chatgpt.e835ae761afa",
+    "serverSha256": "3960272b1f55e5c95331e0cdaaaee43b8e2cec8d659b87bb3c66aa8bab107dcd",
+    "rollbackSourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas60-nested-folders-20260814",
+    "rollbackImage": "onedrive-chatgpt-nas:0.6.4-nas60-nested-folders-20260814",
+    "rollbackImageId": "sha256:4d7e7e8a066bcaa255e6ae96675205468c7f784697e53fe35d111acc4e07eafb",
+    "sourceIdentityNote": "All 92 source files plus the release manifest were uploaded to a new immutable NAS61 directory and individually verified by MD5 and size. Production uses the same source under the OAuth descriptor environment; the noauth focused suffix differs because security schemes are part of the advertised contract hash."
   },
   "fixes": [
     { "area": "Focused text-write schema", "result": "Work now receives one unambiguous remotePath plus content branch." },
@@ -412,6 +488,10 @@
     {
       "area": "Multiple exact filename misses",
       "result": "A batch now shares one bounded recursive traversal instead of rescanning the same nested folders once per filename."
+    },
+    {
+      "area": "Observed OneDrive and SharePoint links",
+      "result": "The hosted connector resolves each trusted link directly through Microsoft Graph share addressing, preserves exact source-drive identity, and avoids filename search or folder traversal."
     }
   ],
   "blockedCoverage": [

@@ -1,24 +1,36 @@
 # OneDrive 0.6.4 Parity Release Report
 
-Decision: Pending — direct OneDrive/SharePoint link opening passed offline validation; immutable NAS61 deployment, ChatGPT refresh, and new-version live matrices remain pending
+Decision: Pass — NAS61 deployed healthy, the existing ChatGPT app refreshed in place, direct OneDrive-link opening passed live UI beta, and both full live matrices completed with exact cleanup
 Date: 2026-08-14
-Generated: 2026-08-14T22:08:00Z
+Generated: 2026-08-14T22:28:00Z
 Tested source base commit: `5853e60b087d88e795a522cf90534836cdc41975`
 Plugin version: `0.6.4+codex.20260814215809`
 Focused source server version: `0.6.4+codex.20260814215809.chatgpt.381b2980cf1e`
-Live OAuth server version: `0.6.4+codex.20260813025943.chatgpt.eb2ef5cc3116`
+Live OAuth server version: `0.6.4+codex.20260814215809.chatgpt.e835ae761afa`
 Tool contract: 84 exact tool names; 19 focused ChatGPT tools
 Packaged-content digest: `1738c58bc5819e4c6e6b73af54eab5ce50dbbbb8cfa48968596f96c7dcf59809`
-NAS release-manifest SHA-256: `fecbd001a89c5a41e3c0053e0d5f48c9527ca7aaf0dbb22f7faffb984f7ef98e`
-Server SHA-256: `1e82d65f417fca38daef6a95b7a1f85c8e403576756f7f7ff12a626d28e0a2ab`
+NAS release-manifest SHA-256: `89fc9cdabb96601455c9db68e0231f86bafdcb4756e40dd752cf7092eae339ff`
+Server SHA-256: `3960272b1f55e5c95331e0cdaaaee43b8e2cec8d659b87bb3c66aa8bab107dcd`
 
 ## 2026-08-13 release candidate
 
 The parity implementation is committed and the final frozen offline suite is green. It expands the hosted surface from 15 to 19 focused tools, adds bounded Office inspection/review, materialized downloads and previews, version/recent reads with native guarded restore, enterprise drive discovery/fetch, account-and-drive state isolation, and the associated availability and hosted-boundary hardening.
 
-Current release-candidate evidence: mock Microsoft Graph 210/210, full/focused/OAuth tool contracts 84/19/19, ChatGPT golden routing 19/19 with 15 ambiguity pairs, hosted-boundary checks, and prepackage self-check 32/32. The new read-only `urls` mode validates OneDrive/SharePoint hosts, resolves each link through Microsoft Graph share addressing, reads from the exact case-preserved source drive, rejects mixed or untrusted selectors before Graph, and does not echo access-bearing input links. NAS61 deployment, ChatGPT refresh, and fresh source/installed live matrices remain pending.
+Final release evidence: mock Microsoft Graph 210/210, full/focused/OAuth tool contracts 84/19/19, ChatGPT golden routing 19/19 with 15 ambiguity pairs, hosted-boundary checks, and prepackage self-check 32/32. The new read-only `urls` mode validates OneDrive/SharePoint hosts, resolves each link through Microsoft Graph share addressing, reads from the exact case-preserved source drive, rejects mixed or untrusted selectors before Graph, and does not echo access-bearing input links. NAS61, the existing ChatGPT app, and both fresh full live matrices are now verified.
 
 The detailed older sections below preserve prior production evidence as historical baseline and rollback context.
+
+## 2026-08-14 NAS61 direct-link deployment and ChatGPT beta
+
+NAS61 is deployed from `/volume1/docker/onedrive-chatgpt/app-0.6.4-nas61-link-open-20260814` as `onedrive-chatgpt-nas:0.6.4-nas61-link-open-20260814`. Container `1e0862a470b3fe4e391dd3bfbc601101f339e95c15b57f111ae0091524e1c90e` is running and healthy with zero restarts on immutable image `sha256:06c4392e2f41fa87a26eef592dbb425ed47e02bc8e0eb9160734a038c0e2879d`. Public health, OAuth authorization-server metadata, protected-resource metadata, and expected MCP `GET` 405 behavior passed. Exact NAS60 source and image `sha256:4d7e7e8a066bcaa255e6ae96675205468c7f784697e53fe35d111acc4e07eafb` remain the rollback target.
+
+All 92 packaged source files plus the release manifest were staged under the new immutable NAS61 directory and individually verified by MD5 and size. The release-manifest SHA-256 is `89fc9cdabb96601455c9db68e0231f86bafdcb4756e40dd752cf7092eae339ff`; the deployed server SHA-256 is `3960272b1f55e5c95331e0cdaaaee43b8e2cec8d659b87bb3c66aa8bab107dcd`.
+
+ChatGPT refreshed the existing mapped app `plugin_asdk_app_6a6995abb030819187d50d7080d4ae95` in place from `https://glovernas.tail5dbbc4.ts.net/mcp` and displayed `Actions refreshed.` The refreshed `onedrive_open_files` action exposes bounded `names` and `urls` arrays while the focused surface remains 19 actions. No duplicate app was created.
+
+The new ChatGPT Work conversation passed three read-only probes: the exact nested workbook path resolved to its stable item ID and provider-observed OneDrive URL; that observed URL then opened directly and was classified as URL input with the same stable identity; and `https://example.com/not-a-onedrive-link` was rejected as untrusted. Evidence: https://chatgpt.com/c/6a7f939f-1ee4-83ea-96a1-d83172d0a3d0.
+
+The current-source and independently installed-cache full live matrices each completed 106 checks with 97 passed, zero failed, nine explicitly blocked, and 83 of 84 tools exercised. Runtime was 248,496 ms for `codex-beta-nas61-source-20260814` and 284,234 ms for `codex-beta-nas61-installed-20260814`. Both isolated remote fixture roots and local work directories were removed. A final stale-root audit found zero cleanup candidates, and installed parity matched all 92 packaged files across bytes, modes, file types, and symlink targets without overwriting an older cache.
 
 ## 2026-08-14 NAS60 nested-folder deployment and ChatGPT refresh
 
@@ -44,7 +56,7 @@ ChatGPT refreshed the mapped OneDrive OAuth app from `https://glovernas.tail5dbb
 
 The source/noauth focused suffix `.37923d62a462` and live OAuth suffix `.d8d3679a1016` are deterministic variants of the same artifact: the OAuth security scheme is included in the advertised contract hash. Direct checks inside the deployed container confirmed exact source parity for `mcp/server.mjs`, `assets/chatgpt-icon.png`, and `.codex-plugin/plugin.json`.
 
-This historical NAS59 section is deployment and connector-canary evidence only; the current NAS60 source and installed-cache matrices, doctor/tenant checks, and cleanup audit now provide the release-complete evidence above.
+This historical NAS59 section is deployment and connector-canary evidence only; the current NAS61 deployment, source and installed-cache matrices, doctor/tenant checks, and cleanup audit provide the release-complete evidence above.
 
 ## Outcome
 
@@ -118,7 +130,7 @@ Evidence: https://chatgpt.com/c/6a77b265-cac4-83ea-a802-65c093afe437
 
 ## Offline and release verification
 
-- Mock Microsoft Graph: 208/208
+- Mock Microsoft Graph: 210/210
 - Current source live Microsoft Graph: 97 passed, 0 failed, 9 explicitly blocked; 83/84 tools exercised; exact cleanup passed
 - Installed-cache live Microsoft Graph: 97 passed, 0 failed, 9 explicitly blocked; 83/84 tools exercised; exact cleanup passed
 - Ranked ChatGPT Work search: source and installed-cache live read-only betas each passed 5/5 checks; exact-at-one 3/3; MRR@10 1.0; unrelated top-five 0
