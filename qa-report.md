@@ -1,16 +1,22 @@
 # OneDrive 0.6.4 Parity Release Report
 
-Decision: Pass — NAS61 deployed healthy, the existing ChatGPT app refreshed in place, direct OneDrive-link opening passed live UI beta, and both full live matrices completed with exact cleanup
+Decision: Pending — NAS62 filename-only hyperlink deployment, ChatGPT action refresh, live UI beta, installed-cache parity, and final cleanup evidence
 Date: 2026-08-14
-Generated: 2026-08-14T22:28:00Z
-Tested source base commit: `5853e60b087d88e795a522cf90534836cdc41975`
-Plugin version: `0.6.4+codex.20260814215809`
-Focused source server version: `0.6.4+codex.20260814215809.chatgpt.381b2980cf1e`
-Live OAuth server version: `0.6.4+codex.20260814215809.chatgpt.e835ae761afa`
+Generated: 2026-08-14T22:58:18Z
+Tested source base commit: `b63789fe01e490d1368b1e53e99c2f9d0afc6f56`
+Plugin version: `0.6.4+codex.20260814225653`
+Focused source server version: `0.6.4+codex.20260814225653.chatgpt.6ff9e65114bc`
+Current live NAS61 OAuth server version: `0.6.4+codex.20260814215809.chatgpt.e835ae761afa`
 Tool contract: 84 exact tool names; 19 focused ChatGPT tools
 Packaged-content digest: `1738c58bc5819e4c6e6b73af54eab5ce50dbbbb8cfa48968596f96c7dcf59809`
 NAS release-manifest SHA-256: `89fc9cdabb96601455c9db68e0231f86bafdcb4756e40dd752cf7092eae339ff`
-Server SHA-256: `3960272b1f55e5c95331e0cdaaaee43b8e2cec8d659b87bb3c66aa8bab107dcd`
+Server SHA-256: `01306757f602380da73823f4a7b20f77f8dfdb7902eeb50690eb6be3cef2d96b`
+
+## 2026-08-14 NAS62 filename-only hyperlink candidate
+
+Release `0.6.4+codex.20260814225653` makes the model-visible result from `onedrive_open_files` a Markdown hyperlink whose visible text is only the resolved filename. The canonical provider URL, stable item ID, extracted text, and metadata remain in structured content. Target deployment source is `/volume1/docker/onedrive-chatgpt/app-0.6.4-nas62-filename-links-20260814`; target image is `onedrive-chatgpt-nas:0.6.4-nas62-filename-links-20260814`. NAS61 remains the required rollback image until NAS62 passes health, public OAuth/MCP, ChatGPT refresh, and live read-only presentation checks.
+
+Offline candidate evidence is green: mock Microsoft Graph 210/210, full/focused/OAuth tool contracts 84/19/19, ChatGPT golden routing 19/19, hosted-boundary checks, and prepackage self-check 32/32. Deployment, installed-cache parity, live UI beta, and final cleanup evidence are pending.
 
 ## 2026-08-13 release candidate
 

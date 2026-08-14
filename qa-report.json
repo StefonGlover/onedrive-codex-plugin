@@ -1,14 +1,14 @@
 {
   "schemaVersion": 2,
-  "decision": "Pass — NAS61 deployed healthy, the existing ChatGPT app refreshed in place, direct OneDrive-link opening passed live UI beta, and both full live matrices completed with exact cleanup",
+  "decision": "Pending — NAS62 filename-only hyperlink deployment, ChatGPT action refresh, live UI beta, installed-cache parity, and final cleanup evidence",
   "date": "2026-08-14",
-  "generatedAt": "2026-08-14T22:28:00Z",
+  "generatedAt": "2026-08-14T22:58:18Z",
   "source": {
-    "commit": "5853e60b087d88e795a522cf90534836cdc41975",
-    "pluginVersion": "0.6.4+codex.20260814215809",
-    "serverVersion": "0.6.4+codex.20260814215809.chatgpt.381b2980cf1e",
-    "serverSha256": "3960272b1f55e5c95331e0cdaaaee43b8e2cec8d659b87bb3c66aa8bab107dcd",
-    "contentDigest": "1738c58bc5819e4c6e6b73af54eab5ce50dbbbb8cfa48968596f96c7dcf59809",
+    "commit": "b63789fe01e490d1368b1e53e99c2f9d0afc6f56",
+    "pluginVersion": "0.6.4+codex.20260814225653",
+    "serverVersion": "0.6.4+codex.20260814225653.chatgpt.6ff9e65114bc",
+    "serverSha256": "01306757f602380da73823f4a7b20f77f8dfdb7902eeb50690eb6be3cef2d96b",
+    "contentDigest": null,
     "workingTree": "Release code is committed at the recorded commit; changes after that commit are limited to QA evidence."
   },
   "contract": {
@@ -17,9 +17,9 @@
     "fullToolCount": 84,
     "fullBytes": 344300,
     "chatgptToolCount": 19,
-    "chatgptBytes": 34942,
-    "chatgptOauthBytes": 37640,
-    "reductionPercent": 89.9,
+    "chatgptBytes": 35208,
+    "chatgptOauthBytes": 37906,
+    "reductionPercent": 89.8,
     "goldenPrompts": 19,
     "ambiguityPairs": 15
   },
@@ -84,7 +84,7 @@
       "remoteMutations": "isolated disposable fixtures only"
     },
     "source": {
-      "status": "pass",
+      "status": "pending",
       "surface": "Current source full 84-tool profile against connected personal OneDrive",
       "runId": "codex-beta-nas61-source-20260814",
       "folderName": "Codex OneDrive Plugin Beta Test codex-beta-nas61-source-20260814",
@@ -102,7 +102,7 @@
       "remoteMutations": "isolated disposable fixtures only"
     },
     "installed": {
-      "status": "pass",
+      "status": "pending",
       "surface": "Installed versioned-cache full 84-tool profile against connected personal OneDrive",
       "runId": "codex-beta-nas61-installed-20260814",
       "folderName": "Codex OneDrive Plugin Beta Test codex-beta-nas61-installed-20260814",
@@ -405,13 +405,13 @@
     }
   },
   "installedBuild": {
-    "status": "pass",
-    "version": "0.6.4+codex.20260814215809",
-    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.4+codex.20260814215809",
+    "status": "pending",
+    "version": "0.6.4+codex.20260814225653",
+    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.4+codex.20260814225653",
     "oldCacheOverwritten": false
   },
   "sourceCacheParity": {
-    "status": "pass",
+    "status": "pending",
     "filesChecked": 92,
     "bytes": "pass",
     "modes": "pass",
@@ -420,7 +420,7 @@
     "serverSha256Matched": true
   },
   "cleanup": {
-    "status": "pass",
+    "status": "pending",
     "runId": "codex-beta-nas61-cleanup-20260814",
     "staleDays": 0,
     "candidateCount": 0,
@@ -433,7 +433,7 @@
     "isolatedLocalResidue": false
   },
   "deployment": {
-    "status": "pass",
+    "status": "pending",
     "platform": "Synology DS923+ Container Manager",
     "project": "onedrive-chatgpt",
     "projectId": "6ade094d-9ebe-46ef-83cb-f9bb443c8300",
