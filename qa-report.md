@@ -1,24 +1,34 @@
 # OneDrive 0.6.4 Parity Release Report
 
-Decision: Pending — NAS59 and the ChatGPT 19-action OAuth canary passed; the 2026-08-13 full live Microsoft Graph and installed-cache parity matrix remains pending
-Date: 2026-08-13
-Generated: 2026-08-13T06:35:58Z
-Tested source base commit: `dd2904418665d576f717a021b1451e5aa9efff9c`
+Decision: Pending — NAS60 nested-folder optimization and the refreshed ChatGPT 19-action OAuth app passed; the full live Microsoft Graph and installed-cache parity matrix remains pending
+Date: 2026-08-14
+Generated: 2026-08-14T20:35:27Z
+Tested source base commit: `19029bff8ee6a525b695e3b7c808b91334696442`
 Plugin version: `0.6.4+codex.20260813025943`
-Focused source server version: `0.6.4+codex.20260813025943.chatgpt.37923d62a462`
-Live OAuth server version: `0.6.4+codex.20260813025943.chatgpt.d8d3679a1016`
+Focused source server version: `0.6.4+codex.20260813025943.chatgpt.fd16f4230688`
+Live OAuth server version: `0.6.4+codex.20260813025943.chatgpt.eb2ef5cc3116`
 Tool contract: 84 exact tool names; 19 focused ChatGPT tools
-Packaged-content digest: `52b4243e4fbd962a18b9388a37492fd9044facddacfaa2a2334a10795e06d568`
-NAS deployment archive SHA-256: `1ce8bcae2b2fa55414804d62b9a32648be33f7485208b58298094064f539f432`
-Server SHA-256: `736166a0faa24550b09668af55b491bf893c1facbde966ab3964f83854627537`
+Packaged-content digest: `31a68740b900ee17a6cd56d0a260f2ee82b193e8f9ebc3ec1efc3f54542023f0`
+NAS release-manifest SHA-256: `fecbd001a89c5a41e3c0053e0d5f48c9527ca7aaf0dbb22f7faffb984f7ef98e`
+Server SHA-256: `1e82d65f417fca38daef6a95b7a1f85c8e403576756f7f7ff12a626d28e0a2ab`
 
 ## 2026-08-13 release candidate
 
 The parity implementation is committed and the final frozen offline suite is green. It expands the hosted surface from 15 to 19 focused tools, adds bounded Office inspection/review, materialized downloads and previews, version/recent reads with native guarded restore, enterprise drive discovery/fetch, account-and-drive state isolation, and the associated availability and hosted-boundary hardening.
 
-Current release-candidate evidence: mock Microsoft Graph 206/206, OAuth compatibility 169/169, full/focused/OAuth tool contracts 84/19/19, ChatGPT golden routing 19/19 with 15 ambiguity pairs, prepackage self-check 32/32, materialized resources 50/50, heavyweight admission 24/24, resources/read admission 17/17, bounded local state 3017/3017, and managed quota 11/11. NAS59 is deployed and the ChatGPT OAuth app passed a read-only canary; the full current-release live Graph and installed-cache evidence remain pending.
+Current release-candidate evidence: mock Microsoft Graph 208/208, OAuth compatibility 169/169, full/focused/OAuth tool contracts 84/19/19, ChatGPT golden routing 19/19 with 15 ambiguity pairs, prepackage self-check 32/32, materialized resources 50/50, heavyweight admission 24/24, resources/read admission 17/17, bounded local state 3017/3017, and managed quota 11/11. NAS60 is deployed and the refreshed ChatGPT OAuth app passed both a general read-only canary and an exact nested-path workbook read; the full current-release live Graph and installed-cache evidence remain pending.
 
-The detailed sections below preserve the 2026-08-09 production evidence as historical baseline and rollback context; they do not attest the new 2026-08-13 build.
+The detailed older sections below preserve prior production evidence as historical baseline and rollback context.
+
+## 2026-08-14 NAS60 nested-folder deployment and ChatGPT refresh
+
+NAS60 is deployed from `/volume1/docker/onedrive-chatgpt/app-0.6.4-nas60-nested-folders-20260814` as `onedrive-chatgpt-nas:0.6.4-nas60-nested-folders-20260814`. Container `b65cdceb7421c6fb1438cd527ce11619645420a5b20cc00244c0e7b4fab0cf98` is running and healthy with zero restarts on image `sha256:4d7e7e8a066bcaa255e6ae96675205468c7f784697e53fe35d111acc4e07eafb`, Node 24.19.0, host networking, the preserved 2 GiB memory limit, and the existing persistent data/runtime mounts. The exact NAS59 source, compose identity, and image `sha256:0faf833f518e9361127bb95c07c9225934ea0665330f0c1f91a4b9b07f21bff7` remain available for rollback.
+
+The source tree contained 92 packaged files; NAS staging added one release manifest, and all 93 remote files passed MD5-and-size verification. Public health, OAuth authorization-server metadata, protected-resource metadata, MCP `GET` 405 behavior, and MCP initialization passed. The live OAuth server version exactly matched the production-environment source contract at `0.6.4+codex.20260813025943.chatgpt.eb2ef5cc3116`, with 19 focused actions.
+
+ChatGPT refreshed the existing mapped app `plugin_asdk_app_6a6995abb030819187d50d7080d4ae95` in place from `https://glovernas.tail5dbbc4.ts.net/mcp` and displayed `Actions refreshed.` All 19 expected actions remained present, and the refreshed `onedrive_open_files` action now documents known root-relative path resolution and a shared bounded filename fallback traversal. No duplicate app was created.
+
+Two post-deployment reads passed without mutation. `onedrive_read_actions` returned one recent item through the existing OAuth connection. Then `onedrive_open_files` opened the known nested workbook path `Personal/Documents/Career Development/QSE Job Tracker.xlsx` in 4,654 ms. The focused mock regression separately proves that this path mode issues one direct metadata request with zero search and zero folder scans, while two filename index misses share each traversed folder once. The full live matrix remains pending, so the release decision remains Pending.
 
 ## 2026-08-13 NAS59 and ChatGPT canary
 

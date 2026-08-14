@@ -1,14 +1,14 @@
 {
   "schemaVersion": 2,
-  "decision": "Pending — NAS59 and the ChatGPT 19-action OAuth canary passed; the 2026-08-13 full live Microsoft Graph and installed-cache parity matrix remains pending",
-  "date": "2026-08-13",
-  "generatedAt": "2026-08-13T06:35:58Z",
+  "decision": "Pending — NAS60 nested-folder optimization and the refreshed ChatGPT 19-action OAuth app passed; the full live Microsoft Graph and installed-cache parity matrix remains pending",
+  "date": "2026-08-14",
+  "generatedAt": "2026-08-14T20:35:27Z",
   "source": {
-    "commit": "dd2904418665d576f717a021b1451e5aa9efff9c",
+    "commit": "19029bff8ee6a525b695e3b7c808b91334696442",
     "pluginVersion": "0.6.4+codex.20260813025943",
-    "serverVersion": "0.6.4+codex.20260813025943.chatgpt.37923d62a462",
-    "serverSha256": "736166a0faa24550b09668af55b491bf893c1facbde966ab3964f83854627537",
-    "contentDigest": "52b4243e4fbd962a18b9388a37492fd9044facddacfaa2a2334a10795e06d568",
+    "serverVersion": "0.6.4+codex.20260813025943.chatgpt.fd16f4230688",
+    "serverSha256": "1e82d65f417fca38daef6a95b7a1f85c8e403576756f7f7ff12a626d28e0a2ab",
+    "contentDigest": "31a68740b900ee17a6cd56d0a260f2ee82b193e8f9ebc3ec1efc3f54542023f0",
     "workingTree": "Release code is committed at the recorded commit; changes after that commit are limited to QA evidence."
   },
   "contract": {
@@ -17,8 +17,8 @@
     "fullToolCount": 84,
     "fullBytes": 344300,
     "chatgptToolCount": 19,
-    "chatgptBytes": 34652,
-    "chatgptOauthBytes": 37350,
+    "chatgptBytes": 34677,
+    "chatgptOauthBytes": 37375,
     "reductionPercent": 89.9,
     "goldenPrompts": 19,
     "ambiguityPairs": 15
@@ -31,7 +31,7 @@
     { "name": "Office Open XML operations", "status": "pass", "wordOperations": 22, "excelOperations": 33, "powerPointOperations": 25 },
     { "name": "Office security corpus", "status": "pass" },
     { "name": "Genuine package reopening", "status": "pass" },
-    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 206 },
+    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 208 },
     { "name": "Read-only OneDrive doctor and tenant checks", "status": "pending" },
     { "name": "Cleanup preview", "status": "pending" },
     { "name": "Whitespace", "status": "pass" }
@@ -108,6 +108,41 @@
         "exampleSchemaValid": true,
         "status": "pass",
         "isError": false
+      },
+      "fullLiveMatrixCompleted": false
+    },
+    "nas60NestedFolderCanary": {
+      "status": "pass",
+      "surface": "Synology NAS60 production deployment and refreshed ChatGPT OneDrive OAuth app",
+      "validatedAt": "2026-08-14T20:35:27Z",
+      "connectionId": "plugin_asdk_app_6a6995abb030819187d50d7080d4ae95",
+      "url": "https://glovernas.tail5dbbc4.ts.net/mcp",
+      "authorization": "OAuth",
+      "refreshResult": "Actions refreshed.",
+      "actionCount": 19,
+      "readOnly": true,
+      "remoteMutations": 0,
+      "readOnlyProbes": [
+        {
+          "tool": "onedrive_read_actions",
+          "operation": "recent",
+          "limit": 1,
+          "status": "pass",
+          "isError": false
+        },
+        {
+          "tool": "onedrive_open_files",
+          "path": "Personal/Documents/Career Development/QSE Job Tracker.xlsx",
+          "status": "pass",
+          "durationMs": 4654,
+          "isError": false
+        }
+      ],
+      "focusedRegression": {
+        "directPathMetadataRequests": 1,
+        "directPathSearchRequests": 0,
+        "directPathFolderScans": 0,
+        "sharedFallbackTraversal": true
       },
       "fullLiveMatrixCompleted": false
     },
@@ -271,14 +306,16 @@
     "platform": "Synology DS923+ Container Manager",
     "project": "onedrive-chatgpt",
     "projectId": "6ade094d-9ebe-46ef-83cb-f9bb443c8300",
-    "deployedAt": "2026-08-13T06:24:30Z",
-    "image": "onedrive-chatgpt-nas:0.6.4-nas59-parity-20260813",
+    "deployedAt": "2026-08-14T20:28:58Z",
+    "image": "onedrive-chatgpt-nas:0.6.4-nas60-nested-folders-20260814",
     "imageTagRetainedByDsm": false,
-    "imageId": "sha256:0faf833f518e9361127bb95c07c9225934ea0665330f0c1f91a4b9b07f21bff7",
-    "containerId": "83b8cb26f3fd75fd3713dc71d3fe302dcde854638a6de8d83c3220c78eecad38",
-    "sourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas59-parity-20260813-healthfix",
-    "buildContextCommit": "09cd5d8ab2bf97f674e9ce042cfda0ba14a0436d",
-    "packageSha256": "1ce8bcae2b2fa55414804d62b9a32648be33f7485208b58298094064f539f432",
+    "imageId": "sha256:4d7e7e8a066bcaa255e6ae96675205468c7f784697e53fe35d111acc4e07eafb",
+    "containerId": "b65cdceb7421c6fb1438cd527ce11619645420a5b20cc00244c0e7b4fab0cf98",
+    "sourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas60-nested-folders-20260814",
+    "buildContextCommit": "19029bff8ee6a525b695e3b7c808b91334696442",
+    "packageFiles": 92,
+    "stagedFilesIncludingManifest": 93,
+    "releaseManifestSha256": "fecbd001a89c5a41e3c0053e0d5f48c9527ca7aaf0dbb22f7faffb984f7ef98e",
     "containerState": "running",
     "containerHealth": "healthy",
     "healthFailingStreak": 0,
@@ -291,13 +328,13 @@
     "publicHealth": "pass",
     "oauthAuthorizationServerMetadata": "pass",
     "oauthProtectedResourceMetadata": "pass",
-    "mcpProtocolVersion": "2025-03-26",
-    "advertisedServerVersion": "0.6.4+codex.20260813025943.chatgpt.d8d3679a1016",
-    "serverSha256": "736166a0faa24550b09668af55b491bf893c1facbde966ab3964f83854627537",
-    "rollbackSourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas58-add-table-row-20260809",
-    "rollbackImage": "onedrive-chatgpt-nas:0.6.4-nas58-add-table-row",
-    "rollbackImageId": "sha256:14d339d3c793ba3d4f29f24a313153219780d28921f671f0c375386afdf935d6",
-    "sourceIdentityNote": "The NAS archive preceded the compose-only dd290441 Synology CPU-limit fix. The live private compose already reflects that fix, and the deployed MCP server SHA-256 matches current source. The live OAuth contract suffix differs from the noauth source suffix only because the environment-derived OAuth security scheme is part of the advertised contract hash."
+    "mcpProtocolVersion": "2025-06-18",
+    "advertisedServerVersion": "0.6.4+codex.20260813025943.chatgpt.eb2ef5cc3116",
+    "serverSha256": "1e82d65f417fca38daef6a95b7a1f85c8e403576756f7f7ff12a626d28e0a2ab",
+    "rollbackSourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas59-parity-20260813-healthfix",
+    "rollbackImage": "onedrive-chatgpt-nas:0.6.4-nas59-parity-20260813",
+    "rollbackImageId": "sha256:0faf833f518e9361127bb95c07c9225934ea0665330f0c1f91a4b9b07f21bff7",
+    "sourceIdentityNote": "All 92 source files plus the release manifest were uploaded to a new immutable NAS60 directory and individually verified by MD5 and size. The live production-OAuth contract suffix exactly matches the same source under the deployed OAuth scope; the noauth source suffix differs because security schemes are part of the advertised contract hash."
   },
   "fixes": [
     { "area": "Focused text-write schema", "result": "Work now receives one unambiguous remotePath plus content branch." },
@@ -312,7 +349,16 @@
     { "area": "Live beta guarded rename/move/copy", "result": "The harness now previews each token-guarded mutation and requires concrete post-commit verification before continuing." },
     { "area": "CI Python bytecode residue", "result": "Python syntax checks write bytecode under the runner temporary directory, so the package-residue guard evaluates source rather than CI-generated __pycache__ files." }
   ],
-  "performanceObservations": [],
+  "performanceObservations": [
+    {
+      "area": "Nested exact-path reads",
+      "result": "Known root-relative paths resolve directly; the live nested workbook canary completed in 4654 ms, and the focused regression proves zero search and zero folder scans for this mode."
+    },
+    {
+      "area": "Multiple exact filename misses",
+      "result": "A batch now shares one bounded recursive traversal instead of rescanning the same nested folders once per filename."
+    }
+  ],
   "blockedCoverage": [
     { "area": "Named-recipient invitation", "reason": "A user-controlled Gmail plus alias was supplied and both silent and email modes reached Microsoft Graph, but personal OneDrive returned sharingFailed. A post-failure permission audit proved no grant or partial state was created; this is an account/recipient limitation, not a connector defect." },
     { "area": "Business Graph Excel", "reason": "The connected OneDrive is personal; business-session behavior remains mock-tested." },
