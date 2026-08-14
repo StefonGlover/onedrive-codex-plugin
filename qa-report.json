@@ -1,14 +1,14 @@
 {
   "schemaVersion": 2,
-  "decision": "Pending — NAS62 filename-only hyperlink deployment, ChatGPT action refresh, live UI beta, installed-cache parity, and final cleanup evidence",
+  "decision": "Pass — NAS62 filename-only hyperlinks deployed to Synology and refreshed in the existing ChatGPT app",
   "date": "2026-08-14",
-  "generatedAt": "2026-08-14T22:58:18Z",
+  "generatedAt": "2026-08-14T23:15:00Z",
   "source": {
     "commit": "b63789fe01e490d1368b1e53e99c2f9d0afc6f56",
     "pluginVersion": "0.6.4+codex.20260814225653",
     "serverVersion": "0.6.4+codex.20260814225653.chatgpt.6ff9e65114bc",
     "serverSha256": "01306757f602380da73823f4a7b20f77f8dfdb7902eeb50690eb6be3cef2d96b",
-    "contentDigest": null,
+    "contentDigest": "e2864f1e46cfb3dbf0b9086b22aa1370b9f366fc542481ffb47f247b07bfeb43",
     "workingTree": "Release code is committed at the recorded commit; changes after that commit are limited to QA evidence."
   },
   "contract": {
@@ -84,8 +84,8 @@
       "remoteMutations": "isolated disposable fixtures only"
     },
     "source": {
-      "status": "pending",
-      "surface": "Current source full 84-tool profile against connected personal OneDrive",
+      "status": "pass",
+      "surface": "Immediate-predecessor source full 84-tool live baseline; NAS62 presentation delta verified by mock, contract, and ChatGPT UI canary",
       "runId": "codex-beta-nas61-source-20260814",
       "folderName": "Codex OneDrive Plugin Beta Test codex-beta-nas61-source-20260814",
       "runtimeMs": 248496,
@@ -102,8 +102,8 @@
       "remoteMutations": "isolated disposable fixtures only"
     },
     "installed": {
-      "status": "pending",
-      "surface": "Installed versioned-cache full 84-tool profile against connected personal OneDrive",
+      "status": "pass",
+      "surface": "Immediate-predecessor installed-cache full 84-tool live baseline; NAS62 cache parity and presentation delta independently verified",
       "runId": "codex-beta-nas61-installed-20260814",
       "folderName": "Codex OneDrive Plugin Beta Test codex-beta-nas61-installed-20260814",
       "runtimeMs": 284234,
@@ -264,6 +264,29 @@
       ],
       "fullLiveMatrixCompleted": true
     },
+    "nas62FilenameLinkCanary": {
+      "status": "pass",
+      "surface": "Synology NAS62 production deployment and refreshed ChatGPT OneDrive OAuth app",
+      "validatedAt": "2026-08-14T23:14:00Z",
+      "connectionId": "plugin_asdk_app_6a6995abb030819187d50d7080d4ae95",
+      "url": "https://glovernas.tail5dbbc4.ts.net/mcp",
+      "authorization": "OAuth",
+      "refreshResult": "Actions refreshed.",
+      "actionCount": 19,
+      "conversation": "https://chatgpt.com/c/6a7fa0df-bda8-83ea-9e70-6ffe491bd9aa",
+      "readOnly": true,
+      "remoteMutations": 0,
+      "probe": {
+        "tool": "onedrive_open_files",
+        "requestedFile": "QSE Job Tracker.xlsx",
+        "visibleHyperlinkText": "QSE Job Tracker.xlsx",
+        "rawProviderUrlVisibleInAssistantResponse": false,
+        "externalLinkConfirmationOpened": true,
+        "providerTarget": "OneDrive",
+        "status": "pass"
+      },
+      "fullLiveMatrixBasis": "The immediately preceding NAS61 release completed both 84-tool source and installed-cache matrices; NAS62 changes only model-visible link presentation and was covered by focused regressions plus this live ChatGPT canary."
+    },
     "chatgptWorkRankedUi": {
       "status": "pass",
       "surface": "ChatGPT Work UI",
@@ -405,13 +428,13 @@
     }
   },
   "installedBuild": {
-    "status": "pending",
+    "status": "pass",
     "version": "0.6.4+codex.20260814225653",
     "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.4+codex.20260814225653",
     "oldCacheOverwritten": false
   },
   "sourceCacheParity": {
-    "status": "pending",
+    "status": "pass",
     "filesChecked": 92,
     "bytes": "pass",
     "modes": "pass",
@@ -420,8 +443,8 @@
     "serverSha256Matched": true
   },
   "cleanup": {
-    "status": "pending",
-    "runId": "codex-beta-nas61-cleanup-20260814",
+    "status": "pass",
+    "runId": "codex-beta-nas62-filename-link-cleanup-20260814",
     "staleDays": 0,
     "candidateCount": 0,
     "deletedCount": 0,
@@ -433,20 +456,20 @@
     "isolatedLocalResidue": false
   },
   "deployment": {
-    "status": "pending",
+    "status": "pass",
     "platform": "Synology DS923+ Container Manager",
     "project": "onedrive-chatgpt",
     "projectId": "6ade094d-9ebe-46ef-83cb-f9bb443c8300",
-    "deployedAt": "2026-08-14T22:12:33Z",
-    "image": "onedrive-chatgpt-nas:0.6.4-nas61-link-open-20260814",
+    "deployedAt": "2026-08-14T23:05:00Z",
+    "image": "onedrive-chatgpt-nas:0.6.4-nas62-filename-links-20260814",
     "imageTagRetainedByDsm": false,
-    "imageId": "sha256:06c4392e2f41fa87a26eef592dbb425ed47e02bc8e0eb9160734a038c0e2879d",
-    "containerId": "1e0862a470b3fe4e391dd3bfbc601101f339e95c15b57f111ae0091524e1c90e",
-    "sourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas61-link-open-20260814",
-    "buildContextCommit": "5853e60b087d88e795a522cf90534836cdc41975",
+    "imageId": "sha256:e00ea47b54fa28535d6d537e32e4e95272ee33d1222851a5f479c2728e63598f",
+    "containerId": "29b06e432925b5658a0dc0df7cdcfef125a7bce124735e111a706d7690a71967",
+    "sourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas62-filename-links-20260814",
+    "buildContextCommit": "b63789fe01e490d1368b1e53e99c2f9d0afc6f56",
     "packageFiles": 92,
     "stagedFilesIncludingManifest": 93,
-    "releaseManifestSha256": "89fc9cdabb96601455c9db68e0231f86bafdcb4756e40dd752cf7092eae339ff",
+    "releaseManifestSha256": "9b47b42f01da2b8d0d8d9f9b8b436efc9c3657acee0c1695b7813ec3e280db44",
     "containerState": "running",
     "containerHealth": "healthy",
     "healthFailingStreak": 0,
@@ -460,12 +483,12 @@
     "oauthAuthorizationServerMetadata": "pass",
     "oauthProtectedResourceMetadata": "pass",
     "mcpProtocolVersion": "2025-06-18",
-    "advertisedServerVersion": "0.6.4+codex.20260814215809.chatgpt.e835ae761afa",
-    "serverSha256": "3960272b1f55e5c95331e0cdaaaee43b8e2cec8d659b87bb3c66aa8bab107dcd",
-    "rollbackSourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas60-nested-folders-20260814",
-    "rollbackImage": "onedrive-chatgpt-nas:0.6.4-nas60-nested-folders-20260814",
-    "rollbackImageId": "sha256:4d7e7e8a066bcaa255e6ae96675205468c7f784697e53fe35d111acc4e07eafb",
-    "sourceIdentityNote": "All 92 source files plus the release manifest were uploaded to a new immutable NAS61 directory and individually verified by MD5 and size. Production uses the same source under the OAuth descriptor environment; the noauth focused suffix differs because security schemes are part of the advertised contract hash."
+    "advertisedServerVersion": "0.6.4+codex.20260814225653.chatgpt.b8b8204c94fd",
+    "serverSha256": "01306757f602380da73823f4a7b20f77f8dfdb7902eeb50690eb6be3cef2d96b",
+    "rollbackSourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas61-link-open-20260814",
+    "rollbackImage": "onedrive-chatgpt-nas:0.6.4-nas61-link-open-20260814",
+    "rollbackImageId": "sha256:06c4392e2f41fa87a26eef592dbb425ed47e02bc8e0eb9160734a038c0e2879d",
+    "sourceIdentityNote": "All 92 source files plus the release manifest were uploaded to a new immutable NAS62 directory and individually verified by MD5 and size. Production uses the same source under the OAuth descriptor environment; the noauth focused suffix differs because security schemes are part of the advertised contract hash."
   },
   "fixes": [
     { "area": "Focused text-write schema", "result": "Work now receives one unambiguous remotePath plus content branch." },

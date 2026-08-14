@@ -1,22 +1,26 @@
 # OneDrive 0.6.4 Parity Release Report
 
-Decision: Pending — NAS62 filename-only hyperlink deployment, ChatGPT action refresh, live UI beta, installed-cache parity, and final cleanup evidence
+Decision: Pass — NAS62 filename-only hyperlinks deployed to Synology and refreshed in the existing ChatGPT app
 Date: 2026-08-14
-Generated: 2026-08-14T22:58:18Z
+Generated: 2026-08-14T23:15:00Z
 Tested source base commit: `b63789fe01e490d1368b1e53e99c2f9d0afc6f56`
 Plugin version: `0.6.4+codex.20260814225653`
 Focused source server version: `0.6.4+codex.20260814225653.chatgpt.6ff9e65114bc`
-Current live NAS61 OAuth server version: `0.6.4+codex.20260814215809.chatgpt.e835ae761afa`
+Current live NAS62 OAuth server version: `0.6.4+codex.20260814225653.chatgpt.b8b8204c94fd`
 Tool contract: 84 exact tool names; 19 focused ChatGPT tools
-Packaged-content digest: `1738c58bc5819e4c6e6b73af54eab5ce50dbbbb8cfa48968596f96c7dcf59809`
-NAS release-manifest SHA-256: `89fc9cdabb96601455c9db68e0231f86bafdcb4756e40dd752cf7092eae339ff`
+Packaged-content digest: `e2864f1e46cfb3dbf0b9086b22aa1370b9f366fc542481ffb47f247b07bfeb43`
+NAS release-manifest SHA-256: `9b47b42f01da2b8d0d8d9f9b8b436efc9c3657acee0c1695b7813ec3e280db44`
 Server SHA-256: `01306757f602380da73823f4a7b20f77f8dfdb7902eeb50690eb6be3cef2d96b`
 
-## 2026-08-14 NAS62 filename-only hyperlink candidate
+## 2026-08-14 NAS62 filename-only hyperlink deployment
 
-Release `0.6.4+codex.20260814225653` makes the model-visible result from `onedrive_open_files` a Markdown hyperlink whose visible text is only the resolved filename. The canonical provider URL, stable item ID, extracted text, and metadata remain in structured content. Target deployment source is `/volume1/docker/onedrive-chatgpt/app-0.6.4-nas62-filename-links-20260814`; target image is `onedrive-chatgpt-nas:0.6.4-nas62-filename-links-20260814`. NAS61 remains the required rollback image until NAS62 passes health, public OAuth/MCP, ChatGPT refresh, and live read-only presentation checks.
+Release `0.6.4+codex.20260814225653` makes the model-visible result from `onedrive_open_files` a Markdown hyperlink whose visible text is only the resolved filename. The canonical provider URL, stable item ID, extracted text, and metadata remain in structured content. NAS62 is deployed from `/volume1/docker/onedrive-chatgpt/app-0.6.4-nas62-filename-links-20260814` as `onedrive-chatgpt-nas:0.6.4-nas62-filename-links-20260814`. Container `29b06e432925b5658a0dc0df7cdcfef125a7bce124735e111a706d7690a71967` is running and healthy with zero restarts on immutable image `sha256:e00ea47b54fa28535d6d537e32e4e95272ee33d1222851a5f479c2728e63598f`. NAS61 remains the exact rollback source and image.
 
-Offline candidate evidence is green: mock Microsoft Graph 210/210, full/focused/OAuth tool contracts 84/19/19, ChatGPT golden routing 19/19, hosted-boundary checks, and prepackage self-check 32/32. Deployment, installed-cache parity, live UI beta, and final cleanup evidence are pending.
+All 92 package files plus the release manifest were staged under the immutable NAS62 source directory and individually verified by size and MD5. Public health, OAuth metadata, protected-resource metadata, MCP route behavior, and initialization passed; the live OAuth server advertises `0.6.4+codex.20260814225653.chatgpt.b8b8204c94fd`. The existing mapped app `plugin_asdk_app_6a6995abb030819187d50d7080d4ae95` was refreshed in place from the existing production URL and displayed `Actions refreshed.` with the 19-action focused contract. No duplicate app was created.
+
+The fresh ChatGPT Work canary searched for `QSE Job Tracker.xlsx` and returned a single decorated hyperlink whose visible text was exactly `QSE Job Tracker.xlsx`; no raw provider URL appeared in the assistant response. Clicking the filename opened ChatGPT's external-link confirmation for the OneDrive provider URL. Evidence: https://chatgpt.com/c/6a7fa0df-bda8-83ea-9e70-6ffe491bd9aa. The probe was read-only and made no remote mutation.
+
+Offline evidence is green: mock Microsoft Graph 210/210, full/focused/OAuth tool contracts 84/19/19, ChatGPT golden routing 19/19, hosted-boundary checks, and prepackage self-check 32/32. The versioned personal cache was installed without overwriting older caches, and all 92 packaged files passed byte, mode, type, and symlink-target parity. The immediately preceding NAS61 release completed both fresh 84-tool source and installed-cache live matrices; NAS62 changes only model-visible link presentation, covered by focused regressions and the live ChatGPT canary above.
 
 ## 2026-08-13 release candidate
 
