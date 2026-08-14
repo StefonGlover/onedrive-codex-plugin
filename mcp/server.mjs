@@ -2247,7 +2247,7 @@ const chatgptCompatibilityTools = [
   {
     name: "onedrive_open_files",
     title: "Open exact OneDrive files",
-    description: "Read one or more specifically named OneDrive files in one bounded call.",
+    description: "Read one or more exact OneDrive filenames or known root-relative file paths in one bounded call.",
     inputSchema: {
       type: "object",
       required: ["names"],
@@ -2258,7 +2258,7 @@ const chatgptCompatibilityTools = [
           maxItems: 5,
           uniqueItems: true,
           items: { type: "string", minLength: 1 },
-          description: "Exact filenames, including extensions, to locate and read."
+          description: "Exact filenames, including extensions, or known root-relative OneDrive file paths to locate and read."
         }
       },
       additionalProperties: false
@@ -2857,7 +2857,7 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "OneDrive item ready"
   },
   onedrive_open_files: {
-    description: "Use this when the user provides one or more exact filenames and wants their contents. It locates and extracts up to five files in one read-only call, and falls back to a bounded live folder scan when OneDrive indexing misses; use search then fetch for discovery, partial names, or ambiguous results.",
+    description: "Use this when the user provides one or more exact filenames or known root-relative OneDrive paths and wants their contents in one read-only call. Known paths resolve directly; filename index misses share one bounded live folder scan across the batch. Use search then fetch for discovery, partial names, or ambiguous results.",
     invoking: "Opening OneDrive files…",
     invoked: "OneDrive files ready"
   },
@@ -12114,6 +12114,7 @@ async function chatgptSearch(args = {}, internal = {}) {
   let exactFilenameFallbackAttempted = false;
   let exactFilenameFallbackResults = [];
   if (exactFilenameQuery
+    && internal.skipExactFilenameFallback !== true
     && !rankedResults.some((item) => exactFilenameKey(item.title) === exactFilenameKey(exactFilenameQuery))) {
     exactFilenameFallbackAttempted = true;
     try {
@@ -12789,6 +12790,17 @@ function chatgptExactFilenameQuery(value) {
   return uniqueBare.length === 1 ? uniqueBare[0] : null;
 }
 
+function chatgptExactRemotePath(value) {
+  const candidate = String(value || "").trim().normalize("NFKC");
+  if (!candidate.includes("/") || Buffer.byteLength(candidate, "utf8") > 1024 || /[\0\r\n]/u.test(candidate)) return null;
+  try {
+    const path = assertSafeRemotePath(candidate, "OneDrive path");
+    return path && validExactFilenameCandidate(basename(path)) ? path : null;
+  } catch {
+    return null;
+  }
+}
+
 async function chatgptExactFilenameFallback(requestedName) {
   const expectedKey = exactFilenameKey(requestedName);
   const cache = await loadMetadataCache();
@@ -12829,48 +12841,141 @@ async function chatgptExactFilenameFallback(requestedName) {
     .map((item) => chatgptSearchResult(item, requestedName));
 }
 
+async function chatgptExactFilenameBatchFallback(requestedNames = []) {
+  const namesByKey = new Map();
+  for (const name of requestedNames) {
+    const key = exactFilenameKey(name);
+    if (key && !namesByKey.has(key)) namesByKey.set(key, String(name));
+  }
+  if (!namesByKey.size) return { matchesByKey: new Map(), scanSummary: null };
+
+  const matchesByKey = new Map([...namesByKey.keys()].map((key) => [key, []]));
+  const scanned = await scan({
+    // scan invokes this bounded internal callback before public result
+    // filtering. Retain at most ten matches per requested filename so one
+    // duplicate-heavy name cannot crowd another name out of the batch.
+    onItem: (item) => {
+      const key = exactFilenameKey(item?.name);
+      const matches = matchesByKey.get(key);
+      const simplified = simplifyItem(item);
+      if (!simplified?.file || !item?.id || !matches || matches.length >= 10) return;
+      const result = chatgptSearchResult(simplified, namesByKey.get(key));
+      matches.push(item.remoteItem && simplified.driveId
+        ? { ...result, id: encodeEnterpriseDriveItemId(simplified.driveId, simplified.id) }
+        : { ...result, id: String(item.id || simplified.id || "") });
+    },
+    includeFiles: false,
+    includeFolders: false,
+    maxItems: 2000,
+    maxFolders: 300,
+    maxDepth: 20,
+    maxResults: 1,
+    stopAfterResults: false,
+    scanConcurrency: 3,
+    format: "full",
+    cacheResults: true
+  });
+  return { matchesByKey, scanSummary: scanned.summary || null };
+}
+
 async function chatgptOpenFiles(args = {}) {
   const startedAt = Date.now();
   const names = args.names || [];
-  const files = await mapWithConcurrency(names, 2, async (name) => {
-    const fileStartedAt = Date.now();
+  const lookups = await mapWithConcurrency(names, 3, async (name) => {
     const requestedName = String(name || "").trim();
+    const fileStartedAt = Date.now();
+    const pathLike = requestedName.includes("/");
     try {
-      const searched = await chatgptSearch({ query: requestedName });
-      const exact = (searched.results || []).filter((candidate) => exactFilenameKey(candidate.title) === exactFilenameKey(requestedName));
-      if (exact.length === 0) {
+      const directPath = chatgptExactRemotePath(requestedName);
+      if (pathLike && !directPath) throw new Error("OneDrive file path is invalid or does not end with a supported filename.");
+      if (directPath) {
+        const raw = await getRawInfo({ path: directPath, cacheResults: true });
+        const simplified = simplifyItem(raw);
+        if (simplified?.folder) throw new Error(`OneDrive path resolves to a folder, not a file: ${directPath}`);
         return {
           name: requestedName,
-          status: "not_found",
-          candidates: (searched.results || []).slice(0, 3),
-          durationMs: elapsedMs(fileStartedAt)
+          startedAt: fileStartedAt,
+          lookupMode: "direct-path",
+          exact: [{ ...chatgptSearchResult(simplified, basename(directPath)), id: String(raw.id || simplified.id || "") }],
+          candidates: []
         };
       }
-      if (exact.length > 1) {
-        return {
-          name: requestedName,
-          status: "ambiguous",
-          candidates: exact.slice(0, 3),
-          durationMs: elapsedMs(fileStartedAt)
-        };
-      }
-      const fetched = await chatgptFetch({ id: exact[0].id });
       return {
         name: requestedName,
+        startedAt: fileStartedAt,
+        lookupMode: "filename",
+        searched: await chatgptSearch({ query: requestedName }, { skipExactFilenameFallback: true })
+      };
+    } catch (error) {
+      return {
+        name: requestedName,
+        startedAt: fileStartedAt,
+        lookupMode: pathLike ? "direct-path" : "filename",
+        error: safeToolErrorMessage(error),
+        errorCode: error?.graphStatus === 404 ? "not_found" : "error"
+      };
+    }
+  });
+
+  const unresolvedNames = lookups
+    .filter((entry) => entry.lookupMode === "filename" && !entry.error)
+    .filter((entry) => !(entry.searched?.results || []).some((candidate) => exactFilenameKey(candidate.title) === exactFilenameKey(entry.name)))
+    .map((entry) => entry.name);
+  let fallback = { matchesByKey: new Map(), scanSummary: null };
+  if (unresolvedNames.length) {
+    try {
+      fallback = await chatgptExactFilenameBatchFallback(unresolvedNames);
+    } catch (error) {
+      recordLocalWarning("ChatGPT shared exact-filename scan fallback", error);
+    }
+  }
+
+  const files = await mapWithConcurrency(lookups, 2, async (lookup) => {
+    const duration = () => elapsedMs(lookup.startedAt);
+    if (lookup.error) {
+      return lookup.errorCode === "not_found"
+        ? { name: lookup.name, status: "not_found", candidates: [], durationMs: duration() }
+        : { name: lookup.name, status: "error", error: lookup.error, durationMs: duration() };
+    }
+    const searchedExact = lookup.exact || (lookup.searched?.results || [])
+      .filter((candidate) => exactFilenameKey(candidate.title) === exactFilenameKey(lookup.name));
+    const exact = searchedExact.length
+      ? searchedExact
+      : fallback.matchesByKey.get(exactFilenameKey(lookup.name)) || [];
+    if (exact.length === 0) {
+      return {
+        name: lookup.name,
+        status: "not_found",
+        candidates: (lookup.searched?.results || []).slice(0, 3),
+        durationMs: duration()
+      };
+    }
+    if (exact.length > 1) {
+      return {
+        name: lookup.name,
+        status: "ambiguous",
+        candidates: exact.slice(0, 3),
+        durationMs: duration()
+      };
+    }
+    try {
+      const fetched = await chatgptFetch({ id: exact[0].id });
+      return {
+        name: lookup.name,
         status: "found",
         id: fetched.id,
         title: fetched.title,
         text: fetched.text,
         url: fetched.url,
         metadata: fetched.metadata,
-        durationMs: elapsedMs(fileStartedAt)
+        durationMs: duration()
       };
     } catch (error) {
       return {
-        name: requestedName,
+        name: lookup.name,
         status: "error",
         error: safeToolErrorMessage(error),
-        durationMs: elapsedMs(fileStartedAt)
+        durationMs: duration()
       };
     }
   });
@@ -12883,7 +12988,11 @@ async function chatgptOpenFiles(args = {}) {
       found: files.filter((file) => file.status === "found").length,
       ambiguous: files.filter((file) => file.status === "ambiguous").length,
       notFound: files.filter((file) => file.status === "not_found").length,
-      errors: files.filter((file) => file.status === "error").length
+      errors: files.filter((file) => file.status === "error").length,
+      directPathLookups: lookups.filter((entry) => entry.lookupMode === "direct-path").length,
+      sharedFallbackNames: unresolvedNames.length,
+      sharedFallbackFoldersVisited: fallback.scanSummary?.foldersVisited || 0,
+      sharedFallbackItemsScanned: fallback.scanSummary?.itemsScanned || 0
     }));
   }
   return result;

@@ -821,6 +821,32 @@ const graph = createServer(async (req, res) => {
     }));
   }
 
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/nested-index-miss-a") {
+    return json(res, 200, item("nested-index-miss-a", "Nested Folder Invoice.txt", {
+      parentReference: { id: "folder-a", path: "/drive/root:/Folder A" }
+    }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/nested-index-miss-b") {
+    return json(res, 200, item("nested-index-miss-b", "Nested Folder Notes.txt", {
+      parentReference: { id: "folder-b", path: "/drive/root:/Folder B" }
+    }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/root:/Folder%20B/Nested%20Folder%20Notes.txt:") {
+    return json(res, 200, item("nested-index-miss-b", "Nested Folder Notes.txt", {
+      parentReference: { id: "folder-b", path: "/drive/root:/Folder B" }
+    }));
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/nested-index-miss-a/content") {
+    return text(res, 200, "nested invoice content\n");
+  }
+
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/nested-index-miss-b/content") {
+    return text(res, 200, "nested notes content\n");
+  }
+
   if (req.method === "GET" && path === "/v1.0/me/drive/items/common-rtf/content") {
     count("common-rtf-content-read");
     if (delayedCommonContentMs) await new Promise((resolvePromise) => setTimeout(resolvePromise, delayedCommonContentMs));
@@ -2018,10 +2044,15 @@ const graph = createServer(async (req, res) => {
           file: { mimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
         }),
         ...(chatgptExactIndexMissEnabled
-          ? [item("chatgpt-exact-index-miss", "invoice-3095.pdf", {
-            parentReference: { id: "folder-a", path: "/drive/root:/Folder A" },
-            file: { mimeType: "application/pdf" }
-          })]
+          ? [
+              item("chatgpt-exact-index-miss", "invoice-3095.pdf", {
+                parentReference: { id: "folder-a", path: "/drive/root:/Folder A" },
+                file: { mimeType: "application/pdf" }
+              }),
+              item("nested-index-miss-a", "Nested Folder Invoice.txt", {
+                parentReference: { id: "folder-a", path: "/drive/root:/Folder A" }
+              })
+            ]
           : [])
       ]
     });
@@ -2066,7 +2097,12 @@ const graph = createServer(async (req, res) => {
         item("quarterly-report", "Quarterly Report.docx", {
           parentReference: { path: "/drive/root:/Folder B" },
           file: { mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
-        })
+        }),
+        ...(chatgptExactIndexMissEnabled
+          ? [item("nested-index-miss-b", "Nested Folder Notes.txt", {
+              parentReference: { id: "folder-b", path: "/drive/root:/Folder B" }
+            })]
+          : [])
       ]
     });
   }
@@ -6187,6 +6223,50 @@ process.exit(2);
         graphSearchCalls: searchRequests.length,
         usedFolderScan: true
       };
+    } finally {
+      chatgptExactIndexMissEnabled = false;
+    }
+  });
+
+  await check("ChatGPT exact-file opener resolves a known nested path without search or traversal", async () => {
+    await tool("onedrive_cache_clear");
+    const before = requests.length;
+    const opened = await tool("onedrive_open_files", { names: ["Folder B/Nested Folder Notes.txt"] });
+    assert(!opened.isError, "known-path exact-file opener should succeed", opened);
+    const result = opened.value.files?.[0];
+    assert(result?.status === "found" && result.id === "nested-index-miss-b", "known nested path should resolve the exact item", result);
+    assert(result.text.includes("nested notes content"), "known nested path should return file contents", result);
+    const added = requests.slice(before);
+    assert(added.filter((request) => decodeURIComponent(request.url).includes("/search(q='")).length === 0, "known nested path must bypass Graph search", added);
+    assert(!added.some((request) => request.path === "/v1.0/me/drive/items/root/children"), "known nested path must bypass recursive traversal", added);
+    assert(added.filter((request) => request.path === "/v1.0/me/drive/root:/Folder%20B/Nested%20Folder%20Notes.txt:").length === 1, "known nested path should use one direct metadata request", added);
+    const beforeUnsafe = requests.length;
+    const unsafe = await tool("onedrive_open_files", { names: ["Folder B/../secrets.txt"] });
+    assert(!unsafe.isError && unsafe.value.files?.[0]?.status === "error", "unsafe nested path should fail as a controlled per-file error", unsafe);
+    assert(requests.length === beforeUnsafe, "unsafe nested path must fail before Graph without falling back to search", requests.slice(beforeUnsafe));
+    return { status: result.status, directMetadataReads: 1, searchCalls: 0, folderScans: 0, unsafePathFailedBeforeGraph: true };
+  });
+
+  await check("ChatGPT exact-file opener shares one nested traversal across filename misses", async () => {
+    await tool("onedrive_cache_clear");
+    await tool("onedrive_content_index_clear");
+    chatgptExactIndexMissEnabled = true;
+    try {
+      const before = requests.length;
+      const opened = await tool("onedrive_open_files", {
+        names: ["Nested Folder Invoice.txt", "Nested Folder Notes.txt"]
+      });
+      assert(!opened.isError, "shared nested exact-file opener should succeed", opened);
+      assert(opened.value.files?.map((entry) => entry.name).join("|") === "Nested Folder Invoice.txt|Nested Folder Notes.txt", "shared opener must preserve request order", opened.value.files);
+      assert(opened.value.files?.every((entry) => entry.status === "found"), "shared traversal should find both nested files", opened.value.files);
+      assert(opened.value.files[0].id === "nested-index-miss-a" && opened.value.files[0].text.includes("nested invoice content"), "first nested file mismatch", opened.value.files[0]);
+      assert(opened.value.files[1].id === "nested-index-miss-b" && opened.value.files[1].text.includes("nested notes content"), "second nested file mismatch", opened.value.files[1]);
+      const added = requests.slice(before);
+      const folderAScans = added.filter((request) => request.path === "/v1.0/me/drive/items/folder-a/children").length;
+      const folderBScans = added.filter((request) => request.path === "/v1.0/me/drive/items/folder-b/children").length;
+      assert(folderAScans === 1 && folderBScans === 1, "multiple filename misses must share one recursive traversal", { folderAScans, folderBScans, added });
+      assert(added.filter((request) => decodeURIComponent(request.url).includes("/search(q='")).length === 2, "each exact filename should receive one indexed query before the shared scan", added);
+      return { files: 2, folderAScans, folderBScans, repeatedTraversals: 0 };
     } finally {
       chatgptExactIndexMissEnabled = false;
     }
