@@ -1,14 +1,14 @@
 # OneDrive 0.6.4 Parity Release Report
 
-Decision: Pending — NAS60 nested-folder optimization and the refreshed ChatGPT 19-action OAuth app passed; the full live Microsoft Graph and installed-cache parity matrix remains pending
+Decision: Pass — NAS60 nested-folder optimization, the refreshed ChatGPT 19-action OAuth app, both full live Microsoft Graph matrices, installed-cache parity, and zero-residue cleanup passed
 Date: 2026-08-14
-Generated: 2026-08-14T20:35:27Z
-Tested source base commit: `19029bff8ee6a525b695e3b7c808b91334696442`
+Generated: 2026-08-14T21:02:00Z
+Tested source base commit: `89281afb6d74fab35edd470ba50b74b98df3cc0c`
 Plugin version: `0.6.4+codex.20260813025943`
 Focused source server version: `0.6.4+codex.20260813025943.chatgpt.fd16f4230688`
 Live OAuth server version: `0.6.4+codex.20260813025943.chatgpt.eb2ef5cc3116`
 Tool contract: 84 exact tool names; 19 focused ChatGPT tools
-Packaged-content digest: `31a68740b900ee17a6cd56d0a260f2ee82b193e8f9ebc3ec1efc3f54542023f0`
+Packaged-content digest: `a85b93fd8102a9350e841ccdb2186937798a6de433d3739e2c98ae8374ed1197`
 NAS release-manifest SHA-256: `fecbd001a89c5a41e3c0053e0d5f48c9527ca7aaf0dbb22f7faffb984f7ef98e`
 Server SHA-256: `1e82d65f417fca38daef6a95b7a1f85c8e403576756f7f7ff12a626d28e0a2ab`
 
@@ -16,7 +16,7 @@ Server SHA-256: `1e82d65f417fca38daef6a95b7a1f85c8e403576756f7f7ff12a626d28e0a2a
 
 The parity implementation is committed and the final frozen offline suite is green. It expands the hosted surface from 15 to 19 focused tools, adds bounded Office inspection/review, materialized downloads and previews, version/recent reads with native guarded restore, enterprise drive discovery/fetch, account-and-drive state isolation, and the associated availability and hosted-boundary hardening.
 
-Current release-candidate evidence: mock Microsoft Graph 208/208, OAuth compatibility 169/169, full/focused/OAuth tool contracts 84/19/19, ChatGPT golden routing 19/19 with 15 ambiguity pairs, prepackage self-check 32/32, materialized resources 50/50, heavyweight admission 24/24, resources/read admission 17/17, bounded local state 3017/3017, and managed quota 11/11. NAS60 is deployed and the refreshed ChatGPT OAuth app passed both a general read-only canary and an exact nested-path workbook read; the full current-release live Graph and installed-cache evidence remain pending.
+Current release-candidate evidence: mock Microsoft Graph 208/208, OAuth compatibility 169/169, full/focused/OAuth tool contracts 84/19/19, ChatGPT golden routing 19/19 with 15 ambiguity pairs, prepackage self-check 32/32, materialized resources 50/50, heavyweight admission 24/24, resources/read admission 17/17, bounded local state 3017/3017, and managed quota 11/11. NAS60 is deployed and the refreshed ChatGPT OAuth app passed both a general read-only canary and an exact nested-path workbook read. Fresh source and installed-cache live Graph matrices each passed 97 checks with zero failures, exercised 83 of 84 tools, and completed exact cleanup.
 
 The detailed older sections below preserve prior production evidence as historical baseline and rollback context.
 
@@ -28,7 +28,11 @@ The source tree contained 92 packaged files; NAS staging added one release manif
 
 ChatGPT refreshed the existing mapped app `plugin_asdk_app_6a6995abb030819187d50d7080d4ae95` in place from `https://glovernas.tail5dbbc4.ts.net/mcp` and displayed `Actions refreshed.` All 19 expected actions remained present, and the refreshed `onedrive_open_files` action now documents known root-relative path resolution and a shared bounded filename fallback traversal. No duplicate app was created.
 
-Two post-deployment reads passed without mutation. `onedrive_read_actions` returned one recent item through the existing OAuth connection. Then `onedrive_open_files` opened the known nested workbook path `Personal/Documents/Career Development/QSE Job Tracker.xlsx` in 4,654 ms. The focused mock regression separately proves that this path mode issues one direct metadata request with zero search and zero folder scans, while two filename index misses share each traversed folder once. The full live matrix remains pending, so the release decision remains Pending.
+Two post-deployment reads passed without mutation. `onedrive_read_actions` returned one recent item through the existing OAuth connection. Then `onedrive_open_files` opened the known nested workbook path `Personal/Documents/Career Development/QSE Job Tracker.xlsx` in 4,654 ms. The focused mock regression separately proves that this path mode issues one direct metadata request with zero search and zero folder scans, while two filename index misses share each traversed folder once.
+
+The current-source full live matrix then exercised 83 of the exact 84 tools against the isolated folder `Codex OneDrive Plugin Beta Test codex-beta-nas60-source2-20260814`. It completed 106 checks in 242,771 ms: 97 passed, zero failed, and nine were explicitly blocked by personal-account, provider, or credential-preservation limitations. The only uncalled contract tool was destructive device-code polling. The harness revoked its temporary sharing grants, deleted the exact test folder, verified it absent, and removed its local isolated work directory.
+
+The independently installed versioned cache repeated that result against `Codex OneDrive Plugin Beta Test codex-beta-nas60-installed-20260814`: 106 checks in 264,895 ms, with 97 passed, zero failed, nine explicitly blocked, and 83 of 84 tools exercised. Its remote root and local isolated work were removed. A final stale-root discovery returned zero beta folders, and the source/cache verifier matched all 92 packaged files across bytes, modes, file types, and symlink targets without overwriting an older cache.
 
 ## 2026-08-13 NAS59 and ChatGPT canary
 
@@ -40,7 +44,7 @@ ChatGPT refreshed the mapped OneDrive OAuth app from `https://glovernas.tail5dbb
 
 The source/noauth focused suffix `.37923d62a462` and live OAuth suffix `.d8d3679a1016` are deterministic variants of the same artifact: the OAuth security scheme is included in the advertised contract hash. Direct checks inside the deployed container confirmed exact source parity for `mcp/server.mjs`, `assets/chatgpt-icon.png`, and `.codex-plugin/plugin.json`.
 
-This is deployment and connector-canary evidence only. The current-release full live Microsoft Graph matrix, complete focused live exercise, installed-cache parity, doctor/tenant checks, and cleanup evidence remain pending, so the release decision remains Pending.
+This historical NAS59 section is deployment and connector-canary evidence only; the current NAS60 source and installed-cache matrices, doctor/tenant checks, and cleanup audit now provide the release-complete evidence above.
 
 ## Outcome
 
@@ -112,24 +116,27 @@ Ordinary Chat selected the connected OneDrive plugin and passed root listing, is
 
 Evidence: https://chatgpt.com/c/6a77b265-cac4-83ea-a802-65c093afe437
 
-## Offline verification
+## Offline and release verification
 
-- Mock Microsoft Graph: 188/188
+- Mock Microsoft Graph: 208/208
+- Current source live Microsoft Graph: 97 passed, 0 failed, 9 explicitly blocked; 83/84 tools exercised; exact cleanup passed
+- Installed-cache live Microsoft Graph: 97 passed, 0 failed, 9 explicitly blocked; 83/84 tools exercised; exact cleanup passed
 - Ranked ChatGPT Work search: source and installed-cache live read-only betas each passed 5/5 checks; exact-at-one 3/3; MRR@10 1.0; unrelated top-five 0
-- Full MCP contract: 84 tools, 339,137 descriptor bytes
-- Focused ChatGPT contract: 15 tools, 26,526 bytes; 92.2% reduction
-- Focused OAuth contract: 15 tools, 28,656 bytes
-- Golden routing: 15/15 prompts and 8 ambiguity pairs
+- Full MCP contract: 84 exact tools
+- Focused ChatGPT contract: 19 tools
+- Focused OAuth contract: 19 tools
+- Golden routing: 19/19 prompts and 15 ambiguity pairs
 - OAuth HTTP integration: pass in full and focused profiles
 - OAuth compatibility: 169/169
 - Semantic anchors: 6/6
 - Text patch safety: 6/6
-- Word operation coverage: 21/21
+- Word operation coverage: 22/22
 - Excel operation coverage: 33/33
 - PowerPoint operation coverage: 25/25
 - Genuine Office packages reopened and rendered: DOCX, XLSX, and PPTX pass
 - Storage-root and private-permission tests: pass
-- Plugin package guard, immutable versioned-cache installation, and installed-build parity: pass across 62 package entries
+- Plugin package guard, immutable versioned-cache installation, and installed-build parity: pass across 92 packaged files
+- Final cleanup audit: zero active beta roots, zero temporary permissions or anonymous links, and zero isolated local residue
 
 ## External constraints, not plugin defects
 

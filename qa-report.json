@@ -1,14 +1,14 @@
 {
   "schemaVersion": 2,
-  "decision": "Pending — NAS60 nested-folder optimization and the refreshed ChatGPT 19-action OAuth app passed; the full live Microsoft Graph and installed-cache parity matrix remains pending",
+  "decision": "Pass — NAS60 nested-folder optimization, the refreshed ChatGPT 19-action OAuth app, both full live Microsoft Graph matrices, installed-cache parity, and zero-residue cleanup passed",
   "date": "2026-08-14",
-  "generatedAt": "2026-08-14T20:35:27Z",
+  "generatedAt": "2026-08-14T21:02:00Z",
   "source": {
-    "commit": "19029bff8ee6a525b695e3b7c808b91334696442",
+    "commit": "89281afb6d74fab35edd470ba50b74b98df3cc0c",
     "pluginVersion": "0.6.4+codex.20260813025943",
     "serverVersion": "0.6.4+codex.20260813025943.chatgpt.fd16f4230688",
     "serverSha256": "1e82d65f417fca38daef6a95b7a1f85c8e403576756f7f7ff12a626d28e0a2ab",
-    "contentDigest": "31a68740b900ee17a6cd56d0a260f2ee82b193e8f9ebc3ec1efc3f54542023f0",
+    "contentDigest": "a85b93fd8102a9350e841ccdb2186937798a6de433d3739e2c98ae8374ed1197",
     "workingTree": "Release code is committed at the recorded commit; changes after that commit are limited to QA evidence."
   },
   "contract": {
@@ -32,11 +32,57 @@
     { "name": "Office security corpus", "status": "pass" },
     { "name": "Genuine package reopening", "status": "pass" },
     { "name": "Mock Microsoft Graph", "status": "pass", "checks": 208 },
-    { "name": "Read-only OneDrive doctor and tenant checks", "status": "pending" },
-    { "name": "Cleanup preview", "status": "pending" },
+    { "name": "Read-only OneDrive doctor and tenant checks", "status": "pass" },
+    { "name": "Cleanup preview", "status": "pass" },
     { "name": "Whitespace", "status": "pass" }
   ],
   "liveRuns": {
+    "source": {
+      "status": "pass",
+      "surface": "Current source full 84-tool profile against connected personal OneDrive",
+      "runId": "codex-beta-nas60-source2-20260814",
+      "folderName": "Codex OneDrive Plugin Beta Test codex-beta-nas60-source2-20260814",
+      "runtimeMs": 242771,
+      "report": "work/qa-artifacts/live-codex-beta-20260814-nas60-source2.json",
+      "toolCoverage": {
+        "contract": 84,
+        "exercised": 83,
+        "blocked": 1,
+        "blockedTools": ["onedrive_auth_device_poll"]
+      },
+      "checkSummary": {
+        "pass": 97,
+        "fail": 0,
+        "blocked": 9,
+        "total": 106
+      },
+      "cleanupVerified": true,
+      "localWorkCleaned": true,
+      "remoteMutations": "isolated disposable fixtures only"
+    },
+    "installed": {
+      "status": "pass",
+      "surface": "Installed versioned-cache full 84-tool profile against connected personal OneDrive",
+      "runId": "codex-beta-nas60-installed-20260814",
+      "folderName": "Codex OneDrive Plugin Beta Test codex-beta-nas60-installed-20260814",
+      "runtimeMs": 264895,
+      "report": "work/qa-artifacts/live-codex-beta-20260814-nas60-installed.json",
+      "toolCoverage": {
+        "contract": 84,
+        "exercised": 83,
+        "blocked": 1,
+        "blockedTools": ["onedrive_auth_device_poll"]
+      },
+      "checkSummary": {
+        "pass": 97,
+        "fail": 0,
+        "blocked": 9,
+        "total": 106
+      },
+      "cleanupVerified": true,
+      "localWorkCleaned": true,
+      "remoteMutations": "isolated disposable fixtures only"
+    },
     "chatgptWorkRankedSearch": {
       "status": "pass",
       "surface": "Focused 15-tool ChatGPT Work profile against connected personal OneDrive",
@@ -287,19 +333,28 @@
     }
   },
   "installedBuild": {
-    "status": "pending",
+    "status": "pass",
     "version": "0.6.4+codex.20260813025943",
     "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.4+codex.20260813025943",
     "oldCacheOverwritten": false
   },
   "sourceCacheParity": {
-    "status": "pending",
-    "filesChecked": 0,
-    "bytes": "pending",
-    "modes": "pending",
-    "types": "pending",
-    "symlinkTargets": "pending",
-    "serverSha256Matched": false
+    "status": "pass",
+    "filesChecked": 92,
+    "bytes": "pass",
+    "modes": "pass",
+    "types": "pass",
+    "symlinkTargets": "pass",
+    "serverSha256Matched": true
+  },
+  "cleanup": {
+    "status": "pass",
+    "auditRunId": "codex-beta-nas60-cleanup-audit-20260814",
+    "report": "work/qa-artifacts/live-codex-beta-20260814-nas60-cleanup-audit.json",
+    "remoteTestRootsRemaining": 0,
+    "permissionsRemaining": 0,
+    "anonymousLinksRemaining": 0,
+    "isolatedLocalResidue": false
   },
   "deployment": {
     "status": "pass",
