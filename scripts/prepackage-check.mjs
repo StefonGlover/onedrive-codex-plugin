@@ -729,8 +729,11 @@ function checkToolSchemas() {
     env: { ...process.env, ONEDRIVE_TEST_ACCESS_TOKEN: "prepackage-schema-check" },
     timeout: 10_000
   });
-  if (result.error) return fail(`Could not inspect MCP tool schemas: ${result.error.message}`);
-  if (result.status !== 0 && result.signal !== "SIGTERM") {
+  const boundedInspectionTimeout = result.error?.code === "ETIMEDOUT";
+  if (result.error && !boundedInspectionTimeout) {
+    return fail(`Could not inspect MCP tool schemas: ${result.error.message}`);
+  }
+  if (result.status !== 0 && result.signal !== "SIGTERM" && !boundedInspectionTimeout) {
     return fail(`MCP schema inspection failed: ${result.stderr || result.stdout}`);
   }
   const lines = (result.stdout || "").trim().split("\n").filter(Boolean);
