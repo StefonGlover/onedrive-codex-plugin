@@ -2,7 +2,7 @@
 
 Local Codex plugin for OneDrive file operations through Microsoft Graph.
 
-Release `0.6.4+codex.20260816165025` adds five remotely importable workflow skills, clearer focused Office schemas, explicit personal-account responses for enterprise-only reads, and a subject-scoped 60-second folder-list snapshot with mutation invalidation. It retains filename-only visible hyperlinks, direct link opening, the 19-tool ChatGPT surface, the full 84-tool trusted-local profile, account-and-drive-isolated state, bounded Office inspection and review, materialized downloads and previews, guarded version restore, enterprise exact-drive reads, and prior nested-folder performance improvements.
+Release `0.6.4+codex.20260816170509` adds five remotely importable workflow skills, clearer focused Office schemas, explicit personal-account responses for enterprise-only reads, a subject-scoped 60-second folder-list snapshot with mutation invalidation, and NAS startup ownership for private materialized downloads/previews. It retains filename-only visible hyperlinks, direct link opening, the 19-tool ChatGPT surface, the full 84-tool trusted-local profile, account-and-drive-isolated state, bounded Office inspection and review, guarded version restore, enterprise exact-drive reads, and prior nested-folder performance improvements.
 
 ChatGPT surface note (updated 2026-08-13): the focused 19-tool surface covers discovery, Office inspection/editing/review, materialized downloads and visual previews, recent/version history, enterprise drive libraries, CRUD, sharing, and permissions. Redundant standalone tools remain available only in the full profile; a focused-profile `tools/call` now rejects every unadvertised tool instead of treating a hidden handler as executable compatibility surface. Work requires the delegated OAuth deployment and public compatibility origin described below. Direct Entra v2 endpoints are not sufficient because ChatGPT correctly sends the MCP `resource` parameter and Entra v2 rejects that parameter.
 
@@ -528,14 +528,14 @@ Preview the exact new versioned cache directory, then install only after reviewi
 
 ```bash
 node scripts/install-versioned-cache.mjs
-node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260816165025"
+node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260816170509"
 ```
 
 After both live betas, regenerate the two QA reports, preview their exact sync into that new cache, then apply only those evidence files and re-run parity:
 
 ```bash
-node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260816165025"
-node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260816165025"
+node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260816170509"
+node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260816170509"
 ```
 
 Office compatibility checks are split by purpose:

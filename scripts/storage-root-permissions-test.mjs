@@ -41,8 +41,10 @@ try {
 
   if (!workbook?.sheets?.length) throw new Error("Excel fixture inspection returned no worksheets.");
   const synologyEntrypoint = await readFile(join(pluginRoot, "deploy", "synology", "entrypoint.sh"), "utf8");
-  if (!synologyEntrypoint.includes("/data/chatgpt-uploads")) {
-    throw new Error("Synology entrypoint must pre-create the ChatGPT attachment staging directory for the unprivileged runtime user.");
+  for (const directory of ["/data/chatgpt-uploads", "/data/materialized-resources"]) {
+    if (!synologyEntrypoint.includes(directory)) {
+      throw new Error(`Synology entrypoint must pre-create ${directory} for the unprivileged runtime user.`);
+    }
   }
   for (const secretName of ["oauth-api-client.secret", "oauth-chatgpt-client.secret"]) {
     if (!synologyEntrypoint.includes(`$source_dir/${secretName}`)
@@ -60,6 +62,7 @@ try {
     storageRoot: process.env.ONEDRIVE_STORAGE_ROOT,
     sheets: workbook.sheets.length,
     synologyChatgptUploadRootReady: true,
+    synologyMaterializedResourceRootReady: true,
     synologyOAuthSecretsSeparated: true
   }, null, 2)}\n`);
 } finally {
