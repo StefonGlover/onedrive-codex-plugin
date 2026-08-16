@@ -347,6 +347,15 @@ try {
   }
   const reviewAnnotations = chatgpt.compatibility.onedrive_office_review?.annotations;
   assert(reviewAnnotations?.readOnlyHint === false && reviewAnnotations?.openWorldHint === false && reviewAnnotations?.destructiveHint === true, "Office review must advertise its comment/note mutation impact without claiming external publication.", reviewAnnotations);
+  for (const [name, requiredFields] of Object.entries({
+    onedrive_office_inspect: ["kind", "itemId", "path"],
+    onedrive_office_review: ["kind", "operation", "itemId", "path"],
+    onedrive_download_file: ["itemId", "path", "format"],
+    onedrive_render_preview: ["itemId", "path", "pages"]
+  })) {
+    const schema = chatgpt.compatibility[name]?.inputSchema;
+    assert(!schema?.anyOf && requiredFields.every((field) => field in (schema?.properties || {})), `${name} must advertise stable named selector fields instead of an anonymous object union.`, schema);
+  }
   assert(chatgpt.compatibility.onedrive_read_actions?.inputSchema?.properties?.actions?.items?.properties?.limit?.maximum === 200, "Combined reads must accept the server's bounded 200-item list/search limit.", chatgpt.compatibility.onedrive_read_actions);
   assert(chatgpt.compatibility.onedrive_preview_actions?.annotations?.openWorldHint === false && chatgpt.compatibility.onedrive_preview_actions?.annotations?.destructiveHint === false, "Action previews must not be classified as publishing or destructive.", chatgpt.compatibility.onedrive_preview_actions);
   assert(chatgpt.compatibility.onedrive_commit_actions?.annotations?.openWorldHint === true && chatgpt.compatibility.onedrive_commit_actions?.annotations?.destructiveHint === true, "Guarded batch commits must advertise their maximum publishing and destructive impact.", chatgpt.compatibility.onedrive_commit_actions);
@@ -399,6 +408,7 @@ try {
   const inviteSchema = chatgpt.compatibility.onedrive_invite_permission?.inputSchema?.properties || {};
   assert(inviteSchema.recipients?.description?.includes("exactly one of email, alias, or objectId") && inviteSchema.expectedName?.description?.includes("provide this or expectedId") && inviteSchema.previewToken?.description?.includes("not an auth credential"), "Focused permission invitations must retain recipient and guarded-live-call argument guidance.", inviteSchema);
   const officeItemSchema = chatgpt.compatibility.onedrive_office_batch_transform?.inputSchema?.properties?.items?.items?.properties || {};
+  assert(!chatgpt.compatibility.onedrive_office_batch_transform?.inputSchema?.properties?.items?.items?.anyOf, "Focused Office transform items must advertise named kind/target/operations fields instead of anonymous selector unions.", chatgpt.compatibility.onedrive_office_batch_transform?.inputSchema?.properties?.items?.items);
   assert(officeItemSchema.path?.description?.includes("relative to OneDrive root") && officeItemSchema.operations?.description?.includes("onedrive_office_capabilities") && officeItemSchema.operations?.description?.includes("addTableRow") && officeItemSchema.operations?.description?.includes("two-dimensional") && officeItemSchema.expectedId?.description?.includes("expectedName"), "Focused Office batches must retain selector, addTableRow shape, capabilities-handoff, and identity guidance.", officeItemSchema);
   assert(chatgpt.metadata.every((tool) => /^Use this (?:when|before|to|for)\b/u.test(tool.description || "")), "Every focused ChatGPT tool description must begin with a discriminative 'Use this …' cue.", chatgpt.metadata);
   assert(new Set(chatgpt.metadata.map((tool) => tool.description)).size === chatgpt.metadata.length, "Focused ChatGPT tool descriptions must be unique.", chatgpt.metadata);

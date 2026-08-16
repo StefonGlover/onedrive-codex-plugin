@@ -6583,6 +6583,65 @@ process.exit(2);
     return { nativeRestorePosts: restorePosts.length, contentPuts: 0, staleRejected: true, replayRejected: true };
   });
 
+  await check("focused enterprise reads return structured not-applicable results for personal accounts", async () => {
+    enterpriseAccountMode = false;
+    const before = requests.length;
+    const read = await tool("onedrive_read_actions", {
+      actions: [
+        { operation: "drives", limit: 10 },
+        { operation: "enterpriseSearch", query: "Quarterly plan", limit: 10 },
+        { operation: "libraryList", driveId: "CaseSensitiveDrive-01", limit: 10 }
+      ]
+    });
+    assert(!read.isError && read.value.results?.every((entry) => entry.isError === false), "personal-account enterprise reads should negotiate capability without tool errors", read);
+    for (const result of read.value.results || []) {
+      assert(
+        result.value?.supported === false
+          && result.value?.notApplicable === true
+          && result.value?.status === "not_applicable"
+          && result.value?.reason === "personal_account"
+          && result.value?.requestedOperation === result.operation
+          && result.value?.validPersonalRoute?.operation,
+        "personal-account enterprise results must be explicit, structured, and route-aware",
+        result
+      );
+    }
+    const added = requests.slice(before);
+    assert(added.filter((entry) => entry.path === "/v1.0/me/drive").length === 1, "a focused enterprise batch should share one account capability check", added);
+    assert(!added.some((entry) => entry.path === "/v1.0/me/drives" || entry.path === "/v1.0/search/query" || entry.path.startsWith("/v1.0/drives/")), "personal-account capability negotiation must not call enterprise endpoints or silently fall back", added);
+    return { negotiated: read.value.results.length, accountChecks: 1, enterpriseCalls: 0 };
+  });
+
+  await check("focused repeated folder lists use a short-lived scoped snapshot and mutations invalidate it", async () => {
+    const focused = createMcpClient({ ONEDRIVE_TOOL_PROFILE: "chatgpt" }, "focused-list-snapshot");
+    const before = requests.length;
+    try {
+      const first = await focused.tool("onedrive_read_actions", {
+        actions: [{ operation: "list", path: "", limit: 5, format: "compact" }]
+      });
+      const second = await focused.tool("onedrive_read_actions", {
+        actions: [{ operation: "list", path: "", limit: 5, format: "compact" }]
+      });
+      assert(!first.isError && !second.isError, "focused repeated folder lists should succeed", { first, second });
+      assert(second.value.results?.[0]?.value?.cache?.hit === true, "the second identical focused list should report a scoped in-memory hit", second);
+      const warmRequests = requests.slice(before).filter((entry) => entry.path === "/v1.0/me/drive/root/children");
+      assert(warmRequests.length === 1, "the second identical focused list should avoid a duplicate Graph children read", warmRequests);
+
+      const created = await focused.tool("onedrive_create_folder", { name: "Snapshot invalidation fixture", parentPath: "", conflictBehavior: "fail" });
+      assert(!created.isError, "the snapshot invalidation fixture should be created", created);
+      const childrenReadsBeforeThird = requests.slice(before).filter((entry) => entry.path === "/v1.0/me/drive/root/children").length;
+      const third = await focused.tool("onedrive_read_actions", {
+        actions: [{ operation: "list", path: "", limit: 5, format: "compact" }]
+      });
+      assert(!third.isError && third.value.results?.[0]?.value?.cache?.hit !== true, "a successful mutation must invalidate the focused list snapshot", third);
+      const afterMutationRequests = requests.slice(before).filter((entry) => entry.path === "/v1.0/me/drive/root/children");
+      assert(afterMutationRequests.length === childrenReadsBeforeThird + 1, "the first post-mutation list should return to Graph", afterMutationRequests);
+      return { firstGraphReads: 1, warmGraphReads: 0, postMutationGraphReads: 1 };
+    } finally {
+      await focused.close();
+    }
+  });
+
   await check("focused enterprise discovery returns opaque exact-drive fetch IDs without default-drive state leakage", async () => {
     enterpriseAccountMode = true;
     const before = requests.length;

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync, spawn } from "node:child_process";
-import { constants, createReadStream, createWriteStream, readFileSync } from "node:fs";
+import { constants, createReadStream, createWriteStream, readFileSync, readdirSync } from "node:fs";
 import { appendFile, chmod, copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename as renameFile, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, parse, relative, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -38,6 +38,69 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, "..");
 const pluginManifest = JSON.parse(readFileSync(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"));
+const remoteSkillNames = ["onedrive", "onedrive-excel", "onedrive-powerpoint", "onedrive-review", "onedrive-word"];
+
+function parseRemoteSkillFrontmatter(markdown, skillName) {
+  const match = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/u);
+  if (!match) throw new Error(`Remote skill ${skillName} is missing YAML front matter.`);
+  const frontmatter = {};
+  for (const line of match[1].split(/\r?\n/u)) {
+    const separator = line.indexOf(":");
+    if (separator < 1) throw new Error(`Remote skill ${skillName} contains unsupported YAML front matter.`);
+    const key = line.slice(0, separator).trim();
+    const value = line.slice(separator + 1).trim();
+    if (!/^[A-Za-z0-9_-]+$/u.test(key) || !value || Object.hasOwn(frontmatter, key)) {
+      throw new Error(`Remote skill ${skillName} contains invalid YAML front matter.`);
+    }
+    frontmatter[key] = value;
+  }
+  if (frontmatter.name !== skillName || !frontmatter.description) {
+    throw new Error(`Remote skill ${skillName} front matter must declare its exact name and description.`);
+  }
+  return frontmatter;
+}
+
+function listRemoteSkillFiles(directory, relativeDirectory = "") {
+  const files = [];
+  for (const entry of readdirSync(directory, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
+    if (entry.isSymbolicLink()) throw new Error(`Remote skill resources may not contain symbolic links: ${entry.name}`);
+    const relativePath = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
+    const absolutePath = join(directory, entry.name);
+    if (entry.isDirectory()) files.push(...listRemoteSkillFiles(absolutePath, relativePath));
+    else if (entry.isFile()) files.push({ relativePath, absolutePath });
+    else throw new Error(`Remote skill resources must be regular files: ${relativePath}`);
+  }
+  return files;
+}
+
+function buildRemoteSkillCatalog() {
+  const resourceMap = new Map();
+  const skills = remoteSkillNames.map((skillName) => {
+    const skillRoot = join(pluginRoot, "skills", skillName);
+    const files = listRemoteSkillFiles(skillRoot);
+    const resources = files.map(({ relativePath, absolutePath }) => {
+      const content = readFileSync(absolutePath);
+      const uri = `skill://onedrive/${skillName}/${relativePath}`;
+      resourceMap.set(uri, {
+        uri,
+        mimeType: relativePath.endsWith(".md") ? "text/markdown" : relativePath.endsWith(".yaml") ? "application/yaml" : "application/octet-stream",
+        content
+      });
+      return { uri, digest: `sha256:${createHash("sha256").update(content).digest("hex")}` };
+    });
+    const skillUri = `skill://onedrive/${skillName}/SKILL.md`;
+    const skillResource = resourceMap.get(skillUri);
+    if (!skillResource) throw new Error(`Remote skill ${skillName} is missing SKILL.md.`);
+    return {
+      uri: skillUri,
+      frontmatter: parseRemoteSkillFrontmatter(skillResource.content.toString("utf8"), skillName),
+      resources
+    };
+  });
+  return { skills, resourceMap };
+}
+
+const remoteSkillCatalog = buildRemoteSkillCatalog();
 const chatgptIconDataUri = `data:image/png;base64,${readFileSync(join(pluginRoot, "assets", "chatgpt-icon.png")).toString("base64")}`;
 const defaultStorageRoot = join(homedir(), ".codex", "onedrive-plugin");
 const configPath = join(defaultStorageRoot, "config.json");
@@ -108,6 +171,8 @@ const enterpriseDriveItemIdMaxLength = 4096;
 const enterpriseDriveItemPartMaxLength = 1024;
 const chatgptStaleCacheMaxAgeSeconds = 24 * 60 * 60;
 const chatgptRevalidationCooldownMs = 30 * 1000;
+const chatgptListSnapshotTtlMs = 60 * 1000;
+const chatgptListSnapshotMaxEntries = 128;
 const chatgptFileBlockedIpv4Addresses = new BlockList();
 const chatgptFileBlockedIpv6Addresses = new BlockList();
 for (const [network, prefix, family] of [
@@ -242,6 +307,7 @@ const previewTokensByScope = new Map();
 const watchTimersByScope = new Map();
 const excelSessionPool = new Map();
 const chatgptFetchSnapshotsByScope = new Map();
+const chatgptListSnapshots = new Map();
 const chatgptRevalidations = new Map();
 const chatgptRevalidationLastStartedAt = new Map();
 const chatgptCacheWarmStates = new Map();
@@ -3036,7 +3102,10 @@ function compactChatgptToolDescriptor(tool) {
   }
   if (compact.name === "onedrive_office_batch_transform") {
     const item = compact.inputSchema?.properties?.items?.items;
-    if (item?.properties) item.properties.operations = JSON.parse(JSON.stringify(compactOfficeOperationSchema));
+    if (item?.properties) {
+      delete item.anyOf;
+      item.properties.operations = JSON.parse(JSON.stringify(compactOfficeOperationSchema));
+    }
   } else if ([
     "onedrive_word_batch_update",
     "onedrive_excel_batch_update",
@@ -3050,6 +3119,18 @@ function compactChatgptToolDescriptor(tool) {
   // validation keyword while retaining only the selector and credential-safety
   // descriptions that materially affect model arguments.
   stripSchemaDescriptions(compact.inputSchema);
+  if ([
+    "onedrive_office_inspect",
+    "onedrive_office_review",
+    "onedrive_download_file",
+    "onedrive_render_preview"
+  ].includes(compact.name)) {
+    // A top-level anyOf containing only alternate required fields is rendered
+    // by some ChatGPT clients as anonymous object unions. The handlers already
+    // enforce exactly one item selector and return actionable validation
+    // errors, so advertise the stable named fields directly.
+    delete compact.inputSchema.anyOf;
+  }
   if (compact.name === "onedrive_export_file") {
     compact.inputSchema = {
       type: "object",
@@ -3476,6 +3557,7 @@ function invalidateActiveStorageScope() {
   contentIndexRuntimeStates.clear();
   previewTokensByScope.clear();
   chatgptFetchSnapshotsByScope.clear();
+  chatgptListSnapshots.clear();
   chatgptRevalidations.clear();
   chatgptRevalidationLastStartedAt.clear();
   for (const timers of watchTimersByScope.values()) {
@@ -6638,6 +6720,7 @@ function sanitizeAuditValue(value) {
 }
 
 async function writeMutationAudit(tool, entry) {
+  if (entry?.status === "success") invalidateChatgptListSnapshots();
   const record = sanitizeAuditValue({
     timestamp: new Date().toISOString(),
     tool,
@@ -6900,13 +6983,80 @@ function decodeGraphPath(path = "") {
   }
 }
 
+function chatgptListSnapshotKey(args = {}) {
+  if (toolProfile !== "chatgpt" || args.itemId || args.preset || args.relativePath) return null;
+  const authContextId = currentAuthContextId();
+  if (!authContextId) return null;
+  return JSON.stringify({
+    authContextId,
+    path: cleanPath(args.path || ""),
+    limit: clampInteger(args.limit, 100, 1, 200),
+    select: args.select || defaultSelect,
+    format: args.format || "compact"
+  });
+}
+
+function pruneChatgptListSnapshots(now = Date.now()) {
+  for (const [key, snapshot] of chatgptListSnapshots) {
+    if (now - snapshot.storedAt >= chatgptListSnapshotTtlMs) chatgptListSnapshots.delete(key);
+  }
+  while (chatgptListSnapshots.size > chatgptListSnapshotMaxEntries) {
+    chatgptListSnapshots.delete(chatgptListSnapshots.keys().next().value);
+  }
+}
+
+function invalidateChatgptListSnapshots() {
+  const authContextId = currentAuthContextId();
+  if (!authContextId) {
+    chatgptListSnapshots.clear();
+    return;
+  }
+  for (const key of chatgptListSnapshots.keys()) {
+    try {
+      if (JSON.parse(key).authContextId === authContextId) chatgptListSnapshots.delete(key);
+    } catch {
+      chatgptListSnapshots.delete(key);
+    }
+  }
+}
+
+function readChatgptListSnapshot(args = {}) {
+  const key = chatgptListSnapshotKey(args);
+  if (!key) return null;
+  const now = Date.now();
+  pruneChatgptListSnapshots(now);
+  const snapshot = chatgptListSnapshots.get(key);
+  if (!snapshot) return null;
+  return {
+    ...structuredClone(snapshot.value),
+    cache: {
+      hit: true,
+      source: "scoped_memory",
+      ageMs: Math.max(0, now - snapshot.storedAt),
+      ttlMs: chatgptListSnapshotTtlMs
+    }
+  };
+}
+
+function rememberChatgptListSnapshot(args = {}, value = {}) {
+  const key = chatgptListSnapshotKey(args);
+  if (!key) return;
+  chatgptListSnapshots.delete(key);
+  chatgptListSnapshots.set(key, { storedAt: Date.now(), value: structuredClone(value) });
+  pruneChatgptListSnapshots();
+}
+
 async function list(args = {}) {
+  const cached = readChatgptListSnapshot(args);
+  if (cached) return cached;
   const params = new URLSearchParams();
   params.set("$top", String(clampInteger(args.limit, 100, 1, 200)));
   params.set("$select", args.select || defaultSelect);
   const result = await graph(`${childrenPath(args)}?${params.toString()}`);
   await bestEffortLocalWrite("metadata cache update", async () => await cacheItems(result.value || []));
-  return { items: (result.value || []).map((item) => formatDriveItem(item, args.format)), nextLink: result["@odata.nextLink"] || null };
+  const value = { items: (result.value || []).map((item) => formatDriveItem(item, args.format)), nextLink: result["@odata.nextLink"] || null };
+  rememberChatgptListSnapshot(args, value);
+  return value;
 }
 
 function isDeltaCursor(value) {
@@ -13311,11 +13461,36 @@ function validateChatgptReadAction(action, index) {
   if (action.operation === "recent" && (action.itemId || action.path !== undefined)) throw new Error(`Read action ${index} recent does not accept an item target.`);
   if (action.operation === "compareVersion" && !action.versionId) throw new Error(`Read action ${index} compareVersion requires versionId.`);
   if (action.operation === "libraryList" && !action.driveId) throw new Error(`Read action ${index} libraryList requires driveId.`);
+  if (action.operation === "libraryList") {
+    validateEnterpriseDriveItemPart(action.driveId, "drive ID");
+    if (action.folderItemId) validateEnterpriseDriveItemPart(action.folderItemId, "folder item ID");
+  }
   if (action.operation === "enterpriseSearch" && !String(action.query || "").trim()) throw new Error(`Read action ${index} enterpriseSearch requires query.`);
   if (action.operation === "officeBackups" && action.path !== undefined) throw new Error(`Read action ${index} officeBackups accepts itemId only as an optional filter.`);
 }
 
-async function chatgptReadAction(action, index) {
+const enterpriseReadOperations = new Set(["drives", "enterpriseSearch", "libraryList"]);
+
+function enterpriseReadNotApplicable(operation, drive = {}) {
+  const alternatives = {
+    drives: { operation: "list", path: "" },
+    enterpriseSearch: { operation: "search" },
+    libraryList: { operation: "list", path: "" }
+  };
+  return {
+    supported: false,
+    notApplicable: true,
+    status: "not_applicable",
+    reason: "personal_account",
+    requestedOperation: operation,
+    driveType: "personal",
+    driveId: drive.id || null,
+    validPersonalRoute: alternatives[operation],
+    note: "This enterprise-library operation is unavailable for a personal OneDrive account. No personal-drive fallback was executed."
+  };
+}
+
+async function chatgptReadAction(action, index, enterpriseDrive = null) {
   const startedAt = Date.now();
   try {
     validateChatgptReadAction(action, index);
@@ -13346,11 +13521,11 @@ async function chatgptReadAction(action, index) {
     } else if (action.operation === "compareVersion") {
       value = await compareVersion({ ...target, versionId: action.versionId, compareToVersionId: action.compareToVersionId, maxChanges: action.maxChanges });
     } else if (action.operation === "drives") {
-      value = await listAccessibleDrives(action);
+      value = await listAccessibleDrives(action, enterpriseDrive);
     } else if (action.operation === "enterpriseSearch") {
-      value = await enterpriseDriveSearch(action);
+      value = await enterpriseDriveSearch(action, enterpriseDrive);
     } else if (action.operation === "libraryList") {
-      value = await libraryList(action);
+      value = await libraryList(action, enterpriseDrive);
     } else {
       throw new Error(`Unsupported read operation: ${action.operation}.`);
     }
@@ -13493,8 +13668,25 @@ function reconcileChatgptReadResults(results = []) {
 async function chatgptReadActions(args = {}) {
   const startedAt = Date.now();
   const indexed = (args.actions || []).map((action, index) => ({ action, index }));
+  let enterpriseDrive = null;
+  const requiresEnterprisePreflight = indexed.some(({ action, index }) => {
+    try {
+      validateChatgptReadAction(action, index);
+      return enterpriseReadOperations.has(action.operation);
+    } catch {
+      return false;
+    }
+  });
+  if (requiresEnterprisePreflight) {
+    try {
+      enterpriseDrive = await graph("/me/drive?$select=id,driveType");
+    } catch {
+      // Preserve the existing per-operation error behavior when account
+      // capability discovery itself is unavailable.
+    }
+  }
   const results = await mapWithConcurrency(indexed, 3, async ({ action, index }) => (
-    await chatgptReadAction(action, index)
+    await chatgptReadAction(action, index, enterpriseDrive)
   ));
   const reconciled = reconcileChatgptReadResults(results);
   return {
@@ -13885,7 +14077,9 @@ async function recent(args = {}) {
   return { items: (result.value || []).map((item) => formatDriveItem(item, args.format)), count: (result.value || []).length };
 }
 
-async function listAccessibleDrives(args = {}) {
+async function listAccessibleDrives(args = {}, knownDrive = null) {
+  const drive = knownDrive || await graph("/me/drive?$select=id,driveType");
+  if (drive?.driveType === "personal") return enterpriseReadNotApplicable("drives", drive);
   const limit = clampInteger(args.limit, 25, 1, 200);
   const result = await graph(`/me/drives?$select=id,name,driveType,webUrl,quota,system&$top=${limit}`);
   const drives = (result.value || []).slice(0, limit).map((drive) => ({
@@ -13900,10 +14094,10 @@ async function listAccessibleDrives(args = {}) {
   return { drives, count: drives.length, nextLink: result["@odata.nextLink"] || null };
 }
 
-async function enterpriseDriveSearch(args = {}) {
-  const drive = await graph("/me/drive?$select=id,driveType");
+async function enterpriseDriveSearch(args = {}, knownDrive = null) {
+  const drive = knownDrive || await graph("/me/drive?$select=id,driveType");
   if (drive?.driveType === "personal") {
-    throw new Error("Enterprise search requires a Microsoft work or school account and tenant-consented Files.Read.All or Sites.Read.All access.");
+    return enterpriseReadNotApplicable("enterpriseSearch", drive);
   }
   const limit = clampInteger(args.limit, 25, 1, 50);
   let result;
@@ -13957,7 +14151,9 @@ async function enterpriseDriveSearch(args = {}) {
   };
 }
 
-async function libraryList(args = {}) {
+async function libraryList(args = {}, knownDrive = null) {
+  const drive = knownDrive || await graph("/me/drive?$select=id,driveType");
+  if (drive?.driveType === "personal") return enterpriseReadNotApplicable("libraryList", drive);
   const limit = clampInteger(args.limit, 25, 1, 200);
   const driveId = validateEnterpriseDriveItemPart(args.driveId, "drive ID");
   const base = `/drives/${encodeURIComponent(driveId)}`;
@@ -17304,7 +17500,11 @@ export async function processMcpMessage(message, requestAuth = null) {
       }
       return resultMessage(id, {
         protocolVersion: supportedProtocolVersions.has(requestedProtocolVersion) ? requestedProtocolVersion : "2024-11-05",
-        capabilities: { tools: {}, resources: { subscribe: false, listChanged: false } },
+        capabilities: {
+          tools: {},
+          resources: { subscribe: false, listChanged: false },
+          extensions: { "io.modelcontextprotocol/skills": {} }
+        },
         instructions: serverInstructions,
         serverInfo: {
           name: "onedrive",
@@ -17325,10 +17525,28 @@ export async function processMcpMessage(message, requestAuth = null) {
       }
       return resultMessage(id, { tools: advertisedTools });
     }
+    if (method === "skills/list") {
+      if (params.cursor !== undefined && params.cursor !== null && params.cursor !== "") {
+        return errorMessage(id, -32602, "skills/list cursor is invalid or expired.");
+      }
+      return resultMessage(id, { skills: remoteSkillCatalog.skills });
+    }
+    if (method === "skills/get") {
+      const skill = remoteSkillCatalog.skills.find((entry) => entry.uri === params.uri);
+      if (!skill) return errorMessage(id, -32602, "skills/get requires a listed OneDrive SKILL.md URI.");
+      return resultMessage(id, { skill });
+    }
     if (method === "resources/list") {
       return resultMessage(id, { resources: [] });
     }
     if (method === "resources/read") {
+      const remoteSkillResource = remoteSkillCatalog.resourceMap.get(params.uri);
+      if (remoteSkillResource) {
+        const content = remoteSkillResource.mimeType === "application/octet-stream"
+          ? { uri: remoteSkillResource.uri, mimeType: remoteSkillResource.mimeType, blob: remoteSkillResource.content.toString("base64") }
+          : { uri: remoteSkillResource.uri, mimeType: remoteSkillResource.mimeType, text: remoteSkillResource.content.toString("utf8") };
+        return resultMessage(id, { contents: [content] });
+      }
       if (oauthSettings().mode === "oauth" && requestAuth?.authMode === "oauth_server_error") return resultMessage(id, oauthUnavailableResult());
       if (oauthSettings().mode === "oauth" && requestAuth?.authMode !== "oauth") return resultMessage(id, oauthRequiredResult(requestAuth?.error));
       const callContext = {

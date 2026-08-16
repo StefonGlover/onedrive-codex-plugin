@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -221,6 +222,40 @@ try {
     skillReferences[skillDirectory] = references;
   }
 
+  const server = await import("../mcp/server.mjs");
+  const initialized = await server.processMcpMessage({
+    jsonrpc: "2.0",
+    id: 10,
+    method: "initialize",
+    params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "remote-skill-test", version: "1" } }
+  });
+  if (!initialized.result?.capabilities?.extensions?.["io.modelcontextprotocol/skills"]) {
+    fail("MCP initialize must advertise the remote skills extension.", initialized.result?.capabilities);
+  }
+  const listedSkills = await server.processMcpMessage({ jsonrpc: "2.0", id: 11, method: "skills/list", params: {} });
+  const remoteSkills = listedSkills.result?.skills;
+  if (!Array.isArray(remoteSkills)) fail("skills/list must return a skill catalog.", listedSkills);
+  assertExactSet(remoteSkills.map((skill) => skill.frontmatter?.name), requiredSkills, "Remote skills/list names");
+  for (const skill of remoteSkills) {
+    if (skill.uri !== `skill://onedrive/${skill.frontmatter.name}/SKILL.md`) {
+      fail("Remote skill URI must use the stable OneDrive skill namespace.", skill);
+    }
+    if (!skill.frontmatter.description || !Array.isArray(skill.resources) || !skill.resources.length) {
+      fail("Remote skills must include front matter and a complete resource manifest.", skill);
+    }
+    const fetched = await server.processMcpMessage({ jsonrpc: "2.0", id: 12, method: "skills/get", params: { uri: skill.uri } });
+    if (JSON.stringify(fetched.result?.skill) !== JSON.stringify(skill)) fail("skills/get must return the exact catalog entry.", fetched);
+    for (const resource of skill.resources) {
+      const read = await server.processMcpMessage({ jsonrpc: "2.0", id: 13, method: "resources/read", params: { uri: resource.uri } });
+      const content = read.result?.contents?.[0];
+      if (!content || content.uri !== resource.uri) fail("resources/read must return exactly the requested skill resource.", read);
+      const bytes = typeof content.text === "string" ? Buffer.from(content.text, "utf8") : Buffer.from(content.blob || "", "base64");
+      const digest = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+      if (digest !== resource.digest) fail("Remote skill resource digest does not match resources/read.", { resource, digest });
+    }
+  }
+  await server.shutdownOneDriveServer();
+
   console.log(JSON.stringify({
     ok: true,
     declaration: relative(pluginRoot, declarationPath),
@@ -228,7 +263,11 @@ try {
     compositeOperations: Object.fromEntries(
       Object.entries(compositeDeclarations).map(([toolName, declarationKey]) => [toolName, focusedDeclaration[declarationKey]])
     ),
-    skillReferences
+    skillReferences,
+    remoteSkills: {
+      count: remoteSkills.length,
+      resources: remoteSkills.reduce((total, skill) => total + skill.resources.length, 0)
+    }
   }, null, 2));
 } catch (error) {
   console.error(JSON.stringify({ ok: false, error: error.message, details: error.details }, null, 2));

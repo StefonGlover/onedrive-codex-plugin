@@ -176,8 +176,16 @@ function isToolCall(message) {
   return message?.method === "tools/call";
 }
 
+function isStaticSkillResourceRead(message) {
+  return message?.method === "resources/read"
+    && typeof message?.params?.uri === "string"
+    && message.params.uri.startsWith("skill://onedrive/");
+}
+
 function requiresOAuth(message) {
-  return ["tools/list", "resources/list", "resources/read"].includes(message?.method) || isToolCall(message);
+  return ["tools/list", "resources/list"].includes(message?.method)
+    || (message?.method === "resources/read" && !isStaticSkillResourceRead(message))
+    || isToolCall(message);
 }
 
 async function requestAuthorization(request, messages) {
@@ -255,7 +263,7 @@ async function handleMcp(
     });
     return;
   }
-  if (isBatch && messages.length > 1 && messages.some((message) => message.method === "resources/read")) {
+  if (isBatch && messages.length > 1 && messages.some((message) => message.method === "resources/read" && !isStaticSkillResourceRead(message))) {
     sendJson(response, 400, {
       jsonrpc: "2.0",
       id: null,
@@ -281,7 +289,10 @@ async function handleMcp(
     });
     return;
   }
-  if (messages.length === 1 && messages[0].method === "resources/read" && auth?.authMode !== "oauth_server_error") {
+  if (messages.length === 1
+    && messages[0].method === "resources/read"
+    && !isStaticSkillResourceRead(messages[0])
+    && auth?.authMode !== "oauth_server_error") {
     const subject = resourceReadAdmissionSubject(auth);
     if (!subject) {
       sendJson(response, 503, {

@@ -505,6 +505,37 @@ try {
     "Unauthenticated MCP initialize unexpectedly returned an authentication challenge.",
     [...unauthenticatedInitialize.headers]
   );
+  assert(
+    unauthenticatedInitialize.body?.result?.capabilities?.extensions?.["io.modelcontextprotocol/skills"],
+    "MCP initialize did not advertise the remote skills extension.",
+    unauthenticatedInitialize.body?.result?.capabilities
+  );
+
+  const unauthenticatedSkills = await mcpRequest(baseUrl, {
+    jsonrpc: "2.0",
+    id: 2,
+    method: "skills/list",
+    params: {}
+  });
+  assert(
+    unauthenticatedSkills.status === 200
+      && unauthenticatedSkills.body?.result?.skills?.length === 5,
+    "Unauthenticated plugin scanning could not list the five static OneDrive skills.",
+    unauthenticatedSkills
+  );
+  const skillResourceUri = unauthenticatedSkills.body.result.skills[0].resources[0].uri;
+  const unauthenticatedSkillResource = await mcpRequest(baseUrl, {
+    jsonrpc: "2.0",
+    id: 3,
+    method: "resources/read",
+    params: { uri: skillResourceUri }
+  });
+  assert(
+    unauthenticatedSkillResource.status === 200
+      && unauthenticatedSkillResource.body?.result?.contents?.[0]?.uri === skillResourceUri,
+    "Unauthenticated plugin scanning could not read a listed static skill resource.",
+    unauthenticatedSkillResource
+  );
 
   const oversizedBatch = await mcpRequest(
     baseUrl,
