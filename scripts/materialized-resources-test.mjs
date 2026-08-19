@@ -424,7 +424,8 @@ with open(prefix + ".png", "wb") as output_file:
         dpi: 100,
         outputRoot: renderRoot,
         pdftoppmPath: fakeRenderer,
-        maxOutputBytes: 64
+        maxOutputBytes: 64,
+        timeoutMs: 5_000
       }),
       (error) => error.code === "RENDER_OUTPUT_INVALID"
     );
@@ -437,7 +438,8 @@ with open(prefix + ".png", "wb") as output_file:
         dpi: 100,
         outputRoot: renderRoot,
         pdftoppmPath: fakeRenderer,
-        maxOutputBytes: 64
+        maxOutputBytes: 64,
+        timeoutMs: 5_000
       }),
       /renderer failed/i
     );
