@@ -94,19 +94,34 @@ def production_openxml_operations():
         json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
         "",
     ])
-    result = subprocess.run(
+    process = subprocess.Popen(
         ["node", str(ROOT / "mcp" / "server.mjs")],
         cwd=ROOT,
-        input=requests,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        capture_output=True,
-        check=False,
-        timeout=30,
         env={**os.environ, "ONEDRIVE_TEST_ACCESS_TOKEN": "office-openxml-schema-check"},
     )
-    if result.returncode != 0:
-        raise AssertionError(result.stderr or "MCP schema inspection failed")
-    messages = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    timed_out = False
+    try:
+        stdout, stderr = process.communicate(requests, timeout=10)
+    except subprocess.TimeoutExpired:
+        # Some hosted Node runtimes keep an unrelated handle alive after the
+        # stdio server has returned both bounded schema responses. Stop that
+        # disposable inspection process and validate the responses below.
+        timed_out = True
+        process.terminate()
+        try:
+            stdout, stderr = process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+    messages = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+    if process.returncode != 0 and not timed_out:
+        raise AssertionError(stderr or "MCP schema inspection failed")
+    if not any(message.get("id") == 2 for message in messages):
+        raise AssertionError(stderr or "MCP schema inspection did not return tools/list")
     tools = next(message["result"]["tools"] for message in messages if message.get("id") == 2)
     tools_by_name = {tool["name"]: tool for tool in tools}
     contract = {}
