@@ -9,7 +9,8 @@ on:
 jobs:
   test:
     name: Plugin regression checks (Node ${{ matrix.node }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -24,9 +25,18 @@ jobs:
           node-version: ${{ matrix.node }}
 
       - name: Install shell dependencies
+        timeout-minutes: 12
         run: |
-          sudo apt-get update
-          sudo apt-get install -y zsh libreoffice-writer libreoffice-calc libreoffice-impress poppler-utils
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30
+          sudo apt-get install -y --no-install-recommends \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            zsh libreoffice-writer libreoffice-calc libreoffice-impress poppler-utils
           python3 -m pip install -r scripts/requirements-office-test.txt
 
       - name: Validate manifests and whitespace
