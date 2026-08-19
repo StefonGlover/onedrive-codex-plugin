@@ -1,9 +1,9 @@
 # OneDrive 0.6.4 Parity Release Report
 
-Decision: Pass — NAS62 filename-only hyperlinks deployed to Synology and refreshed in the existing ChatGPT app
-Date: 2026-08-14
-Generated: 2026-08-14T23:15:00Z
-Tested source base commit: `b63789fe01e490d1368b1e53e99c2f9d0afc6f56`
+Decision: Pending — CI portability fixes await a fresh live release beta
+Date: 2026-08-19
+Generated: 2026-08-19T20:25:00Z
+Tested source base commit: `9014d694654b72c8cbb8fba8aed1ed4a641eaedd`
 Plugin version: `0.6.4+codex.20260814225653`
 Focused source server version: `0.6.4+codex.20260814225653.chatgpt.6ff9e65114bc`
 Current live NAS62 OAuth server version: `0.6.4+codex.20260814225653.chatgpt.b8b8204c94fd`
@@ -11,6 +11,8 @@ Tool contract: 84 exact tool names; 19 focused ChatGPT tools
 Packaged-content digest: `e2864f1e46cfb3dbf0b9086b22aa1370b9f366fc542481ffb47f247b07bfeb43`
 NAS release-manifest SHA-256: `9b47b42f01da2b8d0d8d9f9b8b436efc9c3657acee0c1695b7813ec3e280db44`
 Server SHA-256: `01306757f602380da73823f4a7b20f77f8dfdb7902eeb50690eb6be3cef2d96b`
+
+The current source includes CI-only portability corrections validated by the complete offline suite on macOS and hosted Linux. The NAS62 deployment and ChatGPT canary evidence below remain historical release evidence; a fresh live source-and-installed beta is still required before this source can be promoted as a new release.
 
 ## 2026-08-14 NAS62 filename-only hyperlink deployment
 

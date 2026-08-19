@@ -1,15 +1,15 @@
 {
   "schemaVersion": 2,
-  "decision": "Pass — NAS62 filename-only hyperlinks deployed to Synology and refreshed in the existing ChatGPT app",
-  "date": "2026-08-14",
-  "generatedAt": "2026-08-14T23:15:00Z",
+  "decision": "Pending — CI portability fixes await a fresh live release beta",
+  "date": "2026-08-19",
+  "generatedAt": "2026-08-19T20:25:00Z",
   "source": {
-    "commit": "b63789fe01e490d1368b1e53e99c2f9d0afc6f56",
+    "commit": "9014d694654b72c8cbb8fba8aed1ed4a641eaedd",
     "pluginVersion": "0.6.4+codex.20260814225653",
     "serverVersion": "0.6.4+codex.20260814225653.chatgpt.6ff9e65114bc",
     "serverSha256": "01306757f602380da73823f4a7b20f77f8dfdb7902eeb50690eb6be3cef2d96b",
     "contentDigest": "e2864f1e46cfb3dbf0b9086b22aa1370b9f366fc542481ffb47f247b07bfeb43",
-    "workingTree": "Release code is committed at the recorded commit; changes after that commit are limited to QA evidence."
+    "workingTree": "CI portability fixes are committed at the recorded commit; changes after that commit are limited to QA evidence. Prior NAS62 live evidence remains historical until a fresh release beta is run."
   },
   "contract": {
     "toolCount": 84,
