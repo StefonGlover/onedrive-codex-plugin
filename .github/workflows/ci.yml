@@ -58,12 +58,14 @@ jobs:
           node --check mcp/oauth.mjs
           node --check mcp/oauth-compat-server.mjs
           node --check mcp/oauth-facade-token.mjs
+          node --check mcp/auth-vault.mjs
           node --check mcp/bounded-local-state.mjs
           node --check mcp/heavyweight-subprocess-admission.mjs
           node --check mcp/managed-artifact-quota.mjs
           node --check mcp/materialized-resources.mjs
           node --check mcp/resource-read-admission.mjs
           node --check scripts/mock-graph-test.mjs
+          node --check scripts/auth-vault-test.mjs
           node --check scripts/bounded-local-state-test.mjs
           node --check scripts/heavyweight-subprocess-admission-test.mjs
           node --check scripts/hosted-profile-boundary-test.mjs
@@ -96,6 +98,7 @@ jobs:
 
       - name: Run utility self-checks
         run: |
+          node scripts/auth-vault-test.mjs
           node scripts/beta-test.mjs --self-check
           node scripts/benchmark.mjs --self-check
           node scripts/hosted-profile-boundary-test.mjs

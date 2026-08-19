@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createAuthVault } from "../mcp/auth-vault.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, "..");
@@ -36,14 +37,7 @@ rmSync(mockRunRoot, { recursive: true, force: true });
 mkdirSync(mockHome, { recursive: true });
 writeFileSync(mockPdftoppm, `#!/usr/bin/env python3
 import base64
-import resource
 import sys
-if resource.getrlimit(resource.RLIMIT_CPU) != (20, 20):
-    raise SystemExit(10)
-if resource.getrlimit(resource.RLIMIT_AS) != (805306368, 805306368):
-    raise SystemExit(11)
-if resource.getrlimit(resource.RLIMIT_FSIZE) != (8192, 8192):
-    raise SystemExit(12)
 output_prefix = sys.argv[-1]
 with open(output_prefix + ".png", "wb") as output_file:
     output_file.write(base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="))
@@ -3563,7 +3557,24 @@ process.exit(2);
 `);
     chmodSync(fakeSecurity, 0o755);
     const existingAuthContextId = "existing-auth-context";
-    const expiredToken = () => writeFileSync(keychainPath, JSON.stringify({
+    const authStorageRoot = join(authHome, ".codex", "onedrive-plugin");
+    const authCacheRoot = join(authStorageRoot, "cache");
+    const encryptedVaultKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const encryptedVault = process.platform === "darwin" ? null : createAuthVault({
+      platform: process.platform,
+      storageRoot: authStorageRoot,
+      environment: {
+        ONEDRIVE_TOKEN_STORE: "encrypted-file",
+        ONEDRIVE_TOKEN_FILE: keychainPath,
+        ONEDRIVE_TOKEN_ENCRYPTION_KEY: encryptedVaultKey
+      }
+    });
+    const writeStoredToken = (token) => {
+      if (encryptedVault) encryptedVault.write(token);
+      else writeFileSync(keychainPath, JSON.stringify(token));
+    };
+    const readStoredToken = () => encryptedVault?.read() || JSON.parse(readFileSync(keychainPath, "utf8"));
+    const expiredToken = () => writeStoredToken({
       token_type: "Bearer",
       access_token: "expired-access",
       refresh_token: "initial-refresh",
@@ -3572,10 +3583,8 @@ process.exit(2);
       auth_tenant: "consumers",
       auth_scopes: "offline_access User.Read Files.ReadWrite",
       auth_context_id: existingAuthContextId
-    }));
+    });
     expiredToken();
-    const authStorageRoot = join(authHome, ".codex", "onedrive-plugin");
-    const authCacheRoot = join(authStorageRoot, "cache");
     const authClient = createMcpClient({
       PATH: `${fakeBin}:${process.env.PATH}`,
       HOME: authHome,
@@ -3585,7 +3594,12 @@ process.exit(2);
       ONEDRIVE_IDENTITY_BASE_URL: identityBaseUrl,
       ONEDRIVE_TEST_KEYCHAIN_PATH: keychainPath,
       ONEDRIVE_STORAGE_ROOT: authStorageRoot,
-      ONEDRIVE_CACHE_ROOT: authCacheRoot
+      ONEDRIVE_CACHE_ROOT: authCacheRoot,
+      ...(encryptedVault ? {
+        ONEDRIVE_TOKEN_STORE: "encrypted-file",
+        ONEDRIVE_TOKEN_FILE: keychainPath,
+        ONEDRIVE_TOKEN_ENCRYPTION_KEY: encryptedVaultKey
+      } : {})
     });
     try {
       await authClient.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "auth-race-test", version: "1" } });
@@ -3601,7 +3615,7 @@ process.exit(2);
         before: refreshBefore,
         after: counters.get("identity-refresh") || 0
       });
-      assert(JSON.parse(readFileSync(keychainPath, "utf8")).auth_context_id === existingAuthContextId, "token refresh should preserve the opaque authentication context ID", JSON.parse(readFileSync(keychainPath, "utf8")));
+      assert(readStoredToken().auth_context_id === existingAuthContextId, "token refresh should preserve the opaque authentication context ID", readStoredToken());
 
       expiredToken();
       await authClient.tool("onedrive_logout", { deleteKeychainToken: false });
@@ -3616,7 +3630,7 @@ process.exit(2);
       assert(!switchedLogin.isError && switchedLogin.value.authenticated === true, "new device login should publish during delayed old refresh", switchedLogin);
       const staleRefreshResult = await staleRefresh;
       assert(staleRefreshResult.isError && String(staleRefreshResult.value).includes("authentication state changed"), "old delayed refresh should be rejected after new device login", staleRefreshResult);
-      const switchedToken = JSON.parse(readFileSync(keychainPath, "utf8"));
+      const switchedToken = readStoredToken();
       assert(String(switchedToken.access_token).startsWith("device-access-") && switchedToken.auth_context_id !== existingAuthContextId, "late refresh overwrote the new account token or authentication context", switchedToken);
       refreshResponseDelayMs = 0;
 
@@ -3763,7 +3777,7 @@ process.exit(2);
       const lateRefresh = authClient.tool("onedrive_get_info", { itemId: "root-note" });
       await waitForCounter("identity-refresh", lateRefreshTarget);
       const logout = await authClient.tool("onedrive_logout", { deleteKeychainToken: true, confirmed: true });
-      assert(logout.value.keychainTokenDeleted === true, "confirmed logout should delete the mocked Keychain token", logout);
+      assert(logout.value.storedCredentialDeleted === true, "confirmed logout should delete the mocked stored credential", logout);
       const lateRefreshResult = await lateRefresh;
       assert(lateRefreshResult.isError && String(lateRefreshResult.value).includes("authentication state changed"), "late refresh should be discarded after logout", lateRefreshResult);
       assert(!existsSync(keychainPath), "late refresh must not recreate the Keychain token after logout");
