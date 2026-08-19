@@ -14,7 +14,7 @@ jobs:
     env:
       # Keep Python bytecode from every test step out of the source tree so
       # the packaging-residue guard sees only repository content.
-      PYTHONPYCACHEPREFIX: ${{ runner.temp }}/onedrive-pycache
+      PYTHONPYCACHEPREFIX: /tmp/onedrive-pycache
     strategy:
       fail-fast: false
       matrix:
