@@ -2,8 +2,8 @@
 
 Decision: Pending — CI portability fixes await a fresh live release beta
 Date: 2026-08-19
-Generated: 2026-08-19T20:28:00Z
-Tested source base commit: `2053e643ece4dfccd9b4c4756f46e5a879a9c18e`
+Generated: 2026-08-19T20:30:00Z
+Tested source base commit: `386e859c1bad14906d9162ab3c5094154b65e397`
 Plugin version: `0.6.4+codex.20260814225653`
 Focused source server version: `0.6.4+codex.20260814225653.chatgpt.6ff9e65114bc`
 Current live NAS62 OAuth server version: `0.6.4+codex.20260814225653.chatgpt.b8b8204c94fd`
