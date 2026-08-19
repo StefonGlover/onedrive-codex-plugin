@@ -9,8 +9,8 @@ Keep Word documents native `.docx` files and use structured evidence before edit
 
 ## Create a document
 
-1. Use the installed Documents artifact capability to author and validate a local `.docx`; do not fake a Word document with renamed plain text.
-2. Upload it with `onedrive_upload_file`. Preview first if the destination could replace an existing file.
+1. Use `onedrive_create_office_file` with `kind: "word"` for bounded structured titles, paragraphs, and tables; it builds and validates a real `.docx`, previews the exact destination, and verifies the uploaded package.
+2. For advanced styling, images, headers, pagination, or layout, use the installed Documents artifact capability to author and validate a local `.docx`, then upload it with `onedrive_upload_file`. Do not fake a Word document with renamed plain text.
 3. Read it back with `onedrive_office_inspect` using `kind: "word"` and bounded paragraph/table selectors.
 4. Render representative pages with `onedrive_render_preview` when layout, pagination, tables, images, or headers matter.
 5. Return only the observed provider `webUrl` from the upload/readback response.

@@ -9,8 +9,8 @@ Keep workbooks native `.xlsx` files and preserve formulas, styles, validations, 
 
 ## Create a workbook
 
-1. Use the installed Spreadsheets artifact capability to create and validate a local `.xlsx`; do not upload CSV under an Excel extension.
-2. Upload it with `onedrive_upload_file`. Preview first if the destination could replace an existing file.
+1. Use `onedrive_create_office_file` with `kind: "excel"` for bounded structured sheets and rows; it builds and validates a real `.xlsx`, previews the exact destination, and verifies the uploaded package.
+2. For advanced formatting, charts, validation, print layout, or model design, use the installed Spreadsheets artifact capability to create and validate a local `.xlsx`, then upload it with `onedrive_upload_file`. Do not upload CSV under an Excel extension.
 3. Read it back with `onedrive_office_inspect` using `kind: "excel"` and explicit sheet/range bounds.
 4. Render representative sheets with `onedrive_render_preview` when print layout, charts, widths, merged cells, or formatting matter.
 5. Return only the observed provider `webUrl`.

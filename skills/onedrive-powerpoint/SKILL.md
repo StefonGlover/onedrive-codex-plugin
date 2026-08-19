@@ -9,8 +9,8 @@ Keep presentations native `.pptx` files and treat visual verification as part of
 
 ## Create a presentation
 
-1. Use the installed Presentations artifact capability to author and validate a local `.pptx`; do not upload images or plain text under a PowerPoint extension.
-2. Upload it with `onedrive_upload_file`. Preview first if the destination could replace an existing file.
+1. Use `onedrive_create_office_file` with `kind: "powerpoint"` for bounded structured slide titles, bullets, and speaker notes; it builds and validates a real `.pptx`, previews the exact destination, and verifies the uploaded package.
+2. For branded themes, imagery, complex layout, animation, or polished visual storytelling, use the installed Presentations artifact capability to author and validate a local `.pptx`, then upload it with `onedrive_upload_file`. Do not upload images or plain text under a PowerPoint extension.
 3. Read it back with `onedrive_office_inspect` using `kind: "powerpoint"` and bounded slide/shape selectors.
 4. Render representative slides with `onedrive_render_preview` and inspect text fit, clipping, overlap, hierarchy, contrast, and image crop.
 5. Return only the observed provider `webUrl`.

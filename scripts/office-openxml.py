@@ -3803,6 +3803,148 @@ def write_modified_package(source: Path, destination: Path, modifications: Dict[
                 output_package.writestr(name, payload)
 
 
+def create_package(request: Dict[str, Any]) -> Dict[str, Any]:
+    output_path = request.get("outputPath")
+    if not isinstance(output_path, str) or not output_path:
+        raise OfficePackageError("outputPath is required for create.")
+    destination = Path(output_path).expanduser().resolve()
+    kind = request.get("kind")
+    expected_suffix = {"word": ".docx", "excel": ".xlsx", "powerpoint": ".pptx"}.get(kind)
+    if not expected_suffix:
+        raise OfficePackageError("kind must be word, excel, or powerpoint for create.")
+    if destination.suffix.lower() != expected_suffix:
+        raise OfficePackageError("%s creation requires an %s destination." % (kind, expected_suffix))
+    spec = request.get("spec") or {}
+    if not isinstance(spec, dict):
+        raise OfficePackageError("spec must be an object.")
+    allowed_spec_fields = {
+        "word": {"title", "paragraphs", "tables"},
+        "excel": {"title", "sheets"},
+        "powerpoint": {"title", "slides"},
+    }[kind]
+    irrelevant_fields = sorted(set(spec) - allowed_spec_fields)
+    if irrelevant_fields:
+        raise OfficePackageError("%s creation does not accept spec fields: %s." % (kind, ", ".join(irrelevant_fields)))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    def scalar(value: Any, label: str) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        raise OfficePackageError("%s values must be strings, numbers, booleans, or null." % label)
+
+    if kind == "word":
+        try:
+            from docx import Document
+        except ImportError as error:
+            raise OfficePackageError("Word creation requires the pinned python-docx runtime.") from error
+        document = Document()
+        title = str(spec.get("title") or "").strip()
+        if title:
+            document.core_properties.title = title
+            document.add_heading(title, level=0)
+        paragraphs = spec.get("paragraphs") or []
+        tables = spec.get("tables") or []
+        if not isinstance(paragraphs, list) or len(paragraphs) > 5000:
+            raise OfficePackageError("Word paragraphs must be an array with at most 5,000 entries.")
+        if not isinstance(tables, list) or len(tables) > 100:
+            raise OfficePackageError("Word tables must be an array with at most 100 entries.")
+        for index, paragraph in enumerate(paragraphs):
+            document.add_paragraph(str(scalar(paragraph, "Word paragraph %d" % index) or ""))
+        table_cells = 0
+        for table_index, rows in enumerate(tables):
+            if not isinstance(rows, list) or not rows:
+                raise OfficePackageError("Word table %d must contain at least one row." % table_index)
+            if len(rows) > 1000 or any(not isinstance(row, list) or not row for row in rows):
+                raise OfficePackageError("Word table rows must be non-empty arrays with at most 1,000 rows per table.")
+            columns = max(len(row) for row in rows)
+            if columns > 100:
+                raise OfficePackageError("Word tables support at most 100 columns.")
+            table_cells += len(rows) * columns
+            if table_cells > 50_000:
+                raise OfficePackageError("Word creation supports at most 50,000 table cells.")
+            table = document.add_table(rows=len(rows), cols=columns)
+            table.style = "Table Grid"
+            for row_index, row in enumerate(rows):
+                for column_index, value in enumerate(row):
+                    table.cell(row_index, column_index).text = str(scalar(value, "Word table cell") or "")
+        document.save(destination)
+        summary = {"title": title, "paragraphCount": len(paragraphs), "tableCount": len(tables), "tableCellCount": table_cells}
+    elif kind == "excel":
+        try:
+            from openpyxl import Workbook
+        except ImportError as error:
+            raise OfficePackageError("Excel creation requires the pinned openpyxl runtime.") from error
+        sheets = spec.get("sheets") or [{"name": "Sheet1", "rows": []}]
+        if not isinstance(sheets, list) or not sheets or len(sheets) > 100:
+            raise OfficePackageError("Excel sheets must be a non-empty array with at most 100 entries.")
+        workbook = Workbook()
+        workbook.remove(workbook.active)
+        title = str(spec.get("title") or "").strip()
+        if title:
+            workbook.properties.title = title
+        total_rows = 0
+        total_cells = 0
+        names = set()
+        for sheet_index, sheet_spec in enumerate(sheets):
+            if not isinstance(sheet_spec, dict):
+                raise OfficePackageError("Excel sheet %d must be an object." % sheet_index)
+            name = str(sheet_spec.get("name") or "Sheet%d" % (sheet_index + 1)).strip()
+            if not name or len(name) > 31 or re.search(r"[\\/*?:\[\]]", name) or name.lower() in names:
+                raise OfficePackageError("Excel sheet names must be unique, non-empty, at most 31 characters, and contain no reserved characters.")
+            names.add(name.lower())
+            rows = sheet_spec.get("rows") or []
+            if not isinstance(rows, list) or len(rows) > 10_000 or any(not isinstance(row, list) for row in rows):
+                raise OfficePackageError("Excel rows must be arrays with at most 10,000 rows per sheet.")
+            worksheet = workbook.create_sheet(name)
+            for row in rows:
+                if len(row) > 1000:
+                    raise OfficePackageError("Excel creation supports at most 1,000 columns per row.")
+                total_cells += len(row)
+                if total_cells > 250_000:
+                    raise OfficePackageError("Excel creation supports at most 250,000 cells.")
+                worksheet.append([scalar(value, "Excel cell") for value in row])
+            total_rows += len(rows)
+        workbook.save(destination)
+        summary = {"title": title, "sheetCount": len(sheets), "rowCount": total_rows, "cellCount": total_cells}
+    else:
+        try:
+            from pptx import Presentation
+        except ImportError as error:
+            raise OfficePackageError("PowerPoint creation requires the pinned python-pptx runtime.") from error
+        slides = spec.get("slides") or [{"title": str(spec.get("title") or "Untitled presentation"), "bullets": []}]
+        if not isinstance(slides, list) or not slides or len(slides) > 500:
+            raise OfficePackageError("PowerPoint slides must be a non-empty array with at most 500 entries.")
+        presentation = Presentation()
+        title = str(spec.get("title") or "").strip()
+        if title:
+            presentation.core_properties.title = title
+        bullet_count = 0
+        notes_count = 0
+        for slide_index, slide_spec in enumerate(slides):
+            if not isinstance(slide_spec, dict):
+                raise OfficePackageError("PowerPoint slide %d must be an object." % slide_index)
+            bullets = slide_spec.get("bullets") or []
+            if not isinstance(bullets, list) or len(bullets) > 100:
+                raise OfficePackageError("PowerPoint bullets must be an array with at most 100 entries per slide.")
+            slide = presentation.slides.add_slide(presentation.slide_layouts[1])
+            slide.shapes.title.text = str(slide_spec.get("title") or "")
+            body = slide.placeholders[1].text_frame
+            body.clear()
+            for bullet_index, bullet in enumerate(bullets):
+                paragraph = body.paragraphs[0] if bullet_index == 0 else body.add_paragraph()
+                paragraph.text = str(scalar(bullet, "PowerPoint bullet") or "")
+            bullet_count += len(bullets)
+            notes = str(slide_spec.get("notes") or "")
+            if notes:
+                slide.notes_slide.notes_text_frame.text = notes
+                notes_count += 1
+        presentation.save(destination)
+        summary = {"title": title, "slideCount": len(slides), "bulletCount": bullet_count, "notesSlideCount": notes_count}
+
+    validation = validate_package(destination, {"kind": kind, "strictRelationships": True})
+    return {"kind": kind, "outputPath": str(destination), "summary": summary, "validation": validation}
+
+
 def edit_package(path: Path, request: Dict[str, Any]) -> Dict[str, Any]:
     output_path = request.get("outputPath")
     if not isinstance(output_path, str) or not output_path:
@@ -3877,18 +4019,21 @@ def main() -> None:
         configure_process_limits()
         request = read_request()
         action = request.get("action")
-        input_path = request.get("inputPath")
-        if not isinstance(input_path, str) or not input_path:
-            raise OfficePackageError("inputPath is required.")
-        path = Path(input_path).expanduser().resolve()
+        if action == "create":
+            value = create_package(request)
+        else:
+            input_path = request.get("inputPath")
+            if not isinstance(input_path, str) or not input_path:
+                raise OfficePackageError("inputPath is required.")
+            path = Path(input_path).expanduser().resolve()
         if action == "inspect":
             value = inspect_package(path, request)
         elif action == "validate":
             value = validate_package(path, request)
         elif action == "edit":
             value = edit_package(path, request)
-        else:
-            raise OfficePackageError("action must be inspect, validate, or edit.")
+        elif action != "create":
+            raise OfficePackageError("action must be create, inspect, validate, or edit.")
         print(json.dumps({"ok": True, "value": value}, ensure_ascii=False, separators=(",", ":")))
     except Exception as error:  # Keep subprocess failures structured for MCP callers.
         print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False, separators=(",", ":")))

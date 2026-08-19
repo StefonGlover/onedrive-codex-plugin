@@ -10,9 +10,11 @@ const pluginRoot = resolve(scriptsRoot, "..");
 const serverPath = join(pluginRoot, "mcp", "server.mjs");
 const runIdPattern = /^codex-beta-[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/iu;
 const expectedTools = [
+  "search",
   "fetch",
   "onedrive_commit_actions",
   "onedrive_create_folder",
+  "onedrive_create_office_file",
   "onedrive_delete",
   "onedrive_export_file",
   "onedrive_invite_permission",
@@ -124,7 +126,7 @@ if (selfCheck) {
     invalidRunIdRejected: (() => { try { parseRunId("unsafe/run"); return false; } catch { return true; } })(),
     exactTitleMatcher: exactTitle("Example_File.docx")({ title: "Example File.docx" }) === true,
     qualityMetrics: fixture.mrrAt10 === 1 && fixture.exactAtOne === 1 && fixture.unrelatedTopFive === 0,
-    exactWorkToolCount: expectedTools.length === 19
+    exactWorkToolCount: expectedTools.length === 21
   };
   const ok = Object.values(checks).every(Boolean);
   console.log(JSON.stringify({ ok, checks }, null, 2));
@@ -240,7 +242,7 @@ try {
 
   const listed = await request("tools/list");
   const names = (listed.tools || []).map((tool) => tool.name).sort();
-  check("tools/list matches the exact reviewed 19-tool Work surface", JSON.stringify(names) === JSON.stringify(expectedTools), { expected: expectedTools, actual: names });
+  check("tools/list matches the exact reviewed 21-tool Work surface", JSON.stringify(names) === JSON.stringify(expectedTools), { expected: expectedTools, actual: names });
 
   const read = await callTool("onedrive_read_actions", {
     actions: [
@@ -255,6 +257,12 @@ try {
 
   const quality = evaluateSearchQuality(searches, cases);
   check("ranked Work search meets beta relevance thresholds", quality.exactAtOne === cases.length && quality.mrrAt10 === 1 && quality.unrelatedTopFive === 0 && quality.details.every((entry) => entry.rankedSearch && entry.searchMode === "ranked"), quality);
+
+  const standardSearch = await callTool("search", { query: cases[0].query });
+  const repeatedStandardSearch = await callTool("search", { query: cases[0].query });
+  check("standard company-knowledge search returns ranked results and a scoped repeat cache hit",
+    standardSearch.value?.results?.some(cases[0].matches) && repeatedStandardSearch.value?.cache?.hit === true,
+    { resultCount: standardSearch.value?.results?.length || 0, repeatCache: repeatedStandardSearch.value?.cache || null, firstWallMs: standardSearch.wallMs, repeatWallMs: repeatedStandardSearch.wallMs });
 
   const fetchCandidate = searches[1]?.value?.items?.find(cases[1].matches);
   if (fetchCandidate?.id) {

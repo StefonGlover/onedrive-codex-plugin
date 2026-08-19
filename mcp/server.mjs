@@ -173,6 +173,8 @@ const chatgptStaleCacheMaxAgeSeconds = 24 * 60 * 60;
 const chatgptRevalidationCooldownMs = 30 * 1000;
 const chatgptListSnapshotTtlMs = 60 * 1000;
 const chatgptListSnapshotMaxEntries = 128;
+const chatgptSearchSnapshotTtlMs = 60 * 1000;
+const chatgptSearchSnapshotMaxEntries = 128;
 const chatgptFileBlockedIpv4Addresses = new BlockList();
 const chatgptFileBlockedIpv6Addresses = new BlockList();
 for (const [network, prefix, family] of [
@@ -308,6 +310,7 @@ const watchTimersByScope = new Map();
 const excelSessionPool = new Map();
 const chatgptFetchSnapshotsByScope = new Map();
 const chatgptListSnapshots = new Map();
+const chatgptSearchSnapshots = new Map();
 const chatgptRevalidations = new Map();
 const chatgptRevalidationLastStartedAt = new Map();
 const chatgptCacheWarmStates = new Map();
@@ -353,7 +356,7 @@ const previewTokenMaxScopes = 8;
 const previewTokenMaxPerScope = 512;
 const previewScopedTools = new Set([
   "onedrive_preview_actions", "onedrive_commit_actions", "onedrive_export_file",
-  "onedrive_upload", "onedrive_upload_file", "onedrive_write_text", "onedrive_batch_delete", "onedrive_delete", "onedrive_permanent_delete",
+  "onedrive_upload", "onedrive_upload_file", "onedrive_create_office_file", "onedrive_write_text", "onedrive_batch_delete", "onedrive_delete", "onedrive_permanent_delete",
   "onedrive_rename", "onedrive_move", "onedrive_copy",
   "onedrive_create_sharing_link", "onedrive_invite_permission", "onedrive_revoke_permission",
   "onedrive_batch_revoke_permissions", "onedrive_restore_deleted", "onedrive_word_batch_update",
@@ -2269,10 +2272,25 @@ const chatgptCompatibilityTools = [
                 additionalProperties: false
               },
               type: { type: "string", enum: ["file", "folder", "item"] },
-              webUrl: { type: "string" }
+              webUrl: { type: "string" },
+              metadata: {
+                type: "object",
+                additionalProperties: { type: "string" }
+              }
             },
             additionalProperties: false
           }
+        },
+        cache: {
+          type: "object",
+          required: ["hit", "source", "ageMs", "ttlMs"],
+          properties: {
+            hit: { type: "boolean" },
+            source: { type: "string" },
+            ageMs: { type: "integer", minimum: 0 },
+            ttlMs: { type: "integer", minimum: 1 }
+          },
+          additionalProperties: false
         }
       },
       additionalProperties: false
@@ -2709,6 +2727,72 @@ const chatgptCompatibilityTools = [
     }
   },
   {
+    name: "onedrive_create_office_file",
+    title: "Create Office File in OneDrive",
+    description: "Create and validate a new Word, Excel, or PowerPoint file from bounded structured content, then preview and upload it to OneDrive with conflict and replacement guards.",
+    inputSchema: {
+      type: "object",
+      required: ["kind", "remotePath", "spec"],
+      properties: {
+        kind: { type: "string", enum: ["word", "excel", "powerpoint"] },
+        remotePath: { type: "string", minLength: 1, description: "Destination .docx, .xlsx, or .pptx path relative to the OneDrive root." },
+        spec: {
+          type: "object",
+          properties: {
+            title: { type: "string", maxLength: 1000 },
+            paragraphs: { type: "array", maxItems: 5000, items: { type: ["string", "number", "boolean", "null"] } },
+            tables: {
+              type: "array",
+              maxItems: 100,
+              items: {
+                type: "array",
+                minItems: 1,
+                maxItems: 1000,
+                items: { type: "array", minItems: 1, maxItems: 100, items: { type: ["string", "number", "boolean", "null"] } }
+              }
+            },
+            sheets: {
+              type: "array",
+              minItems: 1,
+              maxItems: 100,
+              items: {
+                type: "object",
+                properties: {
+                  name: { type: "string", minLength: 1, maxLength: 31 },
+                  rows: { type: "array", maxItems: 10000, items: { type: "array", maxItems: 1000, items: { type: ["string", "number", "boolean", "null"] } } }
+                },
+                additionalProperties: false
+              }
+            },
+            slides: {
+              type: "array",
+              minItems: 1,
+              maxItems: 500,
+              items: {
+                type: "object",
+                properties: {
+                  title: { type: "string", maxLength: 1000 },
+                  bullets: { type: "array", maxItems: 100, items: { type: ["string", "number", "boolean", "null"] } },
+                  notes: { type: "string", maxLength: 100000 }
+                },
+                additionalProperties: false
+              }
+            }
+          },
+          additionalProperties: false
+        },
+        conflictBehavior: { type: "string", enum: ["fail", "replace", "rename"], default: "fail" },
+        dryRun: { type: "boolean", default: true },
+        confirmed: { type: "boolean", default: false },
+        expectedName: { type: "string", description: "Required for replacement unless expectedId is provided." },
+        expectedId: { type: "string", description: "Required for replacement unless expectedName is provided." },
+        expectedETag: { type: "string", description: "Required current eTag from the matching replacement preview." },
+        previewToken: previewTokenSchema
+      },
+      additionalProperties: false
+    }
+  },
+  {
     name: "onedrive_export_file",
     title: "Export Office File in OneDrive",
     description: "Preview, then ask Microsoft Graph to convert a supported OneDrive document to PDF or plain text and save the converted file back to OneDrive. Every export requires confirmation, a source revision guard, and a scoped preview token.",
@@ -2846,6 +2930,7 @@ const destructiveToolNames = new Set([
   "onedrive_delete",
   "onedrive_permanent_delete",
   "onedrive_upload_file",
+  "onedrive_create_office_file",
   "onedrive_commit_actions"
 ]);
 
@@ -2863,6 +2948,7 @@ const openWorldToolNames = new Set([
   "onedrive_update_file",
   "onedrive_audit_export",
   "onedrive_upload_file",
+  "onedrive_create_office_file",
   "onedrive_commit_actions"
 ]);
 
@@ -2897,6 +2983,7 @@ for (const tool of executableTools) {
 // contract for Codex and local automation while offering a focused ChatGPT
 // profile for tunnel deployments.
 const chatgptToolNames = new Set([
+  "search",
   "fetch",
   "onedrive_open_files",
   "onedrive_preview_actions",
@@ -2909,6 +2996,7 @@ const chatgptToolNames = new Set([
   "onedrive_download_file",
   "onedrive_render_preview",
   "onedrive_upload_file",
+  "onedrive_create_office_file",
   "onedrive_export_file",
   "onedrive_write_text",
   "onedrive_patch_text",
@@ -2935,7 +3023,7 @@ const compactOfficeOperationSchema = {
 
 const chatgptToolMetadata = Object.freeze({
   search: {
-    description: "Use this when the user wants OneDrive discovery from a description, topic, partial name, keywords, aliases, indexed content, or unknown title. Pass one whole intent, including multiple related document targets; it returns a ranked set. Use onedrive_open_files for exact filenames plus content; otherwise pass chosen ids unchanged to fetch.",
+    description: "Use this when the user wants OneDrive discovery by description, topic, partial name, aliases, or indexed content. Pass one whole intent; use onedrive_open_files for exact filenames, then pass chosen ids unchanged to fetch.",
     invoking: "Searching OneDrive…",
     invoked: "OneDrive results ready"
   },
@@ -3003,6 +3091,11 @@ const chatgptToolMetadata = Object.freeze({
     description: "Use this when the user wants to upload a ChatGPT-provided file to OneDrive. Preview first; replacement requires the existing item's expected identity and explicit confirmation.",
     invoking: "Preparing OneDrive upload…",
     invoked: "OneDrive upload result ready"
+  },
+  onedrive_create_office_file: {
+    description: "Use this when the user wants a new Word, Excel, or PowerPoint file created in OneDrive from structured content. Match kind to the extension, preview the validated package, then confirm with the same proof.",
+    invoking: "Building Office file…",
+    invoked: "Office file result ready"
   },
   onedrive_export_file: {
     description: "Use this when the user wants a supported OneDrive document converted to PDF or plain text and the converted copy saved back in OneDrive. Preview first, then use the source identity, source eTag, destination, and previewToken unchanged for the confirmed export.",
@@ -3097,8 +3190,51 @@ function compactChatgptToolDescriptor(tool) {
       "openai/toolInvocation/invoked": metadata.invoked
     };
   }
-  if (["onedrive_read_actions", "onedrive_commit_actions"].includes(compact.name)) {
+  if (["onedrive_preview_actions", "onedrive_read_actions", "onedrive_commit_actions"].includes(compact.name)) {
     delete compact.outputSchema;
+  }
+  if (compact.name === "search") {
+    compact.outputSchema = {
+      type: "object",
+      required: ["results"],
+      properties: {
+        results: {
+          type: "array",
+          maxItems: 10,
+          items: {
+            type: "object",
+            required: ["id", "title", "url"],
+            properties: {
+              id: { type: "string" },
+              title: { type: "string" },
+              url: { type: "string" },
+              metadata: { type: "object", additionalProperties: { type: "string" } }
+            },
+            additionalProperties: true
+          }
+        },
+        cache: { type: "object", additionalProperties: true }
+      },
+      additionalProperties: true
+    };
+  }
+  if (compact.name === "onedrive_open_files") {
+    compact.outputSchema = {
+      type: "object",
+      properties: {
+        files: {
+          type: "array",
+          maxItems: 5,
+          items: {
+            type: "object",
+            properties: { displayLink: { type: "string" } },
+            additionalProperties: true
+          }
+        },
+        durationMs: { type: "integer", minimum: 0 }
+      },
+      additionalProperties: true
+    };
   }
   if (compact.name === "onedrive_office_batch_transform") {
     const item = compact.inputSchema?.properties?.items?.items;
@@ -3112,6 +3248,9 @@ function compactChatgptToolDescriptor(tool) {
     "onedrive_powerpoint_batch_update"
   ].includes(compact.name) && compact.inputSchema?.properties) {
     compact.inputSchema.properties.operations = JSON.parse(JSON.stringify(compactOfficeOperationSchema));
+  }
+  if (compact.name === "onedrive_create_office_file" && compact.inputSchema?.properties) {
+    compact.inputSchema.properties.spec = { type: "object" };
   }
   // Tool descriptions carry the focused routing and safety guidance. Repeating
   // the full contract's prose on every nested schema node makes OAuth
@@ -3217,6 +3356,16 @@ function compactChatgptToolDescriptor(tool) {
     properties.expectedId.description = "For replacement, current item ID; provide this or expectedName.";
     properties.previewToken.description = "Matching same-server upload preview proof, not an auth credential.";
   }
+  if (compact.name === "onedrive_create_office_file" && properties) {
+    properties.remotePath.description = "Destination .docx, .xlsx, or .pptx path relative to the OneDrive root; the extension must match kind.";
+    properties.spec.description = "Bounded structured Office content. Use paragraphs and tables for Word, sheets and rows for Excel, or slides, bullets, and notes for PowerPoint.";
+    properties.dryRun.description = "True builds and validates a local package preview without writing to OneDrive.";
+    properties.confirmed.description = "True only after explicit user confirmation of the matching preview.";
+    properties.expectedName.description = "For replacement, current item name; provide this or expectedId.";
+    properties.expectedId.description = "For replacement, current item ID; provide this or expectedName.";
+    properties.expectedETag.description = "For replacement, current item eTag from the matching preview; required for live replacement.";
+    properties.previewToken.description = "Matching same-server Office creation proof, not an auth credential.";
+  }
   if (compact.name === "onedrive_invite_permission" && properties) {
     properties.recipients.description = "Recipients; each item must contain exactly one of email, alias, or objectId.";
     properties.dryRun.description = "True previews; false requests the live invitation.";
@@ -3268,7 +3417,7 @@ const advertisedServerVersion = toolProfile === "chatgpt"
   ? `${manifestServerVersion}${manifestServerVersion.includes("+") ? "." : "+"}chatgpt.${advertisedContractHash}`
   : manifestServerVersion;
 const serverInstructions = toolProfile === "chatgpt"
-  ? "Use onedrive_read_actions once for bounded folder/search/info/permission, recent, version, or enterprise reads; pass the whole read intent as one bounded operations array, then fetch returned default-drive ids unchanged. Keep enterprise results read-only and preserve driveId plus itemId for inspect/download. For rename/move/copy/share/revoke/version-restore, use onedrive_preview_actions once, then after approval pass exact actions and proofs once to onedrive_commit_actions. Commit is ordered, guarded, non-atomic, stops on first error, and returns verified stable results. Use onedrive_open_files once for exact filenames, known root-relative paths, or observed OneDrive/SharePoint links; pass exactly one of names or urls, and present returned links with only the resolved filename as hyperlink text. Opaque ids and proofs are same-server identifiers, not credentials. Prefer user-visible paths plus expectedName; use ids only without a path. Create folders directly with conflictBehavior fail. Preview and commit dependent actions in dependency order because proofs can become stale. For Office work, inspect bounded structure, request the exact capability schema, then transform; list review evidence before changing comments or notes. Use download/render for visual QA. Use onedrive_export_file for a PDF or text copy saved in OneDrive."
+  ? "Use standard search for descriptive discovery, then fetch ids unchanged. Use onedrive_read_actions once for bounded folder, info, permission, recent, version, or enterprise reads; pass the whole read intent in one bounded operations array. Preserve driveId plus itemId for enterprise inspect/download. For rename, move, copy, share, revoke, or version restore, use onedrive_preview_actions once, then pass exact approved actions and proofs to onedrive_commit_actions. Commit is guarded, ordered, non-atomic, and returns verified stable results. Use onedrive_open_files once for exact filenames, known paths, or observed OneDrive/SharePoint links; pass names or urls and show each resolved filename as hyperlink text. Opaque ids and proofs are same-server identifiers, not credentials. Prefer user-visible paths plus expectedName. Create folders directly with conflictBehavior fail. Use onedrive_create_office_file to build and validate new Word, Excel, or PowerPoint content before upload. Preview dependent actions in dependency order because proofs can become stale. For Office edits, inspect bounded structure, request the exact capability schema, then transform; list review evidence before changing it. Use download/render for visual QA. Use onedrive_export_file for a PDF or text copy saved in OneDrive."
   : "Use onedrive_find for normal OneDrive lookup and the matching structured read tool before an Office edit. Use onedrive_list only for direct folder listings. Keep results bounded. Locate an item before changing it. Mutations default to preview and require confirmation.";
 
 const toolByName = new Map(executableTools.map((tool) => [tool.name, tool]));
@@ -3558,6 +3707,7 @@ function invalidateActiveStorageScope() {
   previewTokensByScope.clear();
   chatgptFetchSnapshotsByScope.clear();
   chatgptListSnapshots.clear();
+  chatgptSearchSnapshots.clear();
   chatgptRevalidations.clear();
   chatgptRevalidationLastStartedAt.clear();
   for (const timers of watchTimersByScope.values()) {
@@ -6359,7 +6509,10 @@ function formatSimplifiedItem(simplified, format = "compact") {
     },
     type: simplified.folder ? "folder" : simplified.file ? "file" : "item",
     size: simplified.size,
+    createdDateTime: simplified.createdDateTime,
     lastModifiedDateTime: simplified.lastModifiedDateTime,
+    mimeType: simplified.file?.mimeType,
+    driveId: simplified.driveId,
     webUrl: simplified.webUrl
   };
 }
@@ -6388,6 +6541,14 @@ function chatgptItemDescriptor(item = {}, fallbackId = "") {
 
 function chatgptSearchResult(item = {}, fallbackTitle = "") {
   const descriptor = chatgptItemDescriptor(item);
+  const metadata = Object.fromEntries(Object.entries({
+    created: item.createdDateTime,
+    modified: item.lastModifiedDateTime,
+    mimeType: item.file?.mimeType || item.mimeType,
+    size: item.size,
+    driveId: item.driveId
+  }).filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(([key, value]) => [key, String(value)]));
   return {
     id: descriptor.itemId,
     title: String(item.name || item.title || fallbackTitle || descriptor.name),
@@ -6396,7 +6557,8 @@ function chatgptSearchResult(item = {}, fallbackTitle = "") {
     path: descriptor.path,
     parent: descriptor.parent,
     type: descriptor.type,
-    webUrl: descriptor.webUrl
+    webUrl: descriptor.webUrl,
+    ...(Object.keys(metadata).length ? { metadata } : {})
   };
 }
 
@@ -6720,7 +6882,10 @@ function sanitizeAuditValue(value) {
 }
 
 async function writeMutationAudit(tool, entry) {
-  if (entry?.status === "success") invalidateChatgptListSnapshots();
+  if (entry?.status === "success") {
+    invalidateChatgptListSnapshots();
+    invalidateChatgptSearchSnapshots();
+  }
   const record = sanitizeAuditValue({
     timestamp: new Date().toISOString(),
     tool,
@@ -7044,6 +7209,68 @@ function rememberChatgptListSnapshot(args = {}, value = {}) {
   chatgptListSnapshots.delete(key);
   chatgptListSnapshots.set(key, { storedAt: Date.now(), value: structuredClone(value) });
   pruneChatgptListSnapshots();
+}
+
+function chatgptSearchSnapshotKey(args = {}, internal = {}) {
+  const authContextId = currentAuthContextId();
+  const query = String(args.query || "").trim().replace(/\s+/gu, " ");
+  if (!authContextId || !query) return null;
+  return JSON.stringify({
+    authContextId,
+    query,
+    includeDiagnostics: internal.includeDiagnostics === true,
+    skipExactFilenameFallback: internal.skipExactFilenameFallback === true
+  });
+}
+
+function pruneChatgptSearchSnapshots(now = Date.now()) {
+  for (const [key, snapshot] of chatgptSearchSnapshots) {
+    if (now - snapshot.storedAt >= chatgptSearchSnapshotTtlMs) chatgptSearchSnapshots.delete(key);
+  }
+  while (chatgptSearchSnapshots.size > chatgptSearchSnapshotMaxEntries) {
+    chatgptSearchSnapshots.delete(chatgptSearchSnapshots.keys().next().value);
+  }
+}
+
+function invalidateChatgptSearchSnapshots() {
+  const authContextId = currentAuthContextId();
+  if (!authContextId) {
+    chatgptSearchSnapshots.clear();
+    return;
+  }
+  for (const key of chatgptSearchSnapshots.keys()) {
+    try {
+      if (JSON.parse(key).authContextId === authContextId) chatgptSearchSnapshots.delete(key);
+    } catch {
+      chatgptSearchSnapshots.delete(key);
+    }
+  }
+}
+
+function readChatgptSearchSnapshot(args = {}, internal = {}) {
+  const key = chatgptSearchSnapshotKey(args, internal);
+  if (!key) return null;
+  const now = Date.now();
+  pruneChatgptSearchSnapshots(now);
+  const snapshot = chatgptSearchSnapshots.get(key);
+  if (!snapshot) return null;
+  return {
+    ...structuredClone(snapshot.value),
+    cache: {
+      hit: true,
+      source: "scoped_memory",
+      ageMs: Math.max(0, now - snapshot.storedAt),
+      ttlMs: chatgptSearchSnapshotTtlMs
+    }
+  };
+}
+
+function rememberChatgptSearchSnapshot(args = {}, internal = {}, value = {}) {
+  const key = chatgptSearchSnapshotKey(args, internal);
+  if (!key) return;
+  chatgptSearchSnapshots.delete(key);
+  chatgptSearchSnapshots.set(key, { storedAt: Date.now(), value: structuredClone(value) });
+  pruneChatgptSearchSnapshots();
 }
 
 async function list(args = {}) {
@@ -12191,6 +12418,9 @@ async function chatgptContentDiscoveryFallback(query, cache, contentIndex, requi
 async function chatgptSearch(args = {}, internal = {}) {
   const startedAt = Date.now();
   const query = String(args.query || "").trim();
+  if (!query) throw new Error("query is required.");
+  const cached = readChatgptSearchSnapshot({ ...args, query }, internal);
+  if (cached) return cached;
   const exactFilenameQuery = chatgptExactFilenameQuery(query);
   const allowLocalFastPath = Boolean(exactFilenameQuery) || findImportantTokens(query).length >= 2;
   const cache = await loadMetadataCache();
@@ -12331,7 +12561,7 @@ async function chatgptSearch(args = {}, internal = {}) {
       usedScanFallback: Boolean(found.summary?.usedScanFallback)
     }));
   }
-  return {
+  const value = {
     results,
     ...(internal.includeDiagnostics === true ? {
       diagnostics: {
@@ -12345,6 +12575,8 @@ async function chatgptSearch(args = {}, internal = {}) {
       }
     } : {})
   };
+  rememberChatgptSearchSnapshot({ ...args, query }, internal, value);
+  return value;
 }
 
 function officePlainText(document, fileName = "Office document") {
@@ -12786,9 +13018,13 @@ function chatgptFetchMetadata(snapshot, overrides = {}) {
   const metadata = {
     type: item.folder ? "folder" : "file",
     size: String(item.size ?? ""),
+    created: String(item.createdDateTime || ""),
     modified: String(item.lastModifiedDateTime || ""),
     mimeType: String(item.file?.mimeType || ""),
     path: String(item.remotePath || item.path || ""),
+    driveId: String(item.driveId || ""),
+    eTag: String(item.eTag || ""),
+    cTag: String(item.cTag || ""),
     previewSource: String(snapshot.source || "metadata"),
     truncated: String(Boolean(snapshot.truncated)),
     ...Object.fromEntries(Object.entries(overrides).map(([key, value]) => [key, String(value)]))
@@ -14070,11 +14306,21 @@ async function updateFile(args = {}) {
 }
 
 async function recent(args = {}) {
+  const requestedLimit = clampInteger(args.limit, 50, 1, 200);
   const params = new URLSearchParams();
-  params.set("$top", String(clampInteger(args.limit, 50, 1, 200)));
+  params.set("$top", String(requestedLimit));
   const result = await graph(`/me/drive/recent?${params.toString()}`);
   await bestEffortLocalWrite("metadata cache update", async () => await cacheItems(result.value || []));
-  return { items: (result.value || []).map((item) => formatDriveItem(item, args.format)), count: (result.value || []).length };
+  const items = (result.value || []).map((item) => formatDriveItem(item, args.format));
+  return {
+    items,
+    count: items.length,
+    requestedLimit,
+    providerReturnedCount: (result.value || []).length,
+    truncated: Boolean(result["@odata.nextLink"]),
+    nextLink: result["@odata.nextLink"] || null,
+    source: "microsoft_graph_recent"
+  };
 }
 
 async function listAccessibleDrives(args = {}, knownDrive = null) {
@@ -14682,6 +14928,133 @@ async function uploadChatgptFile(args = {}) {
   } finally {
     try {
       if (downloaded?.localPath) await rm(downloaded.localPath, { force: true }).catch(() => null);
+    } finally {
+      heavyweightAdmissionLease.release();
+    }
+  }
+}
+
+async function createOfficeFile(args = {}) {
+  const kind = String(args.kind || "");
+  const expectedExtension = { word: ".docx", excel: ".xlsx", powerpoint: ".pptx" }[kind];
+  if (!expectedExtension) throw new Error("kind must be word, excel, or powerpoint.");
+  const destinationPath = assertSafeRemotePath(args.remotePath, "remotePath");
+  if (!destinationPath || extname(destinationPath).toLowerCase() !== expectedExtension) {
+    throw new Error(`${kind} creation requires remotePath to end in ${expectedExtension}.`);
+  }
+  const spec = args.spec || {};
+  const stableSpec = stablePreviewValue(spec);
+  const encodedSpec = JSON.stringify(stableSpec);
+  if (Buffer.byteLength(encodedSpec, "utf8") > 512 * 1024) {
+    throw new Error("Office creation spec exceeds the 512 KiB structured-content limit.");
+  }
+  const conflictBehavior = args.conflictBehavior || "fail";
+  const heavyweightAdmissionLease = acquireHeavyweightBufferLease();
+  let transactionRoot = null;
+  try {
+    const { guard, paths } = await currentScopedStoragePaths("Office creation staging");
+    transactionRoot = join(paths.officeEditingRoot, `create-${randomUUID()}`);
+    await ensurePrivateDirectory(transactionRoot);
+    const localPath = join(transactionRoot, basename(destinationPath));
+    const created = await runOfficeHelper({
+      action: "create",
+      outputPath: localPath,
+      kind,
+      spec: stableSpec
+    }, { _heavyweightAdmissionLease: heavyweightAdmissionLease });
+    assertStorageScopeGuard(guard, "Office creation completion");
+    const packageStat = await stat(localPath);
+    if (packageStat.size > maxOfficePackageBytes) {
+      throw new Error(`Created Office package is ${packageStat.size} bytes, above the ${maxOfficePackageBytes}-byte upload limit.`);
+    }
+    const packageEvidence = {
+      bytes: packageStat.size,
+      sha256: await sha256LocalFile(localPath),
+      validation: created.validation,
+      summary: created.summary
+    };
+    const current = await existingReplacementTarget(destinationPath);
+    if (current?.folder) throw new Error(`Refusing to replace a folder with file content: ${current.name}`);
+    const proof = {
+      kind,
+      destinationPath,
+      conflictBehavior,
+      specSha256: createHash("sha256").update(encodedSpec).digest("hex"),
+      existing: current ? itemVersionProof(current) : null
+    };
+    const preview = {
+      dryRun: args.dryRun !== false,
+      confirmed: args.confirmed === true,
+      kind,
+      destinationPath,
+      conflictBehavior,
+      package: packageEvidence,
+      wouldCreate: current ? null : { name: basename(destinationPath), destinationPath },
+      wouldReplace: conflictBehavior === "replace" && current ? simplifyItem(current) : null,
+      wouldConflict: conflictBehavior === "fail" && current ? simplifyItem(current) : null,
+      wouldRenameOnConflict: conflictBehavior === "rename" && current ? true : false
+    };
+    if (conflictBehavior === "fail" && current) {
+      return {
+        ...preview,
+        blockedByConflict: true,
+        requiredToCreate: "Choose a new destination, conflictBehavior rename, or preview an explicitly guarded replacement."
+      };
+    }
+    if (args.dryRun !== false) return previewWithToken(preview, "onedrive_create_office_file", proof);
+    if (args.confirmed !== true) {
+      return { ...preview, dryRun: false, requiredToCreate: "Set dryRun: false and confirmed: true after reviewing the Office creation preview." };
+    }
+    if (conflictBehavior === "replace" && current) {
+      if (!hasExpectedIdentity(args) || !args.expectedETag) {
+        return { ...preview, dryRun: false, confirmed: true, requiredToCreate: "Provide expectedName or expectedId plus expectedETag matching the existing file." };
+      }
+      assertExpectedItem(current, args, "Office creation replacement");
+      if (args.expectedETag !== current.eTag) throw new Error("Office creation expectedETag no longer matches the current file. Run a fresh preview.");
+    }
+    const previewTokenRequired = previewTokenRequiredResult(preview, "onedrive_create_office_file", proof, args.previewToken, "requiredToCreate");
+    if (previewTokenRequired) return previewTokenRequired;
+    const uploaded = await upload({
+      localPath,
+      remotePath: destinationPath,
+      conflictBehavior: current && conflictBehavior === "replace"
+        ? "replace"
+        : conflictBehavior === "replace"
+          ? "fail"
+          : conflictBehavior,
+      guardedInternalReplace: true,
+      ifMatch: current && conflictBehavior === "replace" ? current.eTag : undefined,
+      uploadMode: "simple",
+      auditTool: "onedrive_create_office_file",
+      auditSource: { kind, specSha256: proof.specSha256, packageSha256: packageEvidence.sha256 }
+    });
+    const inspection = await inspectRemoteOfficePackage(
+      { _resolvedInfo: uploaded.item, itemId: uploaded.item.id },
+      kind,
+      "inspect",
+      { _heavyweightAdmissionLease: heavyweightAdmissionLease }
+    );
+    assertStorageScopeGuard(guard, "Office creation remote verification");
+    const { localPath: omittedLocalPath, ...safeUploaded } = uploaded;
+    return {
+      ...safeUploaded,
+      kind,
+      operationId: mutationOperationId("onedrive_create_office_file", args.previewToken),
+      package: packageEvidence,
+      verification: {
+        verified: inspection.kind === kind && inspection.package?.valid !== false,
+        kind: inspection.kind,
+        paragraphCount: inspection.paragraphCount,
+        tableCount: inspection.tableCount,
+        sheetCount: inspection.sheetCount,
+        cellCount: inspection.cellCount,
+        slideCount: inspection.slideCount,
+        package: inspection.package
+      }
+    };
+  } finally {
+    try {
+      if (transactionRoot) await rm(transactionRoot, { recursive: true, force: true }).catch(() => null);
     } finally {
       heavyweightAdmissionLease.release();
     }
@@ -17406,6 +17779,8 @@ async function callTool(name, args = {}) {
       return textResult(await upload(args));
     case "onedrive_upload_file":
       return textResult(await uploadChatgptFile(args));
+    case "onedrive_create_office_file":
+      return textResult(await createOfficeFile(args));
     case "onedrive_write_text":
       return textResult(await writeText(args));
     case "onedrive_patch_text":
@@ -17672,6 +18047,14 @@ export async function shutdownOneDriveServer() {
 
 function startStdioServer() {
   let buffer = "";
+  let pendingRequests = 0;
+  let stdinEnded = false;
+  let stopping = false;
+  const stopAfterPendingRequests = () => {
+    if (!stdinEnded || pendingRequests !== 0 || stopping) return;
+    stopping = true;
+    void shutdownOneDriveServer().finally(() => process.exit(0));
+  };
   process.stdin.setEncoding("utf8");
   process.stdin.on("data", (chunk) => {
     buffer += chunk;
@@ -17682,15 +18065,29 @@ function startStdioServer() {
       buffer = buffer.slice(newline + 1);
       if (!line) continue;
       try {
-        void processMcpMessage(JSON.parse(line)).then((response) => {
-          if (response) process.stdout.write(`${JSON.stringify(response)}\n`);
-        });
+        const request = JSON.parse(line);
+        pendingRequests += 1;
+        void processMcpMessage(request)
+          .then(async (response) => {
+            if (response) {
+              await new Promise((resolveWrite) => {
+                process.stdout.write(`${JSON.stringify(response)}\n`, resolveWrite);
+              });
+            }
+          })
+          .finally(() => {
+            pendingRequests -= 1;
+            stopAfterPendingRequests();
+          });
       } catch (error) {
         process.stdout.write(`${JSON.stringify(errorMessage(null, -32700, `Parse error: ${error.message}`))}\n`);
       }
     }
   });
-  process.stdin.on("end", () => { shutdownOneDriveServer().catch(() => null); });
+  process.stdin.on("end", () => {
+    stdinEnded = true;
+    stopAfterPendingRequests();
+  });
   for (const signal of ["SIGINT", "SIGTERM"]) {
     process.on(signal, async () => {
       await shutdownOneDriveServer();

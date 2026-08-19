@@ -647,7 +647,7 @@ try {
     { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
     bearerToken({ jti: "linked-tools-list" })
   );
-  const expectedToolCount = 19;
+  const expectedToolCount = 21;
   assert(listed.result?.tools?.length === expectedToolCount, "OAuth HTTP server did not expose the exact tool contract.", listed.result?.tools?.length);
   assert(listed.result.tools.every((tool) => tool.securitySchemes?.[0]?.type === "oauth2"), "A tool is missing oauth2 security metadata.");
   assert(

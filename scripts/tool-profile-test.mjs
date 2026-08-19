@@ -82,6 +82,7 @@ if (process.argv.includes("--probe")) {
       "onedrive_read_actions",
       "onedrive_commit_actions",
       "onedrive_upload_file",
+      "onedrive_create_office_file",
       "onedrive_export_file",
       "onedrive_write_text",
       "onedrive_create_sharing_link",
@@ -242,6 +243,7 @@ try {
   const chatgpt = probe("chatgpt");
   const chatgptOauth = probe("chatgpt", "oauth");
   const expectedFocusedNames = [
+    "search",
     "fetch",
     "onedrive_open_files",
     "onedrive_preview_actions",
@@ -254,6 +256,7 @@ try {
     "onedrive_download_file",
     "onedrive_render_preview",
     "onedrive_upload_file",
+    "onedrive_create_office_file",
     "onedrive_export_file",
     "onedrive_write_text",
     "onedrive_patch_text",
@@ -276,10 +279,10 @@ try {
     ]
   }];
   const fullNames = new Set(full.names);
-  const compatibilityNames = new Set(["search", "fetch", "onedrive_open_files", "onedrive_preview_actions", "onedrive_read_actions", "onedrive_commit_actions", "onedrive_office_inspect", "onedrive_office_review", "onedrive_download_file", "onedrive_render_preview", "onedrive_upload_file", "onedrive_export_file", "onedrive_permanent_delete"]);
+  const compatibilityNames = new Set(["search", "fetch", "onedrive_open_files", "onedrive_preview_actions", "onedrive_read_actions", "onedrive_commit_actions", "onedrive_office_inspect", "onedrive_office_review", "onedrive_download_file", "onedrive_render_preview", "onedrive_upload_file", "onedrive_create_office_file", "onedrive_export_file", "onedrive_permanent_delete"]);
   assert(full.count === 84, "Full profile must preserve the 84-tool contract.", full);
-  assert(chatgpt.count === 19 && JSON.stringify([...chatgpt.names].sort()) === JSON.stringify([...expectedFocusedNames].sort()), "ChatGPT profile must expose exactly the reviewed 19-tool surface.", chatgpt);
-  assert(chatgptOauth.count === 19 && JSON.stringify(chatgptOauth.names) === JSON.stringify(chatgpt.names), "OAuth must expose the same reviewed ChatGPT tool surface.", chatgptOauth);
+  assert(chatgpt.count === 21 && JSON.stringify([...chatgpt.names].sort()) === JSON.stringify([...expectedFocusedNames].sort()), "ChatGPT profile must expose exactly the reviewed 21-tool surface.", chatgpt);
+  assert(chatgptOauth.count === 21 && JSON.stringify(chatgptOauth.names) === JSON.stringify(chatgpt.names), "OAuth must expose the same reviewed ChatGPT tool surface.", chatgptOauth);
   assert(chatgpt.security.topLevel.every((schemes) => JSON.stringify(schemes) === JSON.stringify(expectedNoauthSchemes)), "Every noauth ChatGPT tool must advertise the standard top-level security scheme.", chatgpt.security);
   assert(chatgpt.security.mirrored.every((schemes) => JSON.stringify(schemes) === JSON.stringify(expectedNoauthSchemes)), "Every noauth ChatGPT tool must retain the compatibility security-scheme mirror.", chatgpt.security);
   assert(chatgptOauth.security.topLevel.every((schemes) => JSON.stringify(schemes) === JSON.stringify(expectedOauthSchemes)), "Every OAuth ChatGPT tool must advertise the exact standard top-level security scheme.", chatgptOauth.security);
@@ -290,14 +293,14 @@ try {
     const actualOperations = chatgpt.compatibility[toolName]?.inputSchema?.properties?.actions?.items?.properties?.operation?.enum;
     assert(JSON.stringify(actualOperations) === JSON.stringify(expectedOperations), `${toolName} must advertise its exact reviewed composite operation enum.`, actualOperations);
   }
-  assert(chatgpt.names.includes("fetch") && chatgpt.names.includes("onedrive_read_actions"), "ChatGPT profile must expose fetch plus the combined read path.", chatgpt.names);
-  assert(["search", "onedrive_list", "onedrive_permissions"].every((name) => !chatgpt.names.includes(name)), "ChatGPT must hide redundant single-read tools so Work selects the combined read path.", chatgpt.names);
+  assert(chatgpt.names.includes("search") && chatgpt.names.includes("fetch") && chatgpt.names.includes("onedrive_read_actions"), "ChatGPT profile must expose the standard search/fetch contract plus the combined read path.", chatgpt.names);
+  assert(["onedrive_list", "onedrive_permissions"].every((name) => !chatgpt.names.includes(name)), "ChatGPT must hide redundant single-read tools so Work selects the combined read path.", chatgpt.names);
   assert(chatgpt.names.includes("onedrive_upload_file") && chatgpt.names.includes("onedrive_export_file") && chatgpt.names.includes("onedrive_restore_deleted") && !chatgpt.names.includes("onedrive_permanent_delete"), "ChatGPT profile must expose upload, remote export, and recycle-bin restore while hiding irreversible permanent deletion.", chatgpt.names);
   assert(!chatgpt.names.includes("onedrive_find") && !chatgpt.names.includes("onedrive_get_info") && !chatgpt.names.includes("onedrive_read_text"), "ChatGPT profile must not advertise redundant slow retrieval tools.", chatgpt.names);
   assert(!chatgpt.names.includes("onedrive_preview") && !chatgpt.names.includes("onedrive_recent") && !chatgpt.names.includes("onedrive_office_search"), "ChatGPT profile must not advertise redundant retrieval helpers.", chatgpt.names);
   assert(!chatgpt.names.includes("onedrive_word_get_document") && !chatgpt.names.includes("onedrive_excel_get_workbook") && !chatgpt.names.includes("onedrive_powerpoint_get_presentation"), "ChatGPT profile must use the bounded fetch extractor instead of redundant high-volume Office reads.", chatgpt.names);
   assert(["onedrive_rename", "onedrive_move", "onedrive_copy", "onedrive_create_sharing_link", "onedrive_revoke_permission"].every((name) => !chatgpt.names.includes(name)), "ChatGPT must route guarded item/share mutations through the single commit tool while retaining legacy handlers internally.", chatgpt.names);
-  assert(!["search", "fetch", "onedrive_open_files", "onedrive_preview_actions", "onedrive_read_actions", "onedrive_commit_actions", "onedrive_office_inspect", "onedrive_office_review", "onedrive_download_file", "onedrive_render_preview", "onedrive_upload_file", "onedrive_export_file", "onedrive_permanent_delete"].some((name) => full.names.includes(name)), "ChatGPT compatibility tools must not change the immutable full tool contract.", full.names);
+  assert(!["search", "fetch", "onedrive_open_files", "onedrive_preview_actions", "onedrive_read_actions", "onedrive_commit_actions", "onedrive_office_inspect", "onedrive_office_review", "onedrive_download_file", "onedrive_render_preview", "onedrive_upload_file", "onedrive_create_office_file", "onedrive_export_file", "onedrive_permanent_delete"].some((name) => full.names.includes(name)), "ChatGPT compatibility tools must not change the immutable full tool contract.", full.names);
   assert(full.callBoundary.hiddenIsError === false && full.callBoundary.advertisedIsError === false, "Full profile must continue executing its advertised configuration and Office capability tools.", full.callBoundary);
   const fullWordOperations = full.compatibility.onedrive_word_batch_update?.inputSchema?.properties?.operations?.items?.anyOf || [];
   const fullExcelOperations = full.compatibility.onedrive_excel_batch_update?.inputSchema?.properties?.operations?.items?.anyOf || [];
@@ -333,6 +336,14 @@ try {
   }
   assert("itemId" in fetchResultSchema, "fetch must expose the stable source item ID when id is a progressive continuation.", fetchResultSchema);
   assert(chatgpt.compatibility.fetch?.annotations?.readOnlyHint === true, "fetch must remain read-only.", chatgpt.compatibility);
+  assert(JSON.stringify(chatgpt.compatibility.search?.inputSchema) === JSON.stringify({ type: "object", required: ["query"], properties: { query: { type: "string", minLength: 1 } }, additionalProperties: false }), "search must keep the exact company-knowledge input contract.", chatgpt.compatibility.search);
+  const searchResultSchema = chatgpt.compatibility.search?.outputSchema?.properties || {};
+  assert(searchResultSchema.results?.items?.required?.includes("id")
+    && searchResultSchema.results.items.required.includes("title")
+    && searchResultSchema.results.items.required.includes("url")
+    && searchResultSchema.results.items.properties?.metadata?.type === "object"
+    && searchResultSchema.cache?.type === "object",
+  "search must advertise standard results plus normalized metadata and optional cache evidence.", searchResultSchema);
   const openFilesSchema = chatgpt.compatibility.onedrive_open_files?.inputSchema;
   const openFilesOutputSchema = chatgpt.compatibility.onedrive_open_files?.outputSchema;
   assert(openFilesSchema?.properties?.names?.maxItems === 5 && openFilesSchema?.properties?.urls?.maxItems === 5, "Exact-file opening must expose bounded name/path and OneDrive/SharePoint URL modes.", openFilesSchema);
@@ -361,6 +372,9 @@ try {
   assert(chatgpt.compatibility.onedrive_commit_actions?.annotations?.openWorldHint === true && chatgpt.compatibility.onedrive_commit_actions?.annotations?.destructiveHint === true, "Guarded batch commits must advertise their maximum publishing and destructive impact.", chatgpt.compatibility.onedrive_commit_actions);
   assert(JSON.stringify(chatgpt.compatibility.onedrive_upload_file?._meta?.["openai/fileParams"]) === JSON.stringify(["sourceFile"]), "ChatGPT upload must advertise its file parameter.", chatgpt.compatibility.onedrive_upload_file);
   assert(chatgpt.compatibility.onedrive_upload_file?.annotations?.destructiveHint === true && chatgpt.compatibility.onedrive_export_file?.annotations?.destructiveHint === true, "Upload replacement and remote export must advertise destructive impact.", chatgpt.compatibility);
+  const createOfficeAnnotations = chatgpt.compatibility.onedrive_create_office_file?.annotations;
+  assert(createOfficeAnnotations?.readOnlyHint === false && createOfficeAnnotations?.openWorldHint === true && createOfficeAnnotations?.destructiveHint === true,
+    "Office creation must advertise its remote-write and replacement impact.", createOfficeAnnotations);
   assert(chatgpt.oversized.truncated === true && chatgpt.oversized.boundedBytes <= 1024 * 1024, "Oversized ChatGPT tool results must be bounded below the response cap.", chatgpt.oversized);
   assert(chatgpt.bytes <= maxChatgptToolListBytes, "ChatGPT tools/list payload must stay at or below the 38 KiB discovery budget.", chatgpt);
   assert(chatgptOauth.bytes <= maxChatgptToolListBytes, "OAuth ChatGPT tools/list payload must stay at or below the 38 KiB discovery budget.", chatgptOauth);
@@ -376,6 +390,7 @@ try {
   assert(chatgpt.instructions.includes("not credentials"), "ChatGPT instructions must classify returned OneDrive identifiers accurately.", chatgpt.instructions);
   assert(chatgpt.instructions.includes("Prefer user-visible paths") && chatgpt.instructions.includes("verified stable results"), "ChatGPT instructions must prefer path selectors and verified mutation results.", chatgpt.instructions);
   assert(chatgpt.instructions.includes("onedrive_export_file") && chatgpt.instructions.includes("PDF or text copy saved in OneDrive"), "ChatGPT instructions must route remote document exports through the guarded export tool.", chatgpt.instructions);
+  assert(chatgpt.instructions.includes("Use standard search") && chatgpt.instructions.includes("onedrive_create_office_file") && chatgpt.instructions.includes("build and validate"), "ChatGPT instructions must expose standard discovery and direct validated Office creation.", chatgpt.instructions);
   assert(Object.values(chatgpt.chatgptFileUrlPolicy || {}).every(Boolean), "ChatGPT file URLs must remain host-agnostic while rejecting unsafe URL and network forms.", chatgpt.chatgptFileUrlPolicy);
   const createFolderSchema = chatgpt.compatibility.onedrive_create_folder?.inputSchema;
   assert(createFolderSchema && !["dryRun", "confirmed", "previewToken"].some((field) => field in (createFolderSchema.properties || {})), "Create-folder must not advertise preview-only arguments.", createFolderSchema);
@@ -401,6 +416,15 @@ try {
   assert(JSON.stringify(writeToolSchema.required) === JSON.stringify(["remotePath", "content"]) && !writeToolSchema.anyOf && !("remotePreset" in writeSchema) && !("remoteRelativePath" in writeSchema), "Focused text writes must use one unambiguous remotePath schema branch.", writeToolSchema);
   const uploadSchema = chatgpt.compatibility.onedrive_upload_file?.inputSchema?.properties || {};
   assert(uploadSchema.remotePath?.description?.includes("including filename") && uploadSchema.confirmed?.description?.includes("explicit user confirmation") && uploadSchema.previewToken?.description?.includes("not an auth credential"), "Focused uploads must retain destination and guarded-live-call argument guidance.", uploadSchema);
+  const createOfficeTool = chatgpt.compatibility.onedrive_create_office_file?.inputSchema || {};
+  const createOfficeSchema = createOfficeTool.properties || {};
+  assert(JSON.stringify(createOfficeTool.required) === JSON.stringify(["kind", "remotePath", "spec"])
+    && createOfficeSchema.kind?.enum?.length === 3
+    && createOfficeSchema.remotePath?.description?.includes("extension must match kind")
+    && createOfficeSchema.spec?.description?.includes("sheets and rows")
+    && createOfficeSchema.expectedETag?.description?.includes("required for live replacement")
+    && createOfficeSchema.previewToken?.description?.includes("not an auth credential"),
+  "Focused Office creation must retain kind, destination, structured-content, revision, and preview-proof guidance.", createOfficeTool);
   const exportSchema = chatgpt.compatibility.onedrive_export_file?.inputSchema?.properties || {};
   assert(exportSchema.itemId?.description?.includes("Stable source ID") && exportSchema.remotePath?.description?.includes(".pdf or .txt") && exportSchema.expectedETag?.description?.includes("matching preview") && exportSchema.previewToken?.description?.includes("not an auth credential"), "Focused exports must retain stable source, destination, revision, and preview-proof guidance.", exportSchema);
   assert(!["path", "conflictBehavior", "destinationExpectedId", "destinationExpectedName"].some((field) => field in exportSchema), "Focused exports must remain fail-on-conflict and omit replacement-only fields.", exportSchema);

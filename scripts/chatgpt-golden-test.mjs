@@ -12,6 +12,7 @@ function assert(condition, message, details = undefined) {
 }
 
 const goldenPrompts = [
+  { prompt: "Find the business plan even if I only remember the topic", tool: "search", cues: ["discovery", "partial name", "indexed content", "fetch"] },
   { prompt: "Read the budget workbook you found", tool: "fetch", cues: ["read", "returned by onedrive_read_actions"] },
   { prompt: "Open 2026 Family Budgeting.xlsx and this OneDrive link", tool: "onedrive_open_files", cues: ["exact filenames", "onedrive/sharepoint", "urls", "one read-only call", "never show the bare url"] },
   { prompt: "Preview renaming this workbook, copying it, and creating a view link", tool: "onedrive_preview_actions", cues: ["preview", "read-only batch", "onedrive_commit_actions"] },
@@ -24,6 +25,7 @@ const goldenPrompts = [
   { prompt: "Give me the original file as a downloadable resource", tool: "onedrive_download_file", cues: ["materialized original", "pdf", "mcp resource"] },
   { prompt: "Render the first three slides so I can visually check them", tool: "onedrive_render_preview", cues: ["visual qa", "pages or slides", "image"] },
   { prompt: "Upload this attached PDF to OneDrive", tool: "onedrive_upload_file", cues: ["chatgpt-provided file", "upload"] },
+  { prompt: "Create a Word brief in OneDrive from these paragraphs and this table", tool: "onedrive_create_office_file", cues: ["new word, excel, or powerpoint", "structured content", "validated package", "same proof"] },
   { prompt: "Export this Word document as a PDF beside the source in OneDrive", tool: "onedrive_export_file", cues: ["converted to pdf or plain text", "saved back in onedrive", "preview"] },
   { prompt: "Create a new markdown file with this full content", tool: "onedrive_write_text", cues: ["create or fully replace", "required content field", "never a text field"] },
   { prompt: "Change only one line in this existing text file", tool: "onedrive_patch_text", cues: ["targeted", "preserving", "expectedetag", "previewtoken"] },
@@ -34,9 +36,12 @@ const goldenPrompts = [
 ];
 
 const ambiguityPairs = [
+  ["search", "onedrive_read_actions"],
   ["onedrive_preview_actions", "onedrive_commit_actions"],
   ["onedrive_read_actions", "onedrive_open_files"],
   ["onedrive_upload_file", "onedrive_export_file"],
+  ["onedrive_upload_file", "onedrive_create_office_file"],
+  ["onedrive_create_office_file", "onedrive_office_batch_transform"],
   ["onedrive_upload_file", "onedrive_download_file"],
   ["onedrive_export_file", "onedrive_download_file"],
   ["onedrive_download_file", "onedrive_render_preview"],
@@ -67,6 +72,7 @@ try {
   assert(initialized.result.instructions.includes("onedrive_preview_actions once") && initialized.result.instructions.includes("onedrive_commit_actions"), "ChatGPT instructions must describe the guarded batch preview/commit sequence.", initialized.result.instructions);
   assert(initialized.result.instructions.includes("dependency order") && initialized.result.instructions.includes("proofs can become stale"), "ChatGPT instructions must prevent stale guards in dependent mutation sequences.", initialized.result.instructions);
   assert(initialized.result.instructions.includes("Create folders directly"), "ChatGPT instructions must match the create-folder contract.", initialized.result.instructions);
+  assert(initialized.result.instructions.includes("Use standard search") && initialized.result.instructions.includes("onedrive_create_office_file"), "ChatGPT instructions must route standard discovery and direct Office creation.", initialized.result.instructions);
   assert(initialized.result.instructions.includes("Prefer user-visible paths") && initialized.result.instructions.includes("verified stable results"), "ChatGPT instructions must avoid false credential routing and redundant mutation readbacks.", initialized.result.instructions);
   assert(!initialized.result.instructions.includes("matching structured read tool"), "ChatGPT instructions must not reference tools absent from the focused profile.", initialized.result.instructions);
 

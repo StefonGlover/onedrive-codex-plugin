@@ -52,6 +52,7 @@ let officeWordBuffer = readFileSync(join(officeFixtureDir, "sample.docx"));
 let officeExcelBuffer = readFileSync(join(officeFixtureDir, "sample.xlsx"));
 let officeBusinessBuffer = Buffer.from(officeExcelBuffer);
 let officePowerPointBuffer = readFileSync(join(officeFixtureDir, "sample.pptx"));
+let createdOfficeWordBuffer = null;
 let remoteExportPdfBuffer = null;
 let remoteExportTextBuffer = null;
 const commonRtfBuffer = Buffer.from("{\\rtf1\\ansi Common file extraction\\par Budget total: \\b $1,234\\b0\\par}", "utf8");
@@ -563,6 +564,35 @@ const graph = createServer(async (req, res) => {
       size: body.length,
       parentReference: { path: "/drive/root:/Uploads" }
     }));
+  }
+  const decodedPath = decodeURIComponent(path);
+  const createdOfficeItem = () => item("created-office-word", "Created Beta.docx", {
+    size: createdOfficeWordBuffer?.length || 0,
+    parentReference: { id: "uploads-folder", driveId: "drive", path: "/drive/root:/Uploads" },
+    file: { mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+  });
+  if (req.method === "GET" && decodedPath === "/v1.0/me/drive/root:/Uploads/Created Beta.docx:") {
+    return createdOfficeWordBuffer
+      ? json(res, 200, createdOfficeItem())
+      : json(res, 404, { error: { code: "itemNotFound", message: "created Office fixture is absent" } });
+  }
+  if (req.method === "PUT" && decodedPath === "/v1.0/me/drive/root:/Uploads/Created Beta.docx:/content") {
+    createdOfficeWordBuffer = await readBufferBody(req);
+    count("created-office-word-upload");
+    return json(res, 200, createdOfficeItem());
+  }
+  if (req.method === "GET" && path === "/v1.0/me/drive/items/created-office-word") {
+    return createdOfficeWordBuffer
+      ? json(res, 200, createdOfficeItem())
+      : json(res, 404, { error: { code: "itemNotFound", message: "created Office fixture is absent" } });
+  }
+  if (req.method === "GET" && [
+    "/v1.0/me/drive/items/created-office-word/content",
+    "/v1.0/drives/drive/items/created-office-word/content"
+  ].includes(path)) {
+    if (!createdOfficeWordBuffer) return json(res, 404, { error: { code: "itemNotFound", message: "created Office fixture is absent" } });
+    count("created-office-word-content-read");
+    return binary(res, 200, createdOfficeWordBuffer, { "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document" });
   }
 
   if (req.method === "GET" && path === "/v1.0/me") {
@@ -6142,6 +6172,8 @@ process.exit(2);
       "ChatGPT search should expose stable item identity, location, type, and web URL fields.",
       searchItem
     );
+    assert(searchItem.metadata?.modified && searchItem.metadata?.mimeType === "text/plain" && Number(searchItem.metadata?.size) > 0,
+      "ChatGPT search should expose normalized modified, MIME, and size metadata", searchItem);
     const fetched = await tool("fetch", { id: "root-note" });
     assert(!fetched.isError && fetched.value.text.includes("root note mock content"), "ChatGPT fetch should return indexed text", fetched);
     assert(fetched.value.metadata?.previewSource === "content-index", "ChatGPT fetch should report its local content-index source", fetched.value);
@@ -6159,7 +6191,60 @@ process.exit(2);
     const added = requests.slice(before);
     assert(!added.some((request) => decodeURIComponent(request.url).includes("/search(q='")), "fresh ChatGPT search should not call Graph search", { added });
     assert(!added.some((request) => request.path.endsWith("/content")), "fresh ChatGPT fetch should not call Graph content", { added });
-    return { searchResults: searched.value.results.length, fetchSource: fetched.value.metadata.previewSource, graphRequestsAdded: added.length };
+    const repeated = await tool("search", { query: "root note" });
+    assert(!repeated.isError && repeated.value.cache?.hit === true && repeated.value.cache?.source === "scoped_memory",
+      "repeated ChatGPT search should use the bounded auth-scoped result cache", repeated);
+    return { searchResults: searched.value.results.length, fetchSource: fetched.value.metadata.previewSource, graphRequestsAdded: added.length, repeatCache: repeated.value.cache };
+  });
+
+  await check("focused Office creation previews, uploads, reads back, and invalidates search snapshots", async () => {
+    const args = {
+      kind: "word",
+      remotePath: "Uploads/Created Beta.docx",
+      spec: {
+        title: "Created Beta",
+        paragraphs: ["Created directly from the focused OneDrive contract."],
+        tables: [[["Capability", "Status"], ["Search", "Ready"], ["Office creation", "Ready"]]]
+      },
+      conflictBehavior: "fail"
+    };
+    const putsBefore = counters.get("created-office-word-upload") || 0;
+    const preview = await tool("onedrive_create_office_file", args);
+    assert(!preview.isError && preview.value.dryRun === true && preview.value.previewToken,
+      "focused Office creation should return a scoped preview proof", preview);
+    assert(preview.value.package?.validation?.valid === true
+      && preview.value.package?.summary?.paragraphCount === 1
+      && preview.value.package?.summary?.tableCount === 1,
+    "focused Office creation preview should validate the generated package and summarize content", preview.value);
+    assert((counters.get("created-office-word-upload") || 0) === putsBefore,
+      "Office creation preview must not upload bytes", counters);
+    const live = await tool("onedrive_create_office_file", {
+      ...args,
+      dryRun: false,
+      confirmed: true,
+      previewToken: preview.value.previewToken
+    });
+    assert(!live.isError && live.value.item?.id === "created-office-word" && live.value.verification?.verified === true,
+      "confirmed Office creation should upload and verify the remote OpenXML package", live);
+    assert(live.value.verification?.paragraphCount >= 2 && live.value.verification?.tableCount === 1,
+      "remote readback should observe the generated Word title, paragraph, and table", live.value.verification);
+    assert((counters.get("created-office-word-upload") || 0) === putsBefore + 1
+      && (counters.get("created-office-word-content-read") || 0) === 1,
+    "Office creation should upload exactly once and perform one verification readback", counters);
+    const duplicatePreview = await tool("onedrive_create_office_file", args);
+    assert(!duplicatePreview.isError && duplicatePreview.value.blockedByConflict === true && !duplicatePreview.value.previewToken,
+      "conflictBehavior fail must not issue an actionable token for an occupied Office destination", duplicatePreview);
+    const afterMutation = await tool("search", { query: "root note" });
+    assert(!afterMutation.isError && !afterMutation.value.cache,
+      "successful Office creation must invalidate the current authentication scope's search snapshot", afterMutation);
+    return {
+      previewValidated: true,
+      uploaded: 1,
+      verificationReadbacks: 1,
+      duplicateBlockedBeforeToken: true,
+      searchCacheInvalidated: true,
+      observed: live.value.verification
+    };
   });
 
   await check("ChatGPT cold search verifies opaque service records and warms repeat search", async () => {

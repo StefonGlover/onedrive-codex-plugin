@@ -156,7 +156,7 @@ try {
   });
   const focusedTools = listed?.result?.tools;
   assert.ok(Array.isArray(focusedTools), "Focused tools/list must return a tools array.");
-  assert.equal(focusedTools.length, 19, "Hosted tools/list must expose exactly the reviewed focused surface.");
+  assert.equal(focusedTools.length, 21, "Hosted tools/list must expose exactly the reviewed focused surface.");
   assert.deepEqual(pathFindings(focusedTools), [], "Focused descriptors must not expose local filesystem selectors or concrete host paths.");
 
   const capabilities = await oneDriveServerModule.processMcpMessage({

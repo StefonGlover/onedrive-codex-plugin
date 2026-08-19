@@ -1,6 +1,6 @@
 {
   "name": "onedrive",
-  "version": "0.6.4+codex.20260816170509",
+  "version": "0.6.4+codex.20260819032617",
   "description": "Search, create, edit, review, share, and recover OneDrive files with preview-and-confirm safeguards.",
   "author": {
     "name": "Stefon Glover"
@@ -16,7 +16,7 @@
   "interface": {
     "displayName": "OneDrive",
     "shortDescription": "Search, edit, review, share, and recover OneDrive files safely.",
-    "longDescription": "Use Microsoft OneDrive in ChatGPT Work to search and open files; discover enterprise document libraries; create folders; upload, update, rename, copy, and move content; inspect, render, review, and edit Word, Excel, and PowerPoint files; export PDF or text; manage links and permissions; and recover recycle-bin deletions. Consequential writes and sharing actions use preview-and-confirm safeguards plus post-action verification. Every user signs in with OAuth, and credentials, resources, caches, and indexes stay isolated by account and drive.",
+    "longDescription": "Use Microsoft OneDrive in ChatGPT Work to search and open files; discover enterprise document libraries; create folders and validated Word, Excel, or PowerPoint files; upload, update, rename, copy, and move content; inspect, render, review, and edit Office files; export PDF or text; manage links and permissions; and recover recycle-bin deletions. Consequential writes and sharing actions use preview-and-confirm safeguards plus post-action verification. Every user signs in with OAuth, and credentials, resources, caches, and indexes stay isolated by account and drive.",
     "developerName": "Stefon Glover",
     "category": "Productivity",
     "capabilities": [
@@ -29,6 +29,7 @@
       "Keychain auth",
       "Encrypted Linux auth vault",
       "Microsoft Graph",
+      "Native Office creation",
       "Native Office editing",
       "Version history",
       "Managed editing workspaces",
@@ -36,7 +37,7 @@
     ],
     "defaultPrompt": [
       "Find the enterprise document libraries I can access in OneDrive.",
-      "Find recent documents in OneDrive.",
+      "Create and verify a new Office file in OneDrive from structured content.",
       "Inspect and safely edit a Word, Excel, or PowerPoint file in OneDrive."
     ],
     "brandColor": "#2563EB",
