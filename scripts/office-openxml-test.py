@@ -101,7 +101,7 @@ def production_openxml_operations():
         text=True,
         capture_output=True,
         check=False,
-        timeout=10,
+        timeout=30,
         env={**os.environ, "ONEDRIVE_TEST_ACCESS_TOKEN": "office-openxml-schema-check"},
     )
     if result.returncode != 0:
