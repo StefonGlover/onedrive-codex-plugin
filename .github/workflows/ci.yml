@@ -22,6 +22,10 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          # QA evidence is intentionally one commit newer than the tested
+          # source, so the packaging guard needs that parent for ancestry.
+          fetch-depth: 2
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
