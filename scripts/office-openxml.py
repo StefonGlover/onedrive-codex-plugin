@@ -700,6 +700,243 @@ def excel_formula_dependencies(formula: Optional[str], current_sheet: str) -> Li
     return dependencies
 
 
+EXCEL_ERROR_TOKENS = (
+    "#REF!", "#VALUE!", "#NAME?", "#DIV/0!", "#N/A", "#NUM!", "#NULL!",
+    "#SPILL!", "#CALC!", "#FIELD!", "#GETTING_DATA",
+)
+EXCEL_VOLATILE_FUNCTIONS = ("CELL", "INDIRECT", "INFO", "NOW", "OFFSET", "RAND", "RANDBETWEEN", "TODAY")
+
+
+def excel_explicit_sheet_references(formula: str) -> List[str]:
+    pattern = re.compile(r"(?<!\])(?:'((?:[^']|'')+)'|([A-Za-z_][A-Za-z0-9_.]*))!\$?[A-Za-z]{1,3}\$?[1-9][0-9]*")
+    references = []
+    seen = set()
+    for match in pattern.finditer(formula or ""):
+        sheet = (match.group(1) or match.group(2) or "").replace("''", "'")
+        if sheet and sheet.lower() not in seen:
+            seen.add(sheet.lower())
+            references.append(sheet)
+    return references
+
+
+def excel_cycle_nodes(graph: Dict[str, List[str]]) -> List[str]:
+    nodes = set(graph)
+    adjacency = {node: [target for target in targets if target in nodes] for node, targets in graph.items()}
+    reverse = {node: [] for node in nodes}
+    for node, targets in adjacency.items():
+        for target in targets:
+            reverse[target].append(node)
+
+    visited = set()
+    order: List[str] = []
+    for root in sorted(nodes):
+        if root in visited:
+            continue
+        stack: List[Tuple[str, bool]] = [(root, False)]
+        while stack:
+            node, expanded = stack.pop()
+            if expanded:
+                order.append(node)
+                continue
+            if node in visited:
+                continue
+            visited.add(node)
+            stack.append((node, True))
+            for target in reversed(adjacency.get(node, [])):
+                if target not in visited:
+                    stack.append((target, False))
+
+    assigned = set()
+    cycles = set()
+    for root in reversed(order):
+        if root in assigned:
+            continue
+        component = []
+        stack = [root]
+        assigned.add(root)
+        while stack:
+            node = stack.pop()
+            component.append(node)
+            for target in reverse.get(node, []):
+                if target not in assigned:
+                    assigned.add(target)
+                    stack.append(target)
+        if len(component) > 1 or (len(component) == 1 and component[0] in adjacency.get(component[0], [])):
+            cycles.update(component)
+    return sorted(cycles)
+
+
+def excel_integrity(package: zipfile.ZipFile, workbook: ET.Element, relationships: Dict[str, Dict[str, str]], shared: List[str], request: Dict[str, Any]) -> Dict[str, Any]:
+    max_cells = max(1, min(int(request.get("maxIntegrityCells", 250_000)), 250_000))
+    max_findings = max(1, min(int(request.get("maxIntegrityFindings", 200)), 2_000))
+    sheet_parts: Dict[str, Tuple[str, Optional[str]]] = {}
+    sheets_node = workbook.find(q("s", "sheets"))
+    for sheet in list(sheets_node or []):
+        name = sheet.attrib.get("name", "")
+        relationship = relationships.get(sheet.attrib.get(q("r", "id"), ""), {})
+        target = relationship.get("Target", "")
+        sheet_parts[name.lower()] = (name, resolved_relationship_target("xl/workbook.xml", target) if target else None)
+
+    table_names: Dict[str, Dict[str, Any]] = {}
+    for _, (sheet_name, part) in sheet_parts.items():
+        if not part or part not in package.namelist():
+            continue
+        for table in excel_tables_for_sheet(package, part):
+            for table_name in (table.get("name"), table.get("displayName")):
+                if table_name:
+                    table_names[str(table_name).lower()] = {"name": table_name, "sheet": sheet_name, "part": table.get("part")}
+
+    findings: List[Dict[str, Any]] = []
+    severity_counts = {"error": 0, "warning": 0}
+    total_findings = 0
+    blocking_codes = {"BROKEN_DEFINED_NAME", "CIRCULAR_REFERENCE", "ERROR_CELL_VALUE", "FORMULA_ERROR_TOKEN", "MISSING_TABLE_REFERENCE", "MISSING_WORKSHEET_REFERENCE"}
+    blocking_finding_keys = set()
+
+    def add_finding(code: str, severity: str, message: str, **details: Any) -> None:
+        nonlocal total_findings
+        total_findings += 1
+        severity_counts[severity] = severity_counts.get(severity, 0) + 1
+        finding = {"code": code, "severity": severity, "message": message, **details}
+        if code in blocking_codes:
+            blocking_finding_keys.add(json.dumps(
+                {key: finding.get(key) for key in ("code", "sheet", "address", "name", "reference", "value") if finding.get(key) is not None},
+                sort_keys=True,
+                separators=(",", ":"),
+            ))
+        if len(findings) < max_findings:
+            findings.append(finding)
+
+    names_node = workbook.find(q("s", "definedNames"))
+    for name_node in list(names_node or []):
+        name = name_node.attrib.get("name")
+        value = name_node.text or ""
+        if "#REF!" in value.upper():
+            add_finding("BROKEN_DEFINED_NAME", "error", "Defined name contains a broken #REF! reference.", name=name)
+        for referenced_sheet in excel_explicit_sheet_references(value):
+            if referenced_sheet.lower() not in sheet_parts and not referenced_sheet.startswith("["):
+                add_finding("MISSING_WORKSHEET_REFERENCE", "error", "Defined name refers to a worksheet that does not exist.", name=name, reference=referenced_sheet)
+        if re.search(r"\[[^\]]+\]", value):
+            add_finding("EXTERNAL_WORKBOOK_REFERENCE", "warning", "Defined name refers to an external workbook whose current value was not verified.", name=name)
+
+    formula_count = 0
+    formula_cache_count = 0
+    scanned_cells = 0
+    volatile_formula_count = 0
+    external_formula_count = 0
+    dependency_graph: Dict[str, List[str]] = {}
+    truncated = False
+    for _, (sheet_name, part) in sheet_parts.items():
+        if not part or part not in package.namelist():
+            continue
+        root = xml_root(package, part)
+        for cell in root.iter(q("s", "c")):
+            if scanned_cells >= max_cells:
+                truncated = True
+                break
+            scanned_cells += 1
+            address = str(cell.attrib.get("r") or "").upper()
+            value = excel_cell_value(cell, shared)
+            if cell.attrib.get("t") == "e" or (isinstance(value, str) and value.upper() in EXCEL_ERROR_TOKENS):
+                add_finding("ERROR_CELL_VALUE", "error", "Cell stores an Excel error value.", sheet=sheet_name, address=address, value=value)
+            formula_node = cell.find(q("s", "f"))
+            if formula_node is None:
+                continue
+            formula_count += 1
+            formula = formula_node.text or ""
+            cached = cell.find(q("s", "v"))
+            if cached is not None and cached.text not in (None, ""):
+                formula_cache_count += 1
+            upper_formula = formula.upper()
+            matched_error_tokens = [token for token in EXCEL_ERROR_TOKENS if token in upper_formula]
+            if matched_error_tokens:
+                add_finding("FORMULA_ERROR_TOKEN", "error", "Formula contains an Excel error token.", sheet=sheet_name, address=address, tokens=matched_error_tokens)
+            for referenced_sheet in excel_explicit_sheet_references(formula):
+                if referenced_sheet.lower() not in sheet_parts and not referenced_sheet.startswith("["):
+                    add_finding("MISSING_WORKSHEET_REFERENCE", "error", "Formula refers to a worksheet that does not exist.", sheet=sheet_name, address=address, reference=referenced_sheet)
+            explicit_tables = {
+                match.group(1)
+                for match in re.finditer(r"(?<![A-Za-z0-9_.])([A-Za-z_\\][A-Za-z0-9_.\\]*)\s*\[", formula)
+            }
+            for table_name in sorted(explicit_tables):
+                if table_name.lower() not in table_names:
+                    add_finding("MISSING_TABLE_REFERENCE", "error", "Formula refers to a table that does not exist.", sheet=sheet_name, address=address, reference=table_name)
+            if re.search(r"\[[^\]]+\][^!]*!", formula):
+                external_formula_count += 1
+                add_finding("EXTERNAL_WORKBOOK_REFERENCE", "warning", "Formula refers to an external workbook whose current value was not verified.", sheet=sheet_name, address=address)
+            volatile = [name for name in EXCEL_VOLATILE_FUNCTIONS if re.search(r"(?<![A-Z0-9_.])%s\s*\(" % re.escape(name), upper_formula)]
+            if volatile:
+                volatile_formula_count += 1
+                add_finding("VOLATILE_FORMULA", "warning", "Formula uses volatile functions and may change when recalculated.", sheet=sheet_name, address=address, functions=volatile)
+            source_key = "%s!%s" % (sheet_name.lower(), address)
+            targets = []
+            for dependency in excel_formula_dependencies(formula, sheet_name):
+                if ":" in dependency["address"] or dependency["sheet"].lower() not in sheet_parts:
+                    continue
+                targets.append("%s!%s" % (dependency["sheet"].lower(), dependency["address"].upper()))
+            dependency_graph[source_key] = targets
+        if truncated:
+            break
+
+    cycle_nodes = excel_cycle_nodes(dependency_graph)
+    for node in cycle_nodes:
+        sheet_name, address = node.rsplit("!", 1)
+        add_finding("CIRCULAR_REFERENCE", "error", "Static dependency analysis found a circular cell reference.", sheet=sheet_parts.get(sheet_name, (sheet_name, None))[0], address=address)
+
+    calculation = workbook.find(q("s", "calcPr"))
+    calculation_properties = {
+        "mode": calculation.attrib.get("calcMode", "auto") if calculation is not None else "auto",
+        "calculationId": calculation.attrib.get("calcId") if calculation is not None else None,
+        "fullCalculationOnLoad": calculation.attrib.get("fullCalcOnLoad") in {"1", "true"} if calculation is not None else False,
+        "forceFullCalculation": calculation.attrib.get("forceFullCalc") in {"1", "true"} if calculation is not None else False,
+    }
+    missing_formula_caches = max(0, formula_count - formula_cache_count)
+    needs_recalculation = bool(formula_count and (
+        missing_formula_caches
+        or calculation_properties["fullCalculationOnLoad"]
+        or calculation_properties["forceFullCalculation"]
+        or calculation_properties["mode"] != "auto"
+    ))
+    if truncated:
+        add_finding("INTEGRITY_SCAN_TRUNCATED", "warning", "Workbook integrity scan reached its cell bound; unscanned cells were not assessed.", maxCells=max_cells)
+    if calculation_properties["mode"] != "auto":
+        add_finding("CALCULATION_MODE_NOT_AUTOMATIC", "warning", "Workbook calculation mode is not automatic.", mode=calculation_properties["mode"])
+
+    external_link_parts = sorted(name for name in package.namelist() if name.startswith("xl/externalLinks/") and name.endswith(".xml") and "/_rels/" not in name)
+    status = "fail" if severity_counts["error"] else "warning" if severity_counts["warning"] or needs_recalculation else "pass"
+    all_blocking_finding_keys = sorted(blocking_finding_keys)
+    returned_blocking_finding_keys = all_blocking_finding_keys if request.get("_includeBlockingFindingKeys") is True else all_blocking_finding_keys[:max_findings]
+    return {
+        "status": status,
+        "calculationVerified": False,
+        "calculationEngine": "not-run",
+        "calculation": {
+            **calculation_properties,
+            "formulaCount": formula_count,
+            "cachedFormulaResultCount": formula_cache_count,
+            "missingFormulaCacheCount": missing_formula_caches,
+            "needsRecalculation": needs_recalculation,
+        },
+        "scan": {"scannedCells": scanned_cells, "maxCells": max_cells, "truncated": truncated, "complete": not truncated},
+        "summary": {
+            "findingCount": total_findings,
+            "returnedFindingCount": len(findings),
+            "errorCount": severity_counts["error"],
+            "warningCount": severity_counts["warning"],
+            "formulaCount": formula_count,
+            "volatileFormulaCount": volatile_formula_count,
+            "externalFormulaCount": external_formula_count,
+            "externalLinkPartCount": len(external_link_parts),
+            "circularReferenceCellCount": len(cycle_nodes),
+        },
+        "findings": findings,
+        "findingsTruncated": total_findings > len(findings),
+        "blockingFindingKeyCount": len(all_blocking_finding_keys),
+        "blockingFindingKeys": returned_blocking_finding_keys,
+        "blockingFindingKeysTruncated": len(returned_blocking_finding_keys) < len(all_blocking_finding_keys),
+        "externalLinkParts": external_link_parts[:50],
+    }
+
+
 def inspect_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str, Any]:
     package_names = set(package.namelist())
     workbook = xml_root(package, "xl/workbook.xml")
@@ -819,6 +1056,7 @@ def inspect_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str
     names_node = workbook.find(q("s", "definedNames"))
     for name in list(names_node or []):
         defined_names.append({"name": name.attrib.get("name"), "value": name.text})
+    integrity = excel_integrity(package, workbook, relationships, shared, request)
     return {
         "kind": "excel",
         "reviewFeatures": {
@@ -835,6 +1073,7 @@ def inspect_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Dict[str
         "formulaDependencies": dependency_edges,
         "formulaDependencyCount": len(dependency_edges),
         "definedNames": defined_names,
+        "integrity": integrity,
         "selectors": {
             "sheetNames": sorted(requested_sheets),
             "address": requested_range or None,
@@ -1063,6 +1302,7 @@ def validate_package(path: Path, request: Dict[str, Any]) -> Dict[str, Any]:
         "valid": True,
         "kind": result["kind"],
         "package": result["package"],
+        **({"integrity": result["integrity"]} if result["kind"] == "excel" else {}),
     }
 
 
@@ -2911,6 +3151,46 @@ def excel_update_chart(package: zipfile.ZipFile, modifications: Dict[str, Option
     raise OfficePackageError("Excel chart was not found: %s" % requested)
 
 
+def excel_rewrite_sheet_references(package: zipfile.ZipFile, modifications: Dict[str, Optional[bytes]], old_name: str, new_name: str) -> Dict[str, Any]:
+    quoted_old = "'%s'" % old_name.replace("'", "''")
+    quoted_new = "'%s'" % new_name.replace("'", "''")
+    quoted_pattern = re.compile(r"%s(?=[:!])" % re.escape(quoted_old), re.I)
+    unquoted_pattern = re.compile(r"(?<![A-Za-z0-9_.\]])%s(?=[:!])" % re.escape(old_name), re.I)
+    rewritten = 0
+    affected_parts = []
+    formula_tags = {
+        q("s", "f"), q("s", "formula"), q("s", "formula1"), q("s", "formula2"),
+        q("s", "definedName"), q("s", "calculatedColumnFormula"), q("s", "totalsRowFormula"),
+        q("c", "f"),
+    }
+    part_names = sorted({
+        name for name in set(package.namelist()) | set(modifications)
+        if name.startswith("xl/") and name.endswith(".xml") and modifications.get(name, b"present") is not None
+    })
+    for part in part_names:
+        payload = modifications.get(part)
+        if payload is None:
+            payload = read_package_part(package, part, xml=True)
+        try:
+            root = ET.fromstring(payload)
+        except ET.ParseError as error:
+            raise OfficePackageError("Invalid XML while updating renamed worksheet references in %s: %s" % (part, error)) from error
+        part_rewrites = 0
+        for node in root.iter():
+            if node.tag not in formula_tags or not node.text:
+                continue
+            updated = quoted_pattern.sub(quoted_new, node.text)
+            updated = unquoted_pattern.sub(quoted_new, updated)
+            if updated != node.text:
+                node.text = updated
+                part_rewrites += 1
+        if part_rewrites:
+            store_modified_xml(package, modifications, part, root)
+            rewritten += part_rewrites
+            affected_parts.append(part)
+    return {"rewrittenReferenceCount": rewritten, "affectedParts": affected_parts}
+
+
 def edit_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[str, Optional[bytes]], List[Dict[str, Any]]]:
     sheet_parts = excel_sheet_parts(package)
     modifications: Dict[str, Optional[bytes]] = {}
@@ -2947,8 +3227,9 @@ def edit_excel(package: zipfile.ZipFile, request: Dict[str, Any]) -> Tuple[Dict[
                 raise OfficePackageError("Excel worksheet was not found: %s" % old_name)
             target.attrib["name"] = new_name
             modifications["xl/workbook.xml"] = ET.tostring(workbook, encoding="utf-8", xml_declaration=True)
+            reference_rewrite = excel_rewrite_sheet_references(package, modifications, old_name, new_name)
             sheet_parts[new_name] = sheet_parts.pop(old_name)
-            changes.append({"operation": op_type, "before": old_name, "after": new_name})
+            changes.append({"operation": op_type, "before": old_name, "after": new_name, **reference_rewrite})
             calculation_dirty = True
             continue
         if op_type == "setDefinedName":
@@ -3950,12 +4231,16 @@ def edit_package(path: Path, request: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(output_path, str) or not output_path:
         raise OfficePackageError("outputPath is required for edit.")
     destination = Path(output_path).expanduser().resolve()
+    before_integrity = None
     with zipfile.ZipFile(path, "r") as package:
         inventory = package_inventory(package)
         kind = detect_kind(package, inventory["names"])
         requested_kind = request.get("kind")
         if requested_kind and requested_kind != kind:
             raise OfficePackageError("Expected a %s package but detected %s." % (requested_kind, kind))
+        if kind == "excel":
+            workbook_root = xml_root(package, "xl/workbook.xml")
+            before_integrity = excel_integrity(package, workbook_root, rels_for_part(package, "xl/workbook.xml"), excel_shared_strings(package), {**request, "_includeBlockingFindingKeys": True})
         if inventory["hasDigitalSignatures"]:
             raise OfficePackageError("Digitally signed Office packages are refused because editing would invalidate the signature. Remove the signature in Office before editing.")
         if inventory["hasMacros"] and not request.get("allowMacros", False):
@@ -4010,8 +4295,38 @@ def edit_package(path: Path, request: Dict[str, Any]) -> Dict[str, Any]:
                 current = segment_path
             if segments:
                 shutil.copyfile(current, destination)
-    validation = validate_package(destination, {"kind": kind, "strictRelationships": True})
-    return {"kind": kind, "outputPath": str(destination), "changes": changes, "changeCount": len(changes), "validation": validation}
+    validation = validate_package(destination, {
+        "kind": kind,
+        "strictRelationships": True,
+        **({
+            "_includeBlockingFindingKeys": True,
+            "maxIntegrityCells": request.get("maxIntegrityCells", 250_000),
+            "maxIntegrityFindings": request.get("maxIntegrityFindings", 200),
+        } if kind == "excel" else {}),
+    })
+    integrity_gate = None
+    if kind == "excel":
+        after_integrity = validation.get("integrity", {})
+        before_keys = set((before_integrity or {}).get("blockingFindingKeys", []))
+        after_keys = set(after_integrity.get("blockingFindingKeys", []))
+        introduced = sorted(after_keys - before_keys)
+        integrity_gate = {
+            "passed": not introduced and after_integrity.get("scan", {}).get("complete") is True,
+            "calculationVerified": False,
+            "beforeStatus": (before_integrity or {}).get("status"),
+            "afterStatus": after_integrity.get("status"),
+            "scanComplete": after_integrity.get("scan", {}).get("complete") is True,
+            "introducedBlockingFindingCount": len(introduced),
+            "introducedBlockingFindingKeys": introduced[:50],
+        }
+        if after_integrity.get("scan", {}).get("complete") is not True:
+            raise OfficePackageError("Excel integrity gate refused the edit because the bounded post-edit scan was incomplete.")
+        if introduced:
+            raise OfficePackageError("Excel integrity gate refused the edit because it introduced %d blocking formula or reference finding(s)." % len(introduced))
+        exposed_key_limit = max(1, min(int(request.get("maxIntegrityFindings", 200)), 2_000))
+        after_integrity["blockingFindingKeys"] = after_integrity.get("blockingFindingKeys", [])[:exposed_key_limit]
+        after_integrity["blockingFindingKeysTruncated"] = after_integrity.get("blockingFindingKeyCount", 0) > len(after_integrity["blockingFindingKeys"])
+    return {"kind": kind, "outputPath": str(destination), "changes": changes, "changeCount": len(changes), "validation": validation, **({"integrityGate": integrity_gate} if integrity_gate else {})}
 
 
 def main() -> None:

@@ -562,7 +562,7 @@ const excelOperationsSchema = {
     operationObject(["type"], {
       type: {
         const: "recalculate",
-        description: "Clear cached formula results and mark the workbook for full calculation when Excel opens; this server does not evaluate formulas."
+        description: "On OneDrive Personal/Open XML, clear cached formula results and mark the workbook for full calculation when Excel opens. On OneDrive for Business or SharePoint with backend graph/auto, run Microsoft's workbook calculation engine in the managed session."
       }
     }),
     operationObject(["type", "name"], { type: { const: "addWorksheet" }, name: { type: "string", minLength: 1, maxLength: 31 } }),
@@ -3023,7 +3023,7 @@ const compactOfficeOperationSchema = {
 
 const chatgptToolMetadata = Object.freeze({
   search: {
-    description: "Use this when the user wants OneDrive discovery by description, topic, partial name, aliases, or indexed content. Pass one whole intent; use onedrive_open_files for exact filenames, then pass chosen ids unchanged to fetch.",
+    description: "Use this for OneDrive discovery by description, topic, partial name, aliases, or indexed content. Pass one intent and chosen ids unchanged to fetch; use item-info in onedrive_read_actions when exact size, MIME, or modified time matters.",
     invoking: "Searching OneDrive…",
     invoked: "OneDrive results ready"
   },
@@ -3033,7 +3033,7 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "OneDrive item ready"
   },
   onedrive_open_files: {
-    description: "Use this when the user provides exact filenames, known root-relative OneDrive paths, or observed OneDrive/SharePoint file links and wants their contents in one read-only call. Pass exactly one of names or urls, with at most five values. Known paths and links resolve directly; filename index misses share one bounded live folder scan across the batch. Present each returned URL as the resolved filename hyperlink from displayLink; never show the bare URL. Use search then fetch for discovery, partial names, or ambiguous results.",
+    description: "Use this for exact filenames, known root-relative paths, or observed OneDrive/SharePoint links in one read-only call. Pass exactly one of names or urls, at most five. Paths/links resolve directly; filename misses share one bounded scan. Present displayLink as the resolved filename hyperlink; never show the bare URL. Use search then fetch for discovery, partial names, or ambiguity.",
     invoking: "Opening OneDrive files…",
     invoked: "OneDrive files ready"
   },
@@ -3043,7 +3043,7 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "OneDrive previews ready"
   },
   onedrive_read_actions: {
-    description: "Use this for bounded folder listings, descriptive searches, item-info reads, permission inspections, recent files and versions, or enterprise drive/library discovery. Send independent operations once so OneDrive can run them concurrently; preserve driveId and itemId for read-only cross-library results.",
+    description: "Use this for bounded folder listings, descriptive searches, exact item-info including size/MIME/modified time, permissions and permission inspections, recent files, versions, or enterprise drive/library discovery. Send independent operations once to run concurrently; preserve driveId and itemId for cross-library reads.",
     invoking: "Reading OneDrive in parallel…",
     invoked: "OneDrive reads ready"
   },
@@ -3063,12 +3063,12 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "Office capabilities ready"
   },
   onedrive_office_inspect: {
-    description: "Use this to read bounded structured Word, Excel, or PowerPoint evidence before editing or review. Pass kind, an exact item target, and only the selectors needed; retain the returned stable ID, eTag, coordinates, and anchors.",
+    description: "Use this to read bounded Office evidence before editing or review. Excel also reports formula/reference errors, external links, recalculation state, and calculationVerified false. Pass kind, an exact target, and needed selectors; retain stable ID, eTag, coordinates, and anchors.",
     invoking: "Inspecting Office file…",
     invoked: "Office inspection ready"
   },
   onedrive_office_batch_transform: {
-    description: "Use this when the user wants structured edits across one or more Word, Excel, or PowerPoint files. Read each file with fetch first, check Office capabilities, and preview before confirmation. Excel value/formula edits clear stale formula caches and schedule full calculation when Excel opens; the plugin does not evaluate formulas server-side.",
+    description: "Use this for structured edits across Office files. Fetch each file, check capabilities, and preview before confirmation. Excel edits clear stale formula caches, schedule calculation on open, and refuse newly introduced broken references; calculated values are not evaluated server-side.",
     invoking: "Preparing Office changes…",
     invoked: "Office change result ready"
   },
@@ -3093,7 +3093,7 @@ const chatgptToolMetadata = Object.freeze({
     invoked: "OneDrive upload result ready"
   },
   onedrive_create_office_file: {
-    description: "Use this when the user wants a new Word, Excel, or PowerPoint file created in OneDrive from structured content. Match kind to the extension, preview the validated package, then confirm with the same proof.",
+    description: "Use this when the user wants a new Office file from structured content and no template was requested. Match kind to extension, preview the validated package, then confirm with the same proof. For a named template/reference, copy it through preview/commit, inspect the copy, then edit it.",
     invoking: "Building Office file…",
     invoked: "Office file result ready"
   },
@@ -3416,8 +3416,14 @@ const manifestServerVersion = pluginManifest.version || "0.1.0";
 const advertisedServerVersion = toolProfile === "chatgpt"
   ? `${manifestServerVersion}${manifestServerVersion.includes("+") ? "." : "+"}chatgpt.${advertisedContractHash}`
   : manifestServerVersion;
+export const activeServerRelease = Object.freeze({
+  version: advertisedServerVersion,
+  contractHash: advertisedContractHash,
+  toolCount: advertisedTools.length,
+  profile: toolProfile
+});
 const serverInstructions = toolProfile === "chatgpt"
-  ? "Use standard search for descriptive discovery, then fetch ids unchanged. Use onedrive_read_actions once for bounded folder, info, permission, recent, version, or enterprise reads; pass the whole read intent in one bounded operations array. Preserve driveId plus itemId for enterprise inspect/download. For rename, move, copy, share, revoke, or version restore, use onedrive_preview_actions once, then pass exact approved actions and proofs to onedrive_commit_actions. Commit is guarded, ordered, non-atomic, and returns verified stable results. Use onedrive_open_files once for exact filenames, known paths, or observed OneDrive/SharePoint links; pass names or urls and show each resolved filename as hyperlink text. Opaque ids and proofs are same-server identifiers, not credentials. Prefer user-visible paths plus expectedName. Create folders directly with conflictBehavior fail. Use onedrive_create_office_file to build and validate new Word, Excel, or PowerPoint content before upload. Preview dependent actions in dependency order because proofs can become stale. For Office edits, inspect bounded structure, request the exact capability schema, then transform; list review evidence before changing it. Use download/render for visual QA. Use onedrive_export_file for a PDF or text copy saved in OneDrive."
+  ? "Use standard search for discovery, then fetch ids unchanged; use item-info when exact size, MIME, or modified time matters. Use onedrive_read_actions once for bounded folder, info, permission, recent, version, or enterprise reads; pass the whole read intent in one bounded operations array. Preserve driveId plus itemId for enterprise files. For rename, move, copy, share, revoke, or version restore, use onedrive_preview_actions once, then pass approved actions and proofs to onedrive_commit_actions. Commit is guarded, ordered, non-atomic, and returns verified stable results. Use onedrive_open_files once for exact filenames, paths, or observed OneDrive/SharePoint links; pass names or urls and show each resolved filename as hyperlink text. Opaque ids/proofs are same-server, not credentials. Prefer user-visible paths plus expectedName. Create folders directly with conflictBehavior fail. Use onedrive_create_office_file to build and validate a new file only when no template was requested. For a template/reference, preview and commit its exact copy, inspect the copy, then edit it. Preview dependent actions in dependency order because proofs can become stale. For Office edits, inspect bounded structure and Excel integrity, request the exact capability schema, then transform; list review evidence before changing it. Use onedrive_export_file for a PDF or text copy saved in OneDrive."
   : "Use onedrive_find for normal OneDrive lookup and the matching structured read tool before an Office edit. Use onedrive_list only for direct folder listings. Keep results bounded. Locate an item before changing it. Mutations default to preview and require confirmation.";
 
 const toolByName = new Map(executableTools.map((tool) => [tool.name, tool]));
@@ -10212,6 +10218,7 @@ function focusedOfficeInspection(result, args = {}) {
     truncation: result.truncation || undefined,
     content,
     package: result.package,
+    integrity: kind === "excel" ? result.integrity : undefined,
     backend: result.backend
   };
 }
@@ -10519,8 +10526,8 @@ function officeEditPreviewProof(rawItem, kind, operations, editResult, args = {}
   };
 }
 
-const excelGraphOperationTypes = new Set(["setCell", "setFormula", "setRange", "clearRange", "renameSheet", "addTableRow", "createChart", "updateChart"]);
-const excelGraphOnlyOperationTypes = new Set(["createChart", "updateChart"]);
+const excelGraphOperationTypes = new Set(["setCell", "setFormula", "setRange", "clearRange", "renameSheet", "addTableRow", "createChart", "updateChart", "recalculate"]);
+const excelGraphOnlyOperationTypes = new Set(["createChart", "updateChart", "recalculate"]);
 
 async function resolveExcelOfficeBackend(rawItem, args = {}) {
   if (args.backend === "openxml") return { backend: "openxml", driveType: null, reason: "explicit" };
@@ -10677,6 +10684,24 @@ async function applyExcelGraphOperations(rawItem, resolvedBackend, operations) {
   const semanticVerification = [];
   try {
     for (const operation of operations) {
+      if (operation.type === "recalculate") {
+        writeStarted = true;
+        await graph(`${base}/application/calculate`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ calculationType: "Full" }),
+          maxRetries: 0
+        });
+        semanticVerification.push({
+          operation: operation.type,
+          succeeded: true,
+          calculationRequested: true,
+          calculationVerified: true,
+          calculationType: "Full",
+          calculationEngine: "microsoft-graph-workbook"
+        });
+        continue;
+      }
       if (operation.type === "addTableRow") {
         writeStarted = true;
         const addedRow = await graph(`${base}/tables/${encodeURIComponent(String(operation.table || ""))}/rows/add`, {

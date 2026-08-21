@@ -21,5 +21,6 @@ Omit `index` to append. The server accepts a one-dimensional single-row shorthan
 - Preserve cell styles, row attributes, formula relationships, conditional-format ranges, and data-validation ranges unless the operation preview says otherwise.
 - Inspect formulas and table/range identities before row deletion. Fail closed for the final data row, moved shared-formula masters, and array/data-table formulas.
 - Use `backend: "auto"`. Let supported business `.xlsx` files use a scoped Graph workbook session and let consumer, macro-enabled, or unsupported operations use Open XML.
+- Use `recalculate` only when calculation is part of the requested change. A successful Business/SharePoint Graph calculation can prove that Microsoft's workbook engine ran; a Personal/OpenXML recalculation only clears caches and marks calculation-on-open, so `calculationVerified` remains false.
 - Verify changed cell values and formulas by structured readback. Do not claim a formula result without observed recalculation evidence.
 - Render bounded sheets after chart, print-layout, size, merge, or formatting changes.

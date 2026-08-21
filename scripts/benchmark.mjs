@@ -24,6 +24,31 @@ function parseBooleanFlag(value, name, defaultValue = false) {
   throw new Error(`--${name} expects a boolean value, got ${value}.`);
 }
 
+function parseBoundedInteger(value, name, fallback, minimum, maximum) {
+  if (value === undefined) return fallback;
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < minimum || number > maximum) {
+    throw new Error(`--${name} expects an integer from ${minimum} to ${maximum}.`);
+  }
+  return number;
+}
+
+function percentile(values, probability) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * probability) - 1))];
+}
+
+function latencySummary(results = []) {
+  const wall = results.map((entry) => entry.wallMs).filter(Number.isFinite);
+  const server = results.map((entry) => Number(entry.value?.durationMs ?? entry.value?.summary?.durationMs)).filter(Number.isFinite);
+  return {
+    sampleCount: results.length,
+    wall: { p50Ms: percentile(wall, 0.5), p95Ms: percentile(wall, 0.95), maxMs: Math.max(...wall) },
+    server: { p50Ms: percentile(server, 0.5), p95Ms: percentile(server, 0.95), maxMs: server.length ? Math.max(...server) : null }
+  };
+}
+
 function rejectPendingRequests(pendingRequests, error) {
   for (const [id, waiter] of pendingRequests.entries()) {
     pendingRequests.delete(id);
@@ -59,7 +84,10 @@ async function runSelfCheck() {
     clearNumericFalse: parseBooleanFlag("0", "clear", true) === false,
     toolErrorsFailBenchmark: benchmarkSucceeded([{ isError: false }, { isError: true }]) === false,
     successfulToolsPassBenchmark: benchmarkSucceeded([{ isError: false }]) === true,
-    pendingRejectedOnChildExit: childExitRejected && probePending.size === 0
+    pendingRejectedOnChildExit: childExitRejected && probePending.size === 0,
+    percentileP50: percentile([9, 1, 5, 3, 7], 0.5) === 5,
+    percentileP95: percentile([9, 1, 5, 3, 7], 0.95) === 9,
+    boundedIterations: parseBoundedInteger("3", "iterations", 1, 1, 20) === 3
   };
   const ok = Object.values(checks).every(Boolean);
   console.log(JSON.stringify({ ok, checks }, null, 2));
@@ -78,6 +106,8 @@ const maxFiles = Number(args.maxFiles || 50);
 const maxBytesPerFile = Number(args.maxBytesPerFile || 262144);
 const searchConcurrency = Number(args.searchConcurrency || 2);
 const clear = parseBooleanFlag(args.clear, "clear");
+const iterations = parseBoundedInteger(args.iterations, "iterations", 3, 1, 20);
+const warmP95BudgetMs = parseBoundedInteger(args["warm-p95-ms"], "warm-p95-ms", 5_000, 100, 120_000);
 
 let nextId = 1;
 const pending = new Map();
@@ -259,16 +289,21 @@ try {
     maxFolders
   }));
 
-  progress("warm-find", { query, maxItems, maxFolders });
-  const warmFind = await tool("onedrive_find", {
-    query,
-    useCache: true,
-    useContentIndex: false,
-    searchConcurrency,
-    scanMaxItems: maxItems,
-    scanMaxFolders: maxFolders
-  });
-  results.push(warmFind);
+  const warmFindRuns = [];
+  for (let iteration = 1; iteration <= iterations; iteration += 1) {
+    progress("warm-find", { query, maxItems, maxFolders, iteration, iterations });
+    const warmFind = await tool("onedrive_find", {
+      query,
+      useCache: true,
+      useContentIndex: false,
+      searchConcurrency,
+      scanMaxItems: maxItems,
+      scanMaxFolders: maxFolders
+    });
+    warmFindRuns.push(warmFind);
+    results.push(warmFind);
+  }
+  const warmFind = warmFindRuns[0];
 
   progress("content-index-refresh", { maxFiles, maxBytesPerFile });
   results.push(await tool("onedrive_content_index_refresh", {
@@ -292,12 +327,15 @@ try {
     }));
   }
 
-  const ok = benchmarkSucceeded(results);
+  const warmLatency = latencySummary(warmFindRuns);
+  const latencyBudgetPassed = warmLatency.wall.p95Ms <= warmP95BudgetMs;
+  const ok = benchmarkSucceeded(results) && latencyBudgetPassed;
   console.log(JSON.stringify({
     ok,
     query,
     clear,
-    caps: { maxItems, maxFolders, maxFiles, maxBytesPerFile, searchConcurrency },
+    caps: { maxItems, maxFolders, maxFiles, maxBytesPerFile, searchConcurrency, iterations },
+    serviceLevel: { warmFind: warmLatency, p95BudgetMs: warmP95BudgetMs, passed: latencyBudgetPassed },
     summary: results.map(summary),
     note: "Use --clear to include local cache clear before the cold run. All remote operations are read-only, but cache/index files are local writes."
   }, null, 2));

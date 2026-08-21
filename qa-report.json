@@ -1,37 +1,39 @@
 {
   "schemaVersion": 2,
-  "decision": "Pending — CI portability fixes await a fresh live release beta",
-  "date": "2026-08-19",
-  "generatedAt": "2026-08-19T20:30:00Z",
+  "decision": "Pending — 0.6.5 offline gates pass; immutable NAS66 deployment, same-app refresh, signed-in ChatGPT beta, cache parity, and exact fixture cleanup remain",
+  "date": "2026-08-20",
+  "generatedAt": "2026-08-20T21:25:15Z",
   "source": {
-    "commit": "386e859c1bad14906d9162ab3c5094154b65e397",
-    "pluginVersion": "0.6.4+codex.20260814225653",
-    "serverVersion": "0.6.4+codex.20260814225653.chatgpt.6ff9e65114bc",
-    "serverSha256": "01306757f602380da73823f4a7b20f77f8dfdb7902eeb50690eb6be3cef2d96b",
-    "contentDigest": "e2864f1e46cfb3dbf0b9086b22aa1370b9f366fc542481ffb47f247b07bfeb43",
-    "workingTree": "CI portability fixes are committed at the recorded commit; changes after that commit are limited to QA evidence. Prior NAS62 live evidence remains historical until a fresh release beta is run."
+    "commit": "fb7f628fff3b106358f372aa963e667b6880a0bc",
+    "pluginVersion": "0.6.5+codex.20260820212515",
+    "serverVersion": "0.6.5+codex.20260820212515.chatgpt.bf50db0b0ca8",
+    "serverSha256": "7b64bcc423edd533383a3bb6fc2e1ef44653997af0556729205cf0f6e37381ce",
+    "contentDigest": "67c8b97f4e5b908fde9f91cec9ac88cfc8bea156ab5366f395578ef337d8a3a6",
+    "workingTree": "Release code is committed at the recorded commit; changes after that commit are limited to QA evidence."
   },
   "contract": {
     "toolCount": 84,
     "exact": true,
     "fullToolCount": 84,
     "fullBytes": 344300,
-    "chatgptToolCount": 19,
-    "chatgptBytes": 35208,
-    "chatgptOauthBytes": 37906,
-    "reductionPercent": 89.8,
-    "goldenPrompts": 19,
-    "ambiguityPairs": 15
+    "chatgptToolCount": 21,
+    "chatgptBytes": 35853,
+    "chatgptOauthBytes": 38835,
+    "reductionPercent": 89.6,
+    "goldenPrompts": 21,
+    "ambiguityPairs": 18
   },
   "offlineGates": [
     { "name": "Node 24 and Node 26 syntax/self-checks", "status": "pass" },
-    { "name": "Exact MCP contract", "status": "pass", "toolCount": 84, "focusedToolCount": 19 },
+    { "name": "Exact MCP contract", "status": "pass", "toolCount": 84, "focusedToolCount": 21 },
     { "name": "Plugin manifest/version alignment", "status": "pass" },
     { "name": "Prepackage negative checks", "status": "pass", "checks": 32 },
     { "name": "Office Open XML operations", "status": "pass", "wordOperations": 22, "excelOperations": 33, "powerPointOperations": 25 },
+    { "name": "Excel integrity and calculation routing", "status": "pass", "personalCalculationVerified": false, "businessGraphCalculationVerified": true },
     { "name": "Office security corpus", "status": "pass" },
     { "name": "Genuine package reopening", "status": "pass" },
-    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 210 },
+    { "name": "Mock Microsoft Graph", "status": "pass", "checks": 213 },
+    { "name": "Production canary and supply-chain checks", "status": "pass", "publicCanary": "self-check", "sourceSbom": "pass", "containerScan": "pending-ci" },
     { "name": "Read-only OneDrive doctor and tenant checks", "status": "pass" },
     { "name": "Cleanup preview", "status": "pass" },
     { "name": "Whitespace", "status": "pass" }
@@ -428,13 +430,13 @@
     }
   },
   "installedBuild": {
-    "status": "pass",
-    "version": "0.6.4+codex.20260814225653",
-    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.4+codex.20260814225653",
+    "status": "pending",
+    "version": "0.6.5+codex.20260820212515",
+    "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.5+codex.20260820212515",
     "oldCacheOverwritten": false
   },
   "sourceCacheParity": {
-    "status": "pass",
+    "status": "pending",
     "filesChecked": 92,
     "bytes": "pass",
     "modes": "pass",

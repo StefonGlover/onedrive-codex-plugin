@@ -691,6 +691,16 @@ try {
               at: "2026-07-27T14:41:00.000Z",
               tool: "search",
               isError: true
+            },
+            observability: {
+              release: { version: "0.6.5+codex.test.chatgpt.abc", contractHash: "abc", toolCount: 21, profile: "chatgpt" },
+              uptimeSeconds: 42,
+              toolCalls: 7,
+              toolErrors: 1,
+              graphThrottles: 1,
+              oauthFailures: 2,
+              latency: { sampleCount: 7, windowSize: 100, p50Ms: 25, p95Ms: 90 },
+              sensitive: "must not survive projection"
             }
           }), { status: 200, headers: { "Content-Type": "application/json" } });
         }
@@ -706,6 +716,13 @@ try {
       assert(body.mcp?.lastAuthFailure?.status === 401, "MCP auth status is missing.", body);
       assert(body.mcp?.lastToolFailure?.graphStatus === 403, "MCP Graph status is missing.", body);
       assert(body.mcp?.lastToolCall?.tool === "search", "MCP tool diagnostic is missing.", body);
+      assert(
+        body.mcp?.observability?.release?.toolCount === 21
+          && body.mcp.observability.latency?.windowSize === 100
+          && body.mcp.observability.toolErrors === 1,
+        "MCP release observability projection is missing or malformed.",
+        body
+      );
       const serialized = JSON.stringify(body);
       assert(!serialized.includes("sensitive"), "MCP health projection leaked diagnostic text.", body);
     } finally {

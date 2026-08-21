@@ -3060,6 +3060,30 @@ function safeMcpHealthProjection(value) {
       isError: value.lastToolCall.isError === true
     };
   }
+  if (value.observability && typeof value.observability === "object") {
+    const source = value.observability;
+    const release = source.release && typeof source.release === "object" ? source.release : {};
+    const latency = source.latency && typeof source.latency === "object" ? source.latency : {};
+    projection.observability = {
+      release: {
+        version: String(release.version || "").slice(0, 128),
+        contractHash: String(release.contractHash || "").slice(0, 32),
+        toolCount: Number.isInteger(release.toolCount) ? release.toolCount : 0,
+        profile: String(release.profile || "").slice(0, 32)
+      },
+      uptimeSeconds: Number.isInteger(source.uptimeSeconds) ? source.uptimeSeconds : 0,
+      toolCalls: Number.isInteger(source.toolCalls) ? source.toolCalls : 0,
+      toolErrors: Number.isInteger(source.toolErrors) ? source.toolErrors : 0,
+      graphThrottles: Number.isInteger(source.graphThrottles) ? source.graphThrottles : 0,
+      oauthFailures: Number.isInteger(source.oauthFailures) ? source.oauthFailures : 0,
+      latency: {
+        sampleCount: Number.isInteger(latency.sampleCount) ? latency.sampleCount : 0,
+        windowSize: Number.isInteger(latency.windowSize) ? latency.windowSize : 0,
+        p50Ms: Number.isFinite(latency.p50Ms) ? latency.p50Ms : null,
+        p95Ms: Number.isFinite(latency.p95Ms) ? latency.p95Ms : null
+      }
+    };
+  }
   return projection;
 }
 

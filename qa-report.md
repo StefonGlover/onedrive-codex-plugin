@@ -1,18 +1,48 @@
-# OneDrive 0.6.4 Parity Release Report
+# OneDrive 0.6.5 Integrity and Production Release Report
 
-Decision: Pending — CI portability fixes await a fresh live release beta
-Date: 2026-08-19
-Generated: 2026-08-19T20:30:00Z
-Tested source base commit: `386e859c1bad14906d9162ab3c5094154b65e397`
-Plugin version: `0.6.4+codex.20260814225653`
-Focused source server version: `0.6.4+codex.20260814225653.chatgpt.6ff9e65114bc`
-Current live NAS62 OAuth server version: `0.6.4+codex.20260814225653.chatgpt.b8b8204c94fd`
-Tool contract: 84 exact tool names; 19 focused ChatGPT tools
-Packaged-content digest: `e2864f1e46cfb3dbf0b9086b22aa1370b9f366fc542481ffb47f247b07bfeb43`
-NAS release-manifest SHA-256: `9b47b42f01da2b8d0d8d9f9b8b436efc9c3657acee0c1695b7813ec3e280db44`
-Server SHA-256: `01306757f602380da73823f4a7b20f77f8dfdb7902eeb50690eb6be3cef2d96b`
+Decision: Pending — 0.6.5 offline gates pass; immutable NAS66 deployment, same-app refresh, signed-in ChatGPT beta, cache parity, and exact fixture cleanup remain
+Date: 2026-08-20
+Generated: 2026-08-20T21:25:15Z
+Tested source base commit: `fb7f628fff3b106358f372aa963e667b6880a0bc`
+Plugin version: `0.6.5+codex.20260820212515`
+Focused source server version: `0.6.5+codex.20260820212515.chatgpt.bf50db0b0ca8`
+Current live NAS OAuth server version: `0.6.4+codex.20260819032617.chatgpt.a8e1a22814f9`
+Tool contract: 84 exact tool names; 21 focused ChatGPT tools
+Packaged-content digest: `67c8b97f4e5b908fde9f91cec9ac88cfc8bea156ab5366f395578ef337d8a3a6`
+NAS release-manifest SHA-256: `53837a21e269434b190c6934792af4c048464809f0f112027fa9163ccaa46804`
+Server SHA-256: `7b64bcc423edd533383a3bb6fc2e1ef44653997af0556729205cf0f6e37381ce`
 
-The current source includes CI-only portability corrections validated by the complete offline suite on macOS and hosted Linux. The NAS62 deployment and ChatGPT canary evidence below remain historical release evidence; a fresh live source-and-installed beta is still required before this source can be promoted as a new release.
+## 2026-08-20 NAS66 Excel integrity and production release candidate
+
+Release `0.6.5+codex.20260820212515` adds automatic Excel formula/reference integrity reporting and a fail-closed post-edit gate. It detects formula error tokens, stored error cells, missing sheet/table references, broken defined names, static circular references, external links, volatile formulas, calculation mode, and cache coverage. Sheet renames now rewrite dependent formulas, defined names, tables, and charts. Personal/OpenXML work stays honest with `calculationVerified: false`; supported Business/SharePoint workbooks can invoke Microsoft's Graph calculation engine in a persistent workbook session.
+
+Template requests now resolve, inspect, preview-copy, commit-copy, edit, and re-inspect the exact reference file instead of creating a blank package. Standard Chat metadata routing explicitly enriches exact size, MIME, and modified time through item-info. Production health exposes bounded release, error/throttle, and p50/p95 tool latency counters without tenant content. The release adds an external OAuth/MCP production canary, a repeated-search latency benchmark, exact dependency/base-image checks, deterministic CycloneDX source inventory, and commit-pinned Trivy image/SBOM CI.
+
+Offline evidence is green at 213/213 mock Graph checks, including real Business workbook calculation routing; 169/169 OAuth compatibility checks; 21/21 golden prompts plus three cross-tool workflows and 18 ambiguity pairs; all 80 Office operations; the Office security corpus; native-library reopen; and LibreOffice render without repair diagnostics. The focused contract remains 21 tools at 35,853 bytes without OAuth and 38,835 bytes with OAuth, under its 38 KiB cap. NAS66 deployment and signed-in ChatGPT beta are still pending, so this report does not yet claim release completion.
+
+## 2026-08-18 NAS65 search and native Office creation release
+
+This release exposes the MCP-standard `search` action in the focused ChatGPT profile, adds authentication-scoped 60-second search snapshots with mutation invalidation, enriches compact result metadata, and adds guarded native creation of genuine Word, Excel, and PowerPoint packages. The new creation flow generates and strictly reopens each Open XML package before upload, binds confirmation to the destination and specification, refuses to mint a replacement token without matching remote identity and eTag evidence, and uses create-only semantics if a previously absent destination becomes occupied before commit.
+
+The focused contract is 21 actions while the full contract remains exactly 84 tools. Offline evidence is green at 213/213 mock Graph checks, 169/169 OAuth compatibility checks, 21/21 ChatGPT routing prompts with 18 ambiguity pairs, five remote workflow skills with 16 resources, and all 80 typed Office edit operations. The versioned cache is installed at `$CODEX_HOME/plugins/cache/personal/onedrive/0.6.4+codex.20260819032617`; all 92 packaged files match source across bytes, modes, types, and symlink targets without overwriting an older cache.
+
+NAS65 is deployed from `/volume1/docker/onedrive-chatgpt/app-0.6.4-nas65-search-office-create-20260818` as `onedrive-chatgpt-nas:0.6.4-nas65-search-office-create-20260818`, image `sha256:c469c000e69ebbf09f0808f211254f8d7edc30e07fa3869aa7fd7cd56ae25431`. Container `41a80b4a96895f321de510ab62634fca31d4c3cd22f7a00eb50e8e097471ba70` is running and healthy with zero restarts and zero health-check failures. Public health, OAuth metadata, protected-resource metadata, expected MCP `GET` 405 behavior, unauthenticated tool rejection, and MCP 2025-11-25 initialization all pass. The immutable NAS64 source and image remain available for exact rollback.
+
+The existing ChatGPT app `plugin_asdk_app_6a6995abb030819187d50d7080d4ae95` was refreshed in place with the same OAuth connection and now exposes all 21 focused actions; no duplicate app was created. A signed-in [ChatGPT Work beta](https://chatgpt.com/c/6a852977-fa10-83ea-82e9-eb890b5aeb0e) passed guarded native Word preview and creation, remote package validation, two identical standard searches with a second-hit `scoped_memory` cache result at age 4,357 ms and TTL 60,000 ms, fetch readback by stable item ID, and an occupied-destination refusal that issued no preview token. A separate [standard Chat beta](https://chatgpt.com/c/6a852ad3-c314-83ea-8de5-181eaece2b02) selected the connected OneDrive app and returned the exact filename, stable item ID, modified timestamp, and MIME type through MCP-standard search without mutation; its generic answer renderer did not surface the size or cache fields that Work exposed.
+
+The sole disposable fixture, `Codex NAS65 Native Office Search Cache Test 20260818.docx`, was identity-checked and moved to the OneDrive recycle bin through a fresh guarded preview. Post-cleanup direct lookup fails, standard search no longer returns the stable item ID, and the deletion invalidated the scoped search cache. The cleanup is recoverable and was not a permanent deletion.
+
+Overall, this connector now exceeds the Google Drive plugin for Microsoft-first document work through direct validated Office creation, 80 typed Office mutations, Office inspection/review/render/export, version recovery, guarded write proofs, MCP-standard search/fetch, and private self-hosted OAuth deployment. It does not claim a provider-native Google Docs comment-thread equivalent: Microsoft Graph `driveItem` exposes no comparable OneDrive comment service, so Word-package comments and Office review remain the honest Microsoft-native substitute.
+
+## 2026-08-16 NAS64 workflow, latency, and materialized-resource release
+
+Release `0.6.4+codex.20260816170509` advertises the five bundled OneDrive workflow skills through the MCP skills extension for import during **Scan Tools**, removes anonymous object-union rendering from four focused Office selectors, returns explicit not-applicable evidence for enterprise-only reads on personal accounts, and adds a subject-scoped 60-second list snapshot that is invalidated after successful mutations. A NAS63 live canary exposed a missing unprivileged `/data/materialized-resources` startup directory; NAS64 fixes that ownership contract and adds a regression assertion. NAS64 is deployed from `/volume1/docker/onedrive-chatgpt/app-0.6.4-nas64-materialized-resources-20260816` as `onedrive-chatgpt-nas:0.6.4-nas64-materialized-resources-20260816`, image `sha256:982828dcd793c27238682eceddbaf1d01cb68d721c41e94e391ed07981341bb5`. Container `c1d1fcb89fc598609068eb9936bff68caaaff930a2597e3d55c6f994096d20d7` is running and healthy with zero restarts. NAS63 remains the exact rollback source and image.
+
+Offline evidence is green: mock Microsoft Graph 212/212, OAuth compatibility 169/169, full/focused/OAuth tool contracts 84/19/19, ChatGPT golden routing 19/19, five remote skills with 16 digest-verified resources, all 80 advertised Office operations, hosted-boundary checks, and the remaining utility/security suites. The safe live focused beta passed 5/5 without remote mutation; all three representative queries ranked the intended result first with MRR@10 of 1.0. Public health, OAuth metadata, protected-resource metadata, MCP route behavior, initialize, skill scanning, materialized download, and preview rendering all pass on NAS64. The versioned cache is installed at `$CODEX_HOME/plugins/cache/personal/onedrive/0.6.4+codex.20260816170509`; all 92 package files match source across bytes, modes, types, and symlink targets.
+
+The existing ChatGPT app `plugin_asdk_app_6a6995abb030819187d50d7080d4ae95` was refreshed in place with the same OAuth connection and 19 actions; no duplicate app was created. The refreshed `onedrive_office_inspect` and `onedrive_office_review` schemas expose stable named properties without top-level `anyOf`. A signed-in Work conversation passed four read-only prompts: cold root listing (3,139 ms), the same list from `scoped_memory` (0 ms, age 17,327 ms, TTL 60,000 ms), enterprise discovery returning `not_applicable`/`personal_account` with no personal-drive fallback, and `Dashboard Engine!A1:B5` inspection returning the stable workbook name/eTag, hidden sheet state, 10 cells, and three formulas. Evidence: https://chatgpt.com/c/6a81f0f9-efb8-83ea-9eec-4d8833873981. No OneDrive data was changed.
+
+The current-release live scope intentionally excluded a fresh external recipient invitation and a new recycle/delete matrix because those operations affect other people or cloud data. Their unchanged contracts retain the immediate-predecessor full live baseline and are covered by the current 212-check mock suite. Current NAS64 live coverage includes safe Graph reads, Office inspection/review, materialized download, preview rendering, public OAuth/MCP discovery, remote-skill digest verification, and signed-in ChatGPT orchestration.
 
 ## 2026-08-14 NAS62 filename-only hyperlink deployment
 

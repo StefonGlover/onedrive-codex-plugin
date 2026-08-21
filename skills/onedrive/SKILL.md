@@ -14,7 +14,7 @@ Operate on the signed-in user's remote OneDrive through the plugin. Do not inspe
 - Use `$onedrive-word`, `$onedrive-excel`, or `$onedrive-powerpoint` for format-aware Office creation or editing.
 - Use `$onedrive-review` for comments, notes, versions, visual review, or evidence-backed feedback.
 - Use `onedrive_write_text` or `onedrive_patch_text` for text/code files. Preview replacements and patches before any live write.
-- Use `onedrive_create_folder` for a conflict-safe folder create. Use `onedrive_create_office_file` for bounded structured Word, Excel, or PowerPoint authoring directly in OneDrive, and `onedrive_upload_file` for a genuinely local or chat-provided file.
+- Use `onedrive_create_folder` for a conflict-safe folder create. Use `onedrive_create_office_file` for bounded structured Word, Excel, or PowerPoint authoring only when no template/reference was requested. When a template is named, resolve it exactly, preview/commit a conflict-fail copy, verify the new identity, then inspect and edit only the copy. Use `onedrive_upload_file` for a genuinely local or chat-provided file.
 - Use `onedrive_preview_actions` and `onedrive_commit_actions` for rename, move, copy, permission revocation, and version restore. Use the dedicated preview-gated tool for other mutations such as sharing, delete, restore, text patch, upload replacement, or Office transforms.
 
 ## Preserve mutation safety

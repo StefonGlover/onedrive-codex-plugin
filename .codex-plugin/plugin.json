@@ -1,6 +1,6 @@
 {
   "name": "onedrive",
-  "version": "0.6.4+codex.20260819032617",
+  "version": "0.6.5+codex.20260820212515",
   "description": "Search, create, edit, review, share, and recover OneDrive files with preview-and-confirm safeguards.",
   "author": {
     "name": "Stefon Glover"

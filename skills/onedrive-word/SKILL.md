@@ -17,7 +17,7 @@ Keep Word documents native `.docx` files and use structured evidence before edit
 
 ## Start from a template or reference
 
-Preview a `copy` with `onedrive_preview_actions`, show the exact source and destination, obtain confirmation, and apply it with `onedrive_commit_actions`. Inspect and edit the copy only. Preserve section setup, styles, headers/footers, content controls, images, and table structure unless the user explicitly requests changes.
+Resolve and inspect the exact template first; refuse ambiguity. Preview one conflict-fail `copy` with `onedrive_preview_actions`, show the exact source and destination, obtain confirmation, and apply the unchanged proof once with `onedrive_commit_actions`. Verify a new stable item ID, then inspect and edit the copy only. Preserve section setup, styles, headers/footers, content controls, images, and table structure unless the user explicitly requests changes. Reinspect and render the saved copy; leave the source template unchanged.
 
 ## Edit an existing document
 

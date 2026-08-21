@@ -72,7 +72,7 @@ const requiredDockerLogRotation = {
   maxSize: 'max-size: "10m"',
   maxFile: 'max-file: "3"'
 };
-const expectedPluginVersion = /^0\.6\.4\+codex\.\d{14}$/;
+const expectedPluginVersion = /^0\.6\.5\+codex\.\d{14}$/;
 const expectedChatGptAppKey = "onedrive";
 const chatGptConnectionIdPattern = /^plugin_asdk_app_[0-9a-f]{32}$/;
 const expectedOfficeOperationKinds = {
@@ -108,9 +108,11 @@ const requiredQaOfflineGates = [
   "Plugin manifest/version alignment",
   "Prepackage negative checks",
   "Office Open XML operations",
+  "Excel integrity and calculation routing",
   "Office security corpus",
   "Genuine package reopening",
   "Mock Microsoft Graph",
+  "Production canary and supply-chain checks",
   "Read-only OneDrive doctor and tenant checks",
   "Cleanup preview",
   "Whitespace"
@@ -138,6 +140,8 @@ const requiredFiles = [
   "mcp/text-patch.mjs",
   "scripts/auth-vault-test.mjs",
   "scripts/benchmark.mjs",
+  "scripts/production-canary.mjs",
+  "scripts/supply-chain-check.mjs",
   "scripts/beta-test.mjs",
   "scripts/tool-contract.mjs",
   "scripts/install-versioned-cache.mjs",
@@ -285,7 +289,7 @@ function checkManifest() {
   if (!manifest) return;
   if (manifest.name !== "onedrive") fail(`Unexpected plugin name: ${manifest.name}`);
   if (!expectedPluginVersion.test(manifest.version || "")) {
-    fail(`Plugin version must match 0.6.4+codex.<14-digit timestamp>: ${manifest.version}`);
+    fail(`Plugin version must match 0.6.5+codex.<14-digit timestamp>: ${manifest.version}`);
   }
   const readme = readFileSync(join(pluginRoot, "README.md"), "utf8");
   if (!readme.includes(`Release \`${manifest.version}\``)) {
@@ -847,7 +851,7 @@ if (selfCheck) {
       { apps: "./.app.json" },
       { apps: { onedrive: { id: "asdk_app_6a5e2416985481918d0f6c68785da2c4" } } }
     ).some((issue) => issue.includes("plugin_asdk_app_")),
-    currentVersionAccepted: expectedPluginVersion.test("0.6.4+codex.20260729033800"),
+    currentVersionAccepted: expectedPluginVersion.test("0.6.5+codex.20260820212515"),
     staleVersionRejected: !expectedPluginVersion.test("0.6.1+codex.20260726012710"),
     sensitiveFileNamesRecognized: isSensitivePackageEntryName(".env.local")
       && isSensitivePackageEntryName("signing.pem")

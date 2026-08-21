@@ -459,6 +459,14 @@ try {
 
   const health = await fetch(`${baseUrl}/healthz`).then((response) => response.json());
   assert(health.ok && health.authMode === "oauth", "HTTP health route did not report OAuth mode.", health);
+  assert(
+    health.observability?.release?.toolCount === 21
+      && health.observability.release.profile === "chatgpt"
+      && health.observability.latency?.windowSize === 100
+      && health.observability.toolCalls === 0,
+    "HTTP health route did not expose the bounded focused-release observability contract.",
+    health
+  );
   assert(!JSON.stringify(health).includes("message"), "Unauthenticated health diagnostics must never expose tenant-specific error messages.", health);
 
   const metadataResponse = await fetch(`${baseUrl}/.well-known/oauth-protected-resource/v1/mcp/tunnel_test`);
@@ -823,6 +831,13 @@ try {
       && !Object.hasOwn(healthAfterFailure.lastToolFailure, "message"),
     "Unauthenticated health diagnostics exposed a tenant-specific tool failure message.",
     healthAfterFailure
+  );
+  assert(
+    healthAfterFailure.observability?.toolCalls >= 1
+      && healthAfterFailure.observability.toolErrors >= 1
+      && healthAfterFailure.observability.latency?.sampleCount >= 1,
+    "Tool observability counters were not updated after a failed tool call.",
+    healthAfterFailure.observability
   );
 
   console.log(JSON.stringify({

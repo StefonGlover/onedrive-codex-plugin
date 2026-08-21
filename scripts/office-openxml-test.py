@@ -250,6 +250,36 @@ def main():
         excel = run_helper(xlsx, "excel", searchText="Revenue")
         cells = excel["sheets"][0]["cells"]
         checks["excel"] = excel["sheetCount"] == 1 and cells[0]["value"] == "Revenue" and excel["search"]["matchCount"] == 1 and excel["tableCount"] == 1 and excel["sheets"][0]["tables"][0]["displayName"] == "RevenueTable" and excel["chartCount"] == 1 and excel["sheets"][0]["charts"][0]["title"] == "Revenue Chart" and excel["pivotCount"] == 0
+        checks["excelIntegrityClean"] = excel["integrity"]["status"] == "pass" and excel["integrity"]["calculationVerified"] is False and excel["integrity"]["calculation"]["formulaCount"] == 1
+        broken_integrity_xlsx = root / "broken-integrity.xlsx"
+        with zipfile.ZipFile(xlsx, "r") as source, zipfile.ZipFile(broken_integrity_xlsx, "w", zipfile.ZIP_DEFLATED) as destination:
+            for info in source.infolist():
+                payload = source.read(info.filename)
+                if info.filename == "xl/worksheets/sheet1.xml":
+                    payload = payload.replace(
+                        b"</row><row r=\"2\">",
+                        b"<c r=\"C1\"><f>Missing!A1+#REF!+SUM(GhostTable[Revenue])</f><v>#REF!</v></c><c r=\"D1\" t=\"e\"><v>#VALUE!</v></c></row><row r=\"2\">",
+                        1,
+                    )
+                destination.writestr(info, payload)
+        broken_integrity = run_helper(broken_integrity_xlsx, "excel")
+        broken_codes = {finding["code"] for finding in broken_integrity["integrity"]["findings"]}
+        broken_validation = run_helper(broken_integrity_xlsx, "excel", action="validate")
+        checks["excelIntegrityFindings"] = broken_integrity["integrity"]["status"] == "fail" and {"FORMULA_ERROR_TOKEN", "MISSING_WORKSHEET_REFERENCE", "MISSING_TABLE_REFERENCE", "ERROR_CELL_VALUE"}.issubset(broken_codes) and broken_validation["integrity"]["calculationVerified"] is False
+        bounded_broken_integrity = run_helper(broken_integrity_xlsx, "excel", maxIntegrityFindings=1)["integrity"]
+        checks["excelIntegrityEvidenceBounded"] = (
+            len(bounded_broken_integrity["findings"]) == 1
+            and len(bounded_broken_integrity["blockingFindingKeys"]) == 1
+            and bounded_broken_integrity["blockingFindingKeyCount"] > 1
+            and bounded_broken_integrity["findingsTruncated"] is True
+            and bounded_broken_integrity["blockingFindingKeysTruncated"] is True
+        )
+        refused_integrity_edit = subprocess.run(
+            [sys.executable, str(HELPER)],
+            input=json.dumps({"action": "edit", "inputPath": str(xlsx), "outputPath": str(root / "refused-integrity-edit.xlsx"), "kind": "excel", "operations": [{"type": "setFormula", "sheet": "Data", "address": "C2", "formula": "Missing!A1"}]}),
+            text=True, capture_output=True, check=False,
+        )
+        checks["excelIntegrityEditGate"] = refused_integrity_edit.returncode != 0 and "integrity gate refused" in refused_integrity_edit.stdout
         selected_excel = run_helper(xlsx, "excel", sheetNames=["Data"], address="A1:A1")
         checks["excelSelectors"] = selected_excel["cellCount"] == 1 and selected_excel["sheets"][0]["cells"][0]["formula"] == "SUM(1,2)"
         oversized_excel_range = subprocess.run(
@@ -292,7 +322,29 @@ def main():
             formula_cell = next(cell for cell in sheet_root.iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c") if cell.attrib.get("r") == "A1")
             explicit_recalc_change = next(change for change in rich_excel_edit["changes"] if change["operation"] == "recalculate")
             recalculation_safe = "fullCalcOnLoad=\"1\"" in workbook_xml and "forceFullCalc=\"1\"" in workbook_xml and "xl/calcChain.xml" not in edited_package.namelist() and "calcChain" not in relations_xml and formula_cell.find("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}v") is None and explicit_recalc_change["clearedFormulaCaches"] >= 1
-        checks["excelRangeAndMetadataEdits"] = rich_excel_edit["changeCount"] == 14 and rich_excel["sheets"][0]["name"] == "Results" and rich_cells["B4"]["value"] == 4 and rich_cells["A3"]["styleIndex"] == 2 and rich_cells["A1"]["styleIndex"] == 3 and "$#,##0.00" in styles_xml and "conditionalFormatting" in sheet_xml and "dataValidation" in sheet_xml and "state=\"frozen\"" in sheet_xml and "width=\"18.0\"" in sheet_xml and recalculation_safe and any(entry["name"] == "InputBlock" for entry in rich_excel["definedNames"])
+        checks["excelRangeAndMetadataEdits"] = rich_excel_edit["changeCount"] == 14 and rich_excel["sheets"][0]["name"] == "Results" and rich_cells["B4"]["value"] == 4 and rich_cells["A3"]["styleIndex"] == 2 and rich_cells["A1"]["styleIndex"] == 3 and "$#,##0.00" in styles_xml and "conditionalFormatting" in sheet_xml and "dataValidation" in sheet_xml and "state=\"frozen\"" in sheet_xml and "width=\"18.0\"" in sheet_xml and recalculation_safe and any(entry["name"] == "InputBlock" and "Results" in entry["value"] and "Data!" not in entry["value"] for entry in rich_excel["definedNames"]) and all("Results" in formula and "Data!" not in formula for formula in rich_excel["sheets"][0]["charts"][0]["series"][0]["formulas"])
+        checks["excelRenamePreservesReferences"] = rich_excel_edit["integrityGate"]["passed"] is True and next(change for change in rich_excel_edit["changes"] if change["operation"] == "renameSheet")["rewrittenReferenceCount"] >= 2
+
+        rename_edge_source = root / "rename-edge-source.xlsx"
+        with zipfile.ZipFile(xlsx, "r") as source_package:
+            edge_parts = {name: source_package.read(name) for name in source_package.namelist() if name != "[Content_Types].xml"}
+            edge_content_types = source_package.read("[Content_Types].xml")
+        edge_parts["xl/workbook.xml"] = edge_parts["xl/workbook.xml"].replace(
+            b"</definedNames>",
+            b'<definedName name="ThreeD">Data:Data!$A$1</definedName><definedName name="External">[Other.xlsx]Data!$A$1</definedName></definedNames>',
+        )
+        write_package(rename_edge_source, edge_parts, edge_content_types)
+        rename_edge_output = root / "rename-edge-output.xlsx"
+        rename_edge_edit = run_helper(rename_edge_source, "excel", action="edit", outputPath=str(rename_edge_output), operations=[
+            {"type": "renameSheet", "sheet": "Data", "newName": "Results"},
+        ])
+        rename_edge_inspection = run_helper(rename_edge_output, "excel")
+        rename_edge_names = {entry["name"]: entry["value"] for entry in rename_edge_inspection["definedNames"]}
+        checks["excelRenamePreservesThreeDimensionalAndExternalReferences"] = (
+            rename_edge_edit["integrityGate"]["passed"] is True
+            and rename_edge_names["ThreeD"] == "'Results':'Results'!$A$1"
+            and rename_edge_names["External"] == "[Other.xlsx]Data!$A$1"
+        )
 
         noted_xlsx = root / "noted.xlsx"
         add_note = run_helper(xlsx, "excel", action="edit", outputPath=str(noted_xlsx), operations=[

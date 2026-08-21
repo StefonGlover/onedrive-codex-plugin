@@ -16,16 +16,16 @@ const goldenPrompts = [
   { prompt: "Read the budget workbook you found", tool: "fetch", cues: ["read", "returned by onedrive_read_actions"] },
   { prompt: "Open 2026 Family Budgeting.xlsx and this OneDrive link", tool: "onedrive_open_files", cues: ["exact filenames", "onedrive/sharepoint", "urls", "one read-only call", "never show the bare url"] },
   { prompt: "Preview renaming this workbook, copying it, and creating a view link", tool: "onedrive_preview_actions", cues: ["preview", "read-only batch", "onedrive_commit_actions"] },
-  { prompt: "List the root and search for insurance while checking this folder's permissions", tool: "onedrive_read_actions", cues: ["folder listings", "descriptive searches", "permission inspections", "concurrently"] },
+  { prompt: "List the root and search for insurance while checking this folder's permissions", tool: "onedrive_read_actions", cues: ["folder listings", "descriptive searches", "permissions", "concurrently"] },
   { prompt: "I approve all three previewed actions; apply them", tool: "onedrive_commit_actions", cues: ["approves one or more actions", "stops on the first error", "partial completion"] },
   { prompt: "What exact payload should I use for Excel addTableRow?", tool: "onedrive_office_capabilities", cues: ["exact schema", "valid example"] },
-  { prompt: "Inspect the formulas and notes in this workbook before editing it", tool: "onedrive_office_inspect", cues: ["bounded structured", "stable id"] },
+  { prompt: "Inspect the formulas, references, calculation state, and notes in this workbook before editing it", tool: "onedrive_office_inspect", cues: ["bounded office", "stable id", "calculationverified false"] },
   { prompt: "Update cells in these two Excel workbooks", tool: "onedrive_office_batch_transform", cues: ["structured edits", "preview"] },
   { prompt: "Add a review note to Excel cell B7 and list the existing Word comments", tool: "onedrive_office_review", cues: ["word comments", "excel notes", "exact coordinates"] },
   { prompt: "Give me the original file as a downloadable resource", tool: "onedrive_download_file", cues: ["materialized original", "pdf", "mcp resource"] },
   { prompt: "Render the first three slides so I can visually check them", tool: "onedrive_render_preview", cues: ["visual qa", "pages or slides", "image"] },
   { prompt: "Upload this attached PDF to OneDrive", tool: "onedrive_upload_file", cues: ["chatgpt-provided file", "upload"] },
-  { prompt: "Create a Word brief in OneDrive from these paragraphs and this table", tool: "onedrive_create_office_file", cues: ["new word, excel, or powerpoint", "structured content", "validated package", "same proof"] },
+  { prompt: "Create a Word brief in OneDrive from these paragraphs and this table", tool: "onedrive_create_office_file", cues: ["new office file", "structured content", "validated package", "template"] },
   { prompt: "Export this Word document as a PDF beside the source in OneDrive", tool: "onedrive_export_file", cues: ["converted to pdf or plain text", "saved back in onedrive", "preview"] },
   { prompt: "Create a new markdown file with this full content", tool: "onedrive_write_text", cues: ["create or fully replace", "required content field", "never a text field"] },
   { prompt: "Change only one line in this existing text file", tool: "onedrive_patch_text", cues: ["targeted", "preserving", "expectedetag", "previewtoken"] },
@@ -54,6 +54,28 @@ const ambiguityPairs = [
   ["onedrive_create_folder", "onedrive_commit_actions"],
   ["onedrive_commit_actions", "onedrive_read_actions"],
   ["onedrive_delete", "onedrive_restore_deleted"]
+];
+
+const workflowPrompts = [
+  {
+    prompt: "Create next month's budget from the approved workbook template, preserving its formulas and formatting.",
+    checks: (byName, instructions) => byName.get("onedrive_preview_actions")?.description.includes("copy")
+      && byName.get("onedrive_create_office_file")?.description.includes("template")
+      && instructions.includes("preview and commit its exact copy")
+      && instructions.includes("inspect the copy, then edit it")
+  },
+  {
+    prompt: "Find the exact workbook and tell me its size, MIME type, and last modified time.",
+    checks: (byName, instructions) => byName.get("search")?.description.includes("item-info")
+      && byName.get("onedrive_read_actions")?.description.includes("size/MIME/modified time")
+      && instructions.includes("item-info when exact size, MIME, or modified time matters")
+  },
+  {
+    prompt: "Check this Excel workbook for broken formulas and refuse edits that introduce new reference errors.",
+    checks: (byName, instructions) => byName.get("onedrive_office_inspect")?.description.includes("formula/reference errors")
+      && byName.get("onedrive_office_batch_transform")?.description.includes("refuse newly introduced broken references")
+      && instructions.includes("Excel integrity")
+  }
 ];
 
 try {
@@ -97,10 +119,15 @@ try {
     assert(left.description !== right.description, "Ambiguous tools must not share descriptions.", { leftName, rightName });
   }
 
+  for (const entry of workflowPrompts) {
+    assert(entry.checks(byName, initialized.result.instructions), "Cross-tool workflow routing is incomplete.", { prompt: entry.prompt });
+  }
+
   console.log(JSON.stringify({
     ok: true,
     toolCount: tools.length,
     goldenPromptCount: goldenPrompts.length,
+    workflowPromptCount: workflowPrompts.length,
     ambiguityPairCount: ambiguityPairs.length,
     serverInstructionBytes: Buffer.byteLength(initialized.result.instructions, "utf8")
   }, null, 2));

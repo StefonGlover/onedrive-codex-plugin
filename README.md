@@ -2,9 +2,9 @@
 
 Local Codex plugin for OneDrive file operations through Microsoft Graph.
 
-Release `0.6.4+codex.20260819032617` exposes the standard company-knowledge `search`/`fetch` contract, adds auth-scoped 60-second list and ranked-search snapshots with mutation invalidation, preserves richer created/modified/MIME/size/drive metadata, and creates validated native Word, Excel, or PowerPoint files directly from bounded structured content. It retains filename-only visible hyperlinks, direct link opening, the 21-tool ChatGPT surface, the full 84-tool trusted-local profile, account-and-drive-isolated state, bounded Office inspection/review/editing, guarded version restore, and enterprise exact-drive reads.
+Release `0.6.5+codex.20260820212515` adds a fail-closed Excel formula/reference integrity gate, safe sheet-reference rewriting, real Microsoft workbook recalculation for supported Business/SharePoint workbooks, exact template-copy routing, public release canaries, bounded latency/health telemetry, and reproducible SBOM plus container-vulnerability CI evidence. It retains MCP-standard search/fetch with exact metadata enrichment, direct validated Office creation, filename-only visible hyperlinks, the 21-tool ChatGPT surface, the full 84-tool trusted-local profile, account-and-drive-isolated state, guarded mutations, and enterprise exact-drive reads.
 
-ChatGPT surface note (updated 2026-08-18): the focused 21-tool surface covers standard discovery/fetch, direct validated Office creation, Office inspection/editing/review, materialized downloads and visual previews, recent/version history, enterprise drive libraries, CRUD, sharing, and permissions. Redundant standalone tools remain available only in the full profile; a focused-profile `tools/call` rejects every unadvertised tool. Work requires the delegated OAuth deployment and public compatibility origin described below. Direct Entra v2 endpoints are not sufficient because ChatGPT correctly sends the MCP `resource` parameter and Entra v2 rejects that parameter.
+ChatGPT surface note (updated 2026-08-20): the focused 21-tool surface covers standard discovery/fetch, direct validated Office creation, guarded template copies, Office inspection/editing/review, materialized downloads and visual previews, recent/version history, enterprise drive libraries, CRUD, sharing, and permissions. Redundant standalone tools remain available only in the full profile; a focused-profile `tools/call` rejects every unadvertised tool. Work requires the delegated OAuth deployment and public compatibility origin described below. Direct Entra v2 endpoints are not sufficient because ChatGPT correctly sends the MCP `resource` parameter and Entra v2 rejects that parameter.
 
 This is an unofficial integration and is not affiliated with, endorsed by, or sponsored by Microsoft.
 
@@ -344,12 +344,12 @@ The focused ChatGPT profile advertises 21 tools. Route descriptive or partial-na
 
 The plugin can inspect and edit modern Open XML files without requiring Word, Excel, or PowerPoint to be open. Reads expose structured document content and package-safety metadata. Mutation previews include semantic operation counts and affected objects, are bound to file identity and eTag/cTag, backed up locally by default, uploaded with `If-Match`, validated after commit, and recorded in the mutation audit.
 
-`onedrive_create_office_file` creates a genuine `.docx`, `.xlsx`, or `.pptx` from bounded structured content in the hosted profile. A dry run builds the package in account-and-drive-scoped private staging, validates OpenXML relationships and content types, and returns a proof bound to kind, destination, structured content, conflict mode, and any existing target revision. A confirmed call uploads once and downloads the returned stable item for structured readback. Replacement requires expected identity plus eTag; `conflictBehavior: "fail"` never issues an actionable token for an occupied destination, and a replace preview that found no prior file commits as create-only.
+`onedrive_create_office_file` creates a genuine `.docx`, `.xlsx`, or `.pptx` from bounded structured content in the hosted profile only when no template or reference file was requested. A dry run builds the package in account-and-drive-scoped private staging, validates OpenXML relationships and content types, and returns a proof bound to kind, destination, structured content, conflict mode, and any existing target revision. A confirmed call uploads once and downloads the returned stable item for structured readback. Replacement requires expected identity plus eTag; `conflictBehavior: "fail"` never issues an actionable token for an occupied destination, and a replace preview that found no prior file commits as create-only. Template-driven work instead resolves one exact source, inspects it, previews and commits a guarded copy through `onedrive_preview_actions`/`onedrive_commit_actions`, then edits and re-inspects the new stable item so styles, formulas, charts, and layout are preserved.
 
 Managed Office backups have opaque IDs and manifests containing the original stable item ID and version metadata. Trusted local full-profile clients use `onedrive_office_backups` to list them and `onedrive_office_compare_backup` for a bounded semantic comparison with the current remote content. Focused hosted clients list backups through `onedrive_read_actions` operation `officeBackups`, then remove exact selected IDs only through preview/commit operation `deleteOfficeBackups`. `onedrive_office_restore_backup` defaults to dry-run and requires the preview token, original `expectedId`, and current `expectedETag`; it restores by item ID, creates a rollback backup, audits the mutation, and verifies the restored fingerprint.
 
 - Word exposes durable paragraph, table, content-control, and comment evidence anchors and 22 headless operations, including comment creation/deletion, image insertion/replacement, bookmarks, content controls, table row/column changes, headers/footers, and section properties. `deleteComment` removes the comment plus its range/reference markers. Documents containing tracked changes are refused instead of silently changing review semantics.
-- Excel exposes worksheet, range, defined-name, and table/row-key anchors and 33 headless operations, including worksheet/table lifecycle, merge/unmerge, sort/filter, hyperlinks, notes, images, chart formatting, passwordless sheet protection, and pivot refresh-on-open. Business `.xlsx` Graph writes use scoped persistent sessions; personal workbooks and unsupported Graph operations use Open XML automatically.
+- Excel exposes worksheet, range, defined-name, and table/row-key anchors and 33 headless operations, including worksheet/table lifecycle, merge/unmerge, sort/filter, hyperlinks, notes, images, chart formatting, passwordless sheet protection, and pivot refresh-on-open. Every Personal/OpenXML inspection reports formula-error tokens, stored error cells, missing worksheet/table references, broken defined names, static circular references, external links, volatile formulas, calculation mode, cached-result coverage, and whether the bounded scan completed. Edits are refused before upload if they introduce a blocking finding or the post-edit integrity scan is incomplete. `calculationVerified` stays `false` because OpenXML cannot run Excel's formula engine. Business/SharePoint `.xlsx` Graph writes use scoped persistent sessions; a `recalculate` operation invokes Microsoft's workbook calculation engine and reports that execution as verified, while personal workbooks and unsupported Graph operations use OpenXML automatically.
 - Open XML validation now rejects undeclared prefixes referenced by `mc:Ignorable`, and serialization preserves original namespace declarations even when a prefix appears only in compatibility metadata. `addTableRow` copies the nearest row's cell styles and row attributes/height and extends applicable conditional-format/data-validation ranges. Its canonical `values` payload is a two-dimensional rows array; a one-dimensional single-row shorthand is normalized before validation and execution. `deleteTableRow` compacts one table data row, shifts native hyperlinks, translates ordinary relative A1 formulas, safely shrinks bounded single-column shared-formula groups without changing their formulas or cached values, shrinks applicable ranges, and reports each preservation decision in its preview diff.
 - Untrusted Open XML packages are bounded before parsing: at most 10,000 entries, 256 MiB total expansion, 64 MiB per ZIP member, and 32 MiB per XML/relationship part. Fingerprints stream package members, and Linux helper processes apply CPU, output-file, and 512 MiB address-space ceilings in addition to the container limit.
 - PowerPoint exposes persistent slide and shape anchors and 25 headless operations, including slides, images/cropping, tables and row/column changes, alternative text, z-order, grouping/ungrouping, and layout application.
@@ -521,6 +521,18 @@ Run the benchmark script when comparing cold search, warm cache search, indexed 
 scripts/benchmark.mjs --query="project plan"
 ```
 
+After deployment, run the unauthenticated public production canary. It verifies health latency, OAuth and protected-resource metadata, MCP initialization, the Bearer challenge, the GET refusal, and the exact deployed focused release contract:
+
+```bash
+node scripts/production-canary.mjs --base-url=https://your-production-origin.example --expect-tools=21 --expect-version-prefix=0.6.5+codex.20260820212515
+```
+
+Validate dependency pins and generate a deterministic CycloneDX source SBOM before packaging. CI also builds the production image, fails on fixed High/Critical findings through a commit-pinned Trivy action, and publishes source and image SBOM artifacts:
+
+```bash
+node scripts/supply-chain-check.mjs --output=/tmp/onedrive-source.cdx.json
+```
+
 Run the prepackage guard before refreshing the plugin cache:
 
 ```bash
@@ -531,14 +543,14 @@ Preview the exact new versioned cache directory, then install only after reviewi
 
 ```bash
 node scripts/install-versioned-cache.mjs
-node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260819032617"
+node scripts/install-versioned-cache.mjs --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.5+codex.20260820212515"
 ```
 
 After both live betas, regenerate the two QA reports, preview their exact sync into that new cache, then apply only those evidence files and re-run parity:
 
 ```bash
-node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260819032617"
-node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.4+codex.20260819032617"
+node scripts/install-versioned-cache.mjs --sync-evidence --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.5+codex.20260820212515"
+node scripts/install-versioned-cache.mjs --sync-evidence --confirmed --target="$HOME/.codex/plugins/cache/personal/onedrive/0.6.5+codex.20260820212515"
 ```
 
 Office compatibility checks are split by purpose:

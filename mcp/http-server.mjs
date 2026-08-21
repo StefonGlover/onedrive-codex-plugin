@@ -15,7 +15,7 @@ import {
   createResourceReadAdmissionController,
   holdResourceReadUntilResponseDeadline
 } from "./resource-read-admission.mjs";
-import { activeToolProfile, processMcpMessage, shutdownOneDriveServer } from "./server.mjs";
+import { activeServerRelease, activeToolProfile, processMcpMessage, shutdownOneDriveServer } from "./server.mjs";
 
 const maxRequestBytes = 1024 * 1024;
 const maxBatchMessages = 16;
@@ -25,7 +25,36 @@ const hostedLoopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
 let lastAuthFailure = null;
 let lastToolFailure = null;
 let lastToolCall = null;
+const serverStartedAt = Date.now();
+const recentToolDurationsMs = [];
+let toolCallCount = 0;
+let toolErrorCount = 0;
+let graphThrottleCount = 0;
+let oauthFailureCount = 0;
 const defaultResourceReadAdmission = createResourceReadAdmissionController();
+
+function percentile(values, probability) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((left, right) => left - right);
+  return Math.round(sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * probability) - 1))] * 10) / 10;
+}
+
+function observabilitySnapshot() {
+  return {
+    release: activeServerRelease,
+    uptimeSeconds: Math.max(0, Math.floor((Date.now() - serverStartedAt) / 1000)),
+    toolCalls: toolCallCount,
+    toolErrors: toolErrorCount,
+    graphThrottles: graphThrottleCount,
+    oauthFailures: oauthFailureCount,
+    latency: {
+      sampleCount: recentToolDurationsMs.length,
+      windowSize: 100,
+      p50Ms: percentile(recentToolDurationsMs, 0.5),
+      p95Ms: percentile(recentToolDurationsMs, 0.95)
+    }
+  };
+}
 
 function validateHostedToolProfile(env = process.env) {
   const requestedProfile = String(env.ONEDRIVE_TOOL_PROFILE || "").trim().toLowerCase();
@@ -59,19 +88,31 @@ function authFailureDiagnostic(authMode, error) {
   };
 }
 
-function recordToolDiagnostic(messages, results) {
+function recordToolDiagnostic(messages, results, fallbackDurationMs = null) {
   const toolCalls = messages.filter(isToolCall);
-  const toolResults = results.filter((result) => result?.result);
-  for (let index = 0; index < Math.min(toolCalls.length, toolResults.length); index += 1) {
-    const toolName = String(toolCalls[index]?.params?.name || "unknown").slice(0, 128);
-    const toolResult = toolResults[index].result;
+  const resultById = new Map(results.map((result) => [JSON.stringify([typeof result?.id, result?.id]), result]));
+  for (const toolCall of toolCalls) {
+    const toolResult = resultById.get(JSON.stringify([typeof toolCall?.id, toolCall?.id]))?.result;
+    if (!toolResult) continue;
+    const toolName = String(toolCall?.params?.name || "unknown").slice(0, 128);
+    toolCallCount += 1;
+    const reportedDurationMs = Number(toolResult?._meta?.["onedrive/performance"]?.totalMs);
+    const durationMs = Number.isFinite(reportedDurationMs) && reportedDurationMs >= 0
+      ? reportedDurationMs
+      : fallbackDurationMs;
+    if (Number.isFinite(durationMs) && durationMs >= 0) {
+      recentToolDurationsMs.push(durationMs);
+      if (recentToolDurationsMs.length > 100) recentToolDurationsMs.shift();
+    }
     lastToolCall = {
       at: new Date().toISOString(),
       tool: toolName,
       isError: toolResult?.isError === true
     };
     if (toolResult?.isError) {
+      toolErrorCount += 1;
       const error = toolResult?.structuredContent?.error || {};
+      if (error.graphStatus === 429 || error.code === "rate_limited") graphThrottleCount += 1;
       lastToolFailure = {
         at: new Date().toISOString(),
         tool: toolName,
@@ -213,6 +254,7 @@ async function requestAuthorization(request, messages) {
         ? "oauth_error"
         : "oauth_server_error";
     lastAuthFailure = authFailureDiagnostic(authMode, error);
+    if (authMode !== "oauth_required") oauthFailureCount += 1;
     return {
       authMode,
       error
@@ -329,8 +371,10 @@ async function handleMcp(
       throw error;
     }
   }
+  const processingStartedAt = performance.now();
   const results = (await Promise.all(messages.map((message) => processMcpMessage(message, auth)))).filter(Boolean);
-  recordToolDiagnostic(messages, results);
+  const processingDurationMs = Math.round((performance.now() - processingStartedAt) * 10) / 10;
+  recordToolDiagnostic(messages, results, processingDurationMs);
   if (!results.length) {
     setCommonHeaders(response);
     response.writeHead(202);
@@ -378,6 +422,7 @@ export function createOneDriveHttpServer(env = process.env, { resourceReadAdmiss
           server: "onedrive",
           transport: "streamable-http",
           authMode: settings.mode,
+          observability: observabilitySnapshot(),
           ...(lastAuthFailure ? { lastAuthFailure } : {}),
           ...(lastToolFailure ? { lastToolFailure } : {}),
           ...(lastToolCall ? { lastToolCall } : {})

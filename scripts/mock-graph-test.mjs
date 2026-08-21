@@ -1062,6 +1062,11 @@ const graph = createServer(async (req, res) => {
     return json(res, 200, { id: "business-session", persistChanges: true });
   }
   const businessWorkbookBase = "/v1.0/drives/business-drive/items/office-business/workbook";
+  if (req.method === "POST" && path === `${businessWorkbookBase}/application/calculate`) {
+    const body = await readJsonBody(req);
+    if (body.calculationType !== "Full") return json(res, 400, { error: { code: "invalidArgument", message: "Expected a full workbook calculation." } });
+    return json(res, 200, {});
+  }
   const rangeFormatMatch = path.match(/^\/v1\.0\/drives\/business-drive\/items\/office-business\/workbook\/worksheets\/([^/]+)\/range\(address='([^']+)'\)\/format$/);
   if (req.method === "GET" && rangeFormatMatch) {
     const sheet = decodeURIComponent(rangeFormatMatch[1]);
@@ -3265,13 +3270,17 @@ try {
   });
 
   await check("business Excel uses a scoped Graph workbook session", async () => {
-    const operations = [{ type: "setCell", sheet: "Data", address: "B2", value: "Graph updated" }];
+    const operations = [
+      { type: "setCell", sheet: "Data", address: "B2", value: "Graph updated" },
+      { type: "recalculate" }
+    ];
     const preview = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations });
     assert(!preview.isError && preview.value.backend === "graph", "business Excel preview should select Graph", preview);
     const live = await tool("onedrive_excel_batch_update", { itemId: "office-business", backend: "graph", operations, dryRun: false, confirmed: true, expectedId: "office-business", previewToken: preview.value.previewToken });
     assert(!live.isError && live.value.backend === "graph", "business Excel live update should use Graph", live);
     const sessionRequests = requests.filter((entry) => entry.path.includes("/office-business/workbook/"));
     const rangeRequest = sessionRequests.find((entry) => entry.method === "PATCH" && entry.path.includes("/range"));
+    const calculateRequest = sessionRequests.find((entry) => entry.method === "POST" && entry.path.endsWith("/application/calculate"));
     assert(sessionRequests.some((entry) => entry.path.endsWith("/createSession")), "Graph createSession was not called", { sessionRequests });
     assert(counters.get("excel-create-session") === 2, "Graph createSession should retry the documented safe 504 once", { sessionRequests });
     assert(counters.get("excel-create-session-poll") === 2, "Graph createSession LRO should poll until succeeded", { sessionRequests });
@@ -3279,6 +3288,8 @@ try {
     const createRequest = sessionRequests.find((entry) => entry.path.endsWith("/createSession"));
     assert(createRequest?.headers?.prefer === "respond-async", "Graph createSession should request asynchronous completion", { createRequest });
     assert(rangeRequest?.headers?.["workbook-session-id"] === "business-session", "Graph range write omitted workbook-session-id", { rangeRequest });
+    assert(calculateRequest?.headers?.["workbook-session-id"] === "business-session", "Graph calculation omitted workbook-session-id", { calculateRequest });
+    assert(live.value.uploaded?.semanticVerification?.some((entry) => entry.operation === "recalculate" && entry.calculationVerified === true && entry.calculationEngine === "microsoft-graph-workbook"), "Graph calculation should report an executed Microsoft workbook engine", live.value);
     assert(live.value.uploaded?.sessionManaged === true && live.value.uploaded?.sessionPersistent === true, "Graph write should use the bounded persistent session manager", live.value);
     assert(live.value.uploaded?.sessionClosed === false, "a reusable managed session should remain open until idle cleanup", live.value);
     return { calls: sessionRequests.length, backend: live.value.backend, sessionClosed: live.value.uploaded.sessionClosed };

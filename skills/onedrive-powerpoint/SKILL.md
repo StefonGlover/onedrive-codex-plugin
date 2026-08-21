@@ -17,7 +17,7 @@ Keep presentations native `.pptx` files and treat visual verification as part of
 
 ## Start from a template or reference
 
-Preview a `copy` with `onedrive_preview_actions`, show the exact source and destination, obtain confirmation, and apply it with `onedrive_commit_actions`. Inspect and edit the copy only. Preserve master-derived layouts, theme, slide sizes, placeholders, geometry, notes, alt text, and z-order unless explicitly asked to change them.
+Resolve and inspect the exact template first; refuse ambiguity. Preview one conflict-fail `copy` with `onedrive_preview_actions`, show the exact source and destination, obtain confirmation, and apply the unchanged proof once with `onedrive_commit_actions`. Verify a new stable item ID, then inspect and edit the copy only. Preserve master-derived layouts, theme, slide sizes, placeholders, geometry, notes, alt text, and z-order unless explicitly asked to change them. Reinspect and render the saved copy; leave the source template unchanged.
 
 ## Edit an existing presentation
 

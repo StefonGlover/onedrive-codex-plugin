@@ -1,4 +1,4 @@
-FROM debian:bookworm-slim AS tunnel-client
+FROM debian:bookworm-20260803-slim AS tunnel-client
 
 ARG TUNNEL_CLIENT_VERSION=0.0.10
 ARG TARGETARCH=amd64
