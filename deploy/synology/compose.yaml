@@ -4,7 +4,7 @@ services:
       context: ${ONEDRIVE_APP_CONTEXT:-./app}
       dockerfile: deploy/synology/Dockerfile
       args:
-        TUNNEL_CLIENT_VERSION: "0.0.10"
+        TUNNEL_CLIENT_VERSION: "0.0.12"
         TARGETARCH: "amd64"
     image: ${ONEDRIVE_IMAGE:-onedrive-chatgpt-nas:0.6.5}
     container_name: onedrive-chatgpt

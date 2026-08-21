@@ -86,7 +86,7 @@ function buildSbom(manifest, requirements, dockerfile, parsedDocker) {
 
 async function selfCheck() {
   const requirements = parseRequirements("Example_Package==1.2.3\n");
-  const docker = parseDockerfile("FROM debian:bookworm-20260803-slim AS tunnel-client\nARG TUNNEL_CLIENT_VERSION=0.0.10\nRUN curl SHA256SUMS.txt && sha256sum -c -\nFROM node:24-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03\n");
+  const docker = parseDockerfile("FROM debian:bookworm-20260803-slim AS tunnel-client\nARG TUNNEL_CLIENT_VERSION=0.0.12\nRUN curl SHA256SUMS.txt && sha256sum -c -\nFROM node:24-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03\n");
   const checks = {
     requirementParsed: requirements[0].purl === "pkg:pypi/example_package@1.2.3",
     datedBuilderAccepted: docker.images[0].image === "debian:bookworm-20260803-slim",
@@ -95,7 +95,7 @@ async function selfCheck() {
     floatingImageRejected: false
   };
   try { parseRequirements("example>=1"); } catch { checks.floatingRequirementRejected = true; }
-  try { parseDockerfile("FROM debian:latest AS tunnel-client\nARG TUNNEL_CLIENT_VERSION=0.0.10\nRUN curl SHA256SUMS.txt && sha256sum -c -\nFROM node:latest\n"); } catch { checks.floatingImageRejected = true; }
+  try { parseDockerfile("FROM debian:latest AS tunnel-client\nARG TUNNEL_CLIENT_VERSION=0.0.12\nRUN curl SHA256SUMS.txt && sha256sum -c -\nFROM node:latest\n"); } catch { checks.floatingImageRejected = true; }
   const ok = Object.values(checks).every(Boolean);
   console.log(JSON.stringify({ ok, checks }, null, 2));
   return ok;

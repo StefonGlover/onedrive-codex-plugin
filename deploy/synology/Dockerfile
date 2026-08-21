@@ -1,6 +1,6 @@
 FROM debian:bookworm-20260803-slim AS tunnel-client
 
-ARG TUNNEL_CLIENT_VERSION=0.0.10
+ARG TUNNEL_CLIENT_VERSION=0.0.12
 ARG TARGETARCH=amd64
 
 RUN apt-get update \
