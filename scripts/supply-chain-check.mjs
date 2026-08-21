@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const allowedFlags = new Set(["output", "self-check"]);
+const expectedTunnelVersion = "0.0.12";
 
 function parseArgs(argv = []) {
   const result = {};
@@ -44,6 +45,7 @@ function parseDockerfile(text) {
   }
   const tunnelVersion = text.match(/^ARG TUNNEL_CLIENT_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$/mu)?.[1];
   if (!tunnelVersion) throw new Error("Tunnel client version is not exactly pinned.");
+  if (tunnelVersion !== expectedTunnelVersion) throw new Error(`Tunnel client version must remain ${expectedTunnelVersion}.`);
   const sourceSha256 = text.match(/^ARG TUNNEL_CLIENT_SOURCE_SHA256=([0-9a-f]{64})$/mu)?.[1];
   const sourceCommit = text.match(/^ARG TUNNEL_CLIENT_SOURCE_COMMIT=([0-9a-f]{40})$/mu)?.[1];
   const xNetVersion = text.match(/^ARG TUNNEL_CLIENT_X_NET_VERSION=(v[0-9]+\.[0-9]+\.[0-9]+)$/mu)?.[1];
@@ -52,7 +54,7 @@ function parseDockerfile(text) {
   if (!sourceSha256 || !sourceCommit || !xNetVersion || !otelVersion || !otelContribVersion) {
     throw new Error("Tunnel source checksum, commit, and patched Go module versions must be exactly pinned.");
   }
-  for (const required of ["https://codeload.github.com/openai/tunnel-client/tar.gz/${TUNNEL_CLIENT_SOURCE_COMMIT}", "sha256sum -c -", "go mod tidy", "GOWORK=off", "CGO_ENABLED=0", "go build -mod=readonly -trimpath -buildvcs=false", "pkg/version.GitSHA", "pkg/version.Flavor=runtime"]) {
+  for (const required of ["test \"${TUNNEL_CLIENT_VERSION}\" = \"0.0.12\"", "https://codeload.github.com/openai/tunnel-client/tar.gz/${TUNNEL_CLIENT_SOURCE_COMMIT}", "sha256sum -c -", "go mod tidy", "GOWORK=off", "CGO_ENABLED=0", "go build -mod=readonly -trimpath -buildvcs=false", "pkg/version.GitSHA", "pkg/version.Flavor=runtime"]) {
     if (!text.includes(required)) throw new Error(`Tunnel client checksum verification is missing: ${required}`);
   }
   return { images, tunnelVersion, sourceSha256, sourceCommit, xNetVersion, otelVersion, otelContribVersion };
@@ -106,16 +108,18 @@ function buildSbom(manifest, requirements, dockerfile, parsedDocker) {
 
 async function selfCheck() {
   const requirements = parseRequirements("Example_Package==1.2.3\n");
-  const docker = parseDockerfile("FROM golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36 AS tunnel-client\nARG TUNNEL_CLIENT_VERSION=0.0.12\nARG TUNNEL_CLIENT_SOURCE_SHA256=aeb0a91f00515f77cc25d23de5e1ea4d934a57476e6087bf85c6f527064532eb\nARG TUNNEL_CLIENT_SOURCE_COMMIT=881c9a8fed7cccbe6607cd419863bbca506b8215\nARG TUNNEL_CLIENT_X_NET_VERSION=v0.56.0\nARG TUNNEL_CLIENT_OTEL_VERSION=v1.43.0\nARG TUNNEL_CLIENT_OTEL_CONTRIB_VERSION=v0.65.0\nRUN curl https://codeload.github.com/openai/tunnel-client/tar.gz/${TUNNEL_CLIENT_SOURCE_COMMIT} -o source.tar.gz && sha256sum -c - && go mod tidy && env GOWORK=off GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -mod=readonly -trimpath -buildvcs=false -ldflags '-X github.com/openai/tunnel-client/pkg/version.GitSHA=commit -X github.com/openai/tunnel-client/pkg/version.Flavor=runtime'\nFROM node:24-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03\n");
+  const docker = parseDockerfile("FROM golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36 AS tunnel-client\nARG TUNNEL_CLIENT_VERSION=0.0.12\nARG TUNNEL_CLIENT_SOURCE_SHA256=aeb0a91f00515f77cc25d23de5e1ea4d934a57476e6087bf85c6f527064532eb\nARG TUNNEL_CLIENT_SOURCE_COMMIT=881c9a8fed7cccbe6607cd419863bbca506b8215\nARG TUNNEL_CLIENT_X_NET_VERSION=v0.56.0\nARG TUNNEL_CLIENT_OTEL_VERSION=v1.43.0\nARG TUNNEL_CLIENT_OTEL_CONTRIB_VERSION=v0.65.0\nRUN test \"${TUNNEL_CLIENT_VERSION}\" = \"0.0.12\" && curl https://codeload.github.com/openai/tunnel-client/tar.gz/${TUNNEL_CLIENT_SOURCE_COMMIT} -o source.tar.gz && sha256sum -c - && go mod tidy && env GOWORK=off GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -mod=readonly -trimpath -buildvcs=false -ldflags '-X github.com/openai/tunnel-client/pkg/version.GitSHA=commit -X github.com/openai/tunnel-client/pkg/version.Flavor=runtime'\nFROM node:24-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03\n");
   const checks = {
     requirementParsed: requirements[0].purl === "pkg:pypi/example_package@1.2.3",
     digestBuilderAccepted: docker.images[0].image.includes("@sha256:"),
     digestRuntimeAccepted: docker.images[1].image.includes("@sha256:"),
     sourcePinned: docker.sourceSha256 === "aeb0a91f00515f77cc25d23de5e1ea4d934a57476e6087bf85c6f527064532eb",
     patchesPinned: docker.xNetVersion === "v0.56.0" && docker.otelVersion === "v1.43.0" && docker.otelContribVersion === "v0.65.0",
+    legacyVersionRejected: false,
     floatingRequirementRejected: false,
     floatingImageRejected: false
   };
+  try { parseDockerfile("FROM golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36 AS tunnel-client\nARG TUNNEL_CLIENT_VERSION=0.0.10\nFROM node:24-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03\n"); } catch { checks.legacyVersionRejected = true; }
   try { parseRequirements("example>=1"); } catch { checks.floatingRequirementRejected = true; }
   try { parseDockerfile("FROM golang:latest AS tunnel-client\nARG TUNNEL_CLIENT_VERSION=0.0.12\nRUN curl SHA256SUMS.txt && sha256sum -c -\nFROM node:latest\n"); } catch { checks.floatingImageRejected = true; }
   const ok = Object.values(checks).every(Boolean);

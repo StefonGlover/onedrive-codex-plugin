@@ -13,6 +13,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eu; \
+    test "${TUNNEL_CLIENT_VERSION}" = "0.0.12"; \
     case "${TARGETARCH}" in amd64|arm64) ;; *) echo "Unsupported tunnel-client architecture: ${TARGETARCH}" >&2; exit 1 ;; esac; \
     archive="tunnel-client-${TUNNEL_CLIENT_SOURCE_COMMIT}.tar.gz"; \
     source_url="https://codeload.github.com/openai/tunnel-client/tar.gz/${TUNNEL_CLIENT_SOURCE_COMMIT}"; \
