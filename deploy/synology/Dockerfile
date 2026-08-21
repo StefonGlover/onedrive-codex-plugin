@@ -1,6 +1,8 @@
 FROM golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36 AS tunnel-client
 
 ARG TUNNEL_CLIENT_VERSION=0.0.12
+ARG TUNNEL_CLIENT_SOURCE_ASSET_ID=521784599
+ARG TUNNEL_CLIENT_CHECKSUMS_ASSET_ID=521784601
 ARG TUNNEL_CLIENT_SOURCE_SHA256=813b300d24fd7bd0115ad4b171972c59399c40593b0fa604e9cf1fc3c795587e
 ARG TUNNEL_CLIENT_SOURCE_COMMIT=881c9a8fed7cccbe6607cd419863bbca506b8215
 ARG TUNNEL_CLIENT_X_NET_VERSION=v0.56.0
@@ -15,10 +17,10 @@ RUN apt-get update \
 RUN set -eu; \
     case "${TARGETARCH}" in amd64|arm64) ;; *) echo "Unsupported tunnel-client architecture: ${TARGETARCH}" >&2; exit 1 ;; esac; \
     archive="tunnel-client-runtime-source-v${TUNNEL_CLIENT_VERSION}.tar.gz"; \
-    release="https://github.com/openai/tunnel-client/releases/download/v${TUNNEL_CLIENT_VERSION}"; \
+    asset_api="https://api.github.com/repos/openai/tunnel-client/releases/assets"; \
     mkdir -p /tmp/tunnel; \
-    curl -fsSL "${release}/${archive}" -o "/tmp/tunnel/${archive}"; \
-    curl -fsSL "${release}/SHA256SUMS.txt" -o /tmp/tunnel/SHA256SUMS.txt; \
+    curl -fsSL -H 'Accept: application/octet-stream' -H 'X-GitHub-Api-Version: 2022-11-28' "${asset_api}/${TUNNEL_CLIENT_SOURCE_ASSET_ID}" -o "/tmp/tunnel/${archive}"; \
+    curl -fsSL -H 'Accept: application/octet-stream' -H 'X-GitHub-Api-Version: 2022-11-28' "${asset_api}/${TUNNEL_CLIENT_CHECKSUMS_ASSET_ID}" -o /tmp/tunnel/SHA256SUMS.txt; \
     cd /tmp/tunnel; \
     grep " ${archive}$" SHA256SUMS.txt | sha256sum -c -; \
     printf '%s  %s\n' "${TUNNEL_CLIENT_SOURCE_SHA256}" "${archive}" | sha256sum -c -; \
