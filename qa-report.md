@@ -3,7 +3,7 @@
 Decision: Pass — OneDrive 0.6.5 is deployed on NAS69, refreshed in the existing ChatGPT app, and passed Excel-integrity beta testing with exact cleanup
 Date: 2026-08-21
 Generated: 2026-08-20T21:25:15Z
-Tested source base commit: `8eaf5e4ae91c737d913ff9b8169f1a8a98c8fd0c`
+Tested source base commit: `d79c34e44b19a4cb1681c6b4df7799866d0b5100`
 Plugin version: `0.6.5+codex.20260820212515`
 Focused source server version: `0.6.5+codex.20260820212515.chatgpt.bf50db0b0ca8`
 Current live NAS OAuth server version: `0.6.5+codex.20260820212515.chatgpt.2cbcf743965c`
