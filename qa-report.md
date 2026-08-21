@@ -1,24 +1,24 @@
 # OneDrive 0.6.5 Integrity and Production Release Report
 
-Decision: Pending — 0.6.5 offline gates pass; immutable NAS66 deployment, same-app refresh, signed-in ChatGPT beta, cache parity, and exact fixture cleanup remain
+Decision: Pending — 0.6.5 offline gates pass; immutable NAS67 deployment, same-app refresh, signed-in ChatGPT beta, cache parity, and exact fixture cleanup remain
 Date: 2026-08-20
 Generated: 2026-08-20T21:25:15Z
-Tested source base commit: `ad6e04431ff635a6526f0140f0f877f2f895232c`
+Tested source base commit: `75a4c532c6d580123f824f0e08895421d8d73076`
 Plugin version: `0.6.5+codex.20260820212515`
 Focused source server version: `0.6.5+codex.20260820212515.chatgpt.bf50db0b0ca8`
 Current live NAS OAuth server version: `0.6.4+codex.20260819032617.chatgpt.a8e1a22814f9`
 Tool contract: 84 exact tool names; 21 focused ChatGPT tools
-Packaged-content digest: `67c8b97f4e5b908fde9f91cec9ac88cfc8bea156ab5366f395578ef337d8a3a6`
-NAS release-manifest SHA-256: `53837a21e269434b190c6934792af4c048464809f0f112027fa9163ccaa46804`
-Server SHA-256: `7b64bcc423edd533383a3bb6fc2e1ef44653997af0556729205cf0f6e37381ce`
+Packaged-content digest: `f4a1bd3b949ec7fd4fcc542a1d265b94f2176fffaefb85944def52c7ca8fe9c7`
+NAS release-manifest SHA-256: pending immutable NAS67 staging
+Server SHA-256: `106dc6e87b18ca97dd2c304a2c90acfc5d15214f1bca6292227028a7cf36e26f`
 
-## 2026-08-20 NAS66 Excel integrity and production release candidate
+## 2026-08-20 NAS67 Excel integrity and production release candidate
 
 Release `0.6.5+codex.20260820212515` adds automatic Excel formula/reference integrity reporting and a fail-closed post-edit gate. It detects formula error tokens, stored error cells, missing sheet/table references, broken defined names, static circular references, external links, volatile formulas, calculation mode, and cache coverage. Sheet renames now rewrite dependent formulas, defined names, tables, and charts. Personal/OpenXML work stays honest with `calculationVerified: false`; supported Business/SharePoint workbooks can invoke Microsoft's Graph calculation engine in a persistent workbook session.
 
 Template requests now resolve, inspect, preview-copy, commit-copy, edit, and re-inspect the exact reference file instead of creating a blank package. Standard Chat metadata routing explicitly enriches exact size, MIME, and modified time through item-info. Production health exposes bounded release, error/throttle, and p50/p95 tool latency counters without tenant content. The release adds an external OAuth/MCP production canary, a repeated-search latency benchmark, exact dependency/base-image checks, deterministic CycloneDX source inventory, and commit-pinned Trivy image/SBOM CI.
 
-Offline evidence is green at 213/213 mock Graph checks, including real Business workbook calculation routing; 169/169 OAuth compatibility checks; 21/21 golden prompts plus three cross-tool workflows and 18 ambiguity pairs; all 80 Office operations; the Office security corpus; native-library reopen; and LibreOffice render without repair diagnostics. The source-verified production image also has zero fixed High/Critical findings across the Debian runtime, Node package metadata, pinned Python packages, and rebuilt Go tunnel binary in the local Trivy gate; hosted CI remains required before deployment. The focused contract remains 21 tools at 35,853 bytes without OAuth and 38,835 bytes with OAuth, under its 38 KiB cap. NAS66 deployment and signed-in ChatGPT beta are still pending, so this report does not yet claim release completion.
+Offline evidence is green at 213/213 mock Graph checks, including real Business workbook calculation routing; 169/169 OAuth compatibility checks; 21/21 golden prompts plus three cross-tool workflows and 18 ambiguity pairs; all 80 Office operations; the Office security corpus; native-library reopen; and LibreOffice render without repair diagnostics. The source-verified production image also has zero fixed High/Critical findings across the Debian runtime, Node package metadata, pinned Python packages, and rebuilt Go tunnel binary in the local Trivy gate. The NAS67 correction binds both upstream tunnel source and checksum files to immutable GitHub release-asset IDs while retaining upstream-manifest and independent SHA-256 verification; hosted CI remains required for this correction before deployment. The focused contract remains 21 tools at 35,853 bytes without OAuth and 38,835 bytes with OAuth, under its 38 KiB cap. NAS67 deployment and signed-in ChatGPT beta are still pending, so this report does not yet claim release completion.
 
 ## 2026-08-18 NAS65 search and native Office creation release
 

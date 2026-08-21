@@ -1,14 +1,14 @@
 {
   "schemaVersion": 2,
-  "decision": "Pending — 0.6.5 offline gates pass; immutable NAS66 deployment, same-app refresh, signed-in ChatGPT beta, cache parity, and exact fixture cleanup remain",
+  "decision": "Pending — 0.6.5 offline gates pass; immutable NAS67 deployment, same-app refresh, signed-in ChatGPT beta, cache parity, and exact fixture cleanup remain",
   "date": "2026-08-20",
   "generatedAt": "2026-08-20T21:25:15Z",
   "source": {
-    "commit": "ad6e04431ff635a6526f0140f0f877f2f895232c",
+    "commit": "75a4c532c6d580123f824f0e08895421d8d73076",
     "pluginVersion": "0.6.5+codex.20260820212515",
     "serverVersion": "0.6.5+codex.20260820212515.chatgpt.bf50db0b0ca8",
-    "serverSha256": "7b64bcc423edd533383a3bb6fc2e1ef44653997af0556729205cf0f6e37381ce",
-    "contentDigest": "67c8b97f4e5b908fde9f91cec9ac88cfc8bea156ab5366f395578ef337d8a3a6",
+    "serverSha256": "106dc6e87b18ca97dd2c304a2c90acfc5d15214f1bca6292227028a7cf36e26f",
+    "contentDigest": "f4a1bd3b949ec7fd4fcc542a1d265b94f2176fffaefb85944def52c7ca8fe9c7",
     "workingTree": "Release code is committed at the recorded commit; changes after that commit are limited to QA evidence."
   },
   "contract": {
