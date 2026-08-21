@@ -3,7 +3,7 @@
 Decision: Pending — 0.6.5 offline gates pass; immutable NAS66 deployment, same-app refresh, signed-in ChatGPT beta, cache parity, and exact fixture cleanup remain
 Date: 2026-08-20
 Generated: 2026-08-20T21:25:15Z
-Tested source base commit: `6de8f9113ec74bbe611b76224d312240702c96e5`
+Tested source base commit: `57c46d860f66cc6f6e569b2ac463a193c4f6a45d`
 Plugin version: `0.6.5+codex.20260820212515`
 Focused source server version: `0.6.5+codex.20260820212515.chatgpt.bf50db0b0ca8`
 Current live NAS OAuth server version: `0.6.4+codex.20260819032617.chatgpt.a8e1a22814f9`
