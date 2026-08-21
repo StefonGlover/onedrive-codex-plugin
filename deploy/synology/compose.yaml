@@ -5,6 +5,11 @@ services:
       dockerfile: deploy/synology/Dockerfile
       args:
         TUNNEL_CLIENT_VERSION: "0.0.12"
+        TUNNEL_CLIENT_SOURCE_SHA256: "813b300d24fd7bd0115ad4b171972c59399c40593b0fa604e9cf1fc3c795587e"
+        TUNNEL_CLIENT_SOURCE_COMMIT: "881c9a8fed7cccbe6607cd419863bbca506b8215"
+        TUNNEL_CLIENT_X_NET_VERSION: "v0.56.0"
+        TUNNEL_CLIENT_OTEL_VERSION: "v1.43.0"
+        TUNNEL_CLIENT_OTEL_CONTRIB_VERSION: "v0.65.0"
         TARGETARCH: "amd64"
     image: ${ONEDRIVE_IMAGE:-onedrive-chatgpt-nas:0.6.5}
     container_name: onedrive-chatgpt

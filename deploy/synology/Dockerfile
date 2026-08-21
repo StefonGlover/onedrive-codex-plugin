@@ -1,35 +1,64 @@
-FROM debian:bookworm-20260803-slim AS tunnel-client
+FROM golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36 AS tunnel-client
 
 ARG TUNNEL_CLIENT_VERSION=0.0.12
+ARG TUNNEL_CLIENT_SOURCE_SHA256=813b300d24fd7bd0115ad4b171972c59399c40593b0fa604e9cf1fc3c795587e
+ARG TUNNEL_CLIENT_SOURCE_COMMIT=881c9a8fed7cccbe6607cd419863bbca506b8215
+ARG TUNNEL_CLIENT_X_NET_VERSION=v0.56.0
+ARG TUNNEL_CLIENT_OTEL_VERSION=v1.43.0
+ARG TUNNEL_CLIENT_OTEL_CONTRIB_VERSION=v0.65.0
 ARG TARGETARCH=amd64
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl unzip \
+    && apt-get install -y --no-install-recommends ca-certificates curl python3 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eu; \
     case "${TARGETARCH}" in amd64|arm64) ;; *) echo "Unsupported tunnel-client architecture: ${TARGETARCH}" >&2; exit 1 ;; esac; \
-    archive="tunnel-client-v${TUNNEL_CLIENT_VERSION}-linux-${TARGETARCH}.zip"; \
+    archive="tunnel-client-runtime-source-v${TUNNEL_CLIENT_VERSION}.tar.gz"; \
     release="https://github.com/openai/tunnel-client/releases/download/v${TUNNEL_CLIENT_VERSION}"; \
     mkdir -p /tmp/tunnel; \
     curl -fsSL "${release}/${archive}" -o "/tmp/tunnel/${archive}"; \
     curl -fsSL "${release}/SHA256SUMS.txt" -o /tmp/tunnel/SHA256SUMS.txt; \
     cd /tmp/tunnel; \
     grep " ${archive}$" SHA256SUMS.txt | sha256sum -c -; \
-    unzip -q "${archive}"; \
-    install -m 0755 tunnel-client /usr/local/bin/tunnel-client
+    printf '%s  %s\n' "${TUNNEL_CLIENT_SOURCE_SHA256}" "${archive}" | sha256sum -c -; \
+    tar -xzf "${archive}"; \
+    mv "tunnel-client-runtime-source-v${TUNNEL_CLIENT_VERSION}" source; \
+    test "$(python3 -c 'import json; print(json.load(open("source/SOURCE_EXPORT_METADATA/manifest.json"))["sourceCommit"])')" = "${TUNNEL_CLIENT_SOURCE_COMMIT}"; \
+    cd source; \
+    go mod edit -go=1.26.6; \
+    go get \
+      "golang.org/x/net@${TUNNEL_CLIENT_X_NET_VERSION}" \
+      "go.opentelemetry.io/otel@${TUNNEL_CLIENT_OTEL_VERSION}" \
+      "go.opentelemetry.io/otel/metric@${TUNNEL_CLIENT_OTEL_VERSION}" \
+      "go.opentelemetry.io/otel/sdk@${TUNNEL_CLIENT_OTEL_VERSION}" \
+      "go.opentelemetry.io/otel/sdk/metric@${TUNNEL_CLIENT_OTEL_VERSION}" \
+      "go.opentelemetry.io/otel/trace@${TUNNEL_CLIENT_OTEL_VERSION}" \
+      "go.opentelemetry.io/otel/exporters/prometheus@${TUNNEL_CLIENT_OTEL_CONTRIB_VERSION}" \
+      "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp@${TUNNEL_CLIENT_OTEL_CONTRIB_VERSION}"; \
+    go mod tidy; \
+    ./scripts/rebuild_runtime_from_source.sh \
+      --flavor runtime \
+      --goos linux \
+      --goarch "${TARGETARCH}" \
+      --output /usr/local/bin/tunnel-client; \
+    /usr/local/bin/tunnel-client --version
 
 FROM node:24-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates catdoc gosu poppler-utils python3 python3-venv tesseract-ocr tini \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+    && rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
 
 COPY --from=tunnel-client /usr/local/bin/tunnel-client /usr/local/bin/tunnel-client
 
 COPY scripts/requirements-office-test.txt /tmp/onedrive-office-requirements.txt
 RUN python3 -m venv /opt/onedrive-office \
     && /opt/onedrive-office/bin/pip install --no-cache-dir --requirement /tmp/onedrive-office-requirements.txt \
+    && /opt/onedrive-office/bin/python3 -c "import docx, openpyxl, pptx, PIL" \
+    && /opt/onedrive-office/bin/python3 -m pip uninstall --yes pip setuptools \
     && /opt/onedrive-office/bin/python3 -c "import docx, openpyxl, pptx, PIL" \
     && rm -f /tmp/onedrive-office-requirements.txt
 
