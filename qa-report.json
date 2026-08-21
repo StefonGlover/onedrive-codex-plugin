@@ -4,7 +4,7 @@
   "date": "2026-08-20",
   "generatedAt": "2026-08-20T21:25:15Z",
   "source": {
-    "commit": "57c46d860f66cc6f6e569b2ac463a193c4f6a45d",
+    "commit": "ad6e04431ff635a6526f0140f0f877f2f895232c",
     "pluginVersion": "0.6.5+codex.20260820212515",
     "serverVersion": "0.6.5+codex.20260820212515.chatgpt.bf50db0b0ca8",
     "serverSha256": "7b64bcc423edd533383a3bb6fc2e1ef44653997af0556729205cf0f6e37381ce",
@@ -15,7 +15,7 @@
     "toolCount": 84,
     "exact": true,
     "fullToolCount": 84,
-    "fullBytes": 344300,
+    "fullBytes": 344546,
     "chatgptToolCount": 21,
     "chatgptBytes": 35853,
     "chatgptOauthBytes": 38835,
@@ -33,7 +33,7 @@
     { "name": "Office security corpus", "status": "pass" },
     { "name": "Genuine package reopening", "status": "pass" },
     { "name": "Mock Microsoft Graph", "status": "pass", "checks": 213 },
-    { "name": "Production canary and supply-chain checks", "status": "pass", "publicCanary": "self-check", "sourceSbom": "pass", "containerScan": "pending-ci" },
+    { "name": "Production canary and supply-chain checks", "status": "pass", "publicCanary": "self-check", "sourceSbom": "pass", "containerScan": "local-pass-ci-pending", "fixedHighCriticalFindings": 0 },
     { "name": "Read-only OneDrive doctor and tenant checks", "status": "pass" },
     { "name": "Cleanup preview", "status": "pass" },
     { "name": "Whitespace", "status": "pass" }
