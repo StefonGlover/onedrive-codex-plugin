@@ -1,24 +1,30 @@
 # OneDrive 0.6.5 Integrity and Production Release Report
 
-Decision: Pending — 0.6.5 offline gates pass; immutable NAS69 deployment, same-app refresh, signed-in ChatGPT beta, cache parity, and exact fixture cleanup remain
+Decision: Pass — OneDrive 0.6.5 is deployed on NAS69, refreshed in the existing ChatGPT app, and passed Excel-integrity beta testing with exact cleanup
 Date: 2026-08-21
 Generated: 2026-08-20T21:25:15Z
 Tested source base commit: `8eaf5e4ae91c737d913ff9b8169f1a8a98c8fd0c`
 Plugin version: `0.6.5+codex.20260820212515`
 Focused source server version: `0.6.5+codex.20260820212515.chatgpt.bf50db0b0ca8`
-Current live NAS OAuth server version: `0.6.4+codex.20260819032617.chatgpt.a8e1a22814f9`
+Current live NAS OAuth server version: `0.6.5+codex.20260820212515.chatgpt.2cbcf743965c`
 Tool contract: 84 exact tool names; 21 focused ChatGPT tools
-Packaged-content digest: `4d8b4fffe5437ca763bd01198f0226881814ef53a93a0b0b62aa01808e3e95ab`
-NAS release-manifest SHA-256: pending immutable NAS68 staging
+Packaged-content digest: `73ed948f1928aefc58bd290e638742a24f3e555e99e02fac93d011bb84a75690`
+NAS release-manifest SHA-256: `c06467276a5d1507d075cc444bec40934345b9b31451f88f6076a66c37808fcf`
 Server SHA-256: `106dc6e87b18ca97dd2c304a2c90acfc5d15214f1bca6292227028a7cf36e26f`
 
-## 2026-08-21 NAS69 Excel integrity and production release candidate
+## 2026-08-21 NAS69 Excel integrity production release
 
 Release `0.6.5+codex.20260820212515` adds automatic Excel formula/reference integrity reporting and a fail-closed post-edit gate. It detects formula error tokens, stored error cells, missing sheet/table references, broken defined names, static circular references, external links, volatile formulas, calculation mode, and cache coverage. Sheet renames now rewrite dependent formulas, defined names, tables, and charts. Personal/OpenXML work stays honest with `calculationVerified: false`; supported Business/SharePoint workbooks can invoke Microsoft's Graph calculation engine in a persistent workbook session.
 
 Template requests now resolve, inspect, preview-copy, commit-copy, edit, and re-inspect the exact reference file instead of creating a blank package. Standard Chat metadata routing explicitly enriches exact size, MIME, and modified time through item-info. Production health exposes bounded release, error/throttle, and p50/p95 tool latency counters without tenant content. The release adds an external OAuth/MCP production canary, a repeated-search latency benchmark, exact dependency/base-image checks, deterministic CycloneDX source inventory, and commit-pinned Trivy image/SBOM CI.
 
-Offline evidence is green at 213/213 mock Graph checks, including real Business workbook calculation routing; 169/169 OAuth compatibility checks; 21/21 golden prompts plus three cross-tool workflows and 18 ambiguity pairs; all 80 Office operations; the Office security corpus; native-library reopen; and LibreOffice render without repair diagnostics. The source-verified production image also has zero fixed High/Critical findings across the Debian runtime, Node package metadata, pinned Python packages, and rebuilt Go tunnel binary in the local Trivy gate. NAS69 downloads the exact upstream tunnel commit archive from GitHub codeload, verifies an independently pinned SHA-256, applies the reviewed dependency patches, and performs a transparent CGO-free, trimmed, VCS-disabled Go build with the version and source commit embedded. It additionally refuses any inherited Compose override that attempts to downgrade the reviewed tunnel client below 0.0.12. The focused contract remains 21 tools at 35,853 bytes without OAuth and 38,835 bytes with OAuth, under its 38 KiB cap. NAS69 deployment and signed-in ChatGPT beta are still pending, so this report does not yet claim release completion.
+Offline evidence is green at 213/213 mock Graph checks, including real Business workbook calculation routing; 169/169 OAuth compatibility checks; 21/21 golden prompts plus three cross-tool workflows and 18 ambiguity pairs; all 80 Office operations; the Office security corpus; native-library reopen; and LibreOffice render without repair diagnostics. The source-verified production image also has zero fixed High/Critical findings across the Debian runtime, Node package metadata, pinned Python packages, and rebuilt Go tunnel binary in both local and hosted Trivy gates. NAS69 downloads the exact upstream tunnel commit archive from GitHub codeload, verifies an independently pinned SHA-256, applies the reviewed dependency patches, and performs a transparent CGO-free, trimmed, VCS-disabled Go build with the version and source commit embedded. It additionally refuses any inherited Compose override that attempts to downgrade the reviewed tunnel client below 0.0.12. The focused contract remains 21 tools at 35,853 bytes without OAuth and 38,835 bytes with OAuth, under its 38 KiB cap. Hosted CI run [32446112640](https://github.com/StefonGlover/onedrive-codex-plugin/actions/runs/32446112640) passed both Node versions, production image build, Trivy, source and image SBOMs, and evidence upload.
+
+NAS69 is deployed from `/volume1/docker/onedrive-chatgpt/app-0.6.5-nas69-excel-integrity-20260821` as `onedrive-chatgpt-nas:0.6.5-nas69-excel-integrity-20260821`. Container `d00e4c19768277e28f7507b51934fc640c519233af248f44838d380696b40b07` is running and healthy with zero restarts and zero failed health checks on image `sha256:865ef33f747ebf7c5308c3fb30a1d0e9003e52c4527346efe4380ff9ae0805b1`. Public health, OAuth metadata, protected-resource metadata, MCP initialization, unauthenticated-tool rejection, and MCP GET refusal all pass. Health p95 was 63.9 ms against a 2,000 ms gate. The immutable NAS65 source and image remain the exact rollback target.
+
+The existing ChatGPT app `plugin_asdk_app_6a6995abb030819187d50d7080d4ae95` was refreshed in place; no duplicate was created, and ChatGPT displayed the exact 21-action contract. The signed-in [ChatGPT Work beta](https://chatgpt.com/c/6a87d95e-7a50-83ea-ac61-04822a853edc) inspected the disposable workbook, reported no broken, circular, or external-link findings, and correctly retained `calculationVerified: false` for Personal OneDrive. Its safe `=Data!B4+5` preview passed with zero blocking findings, while `=Missing!A1` was refused before mutation. Exact MIME type, size, modified time, stable ID, path, and source identity were returned, and the exact-template copy remained preview-only. Postconditions proved the workbook ID, eTag, size, timestamp, and hashes were unchanged, and the copy never existed.
+
+The authenticated warm exact-file benchmark passed at p50 3,584 ms and p95 3,684 ms against a 5,000 ms gate, with zero recursive scans on all three warm runs. The final cache contains all 94 packaged files with byte, mode, type, and symlink-target parity. The earlier stale cache was retained at `$CODEX_HOME/plugins/cache/personal/onedrive/0.6.5+codex.20260820212515.stale-20260821T045544Z` instead of being overwritten. The exact disposable workbook was then moved to the OneDrive recycle bin through a fresh guarded preview; active-path lookup now returns `itemNotFound`, so cleanup is complete and recoverable.
 
 ## 2026-08-18 NAS65 search and native Office creation release
 

@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "decision": "Pending — 0.6.5 offline gates pass; immutable NAS69 deployment, same-app refresh, signed-in ChatGPT beta, cache parity, and exact fixture cleanup remain",
+  "decision": "Pass — OneDrive 0.6.5 is deployed on NAS69, refreshed in the existing ChatGPT app, and passed Excel-integrity beta testing with exact cleanup",
   "date": "2026-08-21",
   "generatedAt": "2026-08-20T21:25:15Z",
   "source": {
@@ -8,7 +8,7 @@
     "pluginVersion": "0.6.5+codex.20260820212515",
     "serverVersion": "0.6.5+codex.20260820212515.chatgpt.bf50db0b0ca8",
     "serverSha256": "106dc6e87b18ca97dd2c304a2c90acfc5d15214f1bca6292227028a7cf36e26f",
-    "contentDigest": "4d8b4fffe5437ca763bd01198f0226881814ef53a93a0b0b62aa01808e3e95ab",
+    "contentDigest": "73ed948f1928aefc58bd290e638742a24f3e555e99e02fac93d011bb84a75690",
     "workingTree": "Release code is committed at the recorded commit; changes after that commit are limited to QA evidence."
   },
   "contract": {
@@ -33,12 +33,41 @@
     { "name": "Office security corpus", "status": "pass" },
     { "name": "Genuine package reopening", "status": "pass" },
     { "name": "Mock Microsoft Graph", "status": "pass", "checks": 213 },
-    { "name": "Production canary and supply-chain checks", "status": "pass", "publicCanary": "self-check", "sourceSbom": "pass", "containerScan": "local-pass-ci-pending", "fixedHighCriticalFindings": 0 },
+    { "name": "Production canary and supply-chain checks", "status": "pass", "publicCanary": "live-pass", "sourceSbom": "pass", "containerScan": "local-and-ci-pass", "fixedHighCriticalFindings": 0, "ciRun": "https://github.com/StefonGlover/onedrive-codex-plugin/actions/runs/32446112640" },
     { "name": "Read-only OneDrive doctor and tenant checks", "status": "pass" },
     { "name": "Cleanup preview", "status": "pass" },
     { "name": "Whitespace", "status": "pass" }
   ],
   "liveRuns": {
+    "nas69ExcelIntegrityChatgptBeta": {
+      "status": "pass",
+      "surface": "Synology NAS69 production deployment and signed-in ChatGPT Work UI",
+      "validatedAt": "2026-08-21T04:52:00Z",
+      "connectionId": "plugin_asdk_app_6a6995abb030819187d50d7080d4ae95",
+      "connectionVersionId": "asdk_app_v_6a6995ad78b08191a3e8404036c5017c",
+      "conversation": "https://chatgpt.com/c/6a87d95e-7a50-83ea-ac61-04822a853edc",
+      "actionCount": 21,
+      "sameAppRefreshed": true,
+      "duplicateAppCreated": false,
+      "fixture": "Codex NAS69 Excel Integrity Beta 20260821.xlsx",
+      "checks": {
+        "openXmlPackageValidation": "pass",
+        "remoteReadback": "pass",
+        "formulaIntegrityInspection": "pass",
+        "safeFormulaPreview": "pass",
+        "brokenReferenceRefusedBeforeMutation": "pass",
+        "metadataEnrichment": "pass",
+        "exactTemplateCopyPreview": "pass",
+        "postconditionIdentityAndHashUnchanged": "pass"
+      },
+      "personalCalculationVerified": false,
+      "calculationVerificationNote": "Personal OneDrive uses structural OpenXML validation and schedules full recalculation on open; it does not falsely claim that Excel evaluated formulas server-side.",
+      "remoteMutationCountDuringChatgptPrompt": 0,
+      "copyCommitted": false,
+      "cleanupVerified": true,
+      "cleanupState": "recycle_bin_recoverable",
+      "activeFixtureRemaining": false
+    },
     "sourcePreviousRelease": {
       "status": "pass",
       "surface": "Current source full 84-tool profile against connected personal OneDrive",
@@ -430,14 +459,15 @@
     }
   },
   "installedBuild": {
-    "status": "pending",
+    "status": "pass",
     "version": "0.6.5+codex.20260820212515",
     "path": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.5+codex.20260820212515",
-    "oldCacheOverwritten": false
+    "oldCacheOverwritten": false,
+    "staleCacheBackup": "$CODEX_HOME/plugins/cache/personal/onedrive/0.6.5+codex.20260820212515.stale-20260821T045544Z"
   },
   "sourceCacheParity": {
-    "status": "pending",
-    "filesChecked": 92,
+    "status": "pass",
+    "filesChecked": 94,
     "bytes": "pass",
     "modes": "pass",
     "types": "pass",
@@ -446,32 +476,37 @@
   },
   "cleanup": {
     "status": "pass",
-    "runId": "codex-beta-nas62-filename-link-cleanup-20260814",
+    "runId": "codex-beta-nas69-excel-integrity-20260821",
     "staleDays": 0,
     "candidateCount": 0,
-    "deletedCount": 0,
+    "deletedCount": 1,
     "activeBetaRootsRemaining": 0,
     "localWorkCleaned": true,
     "remoteTestRootsRemaining": 0,
     "permissionsRemaining": 0,
     "anonymousLinksRemaining": 0,
-    "isolatedLocalResidue": false
+    "isolatedLocalResidue": false,
+    "fixture": "Codex NAS69 Excel Integrity Beta 20260821.xlsx",
+    "fixtureItemId": "B8C89DB91F19C763!se6f8265e87b9466d90becfeefef11e12",
+    "fixtureFinalState": "recycle_bin_recoverable",
+    "previewCopyCreated": false,
+    "activePathAbsenceVerified": true
   },
   "deployment": {
     "status": "pass",
     "platform": "Synology DS923+ Container Manager",
     "project": "onedrive-chatgpt",
     "projectId": "6ade094d-9ebe-46ef-83cb-f9bb443c8300",
-    "deployedAt": "2026-08-14T23:05:00Z",
-    "image": "onedrive-chatgpt-nas:0.6.4-nas62-filename-links-20260814",
+    "deployedAt": "2026-08-21T04:39:00Z",
+    "image": "onedrive-chatgpt-nas:0.6.5-nas69-excel-integrity-20260821",
     "imageTagRetainedByDsm": false,
-    "imageId": "sha256:e00ea47b54fa28535d6d537e32e4e95272ee33d1222851a5f479c2728e63598f",
-    "containerId": "29b06e432925b5658a0dc0df7cdcfef125a7bce124735e111a706d7690a71967",
-    "sourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas62-filename-links-20260814",
-    "buildContextCommit": "b63789fe01e490d1368b1e53e99c2f9d0afc6f56",
-    "packageFiles": 92,
-    "stagedFilesIncludingManifest": 93,
-    "releaseManifestSha256": "9b47b42f01da2b8d0d8d9f9b8b436efc9c3657acee0c1695b7813ec3e280db44",
+    "imageId": "sha256:865ef33f747ebf7c5308c3fb30a1d0e9003e52c4527346efe4380ff9ae0805b1",
+    "containerId": "d00e4c19768277e28f7507b51934fc640c519233af248f44838d380696b40b07",
+    "sourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.5-nas69-excel-integrity-20260821",
+    "buildContextCommit": "8eaf5e4ae91c737d913ff9b8169f1a8a98c8fd0c",
+    "packageFiles": 94,
+    "stagedFilesIncludingManifest": 95,
+    "releaseManifestSha256": "c06467276a5d1507d075cc444bec40934345b9b31451f88f6076a66c37808fcf",
     "containerState": "running",
     "containerHealth": "healthy",
     "healthFailingStreak": 0,
@@ -484,13 +519,19 @@
     "publicHealth": "pass",
     "oauthAuthorizationServerMetadata": "pass",
     "oauthProtectedResourceMetadata": "pass",
-    "mcpProtocolVersion": "2025-06-18",
-    "advertisedServerVersion": "0.6.4+codex.20260814225653.chatgpt.b8b8204c94fd",
-    "serverSha256": "01306757f602380da73823f4a7b20f77f8dfdb7902eeb50690eb6be3cef2d96b",
-    "rollbackSourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas61-link-open-20260814",
-    "rollbackImage": "onedrive-chatgpt-nas:0.6.4-nas61-link-open-20260814",
-    "rollbackImageId": "sha256:06c4392e2f41fa87a26eef592dbb425ed47e02bc8e0eb9160734a038c0e2879d",
-    "sourceIdentityNote": "All 92 source files plus the release manifest were uploaded to a new immutable NAS62 directory and individually verified by MD5 and size. Production uses the same source under the OAuth descriptor environment; the noauth focused suffix differs because security schemes are part of the advertised contract hash."
+    "mcpProtocolVersion": "2025-11-25",
+    "advertisedServerVersion": "0.6.5+codex.20260820212515.chatgpt.2cbcf743965c",
+    "serverSha256": "106dc6e87b18ca97dd2c304a2c90acfc5d15214f1bca6292227028a7cf36e26f",
+    "focusedToolCount": 21,
+    "healthP95Ms": 63.9,
+    "healthP95BudgetMs": 2000,
+    "tunnelClientVersion": "0.0.12",
+    "tunnelClientCommit": "881c9a8fed7cccbe6607cd419863bbca506b8215",
+    "fixedHighCriticalContainerFindings": 0,
+    "rollbackSourceDirectory": "/volume1/docker/onedrive-chatgpt/app-0.6.4-nas65-search-office-create-20260818",
+    "rollbackImage": "onedrive-chatgpt-nas:0.6.4-nas65-search-office-create-20260818",
+    "rollbackImageId": "sha256:c469c000e69ebbf09f0808f211254f8d7edc30e07fa3869aa7fd7cd56ae25431",
+    "sourceIdentityNote": "All 94 package files plus the release manifest were staged under a new immutable NAS69 directory and individually verified by size and MD5. The hosted CI run passed both Node versions, the production image build, Trivy, source and image SBOM generation, and evidence upload."
   },
   "fixes": [
     { "area": "Focused text-write schema", "result": "Work now receives one unambiguous remotePath plus content branch." },
@@ -506,6 +547,10 @@
     { "area": "CI Python bytecode residue", "result": "Python syntax checks write bytecode under the runner temporary directory, so the package-residue guard evaluates source rather than CI-generated __pycache__ files." }
   ],
   "performanceObservations": [
+    {
+      "area": "Warm exact-file search",
+      "result": "Three authenticated warm searches completed with p50 3584 ms and p95 3684 ms against a 5000 ms gate; every warm run used zero recursive scans."
+    },
     {
       "area": "Nested exact-path reads",
       "result": "Known root-relative paths resolve directly; the live nested workbook canary completed in 4654 ms, and the focused regression proves zero search and zero folder scans for this mode."
